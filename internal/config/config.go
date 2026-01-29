@@ -1,0 +1,91 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
+	"github.com/user/opencode-gateway/internal/adapters/feishu"
+	"github.com/user/opencode-gateway/internal/adapters/wecom"
+)
+
+// Config captures all runtime configuration knobs for the gateway.
+type Config struct {
+	ServerAddr       string
+	ReadTimeout      time.Duration
+	WriteTimeout     time.Duration
+	ShutdownGrace    time.Duration
+	OpenCodeEndpoint string
+	OpenCodeAPIKey   string
+	WeCom            wecom.Config
+	FeiShu           feishu.Config
+	DingTalk         dingtalk.Config
+}
+
+// Load reads configuration from environment variables with sensible defaults.
+func Load() (Config, error) {
+	cfg := Config{
+		ServerAddr:    getEnv("SERVER_ADDR", ":8080"),
+		ReadTimeout:   getDuration("SERVER_READ_TIMEOUT", 10*time.Second),
+		WriteTimeout:  getDuration("SERVER_WRITE_TIMEOUT", 10*time.Second),
+		ShutdownGrace: getDuration("SERVER_SHUTDOWN_GRACE", 15*time.Second),
+		// OpenCodeEndpoint: os.Getenv("OPENCODE_ENDPOINT", ),
+		OpenCodeEndpoint: "http://localhost:3000",
+		OpenCodeAPIKey:   "123",
+		WeCom: wecom.Config{
+			Token:          os.Getenv("WECOM_TOKEN"),
+			EncodingAESKey: os.Getenv("WECOM_AES_KEY"),
+			CorpID:         os.Getenv("WECOM_CORP_ID"),
+			AgentID:        os.Getenv("WECOM_AGENT_ID"),
+		},
+		FeiShu: feishu.Config{
+			AppID:             os.Getenv("FEISHU_APP_ID"),
+			AppSecret:         os.Getenv("FEISHU_APP_SECRET"),
+			VerificationToken: os.Getenv("FEISHU_VERIFICATION_TOKEN"),
+			EncryptKey:        os.Getenv("FEISHU_ENCRYPT_KEY"),
+		},
+		DingTalk: dingtalk.Config{
+			// Stream mode (preferred)
+			ClientID:     os.Getenv("DINGTALK_CLIENT_ID"),
+			ClientSecret: os.Getenv("DINGTALK_CLIENT_SECRET"),
+			UseStream:    os.Getenv("DINGTALK_USE_STREAM") == "true",
+			// Webhook mode (legacy)
+			AppKey:            os.Getenv("DINGTALK_APP_KEY"),
+			AppSecret:         os.Getenv("DINGTALK_APP_SECRET"),
+			VerificationToken: os.Getenv("DINGTALK_VERIFICATION_TOKEN"),
+			EncryptKey:        os.Getenv("DINGTALK_ENCRYPT_KEY"),
+			SigningSecret:     os.Getenv("DINGTALK_SIGNING_SECRET"),
+		},
+	}
+
+	if cfg.OpenCodeEndpoint == "" {
+		return cfg, fmt.Errorf("missing OPENCODE_ENDPOINT")
+	}
+
+	if cfg.OpenCodeAPIKey == "" {
+		return cfg, fmt.Errorf("missing OPENCODE_API_KEY")
+	}
+
+	return cfg, nil
+}
+
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func getDuration(key string, fallback time.Duration) time.Duration {
+	if raw := os.Getenv(key); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			return d
+		}
+		if seconds, err := strconv.Atoi(raw); err == nil {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return fallback
+}
