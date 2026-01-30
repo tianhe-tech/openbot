@@ -9,7 +9,7 @@ require (
 	github.com/alibabacloud-go/tea-utils/v2 v2.0.9
 	github.com/google/uuid v1.3.0
 	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
-	github.com/sst/opencode-sdk-go v0.1.0
+	github.com/sst/opencode-sdk-go v0.19.2
 )
 
 require (

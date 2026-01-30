@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
@@ -31,8 +32,13 @@ type MessagePayload struct {
 	ThreadID  string            `json:"thread_id,omitempty"`
 	SessionID string            `json:"session_id,omitempty"`
 	Content   string            `json:"content"`
+	Agent     string            `json:"agent,omitempty"`     // 可选：指定使用的agent/skill名称
+	Streaming bool              `json:"streaming,omitempty"` // 是否使用流式返回
 	Metadata  map[string]string `json:"metadata,omitempty"`
 }
+
+// StreamCallback defines a callback for streaming responses.
+type StreamCallback func(chunk string) error
 
 // EventHandler defines a callback for incoming OpenCode events.
 type EventHandler func(ctx context.Context, event *opencode.EventListResponse) error
@@ -43,7 +49,9 @@ type Client struct {
 	eventHandlers   []EventHandler
 	eventListenerMu sync.RWMutex
 	sessions        sync.Map // map[threadID]sessionID
+	sessionLocks    sync.Map // map[threadID]*sync.Mutex for preventing concurrent session operations
 	directory       string
+	timeout         time.Duration // 默认超时时间
 }
 
 // Option mutates a client during construction.
@@ -53,6 +61,13 @@ type Option func(*Client)
 func WithDirectory(dir string) Option {
 	return func(c *Client) {
 		c.directory = dir
+	}
+}
+
+// WithTimeout sets the default timeout for OpenCode operations.
+func WithTimeout(timeout time.Duration) Option {
+	return func(c *Client) {
+		c.timeout = timeout
 	}
 }
 
@@ -72,6 +87,7 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 		),
 		eventHandlers: make([]EventHandler, 0),
 		directory:     ".",
+		timeout:       180 * time.Second, // 默认60秒超时
 	}
 
 	for _, opt := range opts {
@@ -96,7 +112,13 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		return Response{}, ErrEmptyPayload
 	}
 
-	// Get or create session for this thread
+	// Apply timeout to context
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	// Get or create session with lock to prevent concurrent session creation
+	threadLock := c.getThreadLock(payload.ThreadID)
+	threadLock.Lock()
 	sessionID := payload.SessionID
 	if sessionID == "" && payload.ThreadID != "" {
 		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
@@ -110,25 +132,40 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			Title: opencode.F(fmt.Sprintf("%s-%s", payload.Channel, payload.UserID)),
 		})
 		if err != nil {
+			threadLock.Unlock()
 			return Response{}, fmt.Errorf("opencode: create session: %w", err)
 		}
 		sessionID = session.ID
 		if payload.ThreadID != "" {
 			c.sessions.Store(payload.ThreadID, sessionID)
 		}
+		log.Printf("opencode: created new session %s for thread %s", sessionID, payload.ThreadID)
+	}
+	threadLock.Unlock()
+
+	// Build message parts
+	parts := []opencode.SessionPromptParamsPartUnion{}
+
+	// Add agent part if specified
+	if payload.Agent != "" {
+		parts = append(parts, opencode.AgentPartInputParam{
+			Name: opencode.F(payload.Agent),
+			Type: opencode.F(opencode.AgentPartInputTypeAgent),
+		})
 	}
 
-	// Send chat message to session
-	result, err := c.sdk.Session.Chat(ctx, sessionID, opencode.SessionChatParams{
-		Parts: opencode.F([]opencode.SessionChatParamsPartUnion{
-			opencode.SessionChatParamsPart{
-				Text: opencode.F(payload.Content),
-				Type: opencode.F(opencode.SessionChatParamsPartsTypeText),
-			},
-		}),
+	// Add text content
+	parts = append(parts, opencode.TextPartInputParam{
+		Text: opencode.F(payload.Content),
+		Type: opencode.F(opencode.TextPartInputTypeText),
+	})
+
+	// Send prompt message to session
+	result, err := c.sdk.Session.Prompt(ctx, sessionID, opencode.SessionPromptParams{
+		Parts: opencode.F(parts),
 	})
 	if err != nil {
-		return Response{}, fmt.Errorf("opencode: send chat: %w", err)
+		return Response{}, fmt.Errorf("opencode: send prompt: %w", err)
 	}
 
 	// Extract reply from assistant message
@@ -144,12 +181,43 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 // GetSession retrieves session details.
 func (c *Client) GetSession(ctx context.Context, sessionID string) (*opencode.Session, error) {
-	return c.sdk.Session.Get(ctx, sessionID)
+	return c.sdk.Session.Get(ctx, sessionID, opencode.SessionGetParams{})
+}
+
+// ListAgents retrieves all available agents/skills.
+func (c *Client) ListAgents(ctx context.Context) ([]opencode.Agent, error) {
+	result, err := c.sdk.Agent.List(ctx, opencode.AgentListParams{
+		Directory: opencode.F(c.directory),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []opencode.Agent{}, nil
+	}
+	return *result, nil
+}
+
+// ExecuteCommand executes a command in the session context.
+// This can be used to directly invoke skill scripts like websearch.py
+func (c *Client) ExecuteCommand(ctx context.Context, sessionID, command string) (*opencode.SessionCommandResponse, error) {
+	return c.sdk.Session.Command(ctx, sessionID, opencode.SessionCommandParams{
+		Command:   opencode.F(command),
+		Directory: opencode.F(c.directory),
+	})
+}
+
+// ExecuteShell executes a shell command in the session context.
+func (c *Client) ExecuteShell(ctx context.Context, sessionID, command string) (*opencode.AssistantMessage, error) {
+	return c.sdk.Session.Shell(ctx, sessionID, opencode.SessionShellParams{
+		Command:   opencode.F(command),
+		Directory: opencode.F(c.directory),
+	})
 }
 
 // ListSessions retrieves all sessions.
 func (c *Client) ListSessions(ctx context.Context) ([]opencode.Session, error) {
-	result, err := c.sdk.Session.List(ctx)
+	result, err := c.sdk.Session.List(ctx, opencode.SessionListParams{})
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +229,7 @@ func (c *Client) ListSessions(ctx context.Context) ([]opencode.Session, error) {
 
 // StartEventListener begins listening for OpenCode events via SSE.
 func (c *Client) StartEventListener(ctx context.Context) error {
-	stream := c.sdk.Event.ListStreaming(ctx)
+	stream := c.sdk.Event.ListStreaming(ctx, opencode.EventListParams{})
 
 	go func() {
 		defer stream.Close()
@@ -196,8 +264,8 @@ func (c *Client) RegisterEventHandler(handler EventHandler) {
 	c.eventHandlers = append(c.eventHandlers, handler)
 }
 
-// extractReplyFromMessage extracts text content from a chat response.
-func extractReplyFromMessage(msg *opencode.SessionChatResponse) string {
+// extractReplyFromMessage extracts text content from a prompt response.
+func extractReplyFromMessage(msg *opencode.SessionPromptResponse) string {
 	if msg == nil || len(msg.Parts) == 0 {
 		return "(no response)"
 	}
@@ -215,4 +283,34 @@ func extractReplyFromMessage(msg *opencode.SessionChatResponse) string {
 	}
 
 	return strings.Join(textParts, "\n")
+}
+
+// getThreadLock gets or creates a lock for a specific thread to prevent concurrent operations.
+func (c *Client) getThreadLock(threadID string) *sync.Mutex {
+	if threadID == "" {
+		return &sync.Mutex{} // Return a new mutex for single-use
+	}
+
+	lock, _ := c.sessionLocks.LoadOrStore(threadID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+// SendMessageStreaming sends a message and calls the callback for each chunk of the response.
+// Note: OpenCode SDK doesn't support true streaming yet, so we send the full response.
+func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayload, callback StreamCallback) (Response, error) {
+	// For now, just call SendMessage and invoke callback with full response
+	// In future, can implement chunking or use SSE if SDK supports it
+	response, err := c.SendMessage(ctx, payload)
+	if err != nil {
+		return response, err
+	}
+
+	// Call callback with full reply if provided
+	if callback != nil && response.Reply != "" {
+		if err := callback(response.Reply); err != nil {
+			log.Printf("opencode: stream callback error: %v", err)
+		}
+	}
+
+	return response, nil
 }

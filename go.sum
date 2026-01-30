@@ -113,8 +113,8 @@ github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:
 github.com/smartystreets/assertions v0.0.0-20180927180507-b2de0cb4f26d/go.mod h1:OnSkiWE9lh6wB0YB77sQom3nweQdgAjqCqsofrRNTgc=
 github.com/smartystreets/assertions v1.1.0/go.mod h1:tcbTF8ujkAEcZ8TElKY+i30BzYlVhC/LOxJk7iOWnoo=
 github.com/smartystreets/goconvey v1.6.4/go.mod h1:syvi0/a8iFYH4r/RixwvyeAJjdLS9QV7WQ/tjFTllLA=
-github.com/sst/opencode-sdk-go v0.1.0 h1:Uzn4Wh4lK68ickKxyXpW3r+7DJK2Xx1mcfhLwUaGocA=
-github.com/sst/opencode-sdk-go v0.1.0/go.mod h1:uagorfAHZsVy6vf0xY6TlQraM4uCILdZ5tKKhl1oToM=
+github.com/sst/opencode-sdk-go v0.19.2 h1:ffgQpE+ms4F0Wop/tT4tqTvFAbocyWYM8iy543b3Ous=
+github.com/sst/opencode-sdk-go v0.19.2/go.mod h1:rrpo5n0Be43y6tJ29TeMxH1/zeoDcB0D43nJh6gnL34=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.2.0/go.mod h1:qt09Ya8vawLte6SNmTgCsAVtYtaKzEcn8ATUoHMkEqE=
 github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=

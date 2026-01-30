@@ -50,7 +50,9 @@ func Load() (Config, error) {
 			// Stream mode (preferred)
 			ClientID:     os.Getenv("DINGTALK_CLIENT_ID"),
 			ClientSecret: os.Getenv("DINGTALK_CLIENT_SECRET"),
-			UseStream:    os.Getenv("DINGTALK_USE_STREAM") == "true",
+			// ClientID:     "dingk90c2agr1blmauzh",
+			// ClientSecret: "QRRH6n44_3QAW0HYobnr3znqhRPtkqk9Yd3KZSoGraUy9AqPLUif5tIh-vSqloNV",
+			UseStream: true, // 启用Stream模式
 			// Webhook mode (legacy)
 			AppKey:            os.Getenv("DINGTALK_APP_KEY"),
 			AppSecret:         os.Getenv("DINGTALK_APP_SECRET"),

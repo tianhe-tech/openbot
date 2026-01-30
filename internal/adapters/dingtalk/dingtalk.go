@@ -106,18 +106,60 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 	log.Printf("dingtalk stream: received message from %s: %s", userID, content)
 
-	// Send to OpenCode
-	response, err := h.client.SendMessage(ctx, opencode.MessagePayload{
-		Channel:  "dingtalk",
-		UserID:   userID,
-		ThreadID: conversationID,
-		Content:  content,
+	// Handle special commands
+	if content == "/skills" || content == "/agents" {
+		return h.handleListSkills(ctx, data)
+	}
+
+	// Handle /cmd command to execute skill scripts directly
+	if strings.HasPrefix(content, "/cmd ") {
+		command := strings.TrimPrefix(content, "/cmd ")
+		return h.handleExecuteCommand(ctx, data, userID, command)
+	}
+
+	// Parse agent specification: @agent_name message content
+	var agentName string
+	if strings.HasPrefix(content, "@") {
+		parts := strings.SplitN(content[1:], " ", 2)
+		if len(parts) == 2 {
+			agentName = parts[0]
+			content = parts[1]
+			log.Printf("dingtalk stream: using agent '%s' for message", agentName)
+		}
+	}
+
+	// Send to OpenCode with streaming
+	replier := chatbot.NewChatbotReplier()
+
+	// Send initial "thinking" message
+	thinkingMsg := "⏳ 正在思考中..."
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(thinkingMsg)); err != nil {
+		log.Printf("dingtalk stream: failed to send thinking message: %v", err)
+	}
+
+	// Use streaming to get response
+	var fullReply strings.Builder
+	response, err := h.client.SendMessageStreaming(ctx, opencode.MessagePayload{
+		Channel:   "dingtalk",
+		UserID:    userID,
+		ThreadID:  conversationID,
+		Content:   content,
+		Agent:     agentName,
+		Streaming: true,
 		Metadata: map[string]string{
 			"conversation_type": data.ConversationType,
 			"sender_nick":       data.SenderNick,
 		},
+	}, func(chunk string) error {
+		// Accumulate chunks and send updates
+		fullReply.WriteString(chunk)
+		// Send update every few chunks to avoid too many updates
+		return nil
 	})
+
 	if err != nil {
+		errMsg := fmt.Sprintf("❌ 处理失败: %v", err)
+		replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
 		log.Printf("dingtalk stream: failed to send to OpenCode: %v", err)
 		return nil, err
 	}
@@ -126,15 +168,107 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	h.adapter.MapUserToSession(userID, response.SessionID)
 	log.Printf("dingtalk stream: mapped user %s to session %s", userID, response.SessionID)
 
-	// Reply to user via Stream
-	replier := chatbot.NewChatbotReplier()
-	replyText := []byte(response.Reply)
-	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, replyText); err != nil {
+	// Send final complete reply
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(response.Reply)); err != nil {
 		log.Printf("dingtalk stream: failed to reply: %v", err)
 		return nil, err
 	}
 
 	log.Printf("dingtalk stream: replied to user %s", userID)
+	return nil, nil
+}
+
+// handleListSkills handles the /skills command to list available agents.
+func (h *Handler) handleListSkills(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	agents, err := h.client.ListAgents(ctx)
+	if err != nil {
+		log.Printf("dingtalk: failed to list agents: %v", err)
+		return nil, err
+	}
+
+	// Build response message
+	var reply strings.Builder
+	reply.WriteString("📋 可用的 Skills/Agents:\n\n")
+
+	if len(agents) == 0 {
+		reply.WriteString("暂无可用的 agent。\n")
+		reply.WriteString("请在 OpenCode 工作目录创建 AGENTS.md 文件定义 agents。")
+	} else {
+		for i, agent := range agents {
+			reply.WriteString(fmt.Sprintf("%d. **%s**", i+1, agent.Name))
+			if agent.Description != "" {
+				reply.WriteString(fmt.Sprintf("\n   描述: %s", agent.Description))
+			}
+			reply.WriteString(fmt.Sprintf("\n   模式: %s", agent.Mode))
+			if agent.Prompt != "" {
+				reply.WriteString(fmt.Sprintf("\n   提示词: %s", agent.Prompt))
+			}
+			reply.WriteString("\n\n")
+		}
+		reply.WriteString("💡 使用方法: @agent_name 你的消息\n")
+		reply.WriteString("例如: @build 帮我编译项目")
+	}
+
+	// Reply to user
+	replier := chatbot.NewChatbotReplier()
+	replyText := []byte(reply.String())
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, replyText); err != nil {
+		log.Printf("dingtalk: failed to reply: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleExecuteCommand handles direct command execution like skill scripts
+func (h *Handler) handleExecuteCommand(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, command string) ([]byte, error) {
+	// Get or create session for user
+	var sessionID string
+	if sid, ok := h.adapter.GetSessionForUser(userID); ok {
+		sessionID = sid
+	} else {
+		// Create new session if needed
+		response, err := h.client.SendMessage(ctx, opencode.MessagePayload{
+			Channel:  "dingtalk",
+			UserID:   userID,
+			ThreadID: data.ConversationId,
+			Content:  "Initialize session",
+		})
+		if err != nil {
+			log.Printf("dingtalk: failed to create session: %v", err)
+			return nil, err
+		}
+		sessionID = response.SessionID
+		h.adapter.MapUserToSession(userID, sessionID)
+	}
+
+	log.Printf("dingtalk: executing command in session %s: %s", sessionID, command)
+
+	// Execute command
+	result, err := h.client.ExecuteShell(ctx, sessionID, command)
+	if err != nil {
+		log.Printf("dingtalk: command execution failed: %v", err)
+		errMsg := fmt.Sprintf("❌ 命令执行失败: %v", err)
+		replier := chatbot.NewChatbotReplier()
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	// Build response message
+	var reply string
+	if result != nil {
+		reply = fmt.Sprintf("🖥️ 命令执行结果:\n\n```\n%s\n```", result.ID)
+	} else {
+		reply = "🖥️ 命令执行完成"
+	}
+
+	// Send reply
+	replier := chatbot.NewChatbotReplier()
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(reply)); err != nil {
+		log.Printf("dingtalk: failed to reply: %v", err)
+		return nil, err
+	}
+
 	return nil, nil
 }
 
