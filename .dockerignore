@@ -1,0 +1,45 @@
+# Binaries
+openbot
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+README.md
+ARCHITECTURE.md
+*.md
+
+# Examples
+examples/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
