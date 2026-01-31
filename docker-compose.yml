@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  opencode:
+    image: opencode/opencode:latest
+    container_name: opencode
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+    networks:
+      - gateway-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  openbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openbot
+    ports:
+      - "8080:8080"
+    environment:
+      # OpenCode configuration
+      - OPENCODE_ENDPOINT=http://opencode:3000
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-your-api-key}
+      
+      # Server configuration
+      - SERVER_ADDR=:8080
+      - SERVER_READ_TIMEOUT=10s
+      - SERVER_WRITE_TIMEOUT=10s
+      - SERVER_SHUTDOWN_GRACE=15s
+      
+      # WeChat Work configuration
+      - WECOM_TOKEN=${WECOM_TOKEN:-}
+      - WECOM_AES_KEY=${WECOM_AES_KEY:-}
+      - WECOM_CORP_ID=${WECOM_CORP_ID:-}
+      - WECOM_AGENT_ID=${WECOM_AGENT_ID:-}
+      
+      # Feishu configuration
+      - FEISHU_APP_ID=${FEISHU_APP_ID:-}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET:-}
+      - FEISHU_VERIFICATION_TOKEN=${FEISHU_VERIFICATION_TOKEN:-}
+      - FEISHU_ENCRYPT_KEY=${FEISHU_ENCRYPT_KEY:-}
+      
+      # DingTalk configuration
+      - DINGTALK_CLIENT_ID=${DINGTALK_CLIENT_ID:-}
+      - DINGTALK_CLIENT_SECRET=${DINGTALK_CLIENT_SECRET:-}
+      - DINGTALK_APP_KEY=${DINGTALK_APP_KEY:-}
+      - DINGTALK_APP_SECRET=${DINGTALK_APP_SECRET:-}
+      - DINGTALK_VERIFICATION_TOKEN=${DINGTALK_VERIFICATION_TOKEN:-}
+      - DINGTALK_ENCRYPT_KEY=${DINGTALK_ENCRYPT_KEY:-}
+      - DINGTALK_SIGNING_SECRET=${DINGTALK_SIGNING_SECRET:-}
+    depends_on:
+      opencode:
+        condition: service_healthy
+    networks:
+      - gateway-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  gateway-network:
+    driver: bridge
