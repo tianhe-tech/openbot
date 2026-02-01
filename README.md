@@ -14,11 +14,32 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
   - Event routing: OpenCode → Platform
   - Session management and user mapping
 
-- **Smart Session Management** (New! 🎉)
+- **Smart Session Management**
   - **Auto-summarization**: Summarizes conversation after 30 messages
   - **Auto-renewal**: Creates new session after 50 messages
   - **Context preservation**: Carries conversation summary to new sessions
   - **Prevents "context deadline exceeded" errors**
+
+- **Streaming Progress Updates** ⚡ NEW!
+  - Real-time progress notifications every 10 seconds
+  - Intermediate results every 500 characters
+  - Prevents timeout issues for long-running tasks
+  - Better user experience for lengthy AI responses
+
+- **Unified Task Scheduler** 🗓️ NEW!
+  - Multi-session task execution
+  - Priority-based task queue
+  - Worker pool (10 concurrent workers)
+  - Automatic retry mechanism (up to 3 attempts)
+  - REST API for task submission and monitoring
+
+- **Cron Scheduler & `/crontask` Command** ⏰ NEW!
+  - Create scheduled tasks directly from chat
+  - Full cron expression support (6 fields)
+  - Task management: add, list, enable, disable, delete
+  - Automatic session creation for each execution
+  - Perfect for monitoring, reports, and reminders
+  - Command format: `/crontask add "0 */30 * * * *" "任务名" "任务内容"`
 
 - **DingTalk Stream Mode**
   - No public IP required
@@ -71,6 +92,8 @@ Expected output:
 ```
 opencode event listener started
 dingtalk: Stream mode client started
+scheduler: starting task scheduler with 10 workers
+cron-scheduler: starting cron scheduler
 opencode gateway ready on :8080 (bidirectional mode)
 adapters registered: [wecom feishu dingtalk (stream)]
 event listener: active
@@ -80,15 +103,31 @@ event listener: active
 
 | Document | Description |
 |----------|-------------|
-| **[DINGTALK_SETUP.md](DINGTALK_SETUP.md)** | **DingTalk Stream + Webhook setup guide** ⭐ |
+| **[QUICK_START_CRONTASK.md](docs/QUICK_START_CRONTASK.md)** | **⭐ Quick start guide for `/crontask` command** |
+| **[CRONTASK_COMMAND.md](docs/CRONTASK_COMMAND.md)** | **Complete `/crontask` command reference** |
+| **[SCHEDULER_GUIDE.md](docs/SCHEDULER_GUIDE.md)** | **Task scheduler design and API guide** |
+| [DINGTALK_SETUP.md](DINGTALK_SETUP.md) | DingTalk Stream + Webhook setup guide |
 | [API_TEST_GUIDE.md](API_TEST_GUIDE.md) | API testing guide with examples |
 | [API_TEST_SUMMARY.md](API_TEST_SUMMARY.md) | Test results and quick reference |
+| [internal/scheduler/README.md](internal/scheduler/README.md) | Scheduler module overview |
 
 ## 🧪 Testing
 
 ### Quick Test All Adapters
 ```powershell
 .\scripts\test_all.ps1
+```
+
+### Test Scheduler API
+```bash
+./scripts/test_scheduler_api.sh
+```
+
+### Test /crontask in DingTalk
+```
+/crontask help
+/crontask add "0 */30 * * * *" "测试任务" "查看系统负载"
+/crontask list
 ```
 
 ### Detailed I/O Demo
@@ -110,23 +149,25 @@ event listener: active
 
 ```
 ┌─────────────┐
-│   DingTalk  │ (Stream WebSocket)
+│   DingTalk  │ (Stream WebSocket + /crontask)
 │   Feishu    │ (Webhook)
 │   WeCom     │ (Webhook)
 └──────┬──────┘
        │
        ▼
-┌─────────────────────────────┐
-│    Gateway (Adapters)       │
-│  - DingTalk Stream Client   │
-│  - Webhook Endpoints        │
-│  - Session Management       │
-└──────────┬──────────────────┘
+┌─────────────────────────────────────────┐
+│        Gateway (Adapters)               │
+│  - DingTalk Stream Client               │
+│  - Webhook Endpoints                    │
+│  - Session Management                   │
+│  - Task Scheduler (Worker Pool)         │
+│  - Cron Scheduler (robfig/cron)         │
+└──────────┬──────────────────────────────┘
            │
            ▼ (opencode-sdk-go)
-┌─────────────────────────────┐
-│    OpenCode Server          │
-│    http://localhost:3000    │
+┌─────────────────────────────────────────┐
+│        OpenCode Server                  │
+│        http://localhost:4096            │
 └─────────────────────────────┘
 ```
 

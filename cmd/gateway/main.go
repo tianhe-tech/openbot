@@ -15,6 +15,7 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
 	"github.com/user/opencode-gateway/internal/config"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/scheduler"
 	"github.com/user/opencode-gateway/internal/server"
 )
 
@@ -32,10 +33,22 @@ func main() {
 		opencode.WithDirectory("."),
 	)
 
+	// ========== Create Task Scheduler ==========
+	schedulerCfg := scheduler.DefaultTaskSchedulerConfig()
+	taskScheduler := scheduler.NewTaskScheduler(ocClient, schedulerCfg)
+	cronScheduler := scheduler.NewCronScheduler(taskScheduler)
+	webhookHandler := scheduler.NewWebhookHandler(taskScheduler, cronScheduler)
+
 	// Create adapters
 	wecomHandler := wecom.NewHandler(ocClient, cfg.WeCom)
 	feishuHandler := feishu.NewHandler(ocClient, cfg.FeiShu)
 	dingtalkHandler := dingtalk.NewHandler(ocClient, cfg.DingTalk)
+
+	// Set cronScheduler to adapters so they can manage scheduled tasks
+	dingtalkHandler.SetCronScheduler(cronScheduler)
+	// TODO: Add SetCronScheduler to other adapters if needed
+	// wecomHandler.SetCronScheduler(cronScheduler)
+	// feishuHandler.SetCronScheduler(cronScheduler)
 
 	// Register adapters in registry
 	adapterRegistry.Register(wecomHandler.GetAdapter())
@@ -57,6 +70,18 @@ func main() {
 	// Start event listener for bidirectional communication
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Start task scheduler
+	if err := taskScheduler.Start(); err != nil {
+		log.Fatalf("failed to start task scheduler: %v", err)
+	}
+	defer taskScheduler.Stop()
+
+	// Start cron scheduler
+	if err := cronScheduler.Start(); err != nil {
+		log.Fatalf("failed to start cron scheduler: %v", err)
+	}
+	defer cronScheduler.Stop()
 
 	if err := ocClient.StartEventListener(ctx); err != nil {
 		log.Printf("warning: could not start event listener: %v", err)
@@ -82,6 +107,10 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
+
+	// Register scheduler webhook routes
+	webhookHandler.RegisterRoutes(mux)
+	log.Println("scheduler webhook routes registered")
 
 	// Mount adapters (webhook endpoints)
 	wecomHandler.Mount(mux)

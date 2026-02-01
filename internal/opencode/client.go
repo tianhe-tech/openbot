@@ -182,7 +182,7 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 				"500",
 			},
 		},
-		enableSkillHint: true, // 默认启用skill提示
+		enableSkillHint: false, // 默认禁用skill提示，避免输出过多提示信息
 	}
 
 	for _, opt := range opts {
@@ -657,18 +657,53 @@ func (c *Client) ResetSession(threadID string) {
 }
 
 // SendMessageStreaming sends a message and calls the callback for each chunk of the response.
-// 改进版本：使用定时器定期检查并发送进度更新
+// 真正的流式实现：注册StreamingSessionHandler监听实时事件
 func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayload, callback StreamCallback) (Response, error) {
 	if callback == nil {
 		// 如果没有回调，直接使用普通模式
 		return c.SendMessage(ctx, payload)
 	}
 
-	// 使用goroutine异步发送消息，同时定期发送进度更新
+	// 1. 先确定sessionID（可能需要创建新session）
+	threadLock := c.getThreadLock(payload.ThreadID)
+	threadLock.Lock()
+	sessionID := payload.SessionID
+	if sessionID == "" && payload.ThreadID != "" {
+		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
+			sessionID = sid.(string)
+		}
+	}
+
+	// 如果还是没有sessionID，我们需要先创建session
+	if sessionID == "" {
+		sessionCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
+			Title: opencode.F(fmt.Sprintf("%s-%s", payload.Channel, payload.UserID)),
+		})
+		cancel()
+		if err != nil {
+			threadLock.Unlock()
+			return Response{}, fmt.Errorf("opencode: create session for streaming: %w", err)
+		}
+		sessionID = session.ID
+		if payload.ThreadID != "" {
+			c.sessions.Store(payload.ThreadID, sessionID)
+		}
+		c.messageCount.Store(sessionID, 0)
+		c.tokenCount.Store(sessionID, 0)
+		log.Printf("opencode: created new session %s for streaming", sessionID)
+	}
+	threadLock.Unlock()
+
+	// 2. 创建StreamingSessionHandler并注册
+	handler := NewStreamingSessionHandler(sessionID, callback)
+	c.RegisterEventHandler(handler.HandleEvent)
+	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
+
+	// 3. 使用goroutine异步发送消息
 	responseChan := make(chan Response, 1)
 	errorChan := make(chan error, 1)
 
-	// 启动消息发送
 	go func() {
 		response, err := c.SendMessage(ctx, payload)
 		if err != nil {
@@ -678,7 +713,7 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		responseChan <- response
 	}()
 
-	// 定时发送进度更新
+	// 4. 定时发送进度更新（作为后备，如果事件流没有内容）
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -690,6 +725,7 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		"⏳ 快完成了，请耐心等待...",
 	}
 	progressIndex := 0
+	lastProgressTime := time.Now()
 
 	for {
 		select {
@@ -700,31 +736,48 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 			return Response{}, err
 
 		case response := <-responseChan:
-			// 发送最终结果
-			if response.Reply != "" {
-				if err := callback(response.Reply); err != nil {
-					log.Printf("opencode: stream callback error: %v", err)
+			// 检查是否通过streaming handler已经发送了内容
+			sentContent := handler.GetLastContent()
+			log.Printf("opencode: streaming completed, handler sent: %d chars, final response: %d chars",
+				len(sentContent), len(response.Reply))
+
+			// 如果handler没有发送任何内容，或者最终响应与已发送内容不同，发送最终结果
+			if sentContent == "" || sentContent != response.Reply {
+				if response.Reply != "" {
+					log.Printf("opencode: sending final response via callback")
+					if err := callback(response.Reply); err != nil {
+						log.Printf("opencode: final callback error: %v", err)
+					}
 				}
 			}
 			return response, nil
 
 		case <-ticker.C:
-			// 定期发送进度提示（仅当还在等待时）
-			if progressIndex < len(progressMessages) {
-				if err := callback(progressMessages[progressIndex]); err != nil {
-					log.Printf("opencode: progress callback error: %v", err)
-				}
-				progressIndex++
-			} else {
-				// 超过预设的进度消息数量，发送持续等待提示
-				minutes := (progressIndex - len(progressMessages) + 1) * 10 / 60
-				if minutes > 0 {
-					msg := fmt.Sprintf("⏱️ 已等待 %d 分钟，任务仍在执行中...", minutes)
-					if err := callback(msg); err != nil {
+			// 检查handler是否已经发送了内容
+			if handler.HasSentContent() {
+				// handler已经通过事件流发送了内容，不再发送进度提示
+				continue
+			}
+
+			// 只有在一段时间没有通过handler收到内容时，才发送进度提示
+			if time.Since(lastProgressTime) >= 10*time.Second {
+				if progressIndex < len(progressMessages) {
+					if err := callback(progressMessages[progressIndex]); err != nil {
 						log.Printf("opencode: progress callback error: %v", err)
 					}
+					progressIndex++
+				} else {
+					// 超过预设的进度消息数量，发送持续等待提示
+					minutes := (progressIndex - len(progressMessages) + 1) * 10 / 60
+					if minutes > 0 {
+						msg := fmt.Sprintf("⏱️ 已等待 %d 分钟，任务仍在执行中...", minutes)
+						if err := callback(msg); err != nil {
+							log.Printf("opencode: progress callback error: %v", err)
+						}
+					}
+					progressIndex++
 				}
-				progressIndex++
+				lastProgressTime = time.Now()
 			}
 		}
 	}

@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ type StreamingSessionHandler struct {
 	lastUpdateTime time.Time
 	mu             sync.Mutex
 	completed      bool
+	contentSent    bool // 标记是否已发送过内容
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -124,9 +126,8 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 
 	// 根据事件类型处理
 	switch eventType {
-	case "session.updated", "message.updated", "message.completed":
-		// 提取新内容（这里需要根据实际SDK结构调整）
-		// 假设事件中包含消息内容或增量更新
+	case "session.updated", "message.updated", "message.part.updated", "message.completed":
+		// 提取新内容
 		newContent := s.extractContentFromEvent(event)
 		if newContent != "" && newContent != s.lastContent {
 			// 计算增量内容
@@ -137,8 +138,11 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 
 			if incremental != "" {
 				// 调用回调发送增量内容
+				log.Printf("opencode: streaming session %s sending %d new chars", s.sessionID[:8], len(incremental))
 				if err := s.callback(incremental); err != nil {
 					log.Printf("opencode: streaming callback error: %v", err)
+				} else {
+					s.contentSent = true // 标记已发送内容
 				}
 				s.lastContent = newContent
 				s.lastUpdateTime = time.Now()
@@ -146,7 +150,8 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		}
 
 		// 如果是完成事件，标记为已完成
-		if eventType == "message.completed" {
+		if eventType == "message.completed" || eventType == "session.idle" {
+			log.Printf("opencode: streaming session %s completed", s.sessionID[:8])
 			s.completed = true
 		}
 
@@ -160,11 +165,51 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 
 // extractContentFromEvent 从事件中提取内容
 func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventListResponse) string {
-	// TODO: 根据实际SDK事件结构提取内容
-	// 这里需要查看opencode.EventListResponse的具体字段
-	// 可能的字段：event.Data, event.Message, event.Content等
+	if event == nil {
+		return ""
+	}
 
-	// 暂时返回空字符串，需要根据实际情况调整
+	// 尝试解析 message.part.updated 事件
+	// 根据 OpenCode SDK 源码，EventListResponseEventMessagePartUpdatedProperties 包含：
+	// - Delta string (增量文本)
+	// - Part.Text string (part的完整文本)
+	if event.Type == "message.part.updated" {
+		// 定义 properties 结构来解析 JSON
+		type PartUpdateProps struct {
+			Delta string `json:"delta"`
+			Part  struct {
+				Text string `json:"text"`
+				Type string `json:"type"`
+			} `json:"part"`
+		}
+
+		var props PartUpdateProps
+		if jsonData := event.JSON.RawJSON(); jsonData != "" {
+			// 从原始 JSON 中解析 properties 字段
+			var wrapper struct {
+				Properties PartUpdateProps `json:"properties"`
+			}
+			if err := json.Unmarshal([]byte(jsonData), &wrapper); err == nil {
+				props = wrapper.Properties
+
+				// Delta 字段包含增量文本（最重要）
+				if props.Delta != "" {
+					log.Printf("opencode: extracted delta content (%d chars) from message.part.updated event", len(props.Delta))
+					return props.Delta
+				}
+
+				// 如果没有 Delta，尝试返回 Part.Text
+				if props.Part.Text != "" && props.Part.Type == "text" {
+					log.Printf("opencode: extracted text content (%d chars) from Part.Text", len(props.Part.Text))
+					return props.Part.Text
+				}
+			} else {
+				log.Printf("opencode: failed to parse message.part.updated properties: %v", err)
+			}
+		}
+	}
+
+	// 其他事件类型暂时不提取内容
 	return ""
 }
 
@@ -180,4 +225,11 @@ func (s *StreamingSessionHandler) GetLastContent() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastContent
+}
+
+// HasSentContent 检查是否已发送过内容
+func (s *StreamingSessionHandler) HasSentContent() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.contentSent
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/scheduler"
 )
 
 // Config stores DingTalk adapter settings.
@@ -30,10 +31,11 @@ type Config struct {
 // Handler processes DingTalk callbacks and proxies them to OpenCode.
 // Supports both Stream mode and traditional Webhook mode.
 type Handler struct {
-	client       *opencode.Client
-	cfg          Config
-	adapter      *base.BidirectionalAdapter
-	streamClient *client.StreamClient
+	client        *opencode.Client
+	cfg           Config
+	adapter       *base.BidirectionalAdapter
+	streamClient  *client.StreamClient
+	cronScheduler *scheduler.CronScheduler // 定时任务调度器
 }
 
 // NewHandler wires the adapter with an OpenCode client.
@@ -46,6 +48,11 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	h.adapter = base.NewBidirectionalAdapter("dingtalk", h)
 
 	return h
+}
+
+// SetCronScheduler 设置定时任务调度器
+func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
+	h.cronScheduler = cronScheduler
 }
 
 // Start initializes the DingTalk adapter.
@@ -136,6 +143,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 技能缓存已刷新"))
 		}
 		return nil, nil
+	}
+
+	// Handle /crontask command for scheduled tasks
+	if strings.HasPrefix(content, "/crontask") {
+		return h.handleCronTask(ctx, data, userID, content)
 	}
 
 	// Parse agent specification: @agent_name message content
@@ -575,5 +587,367 @@ func (h *Handler) handleAbort(ctx context.Context, data *chatbot.BotCallbackData
 	}
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 任务已中止"))
+	return nil, nil
+}
+
+// handleCronTask 处理定时任务命令
+func (h *Handler) handleCronTask(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 检查是否设置了cronScheduler
+	if h.cronScheduler == nil {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 定时任务功能未启用"))
+		return nil, nil
+	}
+
+	// 解析命令
+	parts := strings.Fields(content)
+	if len(parts) < 2 {
+		return h.sendCronTaskHelp(ctx, data)
+	}
+
+	subCommand := parts[1]
+
+	switch subCommand {
+	case "add", "create", "新增":
+		return h.handleCronTaskAdd(ctx, data, userID, parts[2:])
+	case "list", "ls", "列表":
+		return h.handleCronTaskList(ctx, data)
+	case "delete", "del", "rm", "删除":
+		return h.handleCronTaskDelete(ctx, data, parts[2:])
+	case "enable", "启用":
+		return h.handleCronTaskEnable(ctx, data, parts[2:])
+	case "disable", "禁用":
+		return h.handleCronTaskDisable(ctx, data, parts[2:])
+	case "info", "详情":
+		return h.handleCronTaskInfo(ctx, data, parts[2:])
+	case "help", "帮助":
+		return h.sendCronTaskHelp(ctx, data)
+	default:
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 未知的子命令，使用 /crontask help 查看帮助"))
+		return nil, nil
+	}
+}
+
+// handleCronTaskAdd 添加定时任务
+func (h *Handler) handleCronTaskAdd(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 格式: /crontask add "0 0 9 * * *" "任务名称" "任务内容" [agent]
+	if len(args) < 3 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(
+			"❌ 参数不足\n\n"+
+				"格式: /crontask add \"cron表达式\" \"任务名称\" \"任务内容\" [agent]\n\n"+
+				"示例:\n"+
+				"/crontask add \"0 0 9 * * *\" \"每日检查\" \"查看系统负载\"\n"+
+				"/crontask add \"0 */30 * * * *\" \"半小时监控\" \"检查服务状态\" system_monitor",
+		))
+		return nil, nil
+	}
+
+	cronExpr := args[0]
+	taskName := args[1]
+	taskContent := args[2]
+	agent := ""
+	if len(args) > 3 {
+		agent = args[3]
+	}
+
+	// 创建定时任务
+	now := time.Now()
+	task := &scheduler.ScheduledTask{
+		Name:        taskName,
+		Description: fmt.Sprintf("通过钉钉创建 (用户: %s)", userID),
+		Type:        scheduler.TaskTypeAgent,
+		CronExpr:    cronExpr,
+		Enabled:     true,
+		AdapterType: "dingtalk",
+		Channel:     data.ConversationId,
+		Content:     taskContent,
+		Agent:       agent,
+		Metadata: map[string]interface{}{
+			"created_by":      userID,
+			"created_from":    "dingtalk",
+			"conversation_id": data.ConversationId,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	// 添加到调度器
+	if err := h.cronScheduler.AddScheduledTask(task); err != nil {
+		errMsg := fmt.Sprintf("❌ 创建定时任务失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf(
+		"✅ 定时任务创建成功！\n\n"+
+			"📋 任务ID: %s\n"+
+			"📝 名称: %s\n"+
+			"⏰ Cron: %s\n"+
+			"📄 内容: %s\n"+
+			"🤖 Agent: %s\n"+
+			"⏱️ 下次运行: %s\n\n"+
+			"使用 /crontask list 查看所有任务",
+		task.ID,
+		task.Name,
+		task.CronExpr,
+		task.Content,
+		func() string {
+			if task.Agent != "" {
+				return task.Agent
+			}
+			return "(默认)"
+		}(),
+		func() string {
+			if task.NextRunTime != nil {
+				return task.NextRunTime.Format("2006-01-02 15:04:05")
+			}
+			return "未知"
+		}(),
+	)
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return nil, nil
+}
+
+// handleCronTaskList 列出定时任务
+func (h *Handler) handleCronTaskList(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	tasks := h.cronScheduler.GetScheduledTasksByAdapter("dingtalk")
+	if len(tasks) == 0 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("📋 暂无定时任务\n\n使用 /crontask help 查看如何创建"))
+		return nil, nil
+	}
+
+	var msg strings.Builder
+	msg.WriteString(fmt.Sprintf("📋 定时任务列表 (共 %d 个)\n\n", len(tasks)))
+
+	for i, task := range tasks {
+		status := "✅"
+		if !task.Enabled {
+			status = "⏸️"
+		}
+
+		msg.WriteString(fmt.Sprintf(
+			"%d. %s %s\n"+
+				"   ID: %s\n"+
+				"   Cron: %s\n"+
+				"   Agent: %s\n"+
+				"   运行次数: %d\n",
+			i+1,
+			status,
+			task.Name,
+			task.ID,
+			task.CronExpr,
+			func() string {
+				if task.Agent != "" {
+					return task.Agent
+				}
+				return "(默认)"
+			}(),
+			task.RunCount,
+		))
+
+		if task.NextRunTime != nil {
+			msg.WriteString(fmt.Sprintf("   下次运行: %s\n", task.NextRunTime.Format("2006-01-02 15:04:05")))
+		}
+
+		if task.LastRunTime != nil {
+			msg.WriteString(fmt.Sprintf("   上次运行: %s (%s)\n",
+				task.LastRunTime.Format("2006-01-02 15:04:05"),
+				task.LastRunStatus,
+			))
+		}
+
+		msg.WriteString("\n")
+	}
+
+	msg.WriteString("💡 使用 /crontask info <ID> 查看详情")
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg.String()))
+	return nil, nil
+}
+
+// handleCronTaskDelete 删除定时任务
+func (h *Handler) handleCronTaskDelete(ctx context.Context, data *chatbot.BotCallbackDataModel, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	if len(args) < 1 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 请指定任务ID\n\n格式: /crontask delete <任务ID>"))
+		return nil, nil
+	}
+
+	taskID := args[0]
+
+	if err := h.cronScheduler.RemoveScheduledTask(taskID); err != nil {
+		errMsg := fmt.Sprintf("❌ 删除任务失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf("✅ 任务 %s 已删除", taskID)
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return nil, nil
+}
+
+// handleCronTaskEnable 启用定时任务
+func (h *Handler) handleCronTaskEnable(ctx context.Context, data *chatbot.BotCallbackDataModel, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	if len(args) < 1 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 请指定任务ID\n\n格式: /crontask enable <任务ID>"))
+		return nil, nil
+	}
+
+	taskID := args[0]
+
+	if err := h.cronScheduler.EnableTask(taskID); err != nil {
+		errMsg := fmt.Sprintf("❌ 启用任务失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf("✅ 任务 %s 已启用", taskID)
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return nil, nil
+}
+
+// handleCronTaskDisable 禁用定时任务
+func (h *Handler) handleCronTaskDisable(ctx context.Context, data *chatbot.BotCallbackDataModel, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	if len(args) < 1 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 请指定任务ID\n\n格式: /crontask disable <任务ID>"))
+		return nil, nil
+	}
+
+	taskID := args[0]
+
+	if err := h.cronScheduler.DisableTask(taskID); err != nil {
+		errMsg := fmt.Sprintf("❌ 禁用任务失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf("⏸️ 任务 %s 已禁用", taskID)
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return nil, nil
+}
+
+// handleCronTaskInfo 查看任务详情
+func (h *Handler) handleCronTaskInfo(ctx context.Context, data *chatbot.BotCallbackDataModel, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	if len(args) < 1 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 请指定任务ID\n\n格式: /crontask info <任务ID>"))
+		return nil, nil
+	}
+
+	taskID := args[0]
+
+	task, err := h.cronScheduler.GetScheduledTask(taskID)
+	if err != nil {
+		errMsg := fmt.Sprintf("❌ 获取任务信息失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	status := "✅ 启用"
+	if !task.Enabled {
+		status = "⏸️ 禁用"
+	}
+
+	var msg strings.Builder
+	msg.WriteString(fmt.Sprintf(
+		"📋 定时任务详情\n\n"+
+			"📝 名称: %s\n"+
+			"🆔 ID: %s\n"+
+			"📄 描述: %s\n"+
+			"⏰ Cron: %s\n"+
+			"📊 状态: %s\n"+
+			"🤖 Agent: %s\n"+
+			"📄 内容: %s\n"+
+			"🔢 运行次数: %d\n",
+		task.Name,
+		task.ID,
+		task.Description,
+		task.CronExpr,
+		status,
+		func() string {
+			if task.Agent != "" {
+				return task.Agent
+			}
+			return "(默认)"
+		}(),
+		task.Content,
+		task.RunCount,
+	))
+
+	if task.NextRunTime != nil {
+		msg.WriteString(fmt.Sprintf("⏱️ 下次运行: %s\n", task.NextRunTime.Format("2006-01-02 15:04:05")))
+	}
+
+	if task.LastRunTime != nil {
+		msg.WriteString(fmt.Sprintf(
+			"📅 上次运行: %s\n"+
+				"📊 运行状态: %s\n",
+			task.LastRunTime.Format("2006-01-02 15:04:05"),
+			task.LastRunStatus,
+		))
+
+		if task.LastRunResult != "" {
+			msg.WriteString(fmt.Sprintf("📝 运行结果: %s\n", task.LastRunResult))
+		}
+	}
+
+	msg.WriteString(fmt.Sprintf(
+		"\n⏰ 创建时间: %s\n"+
+			"🔄 更新时间: %s",
+		task.CreatedAt.Format("2006-01-02 15:04:05"),
+		task.UpdatedAt.Format("2006-01-02 15:04:05"),
+	))
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg.String()))
+	return nil, nil
+}
+
+// sendCronTaskHelp 发送定时任务帮助信息
+func (h *Handler) sendCronTaskHelp(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	helpMsg := `📋 定时任务命令帮助
+
+🔹 创建任务
+/crontask add "cron表达式" "任务名称" "任务内容" [agent]
+
+示例:
+• /crontask add "0 0 9 * * *" "每日检查" "查看系统负载"
+• /crontask add "0 */30 * * * *" "半小时监控" "检查服务" monitor
+
+🔹 列出任务
+/crontask list
+
+🔹 查看详情
+/crontask info <任务ID>
+
+🔹 启用/禁用
+/crontask enable <任务ID>
+/crontask disable <任务ID>
+
+🔹 删除任务
+/crontask delete <任务ID>
+
+⏰ Cron表达式格式 (秒 分 时 日 月 周):
+• "0 0 9 * * *" - 每天9点
+• "0 */30 * * * *" - 每30分钟
+• "0 0 12 * * 1-5" - 工作日中午12点
+• "0 0 0 1 * *" - 每月1号零点
+
+💡 提示: 任务会在指定时间自动执行，结果会发送到当前会话`
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(helpMsg))
 	return nil, nil
 }
