@@ -14,7 +14,13 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
   - Event routing: OpenCode → Platform
   - Session management and user mapping
 
-- **DingTalk Stream Mode** (New!)
+- **Smart Session Management** (New! 🎉)
+  - **Auto-summarization**: Summarizes conversation after 30 messages
+  - **Auto-renewal**: Creates new session after 50 messages
+  - **Context preservation**: Carries conversation summary to new sessions
+  - **Prevents "context deadline exceeded" errors**
+
+- **DingTalk Stream Mode**
   - No public IP required
   - Real-time WebSocket connection
   - Auto-reconnect mechanism
@@ -195,6 +201,15 @@ opencode-gateway/
 │   │   └── wecom/wecom.go                # WeCom adapter
 │   ├── config/config.go                  # Configuration
 │   └── opencode/                         # OpenCode client
+│       ├── client.go                     # Smart session management 🎯
+│       ├── client_test.go                # Tests
+│       └── event_listener.go             # Event handling
+├── docs/                                 # Documentation
+│   ├── QUICK_FIX.md                     # Fix context deadline exceeded ⭐
+│   ├── SESSION_MANAGEMENT.md            # Session design doc
+│   └── TESTING_GUIDE.md                 # Testing guide
+├── examples/
+│   └── session_management_demo.go       # Demo program
 ├── scripts/                              # Test scripts
 │   ├── test_dingtalk_config.ps1         # Config checker
 │   ├── demo_io.ps1                      # I/O demo
@@ -203,6 +218,23 @@ opencode-gateway/
 └── README.md                            # This file
 ```
 
+## 🔥 Important Updates
+
+### Context Deadline Exceeded - Fixed! ✅
+
+If you encountered `context deadline exceeded` errors during long conversations, it's now fixed!
+
+**What we added:**
+- Automatic session summarization after 30 messages
+- Automatic new session creation after 50 messages  
+- Context preservation across sessions
+- Zero configuration required - works out of the box
+
+**Learn more:**
+- [Quick Fix Guide](docs/QUICK_FIX.md) - Start here!
+- [Session Management Design](docs/SESSION_MANAGEMENT.md) - Technical details
+- [Testing Guide](docs/TESTING_GUIDE.md) - How to test
+
 ## 📜 License
 
 MIT License
@@ -210,6 +242,7 @@ MIT License
 ## 🔗 Links
 
 - [OpenCode](https://github.com/sst/opencode)
+- [OpenCode Server API](https://opencode.ai/docs/server/)
 - [DingTalk Open Platform](https://open.dingtalk.com/)
 - [DingTalk Stream SDK](https://github.com/open-dingtalk/dingtalk-stream-sdk-go)
 - [DingTalk Stream Tutorial](https://opensource.dingtalk.com/developerpedia/docs/explore/tutorials/stream/bot/go/build-bot)

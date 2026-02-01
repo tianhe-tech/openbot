@@ -28,9 +28,9 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		ServerAddr:    getEnv("SERVER_ADDR", ":8080"),
-		ReadTimeout:   getDuration("SERVER_READ_TIMEOUT", 10*time.Second),
-		WriteTimeout:  getDuration("SERVER_WRITE_TIMEOUT", 10*time.Second),
-		ShutdownGrace: getDuration("SERVER_SHUTDOWN_GRACE", 15*time.Second),
+		ReadTimeout:   getDuration("SERVER_READ_TIMEOUT", 30*time.Second),   // 增加读取超时
+		WriteTimeout:  getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
+		ShutdownGrace: getDuration("SERVER_SHUTDOWN_GRACE", 30*time.Second),
 		// OpenCodeEndpoint: os.Getenv("OPENCODE_ENDPOINT", ),
 		OpenCodeEndpoint: "http://localhost:3000",
 		OpenCodeAPIKey:   "123",
@@ -50,9 +50,7 @@ func Load() (Config, error) {
 			// Stream mode (preferred)
 			ClientID:     os.Getenv("DINGTALK_CLIENT_ID"),
 			ClientSecret: os.Getenv("DINGTALK_CLIENT_SECRET"),
-			// ClientID:     "dingk90c2agr1blmauzh",
-			// ClientSecret: "QRRH6n44_3QAW0HYobnr3znqhRPtkqk9Yd3KZSoGraUy9AqPLUif5tIh-vSqloNV",
-			UseStream: true, // 启用Stream模式
+			UseStream:    true, // 启用Stream模式
 			// Webhook mode (legacy)
 			AppKey:            os.Getenv("DINGTALK_APP_KEY"),
 			AppSecret:         os.Getenv("DINGTALK_APP_SECRET"),

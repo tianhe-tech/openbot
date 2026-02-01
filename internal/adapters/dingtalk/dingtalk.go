@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
@@ -111,10 +112,30 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleListSkills(ctx, data)
 	}
 
+	if content == "/help" || content == "帮助" {
+		return h.handleHelp(ctx, data)
+	}
+
+	// Handle /abort command to abort running session
+	if content == "/abort" || content == "/stop" || content == "停止" {
+		return h.handleAbort(ctx, data, userID)
+	}
+
 	// Handle /cmd command to execute skill scripts directly
 	if strings.HasPrefix(content, "/cmd ") {
 		command := strings.TrimPrefix(content, "/cmd ")
 		return h.handleExecuteCommand(ctx, data, userID, command)
+	}
+
+	// Handle /refresh command to refresh skill cache
+	if content == "/refresh" {
+		replier := chatbot.NewChatbotReplier()
+		if err := h.client.RefreshSkills(ctx); err != nil {
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 刷新技能缓存失败: "+err.Error()))
+		} else {
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 技能缓存已刷新"))
+		}
+		return nil, nil
 	}
 
 	// Parse agent specification: @agent_name message content
@@ -131,15 +152,36 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Send to OpenCode with streaming
 	replier := chatbot.NewChatbotReplier()
 
-	// Send initial "thinking" message
-	thinkingMsg := "⏳ 正在思考中..."
+	// Send initial "thinking" message with estimated wait time
+	thinkingMsg := "⏳ 正在处理中，请稍候...\n💡 提示: 复杂问题可能需要几分钟时间"
+	// 如果指定了agent，添加特定提示
+	if agentName != "" {
+		thinkingMsg = fmt.Sprintf("⏳ 正在使用 @%s 处理中...", agentName)
+		// 如果是build相关的agent，特别提醒
+		if strings.Contains(strings.ToLower(agentName), "build") {
+			thinkingMsg += "\n\n⚠️ 重要提示：build模式需要在OpenCode界面确认操作！"
+			thinkingMsg += "\n请在OpenCode中确认后，结果会自动回复到这里。"
+		}
+	}
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(thinkingMsg)); err != nil {
 		log.Printf("dingtalk stream: failed to send thinking message: %v", err)
 	}
 
+	// 使用独立的context，避免被钉钉SDK的context超时影响
+	// 给予充足的超时时间，让OpenCode能够完成复杂任务
+	timeout := 20 * time.Minute // 默认20分钟
+	if agentName != "" {
+		timeout = 30 * time.Minute // agent模式给30分钟
+	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	log.Printf("dingtalk stream: sending to OpenCode (timeout: %v, agent: %s, content_len: %d)",
+		timeout, agentName, len(content))
+
 	// Use streaming to get response
 	var fullReply strings.Builder
-	response, err := h.client.SendMessageStreaming(ctx, opencode.MessagePayload{
+	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:   "dingtalk",
 		UserID:    userID,
 		ThreadID:  conversationID,
@@ -158,9 +200,42 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	})
 
 	if err != nil {
-		errMsg := fmt.Sprintf("❌ 处理失败: %v", err)
-		replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
-		log.Printf("dingtalk stream: failed to send to OpenCode: %v", err)
+		var errMsg string
+		if strings.Contains(err.Error(), "duplicate request") {
+			errMsg = "⚠️ 您的请求正在处理中，请勿重复发送\n" +
+				"💡 这通常是因为您在30秒内发送了相同的消息"
+			log.Printf("dingtalk stream: duplicate request from user %s", userID)
+		} else if strings.Contains(err.Error(), "max retries exceeded") {
+			errMsg = "❌ 服务暂时不可用（已重试多次失败）\n" +
+				"💡 建议：请稍等片刻后重试"
+			log.Printf("dingtalk stream: max retries for user %s", userID)
+		} else if strings.Contains(err.Error(), "context deadline") || strings.Contains(err.Error(), "timeout") {
+			// 区分是否使用了build模式
+			if agentName != "" && strings.Contains(strings.ToLower(agentName), "build") {
+				errMsg = "⏱️ 等待超时\n\n" +
+					"⚠️ 您正在使用build模式，这需要在OpenCode界面手动确认！\n" +
+					"请检查：\n" +
+					"1. 在OpenCode中是否有待确认的操作\n" +
+					"2. 确认后结果会自动回复\n" +
+					"3. 或者使用chat模式进行普通对话"
+			} else {
+				// 非build模式的超时，可能是任务太复杂
+				errMsg = "⏱️ 处理超时（已等待20-30分钟）\n\n" +
+					"这可能是因为：\n" +
+					"1. 任务非常复杂（如模型微调、大规模代码生成）\n" +
+					"2. OpenCode需要更多时间处理\n" +
+					"3. OpenCode可能在等待外部资源\n\n" +
+					"建议：\n" +
+					"• 请在OpenCode界面查看任务进度\n" +
+					"• 简化您的请求后重试\n" +
+					"• 或将任务拆分成多个小步骤"
+			}
+			log.Printf("dingtalk stream: timeout for user %s, agent=%s", userID, agentName)
+		} else {
+			errMsg = fmt.Sprintf("❌ 处理失败: %v", err)
+			log.Printf("dingtalk stream: error for user %s: %v", userID, err)
+		}
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
 		return nil, err
 	}
 
@@ -390,4 +465,88 @@ type callbackEnvelope struct {
 
 type textEnvelope struct {
 	Content string `json:"content"`
+}
+
+// handleHelp 处理帮助命令
+func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	helpText := `📖 OpenCode Gateway 使用指南
+
+🤖 基本对话：
+直接发送消息即可与AI对话
+
+🔧 可用命令：
+/help 或 帮助 - 显示此帮助信息
+/skills 或 /agents - 查看可用的技能列表
+
+📋 OpenCode 模式说明：
+
+1️⃣ Chat模式（默认）
+   - 直接对话，立即响应
+   - 适合：日常问答、代码解释
+
+2️⃣ Plan模式
+   - AI会先制定计划再执行
+   - 适合：复杂任务规划
+
+3️⃣ Build模式（需要确认）
+   - AI会生成操作计划并等待您确认
+   - ⚠️ 需要在OpenCode界面手动确认
+   - 确认后结果会自动回复到钉钉
+   - 适合：文件修改、代码生成等
+
+💡 使用技巧：
+• 使用 @agent_name 调用特定技能
+  例如：@build 帮我创建一个Python脚本
+• Build模式请求会提示您去OpenCode确认
+• 请勿在30秒内重复发送相同消息
+• 发送 /abort 或 /stop 可以中止正在运行的任务
+
+🛠️ 可用命令：
+/help 或 帮助 - 显示帮助
+/skills - 查看可用技能
+/abort 或 /stop - 中止当前任务
+/refresh - 刷新技能缓存
+
+❓ 问题排查：
+• 如果提示"请求处理中"：请等待当前请求完成
+• 如果超时：可能是build模式等待确认
+• 如果失败：稍后重试或简化问题`
+
+	replier := chatbot.NewChatbotReplier()
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(helpText)); err != nil {
+		log.Printf("dingtalk: failed to send help: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleAbort 处理中止命令
+func (h *Handler) handleAbort(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取用户的session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 未找到活动的会话"))
+		return nil, nil
+	}
+
+	// 检查session是否正在运行
+	if !h.client.IsSessionRunning(sessionID) {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 当前没有正在运行的任务"))
+		return nil, nil
+	}
+
+	// 中止session
+	log.Printf("dingtalk: aborting session %s for user %s", sessionID[:8], userID)
+	if err := h.client.AbortSession(ctx, sessionID); err != nil {
+		errMsg := fmt.Sprintf("❌ 中止任务失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		log.Printf("dingtalk: failed to abort session %s: %v", sessionID, err)
+		return nil, err
+	}
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 任务已中止"))
+	return nil, nil
 }
