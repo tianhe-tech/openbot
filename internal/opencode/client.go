@@ -657,23 +657,77 @@ func (c *Client) ResetSession(threadID string) {
 }
 
 // SendMessageStreaming sends a message and calls the callback for each chunk of the response.
-// Note: OpenCode SDK doesn't support true streaming yet, so we send the full response.
+// 改进版本：使用定时器定期检查并发送进度更新
 func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayload, callback StreamCallback) (Response, error) {
-	// For now, just call SendMessage and invoke callback with full response
-	// In future, can implement chunking or use SSE if SDK supports it
-	response, err := c.SendMessage(ctx, payload)
-	if err != nil {
-		return response, err
+	if callback == nil {
+		// 如果没有回调，直接使用普通模式
+		return c.SendMessage(ctx, payload)
 	}
 
-	// Call callback with full reply if provided
-	if callback != nil && response.Reply != "" {
-		if err := callback(response.Reply); err != nil {
-			log.Printf("opencode: stream callback error: %v", err)
+	// 使用goroutine异步发送消息，同时定期发送进度更新
+	responseChan := make(chan Response, 1)
+	errorChan := make(chan error, 1)
+
+	// 启动消息发送
+	go func() {
+		response, err := c.SendMessage(ctx, payload)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+		responseChan <- response
+	}()
+
+	// 定时发送进度更新
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	progressMessages := []string{
+		"⏳ 正在处理中...",
+		"⏳ 仍在执行中，请稍候...",
+		"⏳ 任务进行中，可能需要一些时间...",
+		"⏳ 继续处理中...",
+		"⏳ 快完成了，请耐心等待...",
+	}
+	progressIndex := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return Response{}, ctx.Err()
+
+		case err := <-errorChan:
+			return Response{}, err
+
+		case response := <-responseChan:
+			// 发送最终结果
+			if response.Reply != "" {
+				if err := callback(response.Reply); err != nil {
+					log.Printf("opencode: stream callback error: %v", err)
+				}
+			}
+			return response, nil
+
+		case <-ticker.C:
+			// 定期发送进度提示（仅当还在等待时）
+			if progressIndex < len(progressMessages) {
+				if err := callback(progressMessages[progressIndex]); err != nil {
+					log.Printf("opencode: progress callback error: %v", err)
+				}
+				progressIndex++
+			} else {
+				// 超过预设的进度消息数量，发送持续等待提示
+				minutes := (progressIndex - len(progressMessages) + 1) * 10 / 60
+				if minutes > 0 {
+					msg := fmt.Sprintf("⏱️ 已等待 %d 分钟，任务仍在执行中...", minutes)
+					if err := callback(msg); err != nil {
+						log.Printf("opencode: progress callback error: %v", err)
+					}
+				}
+				progressIndex++
+			}
 		}
 	}
-
-	return response, nil
 }
 
 // estimateTokens 估算文本的token数量

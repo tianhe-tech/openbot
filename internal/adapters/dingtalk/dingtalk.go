@@ -179,8 +179,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	log.Printf("dingtalk stream: sending to OpenCode (timeout: %v, agent: %s, content_len: %d)",
 		timeout, agentName, len(content))
 
-	// Use streaming to get response
+	// Use streaming to get response with progress updates
 	var fullReply strings.Builder
+	var lastSentLength int
+	var updateCount int
+	const maxUpdates = 5 // 最多发送5次中间更新，避免过于频繁
+
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:   "dingtalk",
 		UserID:    userID,
@@ -193,9 +197,32 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			"sender_nick":       data.SenderNick,
 		},
 	}, func(chunk string) error {
-		// Accumulate chunks and send updates
+		// 处理进度更新
+		if strings.HasPrefix(chunk, "⏳") || strings.HasPrefix(chunk, "⏱️") {
+			// 这是进度提示消息，直接发送
+			log.Printf("dingtalk stream: sending progress update: %s", chunk)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(chunk))
+			return nil
+		}
+
+		// 累积实际内容
 		fullReply.WriteString(chunk)
-		// Send update every few chunks to avoid too many updates
+		currentLength := fullReply.Len()
+
+		// 如果累积了足够多的新内容（至少500字符）且还没超过最大更新次数，发送中间结果
+		if updateCount < maxUpdates && currentLength-lastSentLength >= 500 {
+			log.Printf("dingtalk stream: sending intermediate update (update %d/%d, new content: %d chars)",
+				updateCount+1, maxUpdates, currentLength-lastSentLength)
+
+			// 发送中间结果（带有标记表明这不是最终结果）
+			intermediateMsg := fmt.Sprintf("📝 中间结果 (%d/%d):\n\n%s\n\n⏳ 继续处理中...",
+				updateCount+1, maxUpdates, fullReply.String())
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(intermediateMsg))
+
+			lastSentLength = currentLength
+			updateCount++
+		}
+
 		return nil
 	})
 

@@ -3,7 +3,9 @@ package opencode
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/sst/opencode-sdk-go"
 )
@@ -12,6 +14,25 @@ import (
 type EventDispatcher struct {
 	handlers   map[string][]EventHandler
 	handlersMu sync.RWMutex
+}
+
+// StreamingSessionHandler 处理流式会话输出
+type StreamingSessionHandler struct {
+	sessionID      string
+	callback       StreamCallback
+	lastContent    string
+	lastUpdateTime time.Time
+	mu             sync.Mutex
+	completed      bool
+}
+
+// NewStreamingSessionHandler 创建流式会话处理器
+func NewStreamingSessionHandler(sessionID string, callback StreamCallback) *StreamingSessionHandler {
+	return &StreamingSessionHandler{
+		sessionID:      sessionID,
+		callback:       callback,
+		lastUpdateTime: time.Now(),
+	}
 }
 
 // NewEventDispatcher creates a new event dispatcher.
@@ -85,4 +106,78 @@ func (h *AdapterMessageHandler) Handle(ctx context.Context, event *opencode.Even
 	// - session.error -> notify user of errors
 
 	return nil
+}
+
+// HandleEvent 处理会话更新事件并提取增量内容
+func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *opencode.EventListResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 检查是否已完成
+	if s.completed {
+		return nil
+	}
+
+	// 仅处理与当前session相关的事件
+	eventType := string(event.Type)
+	log.Printf("opencode: streaming handler received event type=%s for session=%s", eventType, s.sessionID[:8])
+
+	// 根据事件类型处理
+	switch eventType {
+	case "session.updated", "message.updated", "message.completed":
+		// 提取新内容（这里需要根据实际SDK结构调整）
+		// 假设事件中包含消息内容或增量更新
+		newContent := s.extractContentFromEvent(event)
+		if newContent != "" && newContent != s.lastContent {
+			// 计算增量内容
+			incremental := newContent
+			if strings.HasPrefix(newContent, s.lastContent) {
+				incremental = strings.TrimPrefix(newContent, s.lastContent)
+			}
+
+			if incremental != "" {
+				// 调用回调发送增量内容
+				if err := s.callback(incremental); err != nil {
+					log.Printf("opencode: streaming callback error: %v", err)
+				}
+				s.lastContent = newContent
+				s.lastUpdateTime = time.Now()
+			}
+		}
+
+		// 如果是完成事件，标记为已完成
+		if eventType == "message.completed" {
+			s.completed = true
+		}
+
+	case "session.error":
+		log.Printf("opencode: session %s encountered error", s.sessionID[:8])
+		s.completed = true
+	}
+
+	return nil
+}
+
+// extractContentFromEvent 从事件中提取内容
+func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventListResponse) string {
+	// TODO: 根据实际SDK事件结构提取内容
+	// 这里需要查看opencode.EventListResponse的具体字段
+	// 可能的字段：event.Data, event.Message, event.Content等
+
+	// 暂时返回空字符串，需要根据实际情况调整
+	return ""
+}
+
+// IsCompleted 检查是否已完成
+func (s *StreamingSessionHandler) IsCompleted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.completed
+}
+
+// GetLastContent 获取最后的内容
+func (s *StreamingSessionHandler) GetLastContent() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastContent
 }
