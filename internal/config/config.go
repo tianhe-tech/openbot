@@ -27,13 +27,12 @@ type Config struct {
 // Load reads configuration from environment variables with sensible defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		ServerAddr:    getEnv("SERVER_ADDR", ":8080"),
-		ReadTimeout:   getDuration("SERVER_READ_TIMEOUT", 30*time.Second),   // 增加读取超时
-		WriteTimeout:  getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
-		ShutdownGrace: getDuration("SERVER_SHUTDOWN_GRACE", 30*time.Second),
-		// OpenCodeEndpoint: os.Getenv("OPENCODE_ENDPOINT", ),
-		OpenCodeEndpoint: "http://localhost:3000",
-		OpenCodeAPIKey:   "123",
+		ServerAddr:       getEnv("SERVER_ADDR", ":8080"),
+		ReadTimeout:      getDuration("SERVER_READ_TIMEOUT", 30*time.Second),   // 增加读取超时
+		WriteTimeout:     getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
+		ShutdownGrace:    getDuration("SERVER_SHUTDOWN_GRACE", 30*time.Second),
+		OpenCodeEndpoint: getEnv("OPENCODE_ENDPOINT", "http://localhost:3000"),
+		OpenCodeAPIKey:   getEnv("OPENCODE_API_KEY", "123"),
 		WeCom: wecom.Config{
 			Token:          os.Getenv("WECOM_TOKEN"),
 			EncodingAESKey: os.Getenv("WECOM_AES_KEY"),

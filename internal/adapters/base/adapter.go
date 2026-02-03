@@ -9,7 +9,7 @@ import (
 
 // MessageSender defines the interface for sending messages back to users.
 type MessageSender interface {
-	SendMessage(ctx context.Context, userID, content string) error
+	SendMessage(ctx context.Context, channel, userID, content string) error
 }
 
 // BidirectionalAdapter enables two-way communication between OpenCode and messaging platforms.
@@ -56,13 +56,19 @@ func (a *BidirectionalAdapter) GetUserForSession(sessionID string) (string, bool
 }
 
 // SendToUser sends a message to a user via the platform's messaging API.
+// channel can be empty for direct messages, or specify a group/channel ID
 func (a *BidirectionalAdapter) SendToUser(ctx context.Context, userID, content string) error {
+	return a.SendToUserInChannel(ctx, "", userID, content)
+}
+
+// SendToUserInChannel sends a message to a user in a specific channel
+func (a *BidirectionalAdapter) SendToUserInChannel(ctx context.Context, channel, userID, content string) error {
 	if a.sender == nil {
 		return fmt.Errorf("adapter %s: no sender configured", a.name)
 	}
 
-	log.Printf("adapter %s: sending message to user %s", a.name, userID)
-	return a.sender.SendMessage(ctx, userID, content)
+	log.Printf("adapter %s: sending message to channel %s, user %s", a.name, channel, userID)
+	return a.sender.SendMessage(ctx, channel, userID, content)
 }
 
 // HandleIncomingEvent processes events from OpenCode and routes them to users.

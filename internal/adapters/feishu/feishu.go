@@ -46,10 +46,10 @@ func (h *Handler) GetAdapter() *base.BidirectionalAdapter {
 }
 
 // SendMessage implements the MessageSender interface to send messages to FeiShu users.
-func (h *Handler) SendMessage(ctx context.Context, userID, content string) error {
+func (h *Handler) SendMessage(ctx context.Context, channel, userID, content string) error {
 	// TODO: Implement FeiShu message sending API
 	// This would use FeiShu's API to send a message to the user
-	log.Printf("feishu: would send message to user %s: %s", userID, content)
+	log.Printf("feishu: would send message to channel %s, user %s: %s", channel, userID, content)
 
 	// Example implementation:
 	// 1. Get access token
