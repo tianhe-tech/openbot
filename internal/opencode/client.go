@@ -1,13 +1,19 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -98,25 +104,56 @@ type RetryConfig struct {
 	RetryableErrors []string // 可重试的错误类型关键字
 }
 
+// QuestionOption 表示问题选项
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+// QuestionItem 表示单个子问题
+type QuestionItem struct {
+	Header   string           `json:"header"`
+	Question string           `json:"question"`
+	Multiple bool             `json:"multiple"`
+	Options  []QuestionOption `json:"options"`
+}
+
+// Question represents a pending question that needs user confirmation
+type Question struct {
+	ID           string         `json:"id"`
+	SessionID    string         `json:"session_id"`
+	MessageID    string         `json:"message_id"`
+	Text         string         `json:"text"`          // 简化的问题文本（向后兼容）
+	Options      []string       `json:"options"`       // 简化的选项列表（向后兼容）
+	Questions    []QuestionItem `json:"questions"`     // 详细的子问题列表（新版）
+	IsPermission bool           `json:"is_permission"` // 是否是权限请求
+	Directory    string         `json:"directory"`     // 权限请求的工作目录
+	CreatedAt    time.Time      `json:"created_at"`
+}
+
 // Client knows how to talk to the remote OpenCode service using the official SDK.
 type Client struct {
-	sdk             *opencode.Client
-	eventHandlers   []EventHandler
-	eventListenerMu sync.RWMutex
-	sessions        sync.Map // map[threadID]sessionID
-	sessionLocks    sync.Map // map[threadID]*sync.Mutex for preventing concurrent session operations
-	messageCount    sync.Map // map[sessionID]int tracks messages per session
-	tokenCount      sync.Map // map[sessionID]int tracks estimated tokens per session
-	sessionSummary  sync.Map // map[sessionID]string stores session summaries
-	modelConfig     sync.Map // map[sessionID]*ModelConfig caches model config per session
-	requestCache    sync.Map // map[requestHash]*RequestRecord 请求去重缓存
-	runningSessions sync.Map // map[sessionID]bool 跟踪正在运行的session
-	directory       string
-	timeout         time.Duration // 默认超时时间
-	retryConfig     RetryConfig   // 重试配置
-	enableSkillHint bool          // 是否在消息中添加skill提示
-	skillHintCache  []string      // 缓存的可用skill列表
-	skillCacheMu    sync.RWMutex
+	sdk              *opencode.Client
+	endpoint         string
+	apiKey           string
+	httpClient       *http.Client
+	eventHandlers    []EventHandler
+	eventListenerMu  sync.RWMutex
+	sessions         sync.Map // map[threadID]sessionID
+	sessionLocks     sync.Map // map[threadID]*sync.Mutex for preventing concurrent session operations
+	messageCount     sync.Map // map[sessionID]int tracks messages per session
+	tokenCount       sync.Map // map[sessionID]int tracks estimated tokens per session
+	sessionSummary   sync.Map // map[sessionID]string stores session summaries
+	modelConfig      sync.Map // map[sessionID]*ModelConfig caches model config per session
+	requestCache     sync.Map // map[requestHash]*RequestRecord 请求去重缓存
+	runningSessions  sync.Map // map[sessionID]bool 跟踪正在运行的session
+	pendingQuestions sync.Map // map[questionID]*Question 待回答的问题
+	directory        string
+	timeout          time.Duration // 默认超时时间
+	retryConfig      RetryConfig   // 重试配置
+	enableSkillHint  bool          // 是否在消息中添加skill提示
+	skillHintCache   []string      // 缓存的可用skill列表
+	skillCacheMu     sync.RWMutex
 }
 
 // Option mutates a client during construction.
@@ -164,6 +201,11 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 			option.WithBaseURL(endpoint),
 			// option.WithAPIKey(apiKey), // If SDK supports API key authentication
 		),
+		endpoint: strings.TrimRight(endpoint, "/"),
+		apiKey:   apiKey,
+		httpClient: &http.Client{
+			Timeout: 60 * time.Second,
+		},
 		eventHandlers: make([]EventHandler, 0),
 		directory:     ".",
 		timeout:       1200 * time.Second, // 20分钟超时，给复杂任务（如模型微调、大规模代码生成）足够时间
@@ -378,6 +420,33 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		Type: opencode.F(opencode.TextPartInputTypeText),
 	})
 
+	// 流式模式下改用异步 prompt_async，避免长任务导致 context deadline
+	if payload.Streaming {
+		c.runningSessions.Store(sessionID, true)
+		if err := c.sendPromptAsync(ctx, sessionID, parts); err != nil {
+			c.runningSessions.Delete(sessionID)
+			c.failRequest(requestHash)
+			return Response{}, fmt.Errorf("opencode: prompt_async: %w", err)
+		}
+
+		// 仅统计用户消息本身的tokens，回复在事件流中获取
+		count, _ := c.messageCount.LoadOrStore(sessionID, 0)
+		c.messageCount.Store(sessionID, count.(int)+1)
+		estimatedMsgTokens := estimateTokens(payload.Content)
+		tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
+		c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens)
+
+		response := Response{
+			Reply:     "",
+			SessionID: sessionID,
+			MessageID: "",
+			Trace:     sessionID,
+		}
+
+		c.completeRequest(requestHash, response)
+		return response, nil
+	}
+
 	// ========== 使用重试机制发送消息 ==========
 	// 标记session为运行状态
 	c.runningSessions.Store(sessionID, true)
@@ -538,6 +607,18 @@ func (c *Client) RegisterEventHandler(handler EventHandler) {
 	c.eventHandlers = append(c.eventHandlers, handler)
 }
 
+var _ MessageSender = (*Client)(nil)
+
+// SendMessageToSession 通过adapter主动推送消息给会话关联的用户
+// 注意：这个方法目前只是记录日志，实际的消息推送通过streaming callback完成
+// 未来可以扩展支持通过adapter的双向通信机制主动推送
+func (c *Client) SendMessageToSession(ctx context.Context, sessionID, content string) error {
+	log.Printf("opencode: SendMessageToSession for session %s (len=%d chars)", sessionID[:8], len(content))
+	// 当前实现：依赖streaming callback机制，这里只是接口占位
+	// 未来可以添加通过adapter反向推送的逻辑
+	return nil
+}
+
 // extractReplyFromMessage extracts text content from a prompt response.
 // OpenCode返回的message包含多个part，每个part可以是：
 // - TextPart: 普通文本
@@ -695,12 +776,22 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 	}
 	threadLock.Unlock()
 
-	// 2. 创建StreamingSessionHandler并注册
-	handler := NewStreamingSessionHandler(sessionID, callback)
+	// 2. 立即通过callback通知sessionID（供adapter建立user映射）
+	log.Printf("opencode: notifying sessionID %s via callback", sessionID)
+	if err := callback(sessionID); err != nil {
+		log.Printf("opencode: failed to notify sessionID via callback: %v", err)
+	} else {
+		log.Printf("opencode: sessionID notification sent successfully")
+	}
+
+	// 3. 创建StreamingSessionHandler并注册
+	handler := NewStreamingSessionHandler(sessionID, callback, func() {
+		c.runningSessions.Delete(sessionID)
+	}, c, c) // 传入c作为messageSender
 	c.RegisterEventHandler(handler.HandleEvent)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
 
-	// 3. 使用goroutine异步发送消息
+	// 4. 使用goroutine异步发送消息
 	responseChan := make(chan Response, 1)
 	errorChan := make(chan error, 1)
 
@@ -713,19 +804,13 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		responseChan <- response
 	}()
 
-	// 4. 定时发送进度更新（作为后备，如果事件流没有内容）
-	ticker := time.NewTicker(10 * time.Second)
+	// 4. 定时检查完成状态（不再发送进度消息）
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	progressMessages := []string{
-		"⏳ 正在处理中...",
-		"⏳ 仍在执行中，请稍候...",
-		"⏳ 任务进行中，可能需要一些时间...",
-		"⏳ 继续处理中...",
-		"⏳ 快完成了，请耐心等待...",
-	}
-	progressIndex := 0
-	lastProgressTime := time.Now()
+	isAsyncMode := false
+	var asyncResponse Response
+	idleCheckCount := 0 // 空闲检测计数器
 
 	for {
 		select {
@@ -736,12 +821,19 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 			return Response{}, err
 
 		case response := <-responseChan:
-			// 检查是否通过streaming handler已经发送了内容
+			// 如果是Async模式（reply为空），标记并继续等待SSE事件
+			if response.Reply == "" {
+				log.Printf("opencode: streaming async mode for session %s, waiting for SSE events", sessionID[:8])
+				isAsyncMode = true
+				asyncResponse = response
+				continue
+			}
+
+			// 同步模式：检查是否通过streaming handler已经发送了内容
 			sentContent := handler.GetLastContent()
 			log.Printf("opencode: streaming completed, handler sent: %d chars, final response: %d chars",
 				len(sentContent), len(response.Reply))
 
-			// 如果handler没有发送任何内容，或者最终响应与已发送内容不同，发送最终结果
 			if sentContent == "" || sentContent != response.Reply {
 				if response.Reply != "" {
 					log.Printf("opencode: sending final response via callback")
@@ -753,31 +845,38 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 			return response, nil
 
 		case <-ticker.C:
-			// 检查handler是否已经发送了内容
-			if handler.HasSentContent() {
-				// handler已经通过事件流发送了内容，不再发送进度提示
+			// 如果在async模式且handler已完成，返回结果
+			if isAsyncMode && handler.IsCompleted() {
+				log.Printf("opencode: async streaming completed via SSE for session %s", sessionID[:8])
+				// 注意：不填充 asyncResponse.Reply，让调用者从 fullReply 获取内容
+				return asyncResponse, nil
+			}
+
+			// 检查是否在等待用户回复（权限/问题确认）
+			if isAsyncMode && handler.IsWaitingForResponse() {
+				lastEventTime, lastEventType := handler.GetLastEventInfo()
+				log.Printf("opencode: waiting for user response (last: %v, type: %s), idle count: %d",
+					lastEventTime.Format("15:04:05"), lastEventType, idleCheckCount)
+				idleCheckCount = 0 // 重置空闲计数器
 				continue
 			}
 
-			// 只有在一段时间没有通过handler收到内容时，才发送进度提示
-			if time.Since(lastProgressTime) >= 10*time.Second {
-				if progressIndex < len(progressMessages) {
-					if err := callback(progressMessages[progressIndex]); err != nil {
-						log.Printf("opencode: progress callback error: %v", err)
-					}
-					progressIndex++
-				} else {
-					// 超过预设的进度消息数量，发送持续等待提示
-					minutes := (progressIndex - len(progressMessages) + 1) * 10 / 60
-					if minutes > 0 {
-						msg := fmt.Sprintf("⏱️ 已等待 %d 分钟，任务仍在执行中...", minutes)
-						if err := callback(msg); err != nil {
-							log.Printf("opencode: progress callback error: %v", err)
-						}
-					}
-					progressIndex++
-				}
-				lastProgressTime = time.Now()
+			// 检查最后一次事件时间
+			lastEventTime, _ := handler.GetLastEventInfo()
+			timeSinceLastEvent := time.Since(lastEventTime)
+
+			// 如果已发送内容且超过2分钟无新事件，认为可能完成
+			if isAsyncMode && handler.HasSentContent() && timeSinceLastEvent > 2*time.Minute {
+				log.Printf("opencode: streaming idle for %v, treating as completed for session %s",
+					timeSinceLastEvent, sessionID[:8])
+				return asyncResponse, nil
+			}
+
+			// 空闲检测：超过5分钟仍无响应
+			if isAsyncMode && timeSinceLastEvent > 5*time.Minute {
+				log.Printf("opencode: streaming timeout (no events for %v) for session %s",
+					timeSinceLastEvent, sessionID[:8])
+				return asyncResponse, nil
 			}
 		}
 	}
@@ -975,6 +1074,53 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 	return nil, fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
 }
 
+// sendPromptAsync 调用 OpenCode 的 prompt_async 接口，立即返回，由事件流提供结果
+func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion) error {
+	if c.endpoint == "" {
+		return fmt.Errorf("opencode: prompt_async unavailable: missing endpoint")
+	}
+
+	params := opencode.SessionPromptParams{
+		Parts: opencode.F(parts),
+	}
+	if c.directory != "" {
+		params.Directory = opencode.F(c.directory)
+	}
+
+	body, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("opencode: prompt_async marshal: %w", err)
+	}
+
+	promptURL, err := url.JoinPath(c.endpoint, "session", sessionID, "prompt_async")
+	if err != nil {
+		promptURL = fmt.Sprintf("%s/session/%s/prompt_async", strings.TrimRight(c.endpoint, "/"), sessionID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, promptURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("opencode: prompt_async request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("opencode: prompt_async do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusAccepted {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("opencode: prompt_async unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	log.Printf("opencode: prompt_async accepted for session %s (status=%d)", sessionID[:8], resp.StatusCode)
+	return nil
+}
+
 // ========== 请求去重 ==========
 
 // generateRequestHash 生成请求的唯一hash
@@ -1030,6 +1176,386 @@ func (c *Client) completeRequest(hash string, response Response) {
 // failRequest 标记请求失败
 func (c *Client) failRequest(hash string) {
 	c.requestCache.Delete(hash)
+}
+
+// StorePendingQuestion stores a question for later answering
+func (c *Client) StorePendingQuestion(q *Question) {
+	c.pendingQuestions.Store(q.ID, q)
+}
+
+// GetPendingQuestion retrieves a pending question
+func (c *Client) GetPendingQuestion(questionID string) (*Question, bool) {
+	val, ok := c.pendingQuestions.Load(questionID)
+	if !ok {
+		return nil, false
+	}
+	return val.(*Question), true
+}
+
+// GetLatestPendingPermission 获取指定 session 最近的待处理权限请求
+// 如果 sessionID 为空，返回任意最近的权限请求
+func (c *Client) GetLatestPendingPermission(sessionID string) (*Question, bool) {
+	var latest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		// 只返回权限请求（以 per_ 开头）
+		if !strings.HasPrefix(q.ID, "per_") {
+			return true
+		}
+		// 如果指定了 sessionID，只返回该 session 的
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		// 找最近创建的
+		if latest == nil || q.CreatedAt.After(latest.CreatedAt) {
+			latest = q
+		}
+		return true
+	})
+	if latest != nil {
+		return latest, true
+	}
+	return nil, false
+}
+
+// GetLatestPendingQuestion 获取指定 session 最近的待处理问题（非权限请求）
+// 如果 sessionID 为空，返回任意最近的问题
+func (c *Client) GetLatestPendingQuestion(sessionID string) (*Question, bool) {
+	var latest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		// 排除权限请求（以 per_ 开头）
+		if strings.HasPrefix(q.ID, "per_") {
+			return true
+		}
+		// 如果指定了 sessionID，只返回该 session 的
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		// 找最近创建的
+		if latest == nil || q.CreatedAt.After(latest.CreatedAt) {
+			latest = q
+		}
+		return true
+	})
+	if latest != nil {
+		return latest, true
+	}
+	return nil, false
+}
+
+// DeletePendingQuestion removes a pending question
+func (c *Client) DeletePendingQuestion(questionID string) {
+	c.pendingQuestions.Delete(questionID)
+}
+
+// AnswerQuestion submits an answer to a pending question or permission request
+func (c *Client) AnswerQuestion(ctx context.Context, questionID string, answer string) error {
+	q, ok := c.GetPendingQuestion(questionID)
+	if !ok {
+		return fmt.Errorf("question not found: %s", questionID)
+	}
+
+	if c.endpoint == "" {
+		return fmt.Errorf("opencode: answer question unavailable: missing endpoint")
+	}
+
+	// 判断是权限请求还是普通问题
+	if strings.HasPrefix(questionID, "per_") {
+		return c.answerPermission(ctx, q, answer)
+	}
+
+	return c.answerNormalQuestion(ctx, q, answer)
+}
+
+// answerPermission 回答权限请求
+func (c *Client) answerPermission(ctx context.Context, q *Question, answer string) error {
+	// 解析用户选择：允许、拒绝、始终允许
+	var response opencode.SessionPermissionRespondParamsResponse
+	var responseStr string
+
+	answerLower := strings.TrimSpace(strings.ToLower(answer))
+	switch answerLower {
+	case "1", "allow", "yes", "允许", "y", "ok", "确认":
+		response = opencode.SessionPermissionRespondParamsResponseOnce
+		responseStr = "once"
+	case "2", "deny", "no", "拒绝", "n", "cancel", "取消":
+		response = opencode.SessionPermissionRespondParamsResponseReject
+		responseStr = "reject"
+	case "3", "always", "始终允许", "始终":
+		response = opencode.SessionPermissionRespondParamsResponseAlways
+		responseStr = "always"
+	default:
+		return fmt.Errorf("无效的回复: %s (回复 '允许'、'拒绝' 或 '始终允许')", answer)
+	}
+
+	log.Printf("opencode: answering permission - ID=%s, sessionID=%s, directory=%s (from question), responseStr=%s",
+		q.ID, q.SessionID, q.Directory, responseStr)
+
+	// 优先使用 HTTP API（与 Python 一致），SDK 作为备选
+	// 原因：SDK 可能存在问题导致 OpenCode 不继续处理
+	directory := q.Directory
+	if directory == "" {
+		directory = c.directory // 回退到 client 的默认 directory
+	}
+
+	log.Printf("opencode: trying HTTP API first for permission respond")
+	if err := c.answerPermissionViaHTTP(ctx, q, responseStr); err != nil {
+		log.Printf("opencode: HTTP API failed: %v, trying SDK", err)
+
+		// 回退到 SDK
+		result, err := c.sdk.Session.Permissions.Respond(ctx, q.SessionID, q.ID, opencode.SessionPermissionRespondParams{
+			Response:  opencode.F(response),
+			Directory: opencode.F(directory),
+		})
+		if err != nil {
+			return fmt.Errorf("opencode: both HTTP and SDK permission respond failed: %w", err)
+		}
+
+		if result != nil {
+			log.Printf("opencode: SDK permission respond succeeded, result=%v", *result)
+		} else {
+			log.Printf("opencode: SDK permission respond succeeded, result=nil")
+		}
+	} else {
+		log.Printf("opencode: HTTP API permission respond succeeded")
+	}
+
+	c.DeletePendingQuestion(q.ID)
+	log.Printf("opencode: answered permission %s for session %s (response=%s)", q.ID, q.SessionID[:8], response)
+	return nil
+}
+
+// answerPermissionViaHTTP 直接调用 HTTP API（与 Python 版本一致）
+func (c *Client) answerPermissionViaHTTP(ctx context.Context, q *Question, response string) error {
+	if c.endpoint == "" {
+		return fmt.Errorf("opencode: answer permission via HTTP unavailable: missing endpoint")
+	}
+
+	// 构造 URL：POST /session/{sessionID}/permissions/{permissionID}
+	permissionURL := fmt.Sprintf("%s/session/%s/permissions/%s", c.endpoint, q.SessionID, q.ID)
+
+	payload := map[string]interface{}{
+		"response": response,
+	}
+	// 使用 Question 中保存的 directory，如果为空则使用 client 的默认 directory
+	directory := q.Directory
+	if directory == "" {
+		directory = c.directory
+	}
+	// ⚠️ 注意：只在 payload 中发送 directory，不要在 query string 中重复
+	if directory != "" {
+		payload["directory"] = directory
+	}
+
+	log.Printf("opencode: HTTP permission API - URL=%s, payload=%+v", permissionURL, payload)
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("opencode: permission HTTP marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, permissionURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("opencode: permission HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	// 不在 query string 中发送 directory，Python 也没有这样做
+
+	log.Printf("opencode: HTTP permission request - URL=%s, method=POST, body=%s",
+		req.URL.String(), string(body))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("opencode: permission HTTP do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	log.Printf("opencode: HTTP permission response - status=%d", resp.StatusCode)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("opencode: permission HTTP unexpected status %d: %s",
+			resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	c.DeletePendingQuestion(q.ID)
+	log.Printf("opencode: answered permission %s for session %s via HTTP API", q.ID, q.SessionID[:8])
+	return nil
+}
+
+// answerNormalQuestion 回答普通问题
+// API 端点: POST /question/:requestID/reply with body {"answers": [[答案1], [答案2], ...]}
+// answers 是一个二维数组：每个子数组对应一个 question 的答案（多选可以有多个元素）
+//
+// 答案格式支持:
+// - 简单格式: "1" - 为第一个问题选择选项1
+// - 多问题格式: "1;2,3;1" - 用分号分隔不同问题的答案，用逗号分隔多选答案
+// - 标签格式: "纯HTML页面;API接口请求;GPU利用率,显存使用情况"
+func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer string) error {
+	// 根据问题 ID 类型选择不同的回答方式
+	// que_xxx: 使用 /question/:id/reply 端点
+	// 其他: 使用 /session/:id/message/:messageID/answer 端点
+
+	var answerURL string
+	var payload map[string]interface{}
+
+	if strings.HasPrefix(q.ID, "que_") {
+		// 新版问题格式，使用 /question/:id/reply 端点
+		answerURL = fmt.Sprintf("%s/question/%s/reply", c.endpoint, q.ID)
+
+		// 解析答案
+		var allAnswers [][]string
+
+		// 检查是否使用分号分隔多个问题的答案
+		if strings.Contains(answer, ";") {
+			// 多问题格式: "1;2,3;1"
+			questionAnswers := strings.Split(answer, ";")
+			for idx, qa := range questionAnswers {
+				var answerItems []string
+				if strings.Contains(qa, ",") {
+					// 多选答案
+					for _, item := range strings.Split(qa, ",") {
+						if trimmed := strings.TrimSpace(item); trimmed != "" {
+							answerItems = append(answerItems, c.resolveAnswerOption(q, idx, trimmed))
+						}
+					}
+				} else {
+					// 单选答案
+					if trimmed := strings.TrimSpace(qa); trimmed != "" {
+						answerItems = []string{c.resolveAnswerOption(q, idx, trimmed)}
+					}
+				}
+				if len(answerItems) > 0 {
+					allAnswers = append(allAnswers, answerItems)
+				}
+			}
+		} else if strings.Contains(answer, ",") {
+			// 单问题多选格式: "选项1,选项2"
+			var answerItems []string
+			for _, item := range strings.Split(answer, ",") {
+				if trimmed := strings.TrimSpace(item); trimmed != "" {
+					answerItems = append(answerItems, c.resolveAnswerOption(q, 0, trimmed))
+				}
+			}
+			allAnswers = [][]string{answerItems}
+		} else {
+			// 单问题单选格式: "1" 或 "选项1"
+			resolved := c.resolveAnswerOption(q, 0, strings.TrimSpace(answer))
+			allAnswers = [][]string{{resolved}}
+		}
+
+		payload = map[string]interface{}{
+			"answers": allAnswers,
+		}
+		log.Printf("opencode: answering question %s via /question/reply endpoint, answers=%v", q.ID, allAnswers)
+	} else {
+		// 旧版格式，使用 /session/:id/message/:messageID/answer 端点
+		answerURL = fmt.Sprintf("%s/session/%s/message/%s/answer", c.endpoint, q.SessionID, q.MessageID)
+		payload = map[string]interface{}{
+			"answer": answer,
+		}
+		log.Printf("opencode: answering question %s via /session/message/answer endpoint", q.ID)
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("opencode: answer marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, answerURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("opencode: answer request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("opencode: answer do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("opencode: answer unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	c.DeletePendingQuestion(q.ID)
+	log.Printf("opencode: answered question %s for session %s", q.ID, q.SessionID[:8])
+	return nil
+}
+
+// resolveAnswerOption 将用户输入的答案（可能是数字索引）解析为实际选项标签
+// questionIndex: 第几个子问题 (0-based)
+// input: 用户输入，可能是 "1" 或 "纯HTML页面" 等
+func (c *Client) resolveAnswerOption(q *Question, questionIndex int, input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+
+	log.Printf("opencode: resolveAnswerOption - qID: %s, questionIndex: %d, input: '%s', hasQuestions: %d, hasSimpleOptions: %d",
+		q.ID, questionIndex, input, len(q.Questions), len(q.Options))
+
+	// 优先使用新版 Questions 数组
+	if len(q.Questions) > 0 {
+		if questionIndex >= len(q.Questions) {
+			log.Printf("opencode: questionIndex %d out of range (has %d questions), returning original input", questionIndex, len(q.Questions))
+			return input
+		}
+
+		qi := q.Questions[questionIndex]
+
+		// 尝试将输入解析为数字
+		if idx, err := strconv.Atoi(input); err == nil {
+			// 数字索引是 1-based
+			if idx >= 1 && idx <= len(qi.Options) {
+				result := qi.Options[idx-1].Label
+				log.Printf("opencode: converted number %d -> '%s'", idx, result)
+				return result
+			} else {
+				log.Printf("opencode: number %d out of range (1-%d)", idx, len(qi.Options))
+			}
+		}
+
+		// 如果不是有效的数字，检查是否是有效的选项标签
+		for _, opt := range qi.Options {
+			if strings.EqualFold(opt.Label, input) {
+				log.Printf("opencode: matched option label '%s'", opt.Label)
+				return opt.Label
+			}
+		}
+	}
+
+	// 回退到简化 Options 数组（旧格式兼容）
+	if len(q.Options) > 0 {
+		// 如果 questionIndex 为 0，尝试使用简化选项
+		if questionIndex == 0 {
+			if idx, err := strconv.Atoi(input); err == nil {
+				if idx >= 1 && idx <= len(q.Options) {
+					result := q.Options[idx-1]
+					log.Printf("opencode: converted number %d -> '%s' (simple options)", idx, result)
+					return result
+				}
+			}
+			for _, opt := range q.Options {
+				if strings.EqualFold(opt, input) {
+					log.Printf("opencode: matched simple option '%s'", opt)
+					return opt
+				}
+			}
+		}
+	}
+
+	// 无法解析，返回原始输入
+	log.Printf("opencode: could not resolve input '%s', returning original", input)
+	return input
 }
 
 // cleanupRequestCache 定期清理过期的请求缓存

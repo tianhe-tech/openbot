@@ -2,42 +2,40 @@
 
 Enterprise messaging platform gateway for OpenCode AI assistant integration.
 
-## 🚀 Features
+## 🌟 Features
 
 - **Multi-Platform Support**
   - ✅ WeCom (企业微信)
   - ✅ Feishu (飞书)
-  - ✅ DingTalk (钉钉) - **Stream Mode + Webhook Mode**
+  - ✅ DingTalk (钉钉) - Stream Mode + Webhook Mode
 
 - **Bidirectional Communication**
   - Message forwarding: Platform → OpenCode
   - Event routing: OpenCode → Platform
   - Session management and user mapping
+  - Permission/Q&A auto-reply support
 
 - **Smart Session Management**
-  - **Auto-summarization**: Summarizes conversation after 30 messages
-  - **Auto-renewal**: Creates new session after 50 messages
-  - **Context preservation**: Carries conversation summary to new sessions
-  - **Prevents "context deadline exceeded" errors**
+  - Auto-summarization: Summarizes conversation after context threshold
+  - Auto-renewal: Creates new session when context is full
+  - Context preservation: Carries conversation summary to new sessions
+  - Token estimation to prevent context overflow
 
-- **Streaming Progress Updates** ⚡ NEW!
-  - Real-time progress notifications every 10 seconds
-  - Intermediate results every 500 characters
+- **Streaming Progress Updates** ⚡
+  - Real-time progress notifications via SSE
+  - Incremental content delivery for long responses
   - Prevents timeout issues for long-running tasks
-  - Better user experience for lengthy AI responses
 
-- **Unified Task Scheduler** 🗓️ NEW!
+- **Task Scheduler** 🗓️
   - Multi-session task execution
   - Priority-based task queue
-  - Worker pool (10 concurrent workers)
-  - Automatic retry mechanism (up to 3 attempts)
+  - Worker pool (10 concurrent workers by default)
   - REST API for task submission and monitoring
 
-- **Cron Scheduler & `/crontask` Command** ⏰ NEW!
+- **Cron Scheduler & `/crontask` Command** ⏰
   - Create scheduled tasks directly from chat
-  - Full cron expression support (6 fields)
+  - Full cron expression support (5-6 fields)
   - Task management: add, list, enable, disable, delete
-  - Automatic session creation for each execution
   - Perfect for monitoring, reports, and reminders
   - Command format: `/crontask add "0 */30 * * * *" "任务名" "任务内容"`
 
@@ -47,111 +45,139 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
   - Auto-reconnect mechanism
   - Easier deployment for internal networks
 
-## 📋 Quick Start
+---
+
+## 🚀 Quick Start
 
 ### 1. Prerequisites
 
-- Go 1.24.3 or later
-- OpenCode Server running (default: http://localhost:3000)
-- Platform credentials (see setup guides below)
+- Go 1.21 or later
+- OpenCode Server running (default: `http://localhost:4096`)
+- Platform credentials (DingTalk/Feishu/WeCom)
 
 ### 2. Build
 
 ```bash
-go build -o bin/gateway.exe cmd/gateway/main.go
+go build -o bin/gateway cmd/gateway/main.go
 ```
 
 ### 3. Configure
 
-#### DingTalk Stream Mode (Recommended)
-```powershell
-$env:DINGTALK_CLIENT_ID = "your-client-id"
-$env:DINGTALK_CLIENT_SECRET = "your-client-secret"
-$env:DINGTALK_USE_STREAM = "true"
+```bash
+# Copy example configuration
+cp .env.example .env
+
+# Edit .env with your settings
+# Required: OPENCODE_ENDPOINT, DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET
 ```
 
-#### DingTalk Webhook Mode (Legacy)
-```powershell
-$env:DINGTALK_APP_KEY = "your-app-key"
-$env:DINGTALK_APP_SECRET = "your-app-secret"
-```
+#### Environment Variables
 
-#### OpenCode
-```powershell
-$env:OPENCODE_ENDPOINT = "http://localhost:3000"
-$env:OPENCODE_API_KEY = "your-api-key"
-```
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OPENCODE_ENDPOINT` | ✅ | - | OpenCode Server URL |
+| `OPENCODE_API_KEY` | ✅ | - | OpenCode API Key |
+| `SERVER_ADDR` | ❌ | `:8080` | Service listen address |
+| `DINGTALK_USE_STREAM` | ❌ | `false` | Enable DingTalk Stream mode |
+| `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID |
+| `DINGTALK_CLIENT_SECRET` | ✅ Stream | DingTalk Client Secret |
 
 ### 4. Run
 
 ```bash
-.\bin\gateway.exe
+./bin/gateway
 ```
 
-Expected output:
+### 5. Verify
+
+```bash
+# Health check
+curl http://localhost:8080/healthz
+
+# Task statistics
+curl http://localhost:8080/api/tasks/stats
 ```
-opencode event listener started
-dingtalk: Stream mode client started
-scheduler: starting task scheduler with 10 workers
-cron-scheduler: starting cron scheduler
-opencode gateway ready on :8080 (bidirectional mode)
-adapters registered: [wecom feishu dingtalk (stream)]
-event listener: active
-```
+
+---
 
 ## 📖 Documentation
 
 | Document | Description |
 |----------|-------------|
-| **[QUICK_START_CRONTASK.md](docs/QUICK_START_CRONTASK.md)** | **⭐ Quick start guide for `/crontask` command** |
-| **[CRONTASK_COMMAND.md](docs/CRONTASK_COMMAND.md)** | **Complete `/crontask` command reference** |
-| **[SCHEDULER_GUIDE.md](docs/SCHEDULER_GUIDE.md)** | **Task scheduler design and API guide** |
-| [DINGTALK_SETUP.md](DINGTALK_SETUP.md) | DingTalk Stream + Webhook setup guide |
-| [API_TEST_GUIDE.md](API_TEST_GUIDE.md) | API testing guide with examples |
-| [API_TEST_SUMMARY.md](API_TEST_SUMMARY.md) | Test results and quick reference |
-| [internal/scheduler/README.md](internal/scheduler/README.md) | Scheduler module overview |
+| **[API.md](docs/API.md)** | Complete API reference |
+| **[DEPLOY.md](docs/DEPLOY.md)** | Deployment and usage guide |
+| **[CONFIGURATION.md](docs/CONFIGURATION.md)** | Configuration reference |
+| **[QUICK_START_CRONTASK.md](docs/QUICK_START_CRONTASK.md)** | Cron task quick start |
+| **[CRONTASK_COMMAND.md](docs/CRONTASK_COMMAND.md)** | Cron command reference |
+| **[SCHEDULER_GUIDE.md](docs/SCHEDULER_GUIDE.md)** | Task scheduler guide |
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | System architecture |
+| **[DOCKER.md](DOCKER.md)** | Docker setup guide |
 
-## 🧪 Testing
+---
 
-### Quick Test All Adapters
-```powershell
-.\scripts\test_all.ps1
+## 🧪 Usage Examples
+
+### Basic Message
+
+In DingTalk/Feishu/WeCom:
+
+```
+帮我写一个 Python 爬虫
 ```
 
-### Test Scheduler API
+### Using Agent/Skill
+
+```
+@build 帮我编译这个项目
+```
+
+Available agents:
+- `@build` - Build mode
+- `@plan` - Planning mode
+- `@chat` - Conversation mode
+
+### Cron Task Commands
+
+| Command | Description |
+|---------|-------------|
+| `/crontask add "cron" "name" "content" [agent]` | Add scheduled task |
+| `/crontask list` | List all tasks |
+| `/crontask enable <id>` | Enable a task |
+| `/crontask disable <id>` | Disable a task |
+| `/crontask delete <id>` | Delete a task |
+| `/crontask info <id>` | Show task details |
+| `/crontask help` | Show help |
+
+**Examples:**
 ```bash
-./scripts/test_scheduler_api.sh
+# Daily report at 9 AM
+/crontask add "0 0 9 * * *" "日报" "生成每日日报"
+
+# Every 30 minutes
+/crontask add "0 */30 * * * *" "监控" "检查系统状态"
+
+# Workday noon (Mon-Fri)
+/crontask add "0 0 12 * * 1-5" "午间检查" "查看日志"
 ```
 
-### Test /crontask in DingTalk
-```
-/crontask help
-/crontask add "0 */30 * * * *" "测试任务" "查看系统负载"
-/crontask list
-```
+### Other Commands
 
-### Detailed I/O Demo
-```powershell
-.\scripts\demo_io.ps1
-```
+| Command | Description |
+|---------|-------------|
+| `/skills` | List available agents |
+| `/help` | Show help information |
+| `/abort` | Abort current task |
+| `/cmd <command>` | Execute shell command |
 
-### Interactive Testing
-```powershell
-.\scripts\test_interactive.ps1 -Adapter dingtalk
-```
-
-### DingTalk Configuration Check
-```powershell
-.\scripts\test_dingtalk_config.ps1
-```
+---
 
 ## 🏗️ Architecture
 
 ```
 ┌─────────────┐
-│   DingTalk  │ (Stream WebSocket + /crontask)
+│  DingTalk   │ (Stream WebSocket + /crontask)
 │   Feishu    │ (Webhook)
-│   WeCom     │ (Webhook)
+│    WeCom    │ (Webhook)
 └──────┬──────┘
        │
        ▼
@@ -162,6 +188,7 @@ event listener: active
 │  - Session Management                   │
 │  - Task Scheduler (Worker Pool)         │
 │  - Cron Scheduler (robfig/cron)         │
+│  - Event Handling & Permission Reply    │
 └──────────┬──────────────────────────────┘
            │
            ▼ (opencode-sdk-go)
@@ -171,24 +198,37 @@ event listener: active
 └─────────────────────────────┘
 ```
 
-## 🌟 What's New
-
-### v0.2.0 - DingTalk Stream Mode
-- ✨ Added DingTalk Stream mode support (github.com/open-dingtalk/dingtalk-stream-sdk-go)
-- ✨ No public IP required for DingTalk deployment
-- ✨ Real-time WebSocket connection with auto-reconnect
-- 🔧 Backward compatible with webhook mode
-- 📚 Comprehensive documentation and test scripts
+---
 
 ## 📊 API Endpoints
 
-| Platform | Endpoint | Method | Mode |
-|----------|----------|--------|------|
-| DingTalk | N/A | WebSocket | Stream |
-| DingTalk | `/dingtalk/callback` | POST | Webhook |
-| Feishu | `/feishu/callback` | POST | Webhook |
-| WeCom | `/wecom/callback` | GET/POST | Webhook |
-| Health | `/healthz` | GET | All |
+### Health & Status
+- `GET /healthz` - Service health check
+- `GET /health` - Detailed health + task stats
+
+### Task Management
+- `POST /api/tasks/submit` - Submit a task
+- `GET /api/tasks/{task_id}` - Get task details
+- `GET /api/tasks/active` - List active tasks
+- `GET /api/tasks/history` - Task history
+- `GET /api/tasks/stats` - Task statistics
+
+### Scheduled Tasks
+- `GET /api/scheduled-tasks` - List all
+- `POST /api/scheduled-tasks` - Create task
+- `POST /api/scheduled-tasks/{id}` - Update task
+- `DELETE /api/scheduled-tasks/{id}` - Delete task
+- `POST /api/scheduled-tasks/enable/{id}` - Enable task
+- `POST /api/scheduled-tasks/disable/{id}` - Disable task
+
+### Platform Webhooks
+- `POST /dingtalk/callback` - DingTalk webhook
+- `POST /feishu/callback` - Feishu webhook
+- `GET/POST /wecom/callback` - WeCom webhook
+
+See [API.md](docs/API.md) for complete API documentation.
+
+---
 
 ## 🔧 Configuration
 
@@ -196,89 +236,204 @@ event listener: active
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID (for Stream mode) |
-| `DINGTALK_CLIENT_SECRET` | ✅ Stream | DingTalk Client Secret (for Stream mode) |
-| `DINGTALK_USE_STREAM` | ⚙️ | Set to "true" to enable Stream mode |
 | `OPENCODE_ENDPOINT` | ✅ | OpenCode Server URL |
 | `OPENCODE_API_KEY` | ✅ | OpenCode API Key |
+| `SERVER_ADDR` | ❌ | Service listen address (`:8080`) |
+| `READ_TIMEOUT` | ❌ | HTTP read timeout (`30s`) |
+| `WRITE_TIMEOUT` | ❌ | HTTP write timeout (`30s`) |
+| `SHUTDOWN_GRACE` | ❌ | Graceful shutdown timeout (`30s`) |
+| `DINGTALK_USE_STREAM` | ❌ | Enable DingTalk Stream mode |
+| `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID |
+| `DINGTALK_CLIENT_SECRET` | ✅ Stream | DingTalk Client Secret |
+| `FEISHU_APP_ID` | ❌ | Feishu App ID |
+| `FEISHU_APP_SECRET` | ❌ | Feishu App Secret |
+| `WECOM_CORP_ID` | ❌ | WeCom Corp ID |
+| `WECOM_AGENT_ID` | ❌ | WeCom Agent ID |
+| `WECOM_TOKEN` | ❌ | WeCom Webhook Token |
+| `WECOM_AES_KEY` | ❌ | WeCom AES Key |
 
-See [DINGTALK_SETUP.md](DINGTALK_SETUP.md) for complete configuration guide.
+Quick example (`.env` file):
+```env
+OPENCODE_ENDPOINT=http://localhost:4096
+OPENCODE_API_KEY=your_api_key
+
+SERVER_ADDR=:8080
+
+DINGTALK_USE_STREAM=true
+DINGTALK_CLIENT_ID=your_client_id
+DINGTALK_CLIENT_SECRET=your_client_secret
+```
+
+---
+
+## 🐳 Docker Deployment
+
+### Build Image
+
+```bash
+docker build -t opencode-gateway:latest .
+```
+
+### Run Container
+
+```bash
+docker run -d \
+  --name opencode-gateway \
+  -p 8080:8080 \
+  --env-file .env \
+  --restart unless-stopped \
+  opencode-gateway:latest
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENCODE_ENDPOINT=http://opencode:4096
+      - DINGTALK_USE_STREAM=true
+      - DINGTALK_CLIENT_ID=${DINGTALK_CLIENT_ID}
+      - DINGTALK_CLIENT_SECRET=${DINGTALK_CLIENT_SECRET}
+    depends_on:
+      - opencode
+  opencode:
+    image: anomaly/opencode:latest
+    ports:
+      - "4096:4096"
+```
+
+Run:
+```bash
+docker-compose up -d
+```
+
+---
 
 ## 🐛 Troubleshooting
 
-### DingTalk Stream Mode
+### Common Issues
 
-**Connection Failed:**
+| Issue | Solution |
+|-------|----------|
+| Service won't start | Check Go version (≥1.21), OpenCode server status |
+| DingTalk Stream not connecting | Verify Client ID/Secret, check network |
+| Tasks not executing | Check Cron expression (5-6 fields), verify task is enabled |
+| Context timeout errors | Fixed automatically by session management |
+
+### Debug Mode
+
+```bash
+# Enable verbose logging
+LOG_LEVEL=debug ./bin/gateway
 ```
-dingtalk stream error: connection failed
-```
-- Verify Client ID and Client Secret
-- Ensure app is published in DingTalk console
-- Check network connectivity
 
-**No Messages Received:**
-- Confirm bot is added to chat
-- Check bot permissions in DingTalk console
-- Review logs in DingTalk Open Platform
+### Logs
 
-See [DINGTALK_SETUP.md](DINGTALK_SETUP.md) for detailed troubleshooting.
+Check logs in:
+- Console output
+- Docker logs: `docker logs opencode-gateway`
+- systemd: `journalctl -u opencode-gateway -f`
 
-## 🔗 Dependencies
-
-- `github.com/sst/opencode-sdk-go` - OpenCode official SDK
-- `github.com/open-dingtalk/dingtalk-stream-sdk-go` v0.9.1 - DingTalk Stream SDK
-- `github.com/gorilla/websocket` v1.5.0 - WebSocket support
-- `github.com/google/uuid` v1.3.0 - UUID generation
+---
 
 ## 📝 Project Structure
 
 ```
 opencode-gateway/
-├── cmd/gateway/main.go                    # Entry point
+├── cmd/
+│   └── gateway/
+│       └── main.go              # Entry point
 ├── internal/
 │   ├── adapters/
-│   │   ├── dingtalk/dingtalk.go          # DingTalk (Stream + Webhook)
-│   │   ├── feishu/feishu.go              # Feishu adapter
-│   │   └── wecom/wecom.go                # WeCom adapter
-│   ├── config/config.go                  # Configuration
-│   └── opencode/                         # OpenCode client
-│       ├── client.go                     # Smart session management 🎯
-│       ├── client_test.go                # Tests
-│       └── event_listener.go             # Event handling
-├── docs/                                 # Documentation
-│   ├── QUICK_FIX.md                     # Fix context deadline exceeded ⭐
-│   ├── SESSION_MANAGEMENT.md            # Session design doc
-│   └── TESTING_GUIDE.md                 # Testing guide
-├── examples/
-│   └── session_management_demo.go       # Demo program
-├── scripts/                              # Test scripts
-│   ├── test_dingtalk_config.ps1         # Config checker
-│   ├── demo_io.ps1                      # I/O demo
-│   └── test_interactive.ps1             # Interactive test
-├── DINGTALK_SETUP.md                    # DingTalk setup guide ⭐
-└── README.md                            # This file
+│   │   ├── base/
+│   │   │   └── adapter.go       # Base adapter interface
+│   │   ├── dingtalk/
+│   │   │   └── dingtalk.go     # DingTalk (Stream + Webhook)
+│   │   ├── feishu/
+│   │   │   └── feishu.go       # Feishu adapter
+│   │   └── wecom/
+│   │       └── wecom.go         # WeCom adapter
+│   ├── config/
+│   │   └── config.go           # Configuration loader
+│   ├── opencode/
+│   │   ├── client.go           # OpenCode client with session management
+│   │   └── event_listener.go   # SSE event handling
+│   ├── server/
+│   │   └── server.go           # HTTP server
+│   └── scheduler/
+│       ├── cron_scheduler.go    # Cron scheduler
+│       ├── scheduler.go        # Task scheduler
+│       ├── task.go             # Task model
+│       └── webhook.go          # HTTP API endpoints
+├── docs/                       # Documentation
+│   ├── API.md                  # API reference
+│   ├── DEPLOY.md               # Deployment guide
+│   ├── CONFIGURATION.md        # Configuration guide
+│   ├── QUICK_START_CRONTASK.md # Cron task quick start
+│   ├── CRONTASK_COMMAND.md     # Cron command reference
+│   ├── SCHEDULER_GUIDE.md      # Task scheduler guide
+│   └── README.md               # Documentation index
+├── .env.example                # Example environment variables
+├── docker-compose.yml          # Docker Compose
+├── Dockerfile                  # Docker image
+├── go.mod                      # Go modules
+├── go.sum                      # Go dependencies
+├── ARCHITECTURE.md             # System architecture
+├── DOCKER.md                   # Docker setup guide
+├── DEPLOYMENT_CHECKLIST.md     # Deployment checklist
+├── SOLUTION_SUMMARY.md         # Solution overview
+└── README.md                   # This file
 ```
 
-## 🔥 Important Updates
+---
 
-### Context Deadline Exceeded - Fixed! ✅
+## 🔥 Key Features Explained
 
-If you encountered `context deadline exceeded` errors during long conversations, it's now fixed!
+### Permission & Q&A Auto-Reply
 
-**What we added:**
-- Automatic session summarization after 30 messages
-- Automatic new session creation after 50 messages  
-- Context preservation across sessions
-- Zero configuration required - works out of the box
+The gateway automatically handles OpenCode permission requests and questions:
 
-**Learn more:**
-- [Quick Fix Guide](docs/QUICK_FIX.md) - Start here!
-- [Session Management Design](docs/SESSION_MANAGEMENT.md) - Technical details
-- [Testing Guide](docs/TESTING_GUIDE.md) - How to test
+1. Detects `permission.asked` and `question.asked` events
+2. Stores pending questions/permissions
+3. Users can reply with simple options:
+   - `允许` / `拒绝` / `始终允许` for permissions
+   - `1`, `2`, `3` for single-choice questions
+   - `选项名` for option labels
+
+### Session Management
+
+- Auto-summarize after 60% context usage
+- Auto-create new session at 80% context threshold
+- Preserve summary across sessions
+- Token estimation to prevent overflow
+
+### Streaming Output
+
+- Real-time content delivery via SSE
+- Progress notifications for long-running tasks
+- Handles permission requests in-stream
+- 5-minute timeout for long-running tasks
+
+---
+
+## 🔗 Dependencies
+
+- `github.com/sst/opencode-sdk-go` - OpenCode official SDK
+- `github.com/open-dingtalk/dingtalk-stream-sdk-go` - DingTalk Stream SDK
+- `github.com/robfig/cron` - Cron scheduler
+
+---
 
 ## 📜 License
 
 MIT License
+
+---
 
 ## 🔗 Links
 
@@ -286,8 +441,7 @@ MIT License
 - [OpenCode Server API](https://opencode.ai/docs/server/)
 - [DingTalk Open Platform](https://open.dingtalk.com/)
 - [DingTalk Stream SDK](https://github.com/open-dingtalk/dingtalk-stream-sdk-go)
-- [DingTalk Stream Tutorial](https://opensource.dingtalk.com/developerpedia/docs/explore/tutorials/stream/bot/go/build-bot)
 
 ---
 
-**For DingTalk integration, see [DINGTALK_SETUP.md](DINGTALK_SETUP.md) for detailed setup instructions.**
+**For detailed setup and usage, see [DEPLOY.md](docs/DEPLOY.md).**

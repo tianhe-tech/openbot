@@ -20,11 +20,15 @@ type CronScheduler struct {
 	cronIDsMu      sync.RWMutex
 	ctx            context.Context
 	cancel         context.CancelFunc
+	parser         cron.Parser // cron表达式解析器
 }
 
 // NewCronScheduler 创建定时任务调度器
 func NewCronScheduler(taskScheduler *TaskScheduler) *CronScheduler {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// 创建支持6字段（秒级）和5字段的cron解析器
+	parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
 
 	return &CronScheduler{
 		cron:           cron.New(cron.WithSeconds()), // 支持秒级精度
@@ -33,6 +37,7 @@ func NewCronScheduler(taskScheduler *TaskScheduler) *CronScheduler {
 		cronIDs:        make(map[string]cron.EntryID),
 		ctx:            ctx,
 		cancel:         cancel,
+		parser:         parser,
 	}
 }
 
@@ -65,12 +70,12 @@ func (cs *CronScheduler) AddScheduledTask(task *ScheduledTask) error {
 	}
 
 	// 验证cron表达式
-	if _, err := cron.ParseStandard(task.CronExpr); err != nil {
+	if _, err := cs.parser.Parse(task.CronExpr); err != nil {
 		return fmt.Errorf("invalid cron expression: %w", err)
 	}
 
 	// 计算下次运行时间
-	schedule, _ := cron.ParseStandard(task.CronExpr)
+	schedule, _ := cs.parser.Parse(task.CronExpr)
 	nextRun := schedule.Next(time.Now())
 	task.NextRunTime = &nextRun
 
@@ -237,11 +242,6 @@ func (cs *CronScheduler) executeScheduledTask(taskID string) {
 	scheduledTask.LastRunTime = &now
 	scheduledTask.RunCount++
 
-	// 计算下次运行时间
-	schedule, _ := cron.ParseStandard(scheduledTask.CronExpr)
-	nextRun := schedule.Next(now)
-	scheduledTask.NextRunTime = &nextRun
-
 	cs.tasksMu.Unlock()
 
 	log.Printf("cron-scheduler: executing scheduled task '%s' (type: %s, run count: %d)",
@@ -250,7 +250,7 @@ func (cs *CronScheduler) executeScheduledTask(taskID string) {
 	// 创建执行任务
 	task := &Task{
 		ID:          fmt.Sprintf("%s-run-%d", scheduledTask.ID, scheduledTask.RunCount),
-		Type:        scheduledTask.Type,
+		Type:        TaskTypeCron, // 标记为定时任务类型
 		Priority:    PriorityNormal,
 		Status:      TaskStatusPending,
 		AdapterType: scheduledTask.AdapterType,
@@ -258,10 +258,17 @@ func (cs *CronScheduler) executeScheduledTask(taskID string) {
 		Content:     scheduledTask.Content,
 		Agent:       scheduledTask.Agent,
 		ScriptPath:  scheduledTask.ScriptPath,
-		Metadata:    scheduledTask.Metadata,
+		Metadata:    make(map[string]interface{}),
 		CreatedAt:   now,
 		MaxRetries:  3,
 	}
+
+	// 复制并添加metadata
+	for k, v := range scheduledTask.Metadata {
+		task.Metadata[k] = v
+	}
+	task.Metadata["name"] = scheduledTask.Name // 确保任务名称在metadata中
+	task.Metadata["scheduled_task_id"] = scheduledTask.ID
 
 	// 提交任务到调度器
 	if err := cs.taskScheduler.SubmitTask(task); err != nil {

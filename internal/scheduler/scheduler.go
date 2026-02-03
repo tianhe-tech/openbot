@@ -177,7 +177,8 @@ func (s *TaskScheduler) executeTask(workerID int, task *Task) {
 	var err error
 
 	switch task.Type {
-	case TaskTypeMessage, TaskTypeAgent:
+	case TaskTypeMessage, TaskTypeAgent, TaskTypeCron:
+		// 定时任务使用和 Agent 相同的执行逻辑
 		result, err = s.executeMessageTask(ctx, task)
 	case TaskTypeScript:
 		result, err = s.executeScriptTask(ctx, task)
@@ -329,11 +330,38 @@ func (s *TaskScheduler) sendResultToAdapter(ctx context.Context, task *Task) {
 		return
 	}
 
-	err := sender.SendMessage(ctx, task.Channel, task.UserID, task.Result)
+	// 格式化消息：添加任务标识和结果
+	var message string
+	if task.Type == TaskTypeCron {
+		// 定时任务，添加任务ID和名称标识
+		taskName := "未命名任务"
+		if name, ok := task.Metadata["name"].(string); ok && name != "" {
+			taskName = name
+		}
+		message = fmt.Sprintf("🔔 定时任务执行完成\n\n📋 任务: %s\n🆔 任务ID: %s\n⏰ 完成时间: %s\n\n📝 执行结果:\n%s",
+			taskName,
+			task.ID,
+			time.Now().Format("2006-01-02 15:04:05"),
+			task.Result,
+		)
+	} else {
+		// 普通任务，直接发送结果
+		message = task.Result
+	}
+
+	// 对于钉钉，如果有 session_webhook，使用它而不是 channel
+	channel := task.Channel
+	if task.AdapterType == "dingtalk" {
+		if webhook, ok := task.Metadata["session_webhook"].(string); ok && webhook != "" {
+			channel = webhook // 将 webhook URL 放在 channel 参数中传递
+		}
+	}
+
+	err := sender.SendMessage(ctx, channel, task.UserID, message)
 	if err != nil {
 		log.Printf("scheduler: failed to send result to adapter '%s': %v", task.AdapterType, err)
 	} else {
-		log.Printf("scheduler: result sent to adapter '%s' for task %s", task.AdapterType, task.ID)
+		log.Printf("scheduler: result sent to adapter '%s' for task %s (channel: %s)", task.AdapterType, task.ID, channel)
 	}
 }
 

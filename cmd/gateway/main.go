@@ -71,6 +71,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Register adapters to taskScheduler for sending results
+	taskScheduler.RegisterAdapter("dingtalk", dingtalkHandler)
+	taskScheduler.RegisterAdapter("feishu", feishuHandler)
+	taskScheduler.RegisterAdapter("wecom", wecomHandler)
+
 	// Start task scheduler
 	if err := taskScheduler.Start(); err != nil {
 		log.Fatalf("failed to start task scheduler: %v", err)

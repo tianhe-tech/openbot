@@ -46,8 +46,8 @@ func (h *Handler) GetAdapter() *base.BidirectionalAdapter {
 }
 
 // SendMessage implements the MessageSender interface.
-func (h *Handler) SendMessage(ctx context.Context, userID, content string) error {
-	log.Printf("wecom: would send message to user %s: %s", userID, content)
+func (h *Handler) SendMessage(ctx context.Context, channel, userID, content string) error {
+	log.Printf("wecom: would send message to channel %s, user %s: %s", channel, userID, content)
 	// TODO: Implement WeCom message sending API
 	return nil
 }

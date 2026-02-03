@@ -277,4 +277,3 @@ DingTalk 返回结果
 
 - [/crontask 命令详细说明](CRONTASK_COMMAND.md)
 - [调度器完整指南](SCHEDULER_GUIDE.md)
-- [Scheduler README](../internal/scheduler/README.md)
