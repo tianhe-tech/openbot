@@ -46,9 +46,9 @@ func main() {
 
 	// Set cronScheduler to adapters so they can manage scheduled tasks
 	dingtalkHandler.SetCronScheduler(cronScheduler)
+	feishuHandler.SetCronScheduler(cronScheduler)
 	// TODO: Add SetCronScheduler to other adapters if needed
 	// wecomHandler.SetCronScheduler(cronScheduler)
-	// feishuHandler.SetCronScheduler(cronScheduler)
 
 	// Register adapters in registry
 	adapterRegistry.Register(wecomHandler.GetAdapter())
@@ -100,6 +100,12 @@ func main() {
 	}
 	defer dingtalkHandler.Stop()
 
+	// Start Feishu WebSocket client if enabled
+	if err := feishuHandler.Start(ctx); err != nil {
+		log.Printf("warning: could not start feishu websocket client: %v", err)
+	}
+	defer feishuHandler.Stop()
+
 	// Setup HTTP server
 	srv := server.New(server.Config{
 		Addr:          cfg.ServerAddr,
@@ -125,7 +131,13 @@ func main() {
 	log.Printf("opencode gateway ready on %s (bidirectional mode)", cfg.ServerAddr)
 
 	// Log registered adapters and their modes
-	adapters := []string{"wecom", "feishu"}
+	var adapters []string
+	adapters = append(adapters, "wecom (webhook)")
+	if cfg.FeiShu.UseWebSocket {
+		adapters = append(adapters, "feishu (websocket)")
+	} else {
+		adapters = append(adapters, "feishu (webhook)")
+	}
 	if cfg.DingTalk.UseStream {
 		adapters = append(adapters, "dingtalk (stream)")
 	} else {
