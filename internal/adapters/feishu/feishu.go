@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -189,7 +190,87 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	}
 	log.Printf("feishu: routing message from user %s (chat=%s)", userLabel, msg.ChatType)
 
-	sessionID, _ := h.adapter.GetSessionForUser(msg.UserID)
+	// ========== 检查是否是快速回复（权限或问题回答）==========
+	content := strings.TrimSpace(msg.Content)
+	sessionID, hasSession := h.adapter.GetSessionForUser(msg.UserID)
+
+	if hasSession {
+		log.Printf("feishu: checking quick reply '%s' for user %s (session: %s)", content, userLabel, sessionID[:min(8, len(sessionID))])
+
+		// 先尝试查找待处理的权限请求
+		permission, ok := h.client.GetLatestPendingPermission(sessionID)
+		if ok {
+			log.Printf("feishu: user %s replied '%s' to permission %s (session: %s)",
+				userLabel, content, permission.ID, sessionID[:min(8, len(sessionID))])
+
+			if err := h.client.AnswerQuestion(ctx, permission.ID, content); err != nil {
+				msg := fmt.Sprintf("❌ 权限回复失败: %v", err)
+				_ = h.sendTextChunks(ctx, target, msg)
+				return "", err
+			}
+
+			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", content)
+			_ = h.sendTextChunks(ctx, target, msg)
+			log.Printf("feishu: successfully answered permission %s, continuing with original SSE listener", permission.ID)
+			// 返回空字符串表示已处理，不需要作为新消息发送给 OpenCode
+			return "handled", nil
+		}
+
+		// 再尝试查找待处理的普通问题
+		question, ok := h.client.GetLatestPendingQuestion(sessionID)
+		if ok {
+			log.Printf("feishu: user %s replied '%s' to question %s", userLabel, content, question.ID)
+			log.Printf("feishu: question details - ID: %s, Options count: %d, Questions count: %d",
+				question.ID, len(question.Options), len(question.Questions))
+
+			// 解析答案 - 支持多种格式
+			answer := content
+			if strings.Contains(content, ";") {
+				log.Printf("feishu: using multi-question answer format: %s", content)
+			} else if strings.Contains(content, ",") {
+				log.Printf("feishu: using multi-select answer format: %s", content)
+			} else if idx, err := strconv.Atoi(strings.TrimSpace(content)); err == nil {
+				log.Printf("feishu: numeric input '%s', converting to option", content)
+
+				if len(question.Questions) > 0 && len(question.Questions[0].Options) > 0 {
+					qi := question.Questions[0]
+					if idx >= 1 && idx <= len(qi.Options) {
+						answer = qi.Options[idx-1].Label
+						log.Printf("feishu: converted %d -> %s (from Questions array)", idx, answer)
+					} else {
+						log.Printf("feishu: index %d out of range (1-%d), using original", idx, len(qi.Options))
+					}
+				} else if len(question.Options) > 0 {
+					if idx >= 1 && idx <= len(question.Options) {
+						answer = question.Options[idx-1]
+						log.Printf("feishu: converted %d -> %s (from Options array)", idx, answer)
+					} else {
+						log.Printf("feishu: index %d out of range (1-%d), using original", idx, len(question.Options))
+					}
+				}
+			} else {
+				log.Printf("feishu: using text input as answer: %s", content)
+			}
+
+			log.Printf("feishu: submitting answer '%s' for question %s (original input: %s)", answer, question.ID, content)
+
+			if err := h.client.AnswerQuestion(ctx, question.ID, answer); err != nil {
+				msg := fmt.Sprintf("❌ 回复失败: %v\n\n问题ID: %s\n答案: %s", err, question.ID, answer)
+				_ = h.sendTextChunks(ctx, target, msg)
+				return "", err
+			}
+
+			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续处理...", answer)
+			_ = h.sendTextChunks(ctx, target, msg)
+			log.Printf("feishu: successfully answered question %s", question.ID)
+			return "handled", nil
+		}
+
+		log.Printf("feishu: no pending question/permission for session %s, treating as new message", sessionID[:min(8, len(sessionID))])
+	}
+	// ========== 快速回复检查结束 ==========
+
+	sessionID, _ = h.adapter.GetSessionForUser(msg.UserID)
 	var fullReply strings.Builder
 
 	callback := func(chunk string) error {
