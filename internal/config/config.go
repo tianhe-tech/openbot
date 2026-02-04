@@ -44,6 +44,7 @@ func Load() (Config, error) {
 			AppSecret:         os.Getenv("FEISHU_APP_SECRET"),
 			VerificationToken: os.Getenv("FEISHU_VERIFICATION_TOKEN"),
 			EncryptKey:        os.Getenv("FEISHU_ENCRYPT_KEY"),
+			UseWebSocket:      getBool("FEISHU_USE_WEBSOCKET", true), // 默认启用WebSocket模式
 		},
 		DingTalk: dingtalk.Config{
 			// Stream mode (preferred)
@@ -84,6 +85,15 @@ func getDuration(key string, fallback time.Duration) time.Duration {
 		}
 		if seconds, err := strconv.Atoi(raw); err == nil {
 			return time.Duration(seconds) * time.Second
+		}
+	}
+	return fallback
+}
+
+func getBool(key string, fallback bool) bool {
+	if raw := os.Getenv(key); raw != "" {
+		if val, err := strconv.ParseBool(raw); err == nil {
+			return val
 		}
 	}
 	return fallback

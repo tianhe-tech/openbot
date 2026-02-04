@@ -264,6 +264,11 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		// LSP 更新事件，静默处理
 		log.Printf("opencode: lsp updated for session %s", s.sessionID[:8])
 
+	case "file.watcher.updated":
+		// 文件监视器更新事件，静默处理
+		// 这是 OpenCode 内部文件监视器检测到文件变化时触发的事件
+		// log.Printf("opencode: file watcher updated for session %s", s.sessionID[:8])
+
 	default:
 		// 未知事件类型，记录日志但不中断
 		if eventType != "" {
