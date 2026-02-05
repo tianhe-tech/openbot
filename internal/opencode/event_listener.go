@@ -248,6 +248,24 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		// Session 状态事件，静默处理
 		log.Printf("opencode: session status changed for session %s", s.sessionID[:8])
 
+	case "session.error":
+		errorMsg := s.extractSessionError(event)
+		if errorMsg == "" {
+			errorMsg = "⚠️ OpenCode 会话发生错误，请稍后重试。"
+		} else {
+			errorMsg = fmt.Sprintf("⚠️ OpenCode 会话出错：%s", errorMsg)
+		}
+
+		if err := s.callback(errorMsg); err != nil {
+			log.Printf("opencode: session.error callback error: %v", err)
+		} else {
+			s.contentSent = true
+		}
+
+		s.completed = true
+		s.notifyCompletion()
+		log.Printf("opencode: session error handled for session %s", s.sessionID[:8])
+
 	case "session.diff":
 		// Session 差异事件，静默处理
 		log.Printf("opencode: session diff for session %s", s.sessionID[:8])
@@ -340,6 +358,80 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 
 	// 其他事件类型暂时不提取内容
 	return ""
+}
+
+// extractSessionError 从 session.error 事件中提取错误信息
+func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListResponse) string {
+	if event == nil {
+		return ""
+	}
+
+	raw := event.JSON.RawJSON()
+	if raw == "" {
+		return ""
+	}
+
+	type SessionErrorProps struct {
+		SessionID string `json:"sessionID"`
+		MessageID string `json:"messageID"`
+		Error     struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Code    string `json:"code"`
+			Detail  string `json:"detail"`
+		} `json:"error"`
+		Message string `json:"message"`
+		Detail  string `json:"detail"`
+		Code    string `json:"code"`
+		Reason  string `json:"reason"`
+	}
+
+	var wrapper struct {
+		Properties SessionErrorProps `json:"properties"`
+	}
+
+	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
+		log.Printf("opencode: failed to parse session.error event: %v", err)
+		return ""
+	}
+
+	props := wrapper.Properties
+
+	var parts []string
+
+	if props.Error.Message != "" {
+		parts = append(parts, props.Error.Message)
+	}
+	if props.Message != "" && props.Message != props.Error.Message {
+		parts = append(parts, props.Message)
+	}
+	if props.Detail != "" {
+		parts = append(parts, props.Detail)
+	}
+	if props.Error.Detail != "" && props.Error.Detail != props.Detail {
+		parts = append(parts, props.Error.Detail)
+	}
+	if props.Reason != "" {
+		parts = append(parts, props.Reason)
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	code := props.Error.Code
+	if code == "" {
+		code = props.Code
+	}
+	if code == "" {
+		code = props.Error.Type
+	}
+
+	message := strings.Join(parts, "; ")
+	if code != "" {
+		return fmt.Sprintf("%s (%s)", message, code)
+	}
+	return message
 }
 
 // extractQuestionFromEvent 从 question.asked 或 permission.asked 事件中提取问题内容和选项
