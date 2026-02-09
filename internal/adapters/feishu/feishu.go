@@ -345,10 +345,12 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		Content:   msg.Content,
 		Streaming: true,
 		Metadata: map[string]string{
-			"message_id":   msg.MessageID,
-			"message_type": msg.MessageType,
-			"chat_type":    msg.ChatType,
-			"chat_id":      msg.ChatID,
+			"message_id":      msg.MessageID,
+			"message_type":    msg.MessageType,
+			"chat_type":       msg.ChatType,
+			"chat_id":         msg.ChatID,
+			"receive_id":      target.receiveID,
+			"receive_id_type": target.receiveIDType,
 		},
 	}, callback)
 	if err != nil {
@@ -359,6 +361,8 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 	if response.SessionID != "" {
 		h.adapter.MapUserToSession(msg.UserID, response.SessionID)
+		h.adapter.MapSessionData(response.SessionID, "receive_id", target.receiveID)
+		h.adapter.MapSessionData(response.SessionID, "receive_id_type", target.receiveIDType)
 	}
 
 	// Send final reply - handle both sync and async modes
@@ -482,6 +486,17 @@ func (h *Handler) GetAdapter() *base.BidirectionalAdapter {
 }
 
 func (h *Handler) SendMessage(ctx context.Context, channel, userID, content string) error {
+	if channel != "" && userID != "" {
+		receiveIDType := channel
+		if receiveIDType == "" {
+			receiveIDType = "open_id"
+		}
+		target := chatTarget{
+			receiveID:     userID,
+			receiveIDType: receiveIDType,
+		}
+		return h.sendTextChunks(ctx, target, content)
+	}
 	target, err := h.resolveChatTarget(userID, channel)
 	if err != nil {
 		return err
@@ -508,9 +523,13 @@ func (h *Handler) sendTextMessage(ctx context.Context, target chatTarget, conten
 	if target.receiveID == "" {
 		return fmt.Errorf("feishu: missing receive_id for message send")
 	}
+	if target.receiveIDType == "" {
+		target.receiveIDType = "open_id"
+	}
+
 	token, err := h.getAccessToken(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("feishu: get access token: %w", err)
 	}
 
 	contentBody, err := json.Marshal(map[string]string{"text": content})
@@ -536,6 +555,13 @@ func (h *Handler) sendTextMessage(ctx context.Context, target chatTarget, conten
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
+	receiveLabel := target.receiveID
+	if len(receiveLabel) > 12 {
+		receiveLabel = receiveLabel[:12]
+	}
+	log.Printf("feishu: sending message via API - receive_id=%s type=%s url=%s",
+		receiveLabel, target.receiveIDType, apiURL)
+
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("feishu: send message: %w", err)
@@ -544,25 +570,29 @@ func (h *Handler) sendTextMessage(ctx context.Context, target chatTarget, conten
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("feishu: send status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		errMsg := fmt.Sprintf("feishu: send status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		log.Printf("feishu: API request failed - URL: %s, Response: %s", apiURL, errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	var body struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return fmt.Errorf("feishu: decode send response: %w", err)
 	}
 	if body.Code != 0 {
-		return fmt.Errorf("feishu: send failed code=%d msg=%s", body.Code, body.Msg)
+		errMsg := fmt.Sprintf("feishu: send failed code=%d msg=%s", body.Code, body.Msg)
+		log.Printf("feishu: API returned error - code=%d msg=%s", body.Code, body.Msg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
-	receiveLabel := target.receiveID
-	if len(receiveLabel) > 8 {
-		receiveLabel = receiveLabel[:8]
-	}
-	log.Printf("feishu: sent %d chars to %s(%s)", len(content), target.receiveIDType, receiveLabel)
+	log.Printf("feishu: message sent successfully - message_id=%s, chars=%d, target=%s(%s)",
+		body.Data.MessageID, len(content), target.receiveIDType, receiveLabel)
 	return nil
 }
 
@@ -832,14 +862,21 @@ func (h *Handler) rememberChatTarget(msg incomingMessage) chatTarget {
 }
 
 func (h *Handler) resolveChatTarget(userID, channel string) (chatTarget, error) {
+	if userID == "" {
+		return chatTarget{}, fmt.Errorf("feishu: unable to resolve chat target - userID is empty")
+	}
 	if channel != "" {
-		return chatTarget{receiveID: channel, receiveIDType: "chat_id"}, nil
+		receiveIDType := channel
+		if receiveIDType == "" {
+			receiveIDType = "open_id"
+		}
+		return chatTarget{
+			receiveID:     userID,
+			receiveIDType: receiveIDType,
+		}, nil
 	}
 	if entry, ok := h.userTargets.Load(userID); ok {
 		return entry.(chatTarget), nil
-	}
-	if userID == "" {
-		return chatTarget{}, fmt.Errorf("feishu: unable to resolve chat target")
 	}
 	return chatTarget{receiveID: userID, receiveIDType: "open_id"}, nil
 }
@@ -1143,12 +1180,9 @@ func (h *Handler) handleCronTaskAdd(ctx context.Context, target chatTarget, user
 		CronExpr:    cronExpr,
 		Enabled:     true,
 		AdapterType: "feishu",
-		Channel:     target.receiveID,
 		Content:     taskContent,
 		Agent:       agent,
 		Metadata: map[string]interface{}{
-			"created_by":      userID,
-			"created_from":    "feishu",
 			"receive_id":      target.receiveID,
 			"receive_id_type": target.receiveIDType,
 		},

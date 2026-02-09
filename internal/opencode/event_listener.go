@@ -130,20 +130,27 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 检查是否已完成
-	if s.completed {
-		return nil
-	}
+	candidateSessionID := extractSessionIDFromEvent(event)
+	eventType := string(event.Type)
 
-	if !s.belongsToSession(event) {
+	log.Printf("opencode: StreamingHandler received event - type=%s, eventSessionID=%s, handlerSessionID=%s",
+		eventType,
+		func() string {
+			if candidateSessionID != "" {
+				return candidateSessionID[:min(8, len(candidateSessionID))]
+			}
+			return "(not found in event)"
+		}(),
+		s.sessionID[:8])
+
+	if s.completed {
+		log.Printf("opencode: ignoring event for completed session %s", s.sessionID[:8])
 		return nil
 	}
 
 	// 仅处理与当前session相关的事件
-	eventType := string(event.Type)
 	log.Printf("opencode: streaming handler event type=%s", eventType)
 
-	// 记录最后一次事件的时间和类型
 	s.lastEventTime = time.Now()
 	s.lastEventType = eventType
 
@@ -266,6 +273,11 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		s.notifyCompletion()
 		log.Printf("opencode: session error handled for session %s", s.sessionID[:8])
 
+		retryMsg := "\n\n是否需要建立新的连接继续操作？\n•回复 '是' 或 'yes' 继续使用旧session\n•回复 '新' 或 'new' 创建新session"
+		if err := s.callback(retryMsg); err != nil {
+			log.Printf("opencode: session.error retry prompt error: %v", err)
+		}
+
 	case "session.diff":
 		// Session 差异事件，静默处理
 		log.Printf("opencode: session diff for session %s", s.sessionID[:8])
@@ -332,14 +344,32 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 	}
 
 	// 尝试解析 message.part.updated 事件
-	// 根据 OpenCode SDK 源码，EventListResponseEventMessagePartUpdatedProperties 包含：
-	// - Delta string (增量文本)
-	// - Part.Text string (part的完整文本)
 	if event.Type == "message.part.updated" {
+		type ToolInput struct {
+			Command     string `json:"command"`
+			Description string `json:"description"`
+			Filepath    string `json:"filepath"`
+			Pattern     string `json:"pattern"`
+			URL         string `json:"url"`
+			Query       string `json:"query"`
+			Content     string `json:"content"`
+		}
+
+		type ToolState struct {
+			Status string    `json:"status"`
+			Input  ToolInput `json:"input"`
+			Output string    `json:"output"`
+			Error  string    `json:"error"`
+		}
+
 		type PartUpdateProps struct {
 			Delta string `json:"delta"`
 			Part  struct {
-				Type string `json:"type"`
+				Type   string    `json:"type"`
+				Tool   string    `json:"tool"`
+				State  ToolState `json:"state"`
+				Text   string    `json:"text"`
+				Reason string    `json:"reason"`
 			} `json:"part"`
 		}
 
@@ -349,14 +379,67 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 			}
 			if err := json.Unmarshal([]byte(jsonData), &wrapper); err == nil {
 				props := wrapper.Properties
-				if props.Delta != "" && props.Part.Type == "text" {
-					return props.Delta
+				partType := props.Part.Type
+
+				switch partType {
+				case "text":
+					// 文本增量内容
+					if props.Delta != "" {
+						return props.Delta
+					}
+
+				case "tool":
+					// 工具调用事件：仅在 running 和 completed/error 时通知
+					toolName := props.Part.Tool
+					state := props.Part.State
+
+					switch state.Status {
+					case "running":
+						// 工具开始执行，发送简洁通知
+						desc := state.Input.Description
+						if desc == "" {
+							desc = state.Input.Command
+						}
+						if desc == "" {
+							desc = state.Input.Filepath
+						}
+						if desc == "" {
+							desc = state.Input.URL
+						}
+						if desc != "" {
+							// 截断过长描述
+							if len([]rune(desc)) > 80 {
+								desc = string([]rune(desc)[:80]) + "..."
+							}
+							return fmt.Sprintf("🔧 [%s] %s\n", toolName, desc)
+						}
+						return fmt.Sprintf("🔧 正在执行 %s...\n", toolName)
+
+					case "completed":
+						// 工具完成，发送结果（如果有且简短）
+						output := strings.TrimSpace(state.Output)
+						if output != "" && len([]rune(output)) <= 200 {
+							return fmt.Sprintf("✅ [%s] %s\n", toolName, output)
+						}
+						// 输出过长或为空，不发送
+
+					case "error":
+						errMsg := strings.TrimSpace(state.Error)
+						if errMsg == "" {
+							errMsg = "执行失败"
+						}
+						if len([]rune(errMsg)) > 200 {
+							errMsg = string([]rune(errMsg)[:200]) + "..."
+						}
+						return fmt.Sprintf("❌ [%s] %s\n", toolName, errMsg)
+					}
+
+					// reasoning、step-start、step-finish 等不向用户发送
 				}
 			}
 		}
 	}
 
-	// 其他事件类型暂时不提取内容
 	return ""
 }
 
@@ -799,6 +882,46 @@ func (s *StreamingSessionHandler) notifyCompletion() {
 	}
 }
 
+// extractSessionIDFromEvent 从事件中提取 sessionID
+func extractSessionIDFromEvent(event *opencode.EventListResponse) string {
+	if event == nil || event.JSON.RawJSON() == "" {
+		return ""
+	}
+
+	var wrapper struct {
+		Properties struct {
+			SessionID string `json:"sessionID"`
+			Message   struct {
+				SessionID string `json:"sessionID"`
+			} `json:"message"`
+			Part struct {
+				SessionID string `json:"sessionID"`
+			} `json:"part"`
+			Info struct {
+				ID string `json:"id"`
+			} `json:"info"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &wrapper); err != nil {
+		return ""
+	}
+
+	if wrapper.Properties.SessionID != "" {
+		return wrapper.Properties.SessionID
+	}
+	if wrapper.Properties.Message.SessionID != "" {
+		return wrapper.Properties.Message.SessionID
+	}
+	if wrapper.Properties.Part.SessionID != "" {
+		return wrapper.Properties.Part.SessionID
+	}
+	// session.created/session.updated events have sessionID in properties.info.id
+	if wrapper.Properties.Info.ID != "" && strings.HasPrefix(wrapper.Properties.Info.ID, "ses_") {
+		return wrapper.Properties.Info.ID
+	}
+	return ""
+}
+
 func (s *StreamingSessionHandler) belongsToSession(event *opencode.EventListResponse) bool {
 	if s.sessionID == "" || event == nil {
 		return true
@@ -815,6 +938,9 @@ func (s *StreamingSessionHandler) belongsToSession(event *opencode.EventListResp
 			Message   struct {
 				SessionID string `json:"sessionID"`
 			} `json:"message"`
+			Part struct {
+				SessionID string `json:"sessionID"`
+			} `json:"part"`
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
@@ -824,6 +950,9 @@ func (s *StreamingSessionHandler) belongsToSession(event *opencode.EventListResp
 	candidate := wrapper.Properties.SessionID
 	if candidate == "" {
 		candidate = wrapper.Properties.Message.SessionID
+	}
+	if candidate == "" {
+		candidate = wrapper.Properties.Part.SessionID
 	}
 
 	if candidate == "" {

@@ -18,6 +18,7 @@ type BidirectionalAdapter struct {
 	sender       MessageSender
 	userSessions sync.Map // map[userID]sessionID
 	sessionUsers sync.Map // map[sessionID]userID
+	sessionData  sync.Map // map[sessionID]map[string]string - 存储session的额外数据（如webhook URL）
 }
 
 // NewBidirectionalAdapter creates a new bidirectional adapter.
@@ -37,6 +38,29 @@ func (a *BidirectionalAdapter) Name() string {
 func (a *BidirectionalAdapter) MapUserToSession(userID, sessionID string) {
 	a.userSessions.Store(userID, sessionID)
 	a.sessionUsers.Store(sessionID, userID)
+}
+
+// MapSessionData stores additional data for a session (like webhook URL).
+func (a *BidirectionalAdapter) MapSessionData(sessionID, key, value string) {
+	if val, ok := a.sessionData.Load(sessionID); ok {
+		data := val.(map[string]string)
+		data[key] = value
+		a.sessionData.Store(sessionID, data)
+	} else {
+		data := map[string]string{key: value}
+		a.sessionData.Store(sessionID, data)
+	}
+}
+
+// GetSessionData retrieves additional data for a session.
+func (a *BidirectionalAdapter) GetSessionData(sessionID, key string) (string, bool) {
+	if val, ok := a.sessionData.Load(sessionID); ok {
+		data := val.(map[string]string)
+		if v, exists := data[key]; exists {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // GetSessionForUser retrieves the session ID for a user.
@@ -78,7 +102,10 @@ func (a *BidirectionalAdapter) HandleIncomingEvent(ctx context.Context, sessionI
 		return fmt.Errorf("adapter %s: no user found for session %s", a.name, sessionID)
 	}
 
-	return a.SendToUser(ctx, userID, content)
+	// Get channel/webhook from session data if available
+	channel, _ := a.GetSessionData(sessionID, "channel")
+
+	return a.SendToUserInChannel(ctx, channel, userID, content)
 }
 
 // AdapterRegistry manages multiple bidirectional adapters.

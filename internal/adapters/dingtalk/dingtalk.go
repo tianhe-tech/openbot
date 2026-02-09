@@ -261,6 +261,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	sessionMapped := false
 	var sessionMappingMu sync.Mutex
 
+	// 第一个 callback 是 sessionID (特殊信号)
+	callbackCalled := false
+
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:   "dingtalk",
 		UserID:    userID,
@@ -274,6 +277,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			"sender_nick":       data.SenderNick,
 		},
 	}, func(chunk string) error {
+		// 🔍 诊断：记录第一个 callback
+		if !callbackCalled {
+			callbackCalled = true
+			log.Printf("dingtalk stream: 🔍 FIRST CALLBACK - chunk='%s', len=%d",
+				chunk[:min(30, len(chunk))], len(chunk))
+		}
+
 		// Map user to session as soon as we receive first callback
 		// This ensures the mapping exists before any question/permission events
 		sessionMappingMu.Lock()
@@ -281,12 +291,20 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			// This is a special signal containing the sessionID (not actual content)
 			// SessionID format: ses_XXXXXXXXXXXXXXXXXXXXXXXXXX (around 30 chars)
 			h.adapter.MapUserToSession(userID, chunk)
-			log.Printf("dingtalk stream: early mapped user %s to session %s", userID, chunk)
+			// Store the session webhook for later use when sending messages from OpenCode Server
+			h.adapter.MapSessionData(chunk, "channel", data.SessionWebhook)
+			log.Printf("dingtalk stream: early mapped user %s to session %s (webhook: %s)", userID, chunk, data.SessionWebhook)
 			sessionMapped = true
 			sessionMappingMu.Unlock()
 			return nil
 		}
 		sessionMappingMu.Unlock()
+
+		// 🔍 诊断：记录内容 callback
+		if len(chunk) > 0 && !strings.HasPrefix(chunk, "ses_") {
+			log.Printf("dingtalk stream: 🔍 CONTENT CALLBACK - len=%d, prefix='%s'",
+				len(chunk), chunk[:min(50, len(chunk))])
+		}
 
 		// 处理进度更新、权限请求、问题确认等需要立即发送的消息
 		if strings.HasPrefix(chunk, "⏳") || strings.HasPrefix(chunk, "⏱️") ||
@@ -361,7 +379,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Map user to session (whether new or existing)
 	if response.SessionID != "" {
 		h.adapter.MapUserToSession(userID, response.SessionID)
-		log.Printf("dingtalk stream: mapped user %s to session %s", userID, response.SessionID)
+		// Store the session webhook for later use
+		h.adapter.MapSessionData(response.SessionID, "channel", data.SessionWebhook)
+		log.Printf("dingtalk stream: 🔍 END - userID=%s, sessionID=%s, fullReplyLen=%d, updateCount=%d, webhook=%s",
+			userID, response.SessionID[:min(8, len(response.SessionID))],
+			fullReply.Len(), updateCount, data.SessionWebhook)
 	}
 
 	// Send final complete reply (only if we have synchronous content)
@@ -377,22 +399,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		accumulatedContent := fullReply.String()
 		if len(accumulatedContent) > 0 {
 			// 有内容但可能没有全部发送（因为中间更新的阈值是500字符）
-			// 如果没有发送过任何中间更新，或者还有新内容，发送最终结果
+			// 如果没有发送过任何中间更新，或者还有新内容，发送最终结果（不加额外前缀）
 			if updateCount == 0 || len(accumulatedContent) > lastSentLength {
-				finalMsg := fmt.Sprintf("✅ 任务完成\n\n%s", accumulatedContent)
-				if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(finalMsg)); err != nil {
+				if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(accumulatedContent)); err != nil {
 					log.Printf("dingtalk stream: failed to send final message: %v", err)
 				} else {
 					log.Printf("dingtalk stream: sent final message to user %s (%d chars total)",
 						userID, len(accumulatedContent))
-				}
-			} else {
-				// 内容已经通过中间更新全部发送，只发送完成提示
-				completionMsg := "✅ 任务已完成"
-				if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(completionMsg)); err != nil {
-					log.Printf("dingtalk stream: failed to send completion message: %v", err)
-				} else {
-					log.Printf("dingtalk stream: sent completion message to user %s", userID)
 				}
 			}
 		} else {

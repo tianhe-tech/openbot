@@ -139,15 +139,19 @@ type Client struct {
 	httpClient       *http.Client
 	eventHandlers    []EventHandler
 	eventListenerMu  sync.RWMutex
-	sessions         sync.Map // map[threadID]sessionID
-	sessionLocks     sync.Map // map[threadID]*sync.Mutex for preventing concurrent session operations
-	messageCount     sync.Map // map[sessionID]int tracks messages per session
-	tokenCount       sync.Map // map[sessionID]int tracks estimated tokens per session
-	sessionSummary   sync.Map // map[sessionID]string stores session summaries
-	modelConfig      sync.Map // map[sessionID]*ModelConfig caches model config per session
-	requestCache     sync.Map // map[requestHash]*RequestRecord 请求去重缓存
-	runningSessions  sync.Map // map[sessionID]bool 跟踪正在运行的session
-	pendingQuestions sync.Map // map[questionID]*Question 待回答的问题
+	sessionHandlers  sync.Map     // map[sessionID]EventHandler for fast lookup
+	messageToSession sync.Map     // map[messageID]sessionID for events with only messageID
+	sessionMu        sync.RWMutex // 用于保护 session 相关操作
+	sessions         sync.Map     // map[threadID]sessionID
+	sessionLocks     sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
+	sessionsMu       sync.RWMutex // 保护 sessions 的读写
+	messageCount     sync.Map     // map[sessionID]int tracks messages per session
+	tokenCount       sync.Map     // map[sessionID]int tracks estimated tokens per session
+	sessionSummary   sync.Map     // map[sessionID]string stores session summaries
+	modelConfig      sync.Map     // map[sessionID]*ModelConfig caches model config per session
+	requestCache     sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
+	runningSessions  sync.Map     // map[sessionID]bool 跟踪正在运行的session
+	pendingQuestions sync.Map     // map[questionID]*Question 待回答的问题
 	directory        string
 	timeout          time.Duration // 默认超时时间
 	retryConfig      RetryConfig   // 重试配置
@@ -286,14 +290,36 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 	threadLock := c.getThreadLock(payload.ThreadID)
 	threadLock.Lock()
 	sessionID := payload.SessionID
+
+	// 🔍 诊断日志：记录 session 查找请求
+	log.Printf("opencode: session lookup - channel=%s, userID=%s, threadID=%s, requestingSessionID=%s",
+		payload.Channel, payload.UserID, payload.ThreadID, sessionID)
+
 	if sessionID == "" && payload.ThreadID != "" {
 		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
-			sessionID = sid.(string)
+			foundSessionID := sid.(string)
+
+			// 🔍 诊断日志：检查 session 是否属于当前用户
+			// 通过查询 adapter 的映射来验证（如果可用）
+			log.Printf("opencode: found cached session %s for threadID %s (requested by %s user %s)",
+				foundSessionID[:8], payload.ThreadID, payload.Channel, payload.UserID)
+
+			// 警告：可能存在 session 混用
+			log.Printf("opencode: ⚠️ WARNING - ThreadID %s is mapped to session %s, but cannot verify ownership!",
+				payload.ThreadID, foundSessionID[:8])
+
+			sessionID = foundSessionID
+		} else {
+			log.Printf("opencode: no cached session for threadID %s, will create new", payload.ThreadID)
 		}
 	}
 
 	// Create new session if needed
 	if sessionID == "" {
+		// 🔍 诊断日志：创建新 session
+		log.Printf("opencode: creating new session - channel=%s, userID=%s, threadID=%s",
+			payload.Channel, payload.UserID, payload.ThreadID)
+
 		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
 			Title: opencode.F(fmt.Sprintf("%s-%s", payload.Channel, payload.UserID)),
 		})
@@ -305,6 +331,9 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		sessionID = session.ID
 		if payload.ThreadID != "" {
 			c.sessions.Store(payload.ThreadID, sessionID)
+			// 🔍 诊断日志：记录 session 映射
+			log.Printf("opencode: mapped threadID %s -> sessionID %s (for %s user %s)",
+				payload.ThreadID, sessionID[:8], payload.Channel, payload.UserID)
 		}
 		c.messageCount.Store(sessionID, 0)
 		c.tokenCount.Store(sessionID, 0)
@@ -312,8 +341,11 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		// 获取模型配置
 		go c.fetchAndCacheModelConfig(context.Background(), sessionID)
 
-		log.Printf("opencode: created new session %s for thread %s", sessionID, payload.ThreadID)
+		log.Printf("opencode: created new session %s for thread %s", sessionID[:8], payload.ThreadID)
 	} else {
+		// 🔍 诊断日志：复用现有 session
+		log.Printf("opencode: reusing existing sessionID %s for %s user %s (threadID %s)",
+			sessionID[:8], payload.Channel, payload.UserID, payload.ThreadID)
 		// 检查是否需要总结或创建新session
 		count, _ := c.messageCount.Load(sessionID)
 		msgCount := count.(int)
@@ -580,14 +612,89 @@ func (c *Client) StartEventListener(ctx context.Context) error {
 		for stream.Next() {
 			event := stream.Current()
 
-			// Dispatch to all registered handlers
+			eventType := string(event.Type)
+
+			// Extract session ID from event (try multiple locations)
+			var sessionID string
+			rawJSON := event.JSON.RawJSON()
+
+			// Debug: log full JSON for message.part.updated events
+			if eventType == "message.part.updated" && len(rawJSON) > 0 {
+				log.Printf("opencode: DEBUG - message.part.updated JSON: %.500s", rawJSON)
+			}
+
+			if rawJSON != "" {
+				var eventWrapper struct {
+					SessionID string `json:"sessionID"`
+					Message   struct {
+						SessionID string `json:"sessionID"`
+						ID        string `json:"id"`
+					} `json:"message"`
+					Properties struct {
+						SessionID string `json:"sessionID"`
+						Message   struct {
+							SessionID string `json:"sessionID"`
+						} `json:"message"`
+						Part struct {
+							SessionID string `json:"sessionID"`
+						} `json:"part"`
+						Info struct {
+							ID string `json:"id"`
+						} `json:"info"`
+					} `json:"properties"`
+				}
+				if err := json.Unmarshal([]byte(rawJSON), &eventWrapper); err == nil {
+					// Try root-level sessionID
+					if eventWrapper.SessionID != "" {
+						sessionID = eventWrapper.SessionID
+					} else if eventWrapper.Properties.SessionID != "" {
+						// Try properties.sessionID
+						sessionID = eventWrapper.Properties.SessionID
+					} else if eventWrapper.Properties.Message.SessionID != "" {
+						// Try properties.message.sessionID
+						sessionID = eventWrapper.Properties.Message.SessionID
+					} else if eventWrapper.Properties.Part.SessionID != "" {
+						// Try properties.part.sessionID (used by message.part.updated events)
+						sessionID = eventWrapper.Properties.Part.SessionID
+					} else if eventWrapper.Message.SessionID != "" {
+						// Try message.sessionID
+						sessionID = eventWrapper.Message.SessionID
+					} else if eventWrapper.Properties.Info.ID != "" && strings.HasPrefix(eventWrapper.Properties.Info.ID, "ses_") {
+						// Try properties.info.id for session.created/session.updated events
+						sessionID = eventWrapper.Properties.Info.ID
+					}
+				}
+			}
+
+			if sessionID != "" && len(sessionID) > 8 {
+				log.Printf("opencode: processing event type=%s, sessionID=%s", eventType, sessionID[:8])
+			} else {
+				log.Printf("opencode: processing event type=%s (no sessionID)", eventType)
+			}
+
+			// Fast path: if session ID found, call the specific session handler
+			if sessionID != "" {
+				if handler, ok := c.sessionHandlers.Load(sessionID); ok {
+					if err := handler.(EventHandler)(ctx, &event); err != nil {
+						log.Printf("opencode: session handler error for %s: %v", sessionID[:8], err)
+					}
+				} else {
+					log.Printf("opencode: no session handler found for %s", sessionID[:8])
+				}
+			}
+
+			// Always dispatch to global handlers
 			c.eventListenerMu.RLock()
 			handlers := c.eventHandlers
 			c.eventListenerMu.RUnlock()
 
+			if len(handlers) > 0 {
+				log.Printf("opencode: dispatching to %d global handlers", len(handlers))
+			}
+
 			for _, handler := range handlers {
 				if err := handler(ctx, &event); err != nil {
-					log.Printf("opencode: event handler error: %v", err)
+					log.Printf("opencode: global event handler error: %v", err)
 				}
 			}
 		}
@@ -605,6 +712,17 @@ func (c *Client) RegisterEventHandler(handler EventHandler) {
 	c.eventListenerMu.Lock()
 	defer c.eventListenerMu.Unlock()
 	c.eventHandlers = append(c.eventHandlers, handler)
+}
+
+// RegisterSessionHandler registers an event handler tied to a specific session.
+// This allows fast lookup and prevents unnecessary processing of unrelated events.
+func (c *Client) RegisterSessionHandler(sessionID string, handler EventHandler) {
+	c.sessionHandlers.Store(sessionID, handler)
+}
+
+// UnregisterSessionHandler removes an event handler for a specific session.
+func (c *Client) UnregisterSessionHandler(sessionID string) {
+	c.sessionHandlers.Delete(sessionID)
 }
 
 var _ MessageSender = (*Client)(nil)
@@ -787,8 +905,9 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 	// 3. 创建StreamingSessionHandler并注册
 	handler := NewStreamingSessionHandler(sessionID, callback, func() {
 		c.runningSessions.Delete(sessionID)
-	}, c, c) // 传入c作为messageSender
-	c.RegisterEventHandler(handler.HandleEvent)
+		c.UnregisterSessionHandler(sessionID)
+	}, c, c)
+	c.RegisterSessionHandler(sessionID, handler.HandleEvent)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
 
 	// 4. 使用goroutine异步发送消息
