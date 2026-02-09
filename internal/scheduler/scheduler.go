@@ -222,7 +222,17 @@ func (s *TaskScheduler) executeTask(workerID int, task *Task) {
 	}
 
 	// 如果需要发送结果到adapter
-	if task.Channel != "" && task.Result != "" {
+	shouldSend := task.Result != "" && (task.Channel != "")
+	if !shouldSend && task.AdapterType == "feishu" {
+		_, hasReceiveID := task.Metadata["receive_id"]
+		shouldSend = hasReceiveID
+	}
+	if !shouldSend && task.AdapterType == "dingtalk" {
+		_, hasWebhook := task.Metadata["session_webhook"]
+		shouldSend = hasWebhook
+	}
+
+	if shouldSend {
 		s.sendResultToAdapter(ctx, task)
 	}
 }
@@ -249,6 +259,7 @@ func (s *TaskScheduler) executeMessageTask(ctx context.Context, task *Task) (*Ta
 		Result:      response.Reply,
 		SessionID:   response.SessionID,
 		CompletedAt: time.Now(),
+		UserID:      task.UserID,
 	}, nil
 }
 
@@ -316,6 +327,7 @@ func (s *TaskScheduler) executeMonitoringTask(ctx context.Context, task *Task) (
 		Result:      response.Reply,
 		SessionID:   response.SessionID,
 		CompletedAt: time.Now(),
+		UserID:      task.UserID,
 	}, nil
 }
 
@@ -349,19 +361,58 @@ func (s *TaskScheduler) sendResultToAdapter(ctx context.Context, task *Task) {
 		message = task.Result
 	}
 
-	// 对于钉钉，如果有 session_webhook，使用它而不是 channel
-	channel := task.Channel
-	if task.AdapterType == "dingtalk" {
-		if webhook, ok := task.Metadata["session_webhook"].(string); ok && webhook != "" {
-			channel = webhook // 将 webhook URL 放在 channel 参数中传递
+	var channel, userID string
+
+	switch task.AdapterType {
+	case "feishu":
+		receiveID, hasRecvID := task.Metadata["receive_id"].(string)
+		receiveIDType, hasRecvType := task.Metadata["receive_id_type"].(string)
+
+		if !hasRecvID || receiveID == "" {
+			log.Printf("scheduler: feishu - no receive_id in metadata, cannot send result")
+			return
 		}
+
+		userID = receiveID
+		if hasRecvType && receiveIDType != "" {
+			channel = receiveIDType
+		} else {
+			channel = "open_id"
+		}
+
+		recvLabel := receiveID
+		if len(recvLabel) > 8 {
+			recvLabel = recvLabel[:8]
+		}
+		log.Printf("scheduler: feishu sending to receive_id=%s type=%s", recvLabel, channel)
+
+	case "dingtalk":
+		if webhook, ok := task.Metadata["session_webhook"].(string); ok && webhook != "" {
+			channel = webhook
+			userID = ""
+			log.Printf("scheduler: dingtalk using session_webhook")
+		} else {
+			log.Printf("scheduler: dingtalk - no session_webhook in metadata, using fallback channel=%s", task.Channel)
+			channel = task.Channel
+			userID = task.UserID
+		}
+
+	default:
+		log.Printf("scheduler: adapter '%s' - using default channel=%s userID=%s", task.AdapterType, task.Channel, task.UserID[:min(12, len(task.UserID))])
+		channel = task.Channel
+		userID = task.UserID
 	}
 
-	err := sender.SendMessage(ctx, channel, task.UserID, message)
+	if channel == "" {
+		log.Printf("scheduler: adapter '%s' - no channel configured, skipping result send", task.AdapterType)
+		return
+	}
+
+	err := sender.SendMessage(ctx, channel, userID, message)
 	if err != nil {
 		log.Printf("scheduler: failed to send result to adapter '%s': %v", task.AdapterType, err)
 	} else {
-		log.Printf("scheduler: result sent to adapter '%s' for task %s (channel: %s)", task.AdapterType, task.ID, channel)
+		log.Printf("scheduler: result sent to adapter '%s' for task %s (channel: %s)", task.AdapterType, task.ID, channel[:min(20, len(channel))])
 	}
 }
 

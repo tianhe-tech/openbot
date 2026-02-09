@@ -92,6 +92,7 @@ type TaskResult struct {
 	Result      string     `json:"result"`
 	Error       string     `json:"error"`
 	SessionID   string     `json:"session_id"`
+	UserID      string     `json:"user_id"` // 用户ID，用于建立session映射
 	CompletedAt time.Time  `json:"completed_at"`
 }
 
