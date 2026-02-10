@@ -67,6 +67,20 @@ func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
 	h.cronScheduler = cronScheduler
 }
 
+// RegisterCronSession 注册定时任务session到adapter，使SSE事件能正确路由
+// 实现 scheduler.SessionRegistrar 接口
+func (h *Handler) RegisterCronSession(sessionID string, metadata map[string]interface{}) {
+	cronUserID := fmt.Sprintf("cron:%s", sessionID[:min(12, len(sessionID))])
+	h.adapter.MapUserToSession(cronUserID, sessionID)
+
+	// 存储webhook URL用于发送消息
+	if webhook, ok := metadata["session_webhook"].(string); ok && webhook != "" {
+		h.adapter.MapSessionData(sessionID, "channel", webhook)
+	}
+
+	log.Printf("dingtalk: registered cron session %s (cronUser=%s)", sessionID[:min(8, len(sessionID))], cronUserID)
+}
+
 // Start initializes the DingTalk adapter.
 // If Stream mode is enabled, it starts the Stream client.
 func (h *Handler) Start(ctx context.Context) error {

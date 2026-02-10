@@ -45,6 +45,14 @@ func (h *Handler) GetAdapter() *base.BidirectionalAdapter {
 	return h.adapter
 }
 
+// RegisterCronSession 注册定时任务session到adapter
+// 实现 scheduler.SessionRegistrar 接口
+func (h *Handler) RegisterCronSession(sessionID string, metadata map[string]interface{}) {
+	cronUserID := fmt.Sprintf("cron:%s", sessionID[:min(12, len(sessionID))])
+	h.adapter.MapUserToSession(cronUserID, sessionID)
+	log.Printf("wecom: registered cron session %s (cronUser=%s)", sessionID[:min(8, len(sessionID))], cronUserID)
+}
+
 // SendMessage implements the MessageSender interface.
 func (h *Handler) SendMessage(ctx context.Context, channel, userID, content string) error {
 	log.Printf("wecom: would send message to channel %s, user %s: %s", channel, userID, content)
