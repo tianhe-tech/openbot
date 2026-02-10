@@ -72,6 +72,23 @@ func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
 	h.cronScheduler = cronScheduler
 }
 
+// RegisterCronSession 注册定时任务session到adapter，使SSE事件能正确路由
+// 实现 scheduler.SessionRegistrar 接口
+func (h *Handler) RegisterCronSession(sessionID string, metadata map[string]interface{}) {
+	cronUserID := fmt.Sprintf("cron:%s", sessionID[:min(12, len(sessionID))])
+	h.adapter.MapUserToSession(cronUserID, sessionID)
+
+	// 存储receive_id用于发送消息
+	if receiveID, ok := metadata["receive_id"].(string); ok && receiveID != "" {
+		h.adapter.MapSessionData(sessionID, "receive_id", receiveID)
+	}
+	if receiveIDType, ok := metadata["receive_id_type"].(string); ok && receiveIDType != "" {
+		h.adapter.MapSessionData(sessionID, "receive_id_type", receiveIDType)
+	}
+
+	log.Printf("feishu: registered cron session %s (cronUser=%s)", sessionID[:min(8, len(sessionID))], cronUserID)
+}
+
 func (h *Handler) Start(ctx context.Context) error {
 	if !h.cfg.UseWebSocket {
 		log.Println("feishu: using traditional webhook mode")

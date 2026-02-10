@@ -30,6 +30,15 @@ func DefaultTaskSchedulerConfig() TaskSchedulerConfig {
 	}
 }
 
+// CronSessionInfo 存储定时任务session的相关信息
+type CronSessionInfo struct {
+	SessionID   string
+	AdapterType string
+	TaskID      string
+	Metadata    map[string]interface{}
+	CreatedAt   time.Time
+}
+
 // TaskScheduler 任务调度器
 type TaskScheduler struct {
 	cfg            TaskSchedulerConfig
@@ -47,11 +56,18 @@ type TaskScheduler struct {
 	wg             sync.WaitGroup
 	adapters       map[string]AdapterSender // adapterType -> sender
 	adaptersMu     sync.RWMutex
+	cronSessions   sync.Map // map[sessionID]*CronSessionInfo 定时任务session映射
 }
 
 // AdapterSender 定义adapter发送消息的接口
 type AdapterSender interface {
 	SendMessage(ctx context.Context, channel, userID, content string) error
+}
+
+// SessionRegistrar 是可选接口，adapter可实现此接口以支持
+// 定时任务的session注册，使事件能正确路由到adapter
+type SessionRegistrar interface {
+	RegisterCronSession(sessionID string, metadata map[string]interface{})
 }
 
 // NewTaskScheduler 创建任务调度器
@@ -214,6 +230,11 @@ func (s *TaskScheduler) executeTask(workerID int, task *Task) {
 			task.SessionID = result.SessionID
 		}
 		log.Printf("scheduler: task %s completed", task.ID)
+	}
+
+	// 注册定时任务session到adapter，使SSE事件能正确路由
+	if result != nil && result.SessionID != "" {
+		s.registerCronSession(task, result.SessionID)
 	}
 
 	// 调用回调
@@ -478,6 +499,9 @@ func (s *TaskScheduler) cleanup() {
 	}
 	s.taskHistory = newHistory
 
+	// 清理过期的定时任务session映射
+	s.CleanupCronSessions(24 * time.Hour)
+
 	log.Printf("scheduler: cleaned up old task history, remaining: %d", len(s.taskHistory))
 }
 
@@ -551,6 +575,60 @@ func (s *TaskScheduler) GetStats() map[string]interface{} {
 		"max_queue_size":      s.cfg.MaxQueueSize,
 		"registered_adapters": len(s.adapters),
 	}
+}
+
+// registerCronSession 注册定时任务session到adapter
+func (s *TaskScheduler) registerCronSession(task *Task, sessionID string) {
+	// 存储session -> adapter映射
+	s.cronSessions.Store(sessionID, &CronSessionInfo{
+		SessionID:   sessionID,
+		AdapterType: task.AdapterType,
+		TaskID:      task.ID,
+		Metadata:    task.Metadata,
+		CreatedAt:   time.Now(),
+	})
+
+	// 如果adapter实现了SessionRegistrar接口，注册session
+	s.adaptersMu.RLock()
+	sender, ok := s.adapters[task.AdapterType]
+	s.adaptersMu.RUnlock()
+
+	if ok {
+		if registrar, implements := sender.(SessionRegistrar); implements {
+			registrar.RegisterCronSession(sessionID, task.Metadata)
+			log.Printf("scheduler: registered cron session %s with adapter '%s'",
+				sessionID[:min(8, len(sessionID))], task.AdapterType)
+		} else {
+			log.Printf("scheduler: adapter '%s' does not implement SessionRegistrar, cron session %s not registered",
+				task.AdapterType, sessionID[:min(8, len(sessionID))])
+		}
+	}
+}
+
+// GetCronSessionInfo 获取定时任务session信息（供主事件处理器查询）
+func (s *TaskScheduler) GetCronSessionInfo(sessionID string) (*CronSessionInfo, bool) {
+	if val, ok := s.cronSessions.Load(sessionID); ok {
+		return val.(*CronSessionInfo), true
+	}
+	return nil, false
+}
+
+// IsCronSession 判断是否为定时任务session
+func (s *TaskScheduler) IsCronSession(sessionID string) bool {
+	_, ok := s.cronSessions.Load(sessionID)
+	return ok
+}
+
+// CleanupCronSessions 清理过期的定时任务session映射
+func (s *TaskScheduler) CleanupCronSessions(maxAge time.Duration) {
+	now := time.Now()
+	s.cronSessions.Range(func(key, value interface{}) bool {
+		info := value.(*CronSessionInfo)
+		if now.Sub(info.CreatedAt) > maxAge {
+			s.cronSessions.Delete(key)
+		}
+		return true
+	})
 }
 
 // convertMetadata 转换metadata格式

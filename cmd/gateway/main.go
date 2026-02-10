@@ -75,6 +75,7 @@ func main() {
 		var foundAdapter *base.BidirectionalAdapter
 		var foundUserID string
 		var foundChannel string
+		var isCronSession bool
 
 		for _, adapter := range []struct {
 			name    string
@@ -91,15 +92,53 @@ func main() {
 				foundAdapter = adapter
 				foundUserID = userID
 				foundChannel = adapter.Name()
+				isCronSession = strings.HasPrefix(userID, "cron:")
 				log.Printf("opencode event: found session %s in adapter %s for user %s",
 					sessionID[:min(8, len(sessionID))], foundChannel, foundUserID)
 				break
 			}
 		}
 
+		// 如果没有找到adapter，检查是否为定时任务session
 		if foundAdapter == nil {
-			log.Printf("opencode event: no adapter found for session %s, skipping", sessionID[:min(8, len(sessionID))])
+			if cronInfo, ok := taskScheduler.GetCronSessionInfo(sessionID); ok {
+				// 这是一个定时任务session，尝试注册到adapter
+				isCronSession = true
+				log.Printf("opencode event: session %s belongs to cron task %s (adapter: %s)",
+					sessionID[:min(8, len(sessionID))], cronInfo.TaskID, cronInfo.AdapterType)
+
+				switch cronInfo.AdapterType {
+				case "dingtalk":
+					foundAdapter = dingtalkHandler.GetAdapter()
+				case "feishu":
+					foundAdapter = feishuHandler.GetAdapter()
+				case "wecom":
+					foundAdapter = wecomHandler.GetAdapter()
+				}
+
+				if foundAdapter != nil {
+					foundChannel = cronInfo.AdapterType
+					foundUserID = fmt.Sprintf("cron:%s", sessionID[:min(12, len(sessionID))])
+					// 注册session到adapter以减少后续查找
+					foundAdapter.MapUserToSession(foundUserID, sessionID)
+				}
+			}
+		}
+
+		if foundAdapter == nil {
+			// 仅在非心跳和session状态事件时打日志，减少噪音
+			if eventType != "server.heartbeat" && eventType != "session.status" &&
+				eventType != "session.updated" && eventType != "session.diff" &&
+				eventType != "message.updated" {
+				log.Printf("opencode event: no adapter found for session %s (type=%s), skipping",
+					sessionID[:min(8, len(sessionID))], eventType)
+			}
 			return nil
+		}
+
+		// 定时任务的权限请求自动审批
+		if isCronSession && (eventType == "permission.asked" || eventType == "question.asked") {
+			return handleCronPermission(ctx, ocClient, event, sessionID, eventType)
 		}
 
 		// Extract content from event based on type
@@ -495,9 +534,46 @@ func extractNormalQuestionJSON(jsonData string) (*opencode.Question, string) {
 	}, msgBuilder.String()
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// handleCronPermission 处理定时任务session的权限请求（自动审批）
+func handleCronPermission(ctx context.Context, ocClient *opencode.Client, event *opencodesdk.EventListResponse, sessionID, eventType string) error {
+	jsonData := event.JSON.RawJSON()
+	if jsonData == "" {
+		return nil
 	}
-	return b
+
+	log.Printf("opencode cron: auto-handling %s for cron session %s", eventType, sessionID[:min(8, len(sessionID))])
+
+	// 提取问题/权限信息
+	question, _ := extractQuestionFromEventJSON(jsonData)
+	if question == nil {
+		log.Printf("opencode cron: could not extract question from %s event for session %s", eventType, sessionID[:min(8, len(sessionID))])
+		return nil
+	}
+
+	// 存储问题以便 AnswerQuestion 能找到
+	ocClient.StorePendingQuestion(question)
+
+	// 自动审批：权限请求选择"允许"，普通问题选择第一个选项
+	var answer string
+	if question.IsPermission {
+		answer = "允许"
+		log.Printf("opencode cron: auto-approving permission %s for cron session %s", question.ID, sessionID[:min(8, len(sessionID))])
+	} else if len(question.Options) > 0 {
+		answer = question.Options[0]
+		log.Printf("opencode cron: auto-selecting first option '%s' for question %s in cron session %s",
+			answer, question.ID, sessionID[:min(8, len(sessionID))])
+	} else {
+		answer = "yes"
+		log.Printf("opencode cron: auto-answering 'yes' for question %s in cron session %s",
+			question.ID, sessionID[:min(8, len(sessionID))])
+	}
+
+	if err := ocClient.AnswerQuestion(ctx, question.ID, answer); err != nil {
+		log.Printf("opencode cron: failed to auto-answer %s for session %s: %v",
+			eventType, sessionID[:min(8, len(sessionID))], err)
+		return err
+	}
+
+	log.Printf("opencode cron: successfully auto-answered %s for cron session %s", eventType, sessionID[:min(8, len(sessionID))])
+	return nil
 }
