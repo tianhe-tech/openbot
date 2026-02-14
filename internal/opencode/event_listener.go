@@ -355,12 +355,36 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 
 	switch partType {
 	case "text":
-		// 文本增量 - 只转发有 delta 的事件
+		// 文本增量 - 优先使用 delta
 		if props.Delta != "" {
 			log.Printf("opencode: 🔍 extractContent - returning text delta (%d chars)", len(props.Delta))
 			return props.Delta
 		}
-		log.Printf("opencode: 🔍 extractContent - text type but delta is empty, text=%s", props.Part.Text)
+
+		// delta 为空但 text 不为空：检查是否有未发送的内容
+		if props.Part.Text != "" {
+			// 如果当前没有任何已发送内容，这可能是一个完整消息，应该发送
+			if s.lastContent == "" {
+				log.Printf("opencode: 🔍 extractContent - no previous content, sending full text (%d chars)", len(props.Part.Text))
+				return props.Part.Text
+			}
+
+			// 检查完整文本是否与已发送内容一致
+			if !strings.HasPrefix(props.Part.Text, s.lastContent) && props.Part.Text != s.lastContent {
+				// 完整文本与已发送内容不一致，可能有遗漏，记录警告
+				log.Printf("opencode: ⚠️ extractContent - text mismatch! current_len=%d, accumulated_len=%d, text_prefix=%.50s...",
+					len(props.Part.Text), len(s.lastContent), props.Part.Text)
+				// 计算差异部分（简单处理：如果完整文本更长，发送差异）
+				if len(props.Part.Text) > len(s.lastContent) {
+					diff := props.Part.Text[len(s.lastContent):]
+					log.Printf("opencode: 🔍 extractContent - sending missing content (%d chars)", len(diff))
+					return diff
+				}
+			}
+
+			log.Printf("opencode: 🔍 extractContent - text type but delta is empty, text already sent (text_len=%d, sent_len=%d)",
+				len(props.Part.Text), len(s.lastContent))
+		}
 
 	case "tool":
 		// 工具调用事件
