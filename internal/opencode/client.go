@@ -158,6 +158,10 @@ type Client struct {
 	enableSkillHint  bool          // 是否在消息中添加skill提示
 	skillHintCache   []string      // 缓存的可用skill列表
 	skillCacheMu     sync.RWMutex
+	lastHealthCheck  time.Time    // 最后一次健康检查时间
+	isHealthy        bool         // OpenCode server是否健康
+	healthCheckMu    sync.RWMutex // 保护健康状态
+
 }
 
 // Option mutates a client during construction.
@@ -228,7 +232,9 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 				"500",
 			},
 		},
-		enableSkillHint: false, // 默认禁用skill提示，避免输出过多提示信息
+		enableSkillHint: false,       // 默认禁用skill提示
+		isHealthy:       false,       // 初始状态未知
+		lastHealthCheck: time.Time{}, // 未检查过
 	}
 
 	for _, opt := range opts {
@@ -238,12 +244,60 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 	// 启动后台清理协程
 	go client.cleanupRequestCache()
 
+	// 启动后进行首次健康检查
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := client.CheckHealth(ctx); err != nil {
+			log.Printf("opencode: initial health check failed: %v", err)
+		} else {
+			log.Printf("opencode: initial health check succeeded")
+		}
+	}()
+
 	return client
 }
 
 // Ready reports if the client has enough data to operate.
 func (c *Client) Ready() bool {
 	return c.sdk != nil
+}
+
+// CheckHealth checks if the OpenCode server is running and accessible.
+// It caches the result for 10 seconds to avoid excessive health checks.
+func (c *Client) CheckHealth(ctx context.Context) error {
+	// 检查缓存的健康状态（10秒内）
+	c.healthCheckMu.RLock()
+	if time.Since(c.lastHealthCheck) < 10*time.Second && c.isHealthy {
+		c.healthCheckMu.RUnlock()
+		return nil
+	}
+	c.healthCheckMu.RUnlock()
+
+	// 执行健康检查：尝试列出sessions
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, err := c.sdk.Session.List(ctx, opencode.SessionListParams{})
+
+	c.healthCheckMu.Lock()
+	c.lastHealthCheck = time.Now()
+	if err != nil {
+		c.isHealthy = false
+		c.healthCheckMu.Unlock()
+		return fmt.Errorf("opencode server不可用: %w\n\n💡 请确保：\n1. OpenCode server已启动\n2. 服务地址配置正确 (%s)\n3. 网络连接正常", err, c.endpoint)
+	}
+	c.isHealthy = true
+	c.healthCheckMu.Unlock()
+
+	return nil
+}
+
+// IsHealthy returns the cached health status.
+func (c *Client) IsHealthy() bool {
+	c.healthCheckMu.RLock()
+	defer c.healthCheckMu.RUnlock()
+	return c.isHealthy
 }
 
 // SendMessage forwards an adapter payload to OpenCode and returns its response.
@@ -258,6 +312,11 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
+	}
+
+	// ========== 健康检查：确保OpenCode server已启动 ==========
+	if err := c.CheckHealth(ctx); err != nil {
+		return Response{}, err
 	}
 
 	// ========== 请求去重检查（仅防止快速重复点击）==========
@@ -320,8 +379,11 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		log.Printf("opencode: creating new session - channel=%s, userID=%s, threadID=%s",
 			payload.Channel, payload.UserID, payload.ThreadID)
 
+		// 将 adapter 和 user 信息编码到 Title 中，格式: [adapter:userId] threadId
+		sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
+
 		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
-			Title: opencode.F(fmt.Sprintf("%s-%s", payload.Channel, payload.UserID)),
+			Title: opencode.F(sessionTitle),
 		})
 		if err != nil {
 			threadLock.Unlock()
@@ -346,6 +408,47 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		// 🔍 诊断日志：复用现有 session
 		log.Printf("opencode: reusing existing sessionID %s for %s user %s (threadID %s)",
 			sessionID[:8], payload.Channel, payload.UserID, payload.ThreadID)
+
+		// 验证 session 是否仍然有效（OpenCode Server 重启后 session 可能失效）
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, checkErr := c.GetSession(checkCtx, sessionID)
+		checkCancel()
+		if checkErr != nil {
+			log.Printf("opencode: ⚠️ session %s is stale (err: %v), creating new session",
+				sessionID[:8], checkErr)
+
+			// 清除旧映射
+			if payload.ThreadID != "" {
+				c.sessions.Delete(payload.ThreadID)
+			}
+			c.messageCount.Delete(sessionID)
+			c.tokenCount.Delete(sessionID)
+			c.modelConfig.Delete(sessionID)
+
+			// 创建新 session
+			sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
+			newSession, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
+				Title: opencode.F(sessionTitle),
+			})
+			if err != nil {
+				threadLock.Unlock()
+				c.failRequest(requestHash)
+				return Response{}, fmt.Errorf("opencode: create replacement session: %w", err)
+			}
+			sessionID = newSession.ID
+			if payload.ThreadID != "" {
+				c.sessions.Store(payload.ThreadID, sessionID)
+				log.Printf("opencode: 🔄 remapped threadID %s -> new sessionID %s (replaced stale session)",
+					payload.ThreadID, sessionID[:8])
+			}
+			c.messageCount.Store(sessionID, 0)
+			c.tokenCount.Store(sessionID, 0)
+			go c.fetchAndCacheModelConfig(context.Background(), sessionID)
+			// 跳过后续的 token 检查，直接使用新 session
+			threadLock.Unlock()
+			goto sendMessage
+		}
+
 		// 检查是否需要总结或创建新session
 		count, _ := c.messageCount.Load(sessionID)
 		msgCount := count.(int)
@@ -426,6 +529,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 	}
 	threadLock.Unlock()
 
+sendMessage:
 	// ========== 增强消息内容 ==========
 	// 添加skill提示（仅在session开始时）
 	enhancedContent := c.enhanceContentWithSkillHint(payload.Content, sessionID)
@@ -593,6 +697,84 @@ func (c *Client) AbortSession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// DeleteSession deletes a session.
+func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
+	log.Printf("opencode: deleting session %s", sessionID[:8])
+	_, err := c.sdk.Session.Delete(ctx, sessionID, opencode.SessionDeleteParams{})
+	if err != nil {
+		return fmt.Errorf("opencode: delete session: %w", err)
+	}
+	// Clean up local caches
+	c.messageCount.Delete(sessionID)
+	c.tokenCount.Delete(sessionID)
+	c.sessionSummary.Delete(sessionID)
+	c.modelConfig.Delete(sessionID)
+	c.runningSessions.Delete(sessionID)
+	return nil
+}
+
+// GetProviders retrieves the list of available providers.
+// Note: This may require direct API call as SDK may not support it yet
+func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
+	if !c.Ready() {
+		return nil, fmt.Errorf("opencode: client not configured")
+	}
+
+	// For now, return empty list - would need direct HTTP call to /config/providers
+	log.Printf("opencode: GetProviders not fully implemented in SDK yet")
+	return []Provider{}, nil
+}
+
+// Provider represents a model provider
+type Provider struct {
+	ID     string  `json:"id"`
+	Name   string  `json:"name"`
+	Models []Model `json:"models"`
+}
+
+// Model represents an AI model
+type Model struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// GetCurrentProvider retrieves the current provider and model for a session.
+// Note: Session may not expose provider/model info directly
+func (c *Client) GetCurrentProvider(ctx context.Context, sessionID string) (*Provider, string, error) {
+	_, err := c.GetSession(ctx, sessionID)
+	if err != nil {
+		return nil, "", fmt.Errorf("opencode: get session: %w", err)
+	}
+
+	// SDK Session doesn't have ProviderID/ModelID fields
+	// Return empty for now
+	log.Printf("opencode: session %s - provider info not available in SDK", sessionID[:8])
+	return nil, "", nil
+}
+
+// UpdateSessionProvider updates the provider and model for a session.
+// Note: SDK may not support this directly
+func (c *Client) UpdateSessionProvider(ctx context.Context, sessionID, providerID, modelID string) error {
+	log.Printf("opencode: updating session %s provider to %s/%s", sessionID[:8], providerID, modelID)
+
+	// SDK SessionUpdateParams may not have ProviderID/ModelID fields
+	// Try using Update with available params
+	_, err := c.sdk.Session.Update(ctx, sessionID, opencode.SessionUpdateParams{
+		// Use available fields only
+	})
+	if err != nil {
+		return fmt.Errorf("opencode: update session: %w", err)
+	}
+
+	// Invalidate cached model config
+	c.modelConfig.Delete(sessionID)
+	// Fetch new config
+	go c.fetchAndCacheModelConfig(context.Background(), sessionID)
+
+	log.Printf("opencode: note - provider/model update may not be fully supported by SDK")
+	return nil
+}
+
 // IsSessionRunning checks if a session is currently running
 func (c *Client) IsSessionRunning(sessionID string) bool {
 	val, ok := c.runningSessions.Load(sessionID)
@@ -603,72 +785,82 @@ func (c *Client) IsSessionRunning(sessionID string) bool {
 }
 
 // StartEventListener begins listening for OpenCode events via SSE.
+// 支持自动重连：当 OpenCode Server 断开或重启后，会自动重新连接事件流。
 func (c *Client) StartEventListener(ctx context.Context) error {
-	stream := c.sdk.Event.ListStreaming(ctx, opencode.EventListParams{})
+	log.Printf("opencode: starting event listener...")
 
-	go func() {
-		defer stream.Close()
+	go c.eventListenerLoop(ctx)
+
+	log.Printf("opencode: event listener started successfully")
+	return nil
+}
+
+// eventListenerLoop 事件监听主循环，支持自动重连
+func (c *Client) eventListenerLoop(ctx context.Context) {
+	reconnectDelay := 2 * time.Second
+	maxReconnectDelay := 60 * time.Second
+	consecutiveFailures := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("opencode: event listener context cancelled, stopping")
+			return
+		default:
+		}
+
+		if consecutiveFailures > 0 {
+			// 指数退避重连
+			delay := reconnectDelay * time.Duration(1<<uint(min(consecutiveFailures-1, 5)))
+			if delay > maxReconnectDelay {
+				delay = maxReconnectDelay
+			}
+			log.Printf("opencode: 🔄 reconnecting event listener in %v (attempt #%d)...", delay, consecutiveFailures)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		log.Printf("opencode: creating event stream...")
+		stream := c.sdk.Event.ListStreaming(ctx, opencode.EventListParams{})
+
+		// 清除旧的 session 缓存（server 重启后 session 可能失效）
+		if consecutiveFailures > 0 {
+			log.Printf("opencode: 🔄 server reconnected after %d failures, invalidating stale session cache", consecutiveFailures)
+			c.invalidateStaleSessions(ctx)
+		}
+
+		eventCount := 0
+		connected := false
 
 		for stream.Next() {
 			event := stream.Current()
+			eventCount++
 
 			eventType := string(event.Type)
 
-			// Extract session ID from event (try multiple locations)
-			var sessionID string
-			rawJSON := event.JSON.RawJSON()
-
-			// Debug: log full JSON for message.part.updated events
-			if eventType == "message.part.updated" && len(rawJSON) > 0 {
-				log.Printf("opencode: DEBUG - message.part.updated JSON: %.500s", rawJSON)
+			// 首次收到事件，标记连接成功
+			if !connected {
+				connected = true
+				if consecutiveFailures > 0 {
+					log.Printf("opencode: ✅ event listener reconnected successfully after %d failures", consecutiveFailures)
+				}
+				consecutiveFailures = 0
 			}
 
-			if rawJSON != "" {
-				var eventWrapper struct {
-					SessionID string `json:"sessionID"`
-					Message   struct {
-						SessionID string `json:"sessionID"`
-						ID        string `json:"id"`
-					} `json:"message"`
-					Properties struct {
-						SessionID string `json:"sessionID"`
-						Message   struct {
-							SessionID string `json:"sessionID"`
-						} `json:"message"`
-						Part struct {
-							SessionID string `json:"sessionID"`
-						} `json:"part"`
-						Info struct {
-							ID string `json:"id"`
-						} `json:"info"`
-					} `json:"properties"`
-				}
-				if err := json.Unmarshal([]byte(rawJSON), &eventWrapper); err == nil {
-					// Try root-level sessionID
-					if eventWrapper.SessionID != "" {
-						sessionID = eventWrapper.SessionID
-					} else if eventWrapper.Properties.SessionID != "" {
-						// Try properties.sessionID
-						sessionID = eventWrapper.Properties.SessionID
-					} else if eventWrapper.Properties.Message.SessionID != "" {
-						// Try properties.message.sessionID
-						sessionID = eventWrapper.Properties.Message.SessionID
-					} else if eventWrapper.Properties.Part.SessionID != "" {
-						// Try properties.part.sessionID (used by message.part.updated events)
-						sessionID = eventWrapper.Properties.Part.SessionID
-					} else if eventWrapper.Message.SessionID != "" {
-						// Try message.sessionID
-						sessionID = eventWrapper.Message.SessionID
-					} else if eventWrapper.Properties.Info.ID != "" && strings.HasPrefix(eventWrapper.Properties.Info.ID, "ses_") {
-						// Try properties.info.id for session.created/session.updated events
-						sessionID = eventWrapper.Properties.Info.ID
-					}
-				}
+			// Log every event for debugging
+			if eventCount <= 10 || eventType != "server.heartbeat" {
+				log.Printf("opencode: [event #%d] type=%s", eventCount, eventType)
 			}
+
+			// Extract session ID using shared helper
+			sessionID := extractSessionIDFromEvent(&event)
 
 			if sessionID != "" && len(sessionID) > 8 {
 				log.Printf("opencode: processing event type=%s, sessionID=%s", eventType, sessionID[:8])
-			} else {
+			} else if eventType != "server.heartbeat" && eventType != "server.connected" {
 				log.Printf("opencode: processing event type=%s (no sessionID)", eventType)
 			}
 
@@ -699,12 +891,62 @@ func (c *Client) StartEventListener(ctx context.Context) error {
 			}
 		}
 
+		stream.Close()
+
+		log.Printf("opencode: event stream ended, total events processed: %d", eventCount)
+
 		if err := stream.Err(); err != nil {
 			log.Printf("opencode: event stream error: %v", err)
 		}
-	}()
 
-	return nil
+		// 检查是否是主动退出
+		select {
+		case <-ctx.Done():
+			log.Printf("opencode: event listener stopped (context cancelled)")
+			return
+		default:
+			// 非主动退出，准备重连
+			consecutiveFailures++
+			log.Printf("opencode: ⚠️ event stream disconnected unexpectedly, will reconnect...")
+		}
+	}
+}
+
+// invalidateStaleSessions 清除可能失效的 session 缓存
+// 当 OpenCode Server 重启后调用，让下次消息时创建新 session
+func (c *Client) invalidateStaleSessions(ctx context.Context) {
+	var staleThreads []string
+
+	c.sessions.Range(func(key, value interface{}) bool {
+		threadID := key.(string)
+		sessionID := value.(string)
+
+		// 尝试验证 session 是否仍然有效
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err := c.GetSession(checkCtx, sessionID)
+		cancel()
+
+		if err != nil {
+			log.Printf("opencode: 🗑️ session %s for thread %s is stale (err: %v), removing",
+				sessionID[:min(8, len(sessionID))], threadID, err)
+			staleThreads = append(staleThreads, threadID)
+		} else {
+			log.Printf("opencode: ✅ session %s for thread %s is still valid",
+				sessionID[:min(8, len(sessionID))], threadID)
+		}
+
+		return true
+	})
+
+	// 删除失效的映射
+	for _, threadID := range staleThreads {
+		c.sessions.Delete(threadID)
+		log.Printf("opencode: removed stale session mapping for thread %s", threadID)
+	}
+
+	if len(staleThreads) > 0 {
+		log.Printf("opencode: invalidated %d stale session mappings", len(staleThreads))
+	}
 }
 
 // RegisterEventHandler adds a new event handler dynamically.
@@ -855,6 +1097,54 @@ func (c *Client) ResetSession(threadID string) {
 	}
 }
 
+// GetSessionForThread retrieves the session ID associated with a thread.
+func (c *Client) GetSessionForThread(threadID string) (string, bool) {
+	val, ok := c.sessions.Load(threadID)
+	if !ok {
+		return "", false
+	}
+	return val.(string), true
+}
+
+// GetSessionInfo retrieves detailed information about a session.
+type SessionInfo struct {
+	SessionID     string
+	Title         string
+	Directory     string
+	MessageCount  int
+	TokenCount    int
+	ContextUsage  float64
+	ContextLength int
+	Created       string // Use string since SDK doesn't have CreatedAt
+}
+
+func (c *Client) GetSessionInfo(ctx context.Context, sessionID string) (*SessionInfo, error) {
+	session, err := c.GetSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert Unix timestamp to time string
+	createdTime := time.Unix(int64(session.Time.Updated), 0).Format("2006-01-02 15:04:05")
+
+	info := &SessionInfo{
+		SessionID:    sessionID,
+		Title:        session.Title,
+		Directory:    session.Directory,
+		MessageCount: c.GetMessageCount(sessionID),
+		TokenCount:   c.GetTokenCount(sessionID),
+		Created:      createdTime,
+	}
+
+	// Get context length
+	info.ContextLength = c.getMaxContextLength(sessionID)
+	if info.ContextLength > 0 && info.TokenCount > 0 {
+		info.ContextUsage = float64(info.TokenCount) / float64(info.ContextLength)
+	}
+
+	return info, nil
+}
+
 // SendMessageStreaming sends a message and calls the callback for each chunk of the response.
 // 真正的流式实现：注册StreamingSessionHandler监听实时事件
 func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayload, callback StreamCallback) (Response, error) {
@@ -870,14 +1160,29 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 	if sessionID == "" && payload.ThreadID != "" {
 		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
 			sessionID = sid.(string)
+
+			// 验证 session 是否仍然有效
+			checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, checkErr := c.GetSession(checkCtx, sessionID)
+			checkCancel()
+			if checkErr != nil {
+				log.Printf("opencode: ⚠️ streaming session %s is stale (err: %v), will create new",
+					sessionID[:min(8, len(sessionID))], checkErr)
+				c.sessions.Delete(payload.ThreadID)
+				c.messageCount.Delete(sessionID)
+				c.tokenCount.Delete(sessionID)
+				sessionID = "" // 强制创建新 session
+			}
 		}
 	}
 
 	// 如果还是没有sessionID，我们需要先创建session
 	if sessionID == "" {
 		sessionCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// 将 adapter 和 user 信息编码到 Title 中，格式: [adapter:userId] threadId
+		sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
 		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
-			Title: opencode.F(fmt.Sprintf("%s-%s", payload.Channel, payload.UserID)),
+			Title: opencode.F(sessionTitle),
 		})
 		cancel()
 		if err != nil {
@@ -966,37 +1271,51 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		case <-ticker.C:
 			// 如果在async模式且handler已完成，返回结果
 			if isAsyncMode && handler.IsCompleted() {
-				log.Printf("opencode: async streaming completed via SSE for session %s", sessionID[:8])
+				log.Printf("opencode: ✅ async streaming completed via SSE for session %s (contentSent=%t, lastContentLen=%d)",
+					sessionID[:8], handler.HasSentContent(), len(handler.GetLastContent()))
 				// 注意：不填充 asyncResponse.Reply，让调用者从 fullReply 获取内容
 				return asyncResponse, nil
 			}
 
-			// 检查是否在等待用户回复（权限/问题确认）
-			if isAsyncMode && handler.IsWaitingForResponse() {
-				lastEventTime, lastEventType := handler.GetLastEventInfo()
-				log.Printf("opencode: waiting for user response (last: %v, type: %s), idle count: %d",
-					lastEventTime.Format("15:04:05"), lastEventType, idleCheckCount)
-				idleCheckCount = 0 // 重置空闲计数器
-				continue
-			}
-
 			// 检查最后一次事件时间
-			lastEventTime, _ := handler.GetLastEventInfo()
+			lastEventTime, lastEventType := handler.GetLastEventInfo()
 			timeSinceLastEvent := time.Since(lastEventTime)
+			hasSentContent := handler.HasSentContent()
+			hasStepFinish := handler.HasReceivedStepFinish()
+			stepFinishTime := handler.GetStepFinishTime()
+			isCompleted := handler.IsCompleted()
 
-			// 如果已发送内容且超过2分钟无新事件，认为可能完成
-			if isAsyncMode && handler.HasSentContent() && timeSinceLastEvent > 2*time.Minute {
-				log.Printf("opencode: streaming idle for %v, treating as completed for session %s",
+			log.Printf("opencode: 🔍 ticker check - session=%s, isAsync=%t, isCompleted=%t, hasSent=%t, hasStepFinish=%t, lastEvent=%v ago (type=%s), idleCount=%d",
+				sessionID[:8], isAsyncMode, isCompleted, hasSentContent, hasStepFinish, timeSinceLastEvent, lastEventType, idleCheckCount)
+
+			// 如果收到了 step-finish 事件且已发送内容，5秒后没有新事件就认为完成
+			// (step-finish 通常标志着模型输出完成，后续应该很快有 session.idle)
+			if isAsyncMode && hasStepFinish && hasSentContent && !stepFinishTime.IsZero() {
+				timeSinceStepFinish := time.Since(stepFinishTime)
+				if timeSinceStepFinish > 5*time.Second {
+					log.Printf("opencode: 🏁 received step-finish %v ago (has sent content), treating as completed for session %s",
+						timeSinceStepFinish, sessionID[:8])
+					return asyncResponse, nil
+				}
+			}
+
+			// 如果已发送内容且超过30秒无新事件，认为可能完成
+			// （从2分钟缩短到30秒，更快响应）
+			if isAsyncMode && hasSentContent && timeSinceLastEvent > 30*time.Second {
+				log.Printf("opencode: ⏱️ streaming idle for %v (has sent content), treating as completed for session %s",
 					timeSinceLastEvent, sessionID[:8])
 				return asyncResponse, nil
 			}
 
-			// 空闲检测：超过5分钟仍无响应
-			if isAsyncMode && timeSinceLastEvent > 5*time.Minute {
-				log.Printf("opencode: streaming timeout (no events for %v) for session %s",
-					timeSinceLastEvent, sessionID[:8])
+			// 如果超过1分钟无任何事件（即使没发送内容），也认为完成
+			// 这处理 OpenCode 不发送完成事件的情况
+			if isAsyncMode && timeSinceLastEvent > 1*time.Minute {
+				log.Printf("opencode: ⏱️ streaming timeout (no events for %v, hasSent=%t), treating as completed for session %s",
+					timeSinceLastEvent, hasSentContent, sessionID[:8])
 				return asyncResponse, nil
 			}
+
+			idleCheckCount++
 		}
 	}
 }

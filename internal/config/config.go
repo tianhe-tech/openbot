@@ -31,7 +31,7 @@ func Load() (Config, error) {
 		ReadTimeout:      getDuration("SERVER_READ_TIMEOUT", 30*time.Second),   // 增加读取超时
 		WriteTimeout:     getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
 		ShutdownGrace:    getDuration("SERVER_SHUTDOWN_GRACE", 30*time.Second),
-		OpenCodeEndpoint: getEnv("OPENCODE_ENDPOINT", "http://localhost:3000"),
+		OpenCodeEndpoint: getEnv("OPENCODE_ENDPOINT", "http://localhost:4096"),
 		OpenCodeAPIKey:   getEnv("OPENCODE_API_KEY", "123"),
 		WeCom: wecom.Config{
 			Token:          os.Getenv("WECOM_TOKEN"),

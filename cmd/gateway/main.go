@@ -126,6 +126,46 @@ func main() {
 		}
 
 		if foundAdapter == nil {
+			// 尝试从 session Title 中恢复映射关系
+			// Title 格式: [adapter:userId] threadId
+			if session, err := ocClient.GetSession(ctx, sessionID); err == nil && session.Title != "" {
+				title := session.Title
+				// 解析 Title: [adapter:userId] threadId
+				if len(title) > 0 && title[0] == '[' {
+					if closeIdx := strings.Index(title, "]"); closeIdx > 0 {
+						info := title[1:closeIdx] // 提取 "adapter:userId"
+						parts := strings.SplitN(info, ":", 2)
+						if len(parts) == 2 {
+							adapterName := parts[0]
+							userID := parts[1]
+
+							log.Printf("opencode event: recovering mapping from session title - adapter=%s, userID=%s, sessionID=%s",
+								adapterName, userID, sessionID[:min(8, len(sessionID))])
+
+							// 找到对应的 adapter 并恢复映射
+							switch adapterName {
+							case "dingtalk":
+								foundAdapter = dingtalkHandler.GetAdapter()
+							case "feishu":
+								foundAdapter = feishuHandler.GetAdapter()
+							case "wecom":
+								foundAdapter = wecomHandler.GetAdapter()
+							}
+
+							if foundAdapter != nil {
+								foundChannel = adapterName
+								foundUserID = userID
+								// 恢复映射关系到内存
+								foundAdapter.MapUserToSession(userID, sessionID)
+								log.Printf("opencode event: successfully recovered mapping for session %s", sessionID[:min(8, len(sessionID))])
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if foundAdapter == nil {
 			// 仅在非心跳和session状态事件时打日志，减少噪音
 			if eventType != "server.heartbeat" && eventType != "session.status" &&
 				eventType != "session.updated" && eventType != "session.diff" &&
@@ -211,6 +251,51 @@ func main() {
 	mux := srv.Mux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Add diagnostic endpoint to view session mappings
+	mux.HandleFunc("/debug/sessions", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		type SessionInfo struct {
+			Adapter  string `json:"adapter"`
+			UserID   string `json:"user_id"`
+			Sessions []struct {
+				SessionID string `json:"session_id"`
+			} `json:"sessions"`
+		}
+
+		var sessionMappings []SessionInfo
+
+		_ = sessionMappings // 用于未来扩展
+
+		for _, adapterInfo := range []struct {
+			name    string
+			handler interface {
+				GetAdapter() *base.BidirectionalAdapter
+			}
+		}{
+			{"dingtalk", dingtalkHandler},
+			{"feishu", feishuHandler},
+			{"wecom", wecomHandler},
+		} {
+			// Note: We can't iterate sync.Map directly without exposing internal state
+			// This is a simplified version showing adapter names
+			info := SessionInfo{
+				Adapter: adapterInfo.name,
+				UserID:  "(internal state - check logs)",
+				Sessions: []struct {
+					SessionID string `json:"session_id"`
+				}{},
+			}
+			sessionMappings = append(sessionMappings, info)
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"note":     "Session mappings are stored in memory. Check application logs for detailed session->user mappings.",
+			"adapters": sessionMappings,
+		})
 	})
 
 	// Register scheduler webhook routes
@@ -329,21 +414,6 @@ func extractContentFromEvent(event *opencodesdk.EventListResponse) (string, erro
 	case "message.part.updated":
 		// 💡 重要：message.part.updated 由 StreamingSessionHandler 处理并通过 callback 发送
 		// 这里不处理，避免重复发送。只返回空字符串告诉调用者忽略此事件。
-		return "", nil
-
-	case "message.completed":
-		var wrapper struct {
-			Properties struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"properties"`
-		}
-		if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &wrapper); err == nil {
-			if wrapper.Properties.Message.Content != "" {
-				return wrapper.Properties.Message.Content, nil
-			}
-		}
 		return "", nil
 
 	case "question.asked", "permission.asked":
