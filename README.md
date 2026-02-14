@@ -411,6 +411,9 @@ The gateway automatically handles OpenCode permission requests and questions:
 - Auto-create new session at 80% context threshold
 - Preserve summary across sessions
 - Token estimation to prevent overflow
+- **🆕 Session Title Encoding**: Automatically encodes adapter and user info in session title
+- **🆕 Auto-Recovery**: Recovers session mappings after service restart from title
+- **🆕 Diagnostic Endpoint**: `GET /debug/sessions` for session mapping status
 
 ### Streaming Output
 
@@ -418,6 +421,31 @@ The gateway automatically handles OpenCode permission requests and questions:
 - Progress notifications for long-running tasks
 - Handles permission requests in-stream
 - 5-minute timeout for long-running tasks
+
+---
+
+## 🔧 Recent Improvements
+
+### v1.1.0 - Session Mapping Enhancement (2026-02-13)
+
+**Problem Fixed**: 
+- Messages couldn't be routed to DingTalk/Feishu after service restart
+- "no adapter found for session" errors when OpenCode returns results
+
+**Solution Implemented**:
+1. **Title Encoding**: Session creation now encodes adapter/user info in session title (format: `[adapter:userId] threadId`)
+2. **Auto-Recovery**: Event handler automatically recovers mappings by parsing session title when not found in memory
+3. **Diagnostic Tools**: Added `/debug/sessions` endpoint for troubleshooting
+
+**Benefits**:
+- ✅ Service restart no longer breaks ongoing sessions
+- ✅ External sessions (created via OpenCode API) can now be routed if they have metadata
+- ✅ Better observability with recovery logging
+
+**Migration**: 
+- Existing sessions (created before v1.1.0) cannot auto-recover (title format doesn't match)
+- Users should resend messages to establish new mappings
+- See [SESSION_MAPPING_TROUBLESHOOTING.md](docs/SESSION_MAPPING_TROUBLESHOOTING.md) for details
 
 ---
 

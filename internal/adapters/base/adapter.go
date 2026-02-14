@@ -79,6 +79,15 @@ func (a *BidirectionalAdapter) GetUserForSession(sessionID string) (string, bool
 	return "", false
 }
 
+// ClearSessionForUser removes the session mapping for a user.
+func (a *BidirectionalAdapter) ClearSessionForUser(userID string) {
+	if sessionID, ok := a.userSessions.Load(userID); ok {
+		a.userSessions.Delete(userID)
+		a.sessionUsers.Delete(sessionID)
+		a.sessionData.Delete(sessionID)
+	}
+}
+
 // SendToUser sends a message to a user via the platform's messaging API.
 // channel can be empty for direct messages, or specify a group/channel ID
 func (a *BidirectionalAdapter) SendToUser(ctx context.Context, userID, content string) error {

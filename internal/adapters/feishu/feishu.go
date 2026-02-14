@@ -343,7 +343,19 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			return nil
 		}
 		if isImmediateChunk(trimmed) {
-			return h.sendTextChunks(ctx, target, raw)
+			log.Printf("feishu: 📤 sending immediate message: %s", trimmed[:min(50, len(trimmed))])
+			if err := h.sendTextChunks(ctx, target, raw); err != nil {
+				log.Printf("feishu: ⚠️ failed to send immediate message: %v", err)
+				// 发送失败时的处理：
+				// - 对于"正在处理中"提示：只返回error保持waiting timer活跃，不加入fullReply（避免污染最终内容）
+				// - 对于其他重要消息（权限、问题等）：加入fullReply确保不丢失
+				if !strings.Contains(trimmed, "正在努力处理中") && !strings.Contains(trimmed, "正在处理") {
+					fullReply.WriteString(raw)
+				}
+				return err
+			}
+			log.Printf("feishu: ✅ immediate message sent successfully")
+			return nil
 		}
 		fullReply.WriteString(raw)
 		return nil
@@ -370,6 +382,10 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			"receive_id_type": target.receiveIDType,
 		},
 	}, callback)
+
+	log.Printf("feishu: 🔍 SendMessageStreaming returned - user=%s, err=%v, reply_len=%d, accumulated_len=%d",
+		userLabel, err, len(response.Reply), fullReply.Len())
+
 	if err != nil {
 		errMsg := fmt.Sprintf("❌ 处理失败: %v", err)
 		_ = h.sendTextChunks(ctx, target, errMsg)

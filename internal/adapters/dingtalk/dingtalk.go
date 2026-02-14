@@ -196,6 +196,36 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleAbort(ctx, data, userID)
 	}
 
+	// Handle /new or /reset command to create new session
+	if content == "/new" || content == "/reset" || content == "新会话" {
+		return h.handleNewSession(ctx, data, userID)
+	}
+
+	// Handle /sessions or /list command to list sessions
+	if content == "/sessions" || content == "/list" {
+		return h.handleListSessions(ctx, data)
+	}
+
+	// Handle /status command to check session status
+	if content == "/status" || content == "状态" {
+		return h.handleStatus(ctx, data, userID)
+	}
+
+	// Handle /clear command to clear/delete current session
+	if content == "/clear" || content == "清除" {
+		return h.handleClear(ctx, data, userID)
+	}
+
+	// Handle /model command to get/set model
+	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
+		return h.handleModel(ctx, data, userID, content)
+	}
+
+	// Handle /config command to view configuration
+	if content == "/config" || content == "配置" {
+		return h.handleConfig(ctx, data, userID)
+	}
+
 	// Handle /cmd command to execute skill scripts directly
 	if strings.HasPrefix(content, "/cmd ") {
 		command := strings.TrimPrefix(content, "/cmd ")
@@ -268,8 +298,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 	var fullReply strings.Builder
 	var lastSentLength int
-	var updateCount int
-	const maxUpdates = 5 // 最多发送5次中间更新，避免过于频繁
+	var lastUpdateTime time.Time
+	const minUpdateInterval = 5 * time.Second // 最小更新间隔：5秒
+	const minUpdateChars = 300                // 最小更新字符数：300字符（减少频率）
 
 	// Track session mapping status
 	sessionMapped := false
@@ -320,35 +351,63 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				len(chunk), chunk[:min(50, len(chunk))])
 		}
 
-		// 处理进度更新、权限请求、问题确认等需要立即发送的消息
+		// 处理特殊消息：权限请求、问题确认、等待提示等需要立即发送的消息
 		if strings.HasPrefix(chunk, "⏳") || strings.HasPrefix(chunk, "⏱️") ||
-			strings.HasPrefix(chunk, "🔐") || strings.HasPrefix(chunk, "❓") {
-			// 这是进度提示/权限请求/问题确认消息，直接发送
-			log.Printf("dingtalk stream: sending immediate message: %s", chunk[:min(50, len(chunk))])
-			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(chunk))
+			strings.HasPrefix(chunk, "🔐") || strings.HasPrefix(chunk, "❓") ||
+			strings.HasPrefix(chunk, "🤔💭") {
+			// 这些是需要立即发送的提示消息
+			log.Printf("dingtalk stream: 📤 sending immediate message: %s", chunk[:min(50, len(chunk))])
+			if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(chunk)); err != nil {
+				log.Printf("dingtalk stream: ⚠️ failed to send immediate message: %v", err)
+				// 发送失败时的处理：
+				// - 对于"正在处理中"提示：只返回error保持waiting timer活跃，不加入fullReply（避免污染最终内容）
+				// - 对于其他重要消息（权限、问题等）：加入fullReply确保不丢失
+				if !strings.Contains(chunk, "正在努力处理中") && !strings.Contains(chunk, "正在处理") {
+					fullReply.WriteString(chunk)
+				}
+				return err
+			}
+			log.Printf("dingtalk stream: ✅ immediate message sent successfully")
 			return nil
 		}
 
 		// 累积实际内容
 		fullReply.WriteString(chunk)
 		currentLength := fullReply.Len()
+		newContentLength := currentLength - lastSentLength
 
-		// 如果累积了足够多的新内容（至少500字符）且还没超过最大更新次数，发送中间结果
-		if updateCount < maxUpdates && currentLength-lastSentLength >= 500 {
-			log.Printf("dingtalk stream: sending intermediate update (update %d/%d, new content: %d chars)",
-				updateCount+1, maxUpdates, currentLength-lastSentLength)
+		// 动态决定是否发送中间更新（基于内容长度和时间间隔）
+		now := time.Now()
+		timeSinceLastUpdate := now.Sub(lastUpdateTime)
 
-			// 发送中间结果（带有标记表明这不是最终结果）
-			intermediateMsg := fmt.Sprintf("📝 中间结果 (%d/%d):\n\n%s\n\n⏳ 继续处理中...",
-				updateCount+1, maxUpdates, fullReply.String())
-			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(intermediateMsg))
+		// 发送中间更新的条件：
+		// 1. 累积了足够多的新内容（至少300字符）
+		// 2. 距离上次更新已经过了至少5秒
+		// 3. 这样可以避免过于频繁的更新，同时保证用户能及时看到进度
+		shouldUpdate := newContentLength >= minUpdateChars && timeSinceLastUpdate >= minUpdateInterval
 
-			lastSentLength = currentLength
-			updateCount++
+		if shouldUpdate {
+			log.Printf("dingtalk stream: 📤 sending intermediate update (new content: %d chars, interval: %v)",
+				newContentLength, timeSinceLastUpdate)
+
+			// 直接发送累积的内容，不添加额外的"中间结果"标记
+			// 用户会看到内容逐步累积，更自然
+			if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fullReply.String())); err != nil {
+				log.Printf("dingtalk stream: ⚠️ failed to send intermediate update: %v", err)
+				// 不返回错误，继续累积内容，下次再试或最后发送
+			} else {
+				lastSentLength = currentLength
+				lastUpdateTime = now
+			}
 		}
 
 		return nil
 	})
+
+	// 🔍 诊断日志：streaming完成时的状态
+	accumulatedContent := fullReply.String()
+	log.Printf("dingtalk stream: 🔍 SendMessageStreaming returned - userID=%s, err=%v, reply_len=%d, accumulated_len=%d",
+		userID, err, len(response.Reply), len(accumulatedContent))
 
 	if err != nil {
 		var errMsg string
@@ -395,10 +454,20 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		h.adapter.MapUserToSession(userID, response.SessionID)
 		// Store the session webhook for later use
 		h.adapter.MapSessionData(response.SessionID, "channel", data.SessionWebhook)
-		log.Printf("dingtalk stream: 🔍 END - userID=%s, sessionID=%s, fullReplyLen=%d, updateCount=%d, webhook=%s",
-			userID, response.SessionID[:min(8, len(response.SessionID))],
-			fullReply.Len(), updateCount, data.SessionWebhook)
 	}
+
+	// 🔍 诊断日志：streaming完成时的状态 (accumulatedContent already defined above)
+	log.Printf("dingtalk stream: 🔍 STREAMING END - userID=%s, sessionID=%s, "+
+		"fullReplyLen=%d, lastSentLen=%d, syncReply=%t, contentPreview='%s'",
+		userID,
+		func() string {
+			if response.SessionID != "" {
+				return response.SessionID[:min(8, len(response.SessionID))]
+			}
+			return "(none)"
+		}(),
+		len(accumulatedContent), lastSentLength, response.Reply != "",
+		accumulatedContent[:min(50, len(accumulatedContent))])
 
 	// Send final complete reply (only if we have synchronous content)
 	// For async mode, the SSE callbacks already sent the content
@@ -407,24 +476,33 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			log.Printf("dingtalk stream: failed to reply: %v", err)
 			return nil, err
 		}
-		log.Printf("dingtalk stream: replied to user %s (sync mode)", userID)
+		log.Printf("dingtalk stream: ✅ sent sync reply to user %s (%d chars)", userID, len(response.Reply))
 	} else {
 		// Async mode - 检查是否有未发送的内容
-		accumulatedContent := fullReply.String()
 		if len(accumulatedContent) > 0 {
-			// 有内容但可能没有全部发送（因为中间更新的阈值是500字符）
-			// 如果没有发送过任何中间更新，或者还有新内容，发送最终结果（不加额外前缀）
-			if updateCount == 0 || len(accumulatedContent) > lastSentLength {
-				if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(accumulatedContent)); err != nil {
-					log.Printf("dingtalk stream: failed to send final message: %v", err)
+			// 有内容但可能没有全部发送（因为中间更新有间隔和字符数限制）
+			unsentLength := len(accumulatedContent) - lastSentLength
+			if unsentLength > 0 {
+				log.Printf("dingtalk stream: 📤 sending final message (%d total chars, %d unsent)",
+					len(accumulatedContent), unsentLength)
+
+				// 🔧 修复：只发送未发送的部分，避免重复
+				unsentContent := accumulatedContent[lastSentLength:]
+				if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(unsentContent)); err != nil {
+					log.Printf("dingtalk stream: ❌ failed to send final message: %v", err)
+					// 不返回错误，避免影响session映射
 				} else {
-					log.Printf("dingtalk stream: sent final message to user %s (%d chars total)",
-						userID, len(accumulatedContent))
+					log.Printf("dingtalk stream: ✅ sent final message to user %s (%d chars total, %d new)",
+						userID, len(accumulatedContent), unsentLength)
 				}
+			} else {
+				log.Printf("dingtalk stream: ✓ all content already sent via intermediate updates (%d chars)",
+					len(accumulatedContent))
 			}
 		} else {
-			// 没有内容累积（可能是权限请求之类的交互式任务）
-			log.Printf("dingtalk: async mode completed for user %s with no accumulated content", userID)
+			// 没有内容累积（可能是权限请求之类的交互式任务，或者全都是特殊消息）
+			log.Printf("dingtalk stream: ℹ️ async mode completed with no accumulated content "+
+				"(callbackCalled=%t, user=%s)", callbackCalled, userID)
 		}
 	}
 
@@ -663,9 +741,22 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 🤖 基本对话：
 直接发送消息即可与AI对话
 
-🔧 可用命令：
+🔧 基本命令：
 /help 或 帮助 - 显示此帮助信息
 /skills 或 /agents - 查看可用的技能列表
+/abort 或 /stop - 中止正在运行的任务
+/refresh - 刷新技能缓存
+
+📊 会话管理：
+/status 或 状态 - 查看当前会话状态
+/new 或 /reset - 创建新会话
+/clear 或 清除 - 删除当前会话
+/sessions 或 /list - 列出所有会话
+
+🤖 模型配置：
+/model - 查看当前模型
+/model <provider>/<model> - 设置模型
+/config 或 配置 - 查看完整配置
 
 📋 OpenCode 模式说明：
 
@@ -688,14 +779,12 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
   例如：@build 帮我创建一个Python脚本
 • Build模式请求会提示您去OpenCode确认
 • 请勿在30秒内重复发送相同消息
-• 发送 /abort 或 /stop 可以中止正在运行的任务
+• 使用 /model 可以切换不同的AI模型
 
-🛠️ 可用命令：
-/help 或 帮助 - 显示帮助
-/skills - 查看可用技能
-/abort 或 /stop - 中止当前任务
-/refresh - 刷新技能缓存
+🛠️ 高级命令：
+/cmd <command> - 执行技能脚本
 /answer <question_id> <answer> - 回答待确认的问题
+/crontask - 管理定时任务
 
 ❓ 问题排查：
 • 如果提示"请求处理中"：请等待当前请求完成
@@ -1515,4 +1604,308 @@ func (h *Handler) getAccessToken(ctx context.Context) (string, error) {
 	}
 
 	return result.AccessToken, nil
+}
+
+// ========== New Command Handlers ==========
+
+// handleNewSession 处理创建新会话命令
+func (h *Handler) handleNewSession(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session（如果有）
+	var oldSessionID string
+	if sid, ok := h.adapter.GetSessionForUser(userID); ok {
+		oldSessionID = sid
+	}
+
+	// 重置session映射
+	threadID := data.ConversationId
+	if threadID != "" {
+		h.client.ResetSession(threadID)
+	}
+	h.adapter.ClearSessionForUser(userID)
+
+	msg := "✅ 已重置会话\n\n"
+	if oldSessionID != "" {
+		msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:8])
+	}
+	msg += "下次发送消息将创建新会话"
+
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+		log.Printf("dingtalk: failed to send new session response: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleListSessions 处理列出所有会话命令
+func (h *Handler) handleListSessions(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessions, err := h.client.ListSessions(ctx)
+	if err != nil {
+		msg := fmt.Sprintf("❌ 获取会话列表失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	if len(sessions) == 0 {
+		msg := "📝 当前没有活跃的会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString(fmt.Sprintf("📝 会话列表 (%d个):\n\n", len(sessions)))
+
+	// 只显示最近的10个
+	maxShow := 10
+	if len(sessions) > maxShow {
+		sessions = sessions[:maxShow]
+	}
+
+	for i, session := range sessions {
+		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", i+1, session.Title))
+		msgBuilder.WriteString(fmt.Sprintf("   ID: %s\n", session.ID[:8]))
+		msgBuilder.WriteString(fmt.Sprintf("   目录: %s\n", session.Directory))
+		updatedTime := time.Unix(int64(session.Time.Updated), 0).Format("2006-01-02 15:04")
+		msgBuilder.WriteString(fmt.Sprintf("   更新: %s\n", updatedTime))
+		msgBuilder.WriteString("\n")
+	}
+
+	if len(sessions) == maxShow {
+		msgBuilder.WriteString(fmt.Sprintf("\n💡 只显示最近%d个会话", maxShow))
+	}
+
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String())); err != nil {
+		log.Printf("dingtalk: failed to send sessions list: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleStatus 处理查看会话状态命令
+func (h *Handler) handleStatus(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	// 获取session详情
+	info, err := h.client.GetSessionInfo(ctx, sessionID)
+	if err != nil {
+		msg := fmt.Sprintf("❌ 获取会话信息失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString("📊 当前会话状态:\n\n")
+	msgBuilder.WriteString(fmt.Sprintf("会话ID: %s\n", info.SessionID[:8]))
+	msgBuilder.WriteString(fmt.Sprintf("标题: %s\n", info.Title))
+	msgBuilder.WriteString(fmt.Sprintf("目录: %s\n", info.Directory))
+	msgBuilder.WriteString(fmt.Sprintf("消息数: %d\n", info.MessageCount))
+	msgBuilder.WriteString(fmt.Sprintf("Token数: %d\n", info.TokenCount))
+	if info.ContextLength > 0 {
+		msgBuilder.WriteString(fmt.Sprintf("上下文: %d/%d (%.1f%%)\n",
+			info.TokenCount, info.ContextLength, info.ContextUsage*100))
+	}
+	msgBuilder.WriteString(fmt.Sprintf("创建时间: %s", info.Created))
+
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String())); err != nil {
+		log.Printf("dingtalk: failed to send status: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleClear 处理清除会话命令
+func (h *Handler) handleClear(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	// 删除session
+	if err := h.client.DeleteSession(ctx, sessionID); err != nil {
+		msg := fmt.Sprintf("❌ 删除会话失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	// 清除本地映射
+	h.adapter.ClearSessionForUser(userID)
+	threadID := data.ConversationId
+	if threadID != "" {
+		h.client.ResetSession(threadID)
+	}
+
+	msg := fmt.Sprintf("✅ 已删除会话 %s\n\n下次发送消息将创建新会话", sessionID[:8])
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+		log.Printf("dingtalk: failed to send clear response: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleModel 处理模型配置命令
+func (h *Handler) handleModel(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 解析命令
+	parts := strings.Fields(content)
+
+	// 如果只是查询
+	if len(parts) == 1 {
+		return h.handleModelQuery(ctx, data, userID)
+	}
+
+	// 如果是设置: /model <provider>/<model> 或 /model <provider> <model>
+	if len(parts) >= 2 {
+		return h.handleModelSet(ctx, data, userID, parts[1:])
+	}
+
+	msg := "❌ 命令格式错误\n\n使用方法:\n/model - 查看当前模型\n/model <provider>/<model> - 设置模型\n/model <provider> <model> - 设置模型\n\n例如:\n/model anthropic/claude-3-opus\n/model openai gpt-4"
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return nil, nil
+}
+
+// handleModelQuery 查询当前模型
+func (h *Handler) handleModelQuery(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		// 没有session，提示用户
+		msg := "ℹ️ 当前没有活跃的会话\n\n" +
+			"💡 模型配置功能需要OpenCode SDK的支持\n" +
+			"目前的SDK版本可能不包含模型配置 API\n\n" +
+			"您可以在OpenCode的Web界面中配置模型\n" +
+			"或等待SDK更新支持此功能"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	// 获取当前provider和model
+	_, _, err := h.client.GetCurrentProvider(ctx, sessionID)
+	if err != nil {
+		msg := fmt.Sprintf("❌ 获取当前模型失败: %v\n\n"+
+			"💡 模型配置功能需要OpenCode SDK的支持\n"+
+			"目前的SDK版本可能不包含此API", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString("🤖 当前会话配置:\n\n")
+	msgBuilder.WriteString(fmt.Sprintf("会话: %s\n", sessionID[:8]))
+	msgBuilder.WriteString("\n💡 模型信息在当前SDK版本中不可用\n")
+	msgBuilder.WriteString("请在OpenCode Web界面中查看和配置模型")
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+	return nil, nil
+}
+
+// handleModelSet 设置模型
+func (h *Handler) handleModelSet(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "❌ 当前没有活跃的会话\n\n请先发送消息创建会话，然后再设置模型"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	var providerID, modelID string
+
+	// 解析参数: provider/model 或 provider model
+	if strings.Contains(args[0], "/") {
+		parts := strings.SplitN(args[0], "/", 2)
+		providerID = parts[0]
+		if len(parts) > 1 {
+			modelID = parts[1]
+		}
+	} else {
+		providerID = args[0]
+		if len(args) > 1 {
+			modelID = args[1]
+		}
+	}
+
+	if providerID == "" {
+		msg := "❌ 提供商ID不能为空"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	// 更新session的provider和model
+	if err := h.client.UpdateSessionProvider(ctx, sessionID, providerID, modelID); err != nil {
+		msg := fmt.Sprintf("❌ 更新模型失败: %v\n\n"+
+			"💡 模型配置功能需要OpenCode SDK的支持\n"+
+			"目前的SDK版本可能不包含此API\n"+
+			"请在OpenCode Web界面中配置模型", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf("✅ 已尝试更新模型配置\n\n提供商: %s\n模型: %s\n会话: %s\n\n"+
+		"💡 注意：当前SDK版本可能不完全支持此功能\n"+
+		"如果需要详细配置，请访问OpenCode Web界面",
+		providerID, modelID, sessionID[:8])
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return nil, nil
+}
+
+// handleConfig 处理配置查看命令
+func (h *Handler) handleConfig(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString("⚙️ 当前配置:\n\n")
+
+	if ok {
+		info, err := h.client.GetSessionInfo(ctx, sessionID)
+		if err == nil {
+			msgBuilder.WriteString(fmt.Sprintf("📊 会话信息:\n"))
+			msgBuilder.WriteString(fmt.Sprintf("  ID: %s\n", info.SessionID[:8]))
+			msgBuilder.WriteString(fmt.Sprintf("  标题: %s\n", info.Title))
+			msgBuilder.WriteString(fmt.Sprintf("  目录: %s\n", info.Directory))
+			msgBuilder.WriteString(fmt.Sprintf("  消息数: %d\n", info.MessageCount))
+			msgBuilder.WriteString(fmt.Sprintf("  Token: %d/%d\n", info.TokenCount, info.ContextLength))
+		}
+	} else {
+		msgBuilder.WriteString("📊 会话信息: 无活跃会话\n")
+	}
+
+	msgBuilder.WriteString("\n🔧 可用命令:\n")
+	msgBuilder.WriteString("  /model - 查看/设置模型\n")
+	msgBuilder.WriteString("  /status - 查看会话状态\n")
+	msgBuilder.WriteString("  /new - 创建新会话\n")
+	msgBuilder.WriteString("  /clear - 清除当前会话\n")
+	msgBuilder.WriteString("  /sessions - 列出所有会话\n")
+	msgBuilder.WriteString("  /skills - 查看可用技能\n")
+	msgBuilder.WriteString("  /help - 查看帮助")
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+	return nil, nil
 }

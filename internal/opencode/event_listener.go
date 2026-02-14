@@ -33,8 +33,11 @@ type StreamingSessionHandler struct {
 	lastEventType      string    // 最后一次收到的事件类型
 	mu                 sync.Mutex
 	completed          bool
-	contentSent        bool // 标记是否已发送过内容
-	waitingForResponse bool // 标记是否正在等待用户回复（如权限确认、问题回答）
+	contentSent        bool        // 标记是否已发送过内容
+	waitingHintSent    bool        // 标记是否已发送等待提示
+	receivedStepFinish bool        // 标记是否已收到 step-finish 事件
+	stepFinishTime     time.Time   // 收到 step-finish 的时间
+	waitingTimer       *time.Timer // 等待提示定时器
 	onComplete         func()
 	client             *Client       // 用于存储问题
 	messageSender      MessageSender // 用于主动推送消息到用户
@@ -42,7 +45,7 @@ type StreamingSessionHandler struct {
 
 // NewStreamingSessionHandler 创建流式会话处理器
 func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onComplete func(), client *Client, messageSender MessageSender) *StreamingSessionHandler {
-	return &StreamingSessionHandler{
+	h := &StreamingSessionHandler{
 		sessionID:      sessionID,
 		callback:       callback,
 		lastUpdateTime: time.Now(),
@@ -50,6 +53,16 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onCom
 		client:         client,
 		messageSender:  messageSender,
 	}
+	// 8秒后若仍未发送过内容，给用户一个等待提示
+	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if !h.contentSent && !h.completed && !h.waitingHintSent {
+			h.waitingHintSent = true
+			_ = h.callback("⏳ 正在努力处理中...\n")
+		}
+	})
+	return h
 }
 
 // NewEventDispatcher creates a new event dispatcher.
@@ -99,32 +112,6 @@ func (d *EventDispatcher) Dispatch(ctx context.Context, event *opencode.EventLis
 	return nil
 }
 
-// AdapterMessageHandler creates an event handler that forwards messages to adapters.
-type AdapterMessageHandler struct {
-	sendToAdapter func(ctx context.Context, channel, userID, content string) error
-}
-
-// NewAdapterMessageHandler creates a handler that forwards OpenCode responses to adapters.
-func NewAdapterMessageHandler(sender func(ctx context.Context, channel, userID, content string) error) *AdapterMessageHandler {
-	return &AdapterMessageHandler{
-		sendToAdapter: sender,
-	}
-}
-
-// Handle processes incoming events and forwards appropriate messages to adapters.
-func (h *AdapterMessageHandler) Handle(ctx context.Context, event *opencode.EventListResponse) error {
-	// Extract message information from event
-	log.Printf("opencode: received event (type=%s)", event.Type)
-
-	// TODO: Implement actual event processing based on SDK Event structure
-	// Based on the event type, route to appropriate handler:
-	// - session.updated -> check for new messages
-	// - message.updated -> forward to user
-	// - session.error -> notify user of errors
-
-	return nil
-}
-
 // HandleEvent 处理会话更新事件并提取增量内容
 func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *opencode.EventListResponse) error {
 	s.mu.Lock()
@@ -157,6 +144,24 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 	// 只处理 message.part.updated 事件获取增量内容
 	switch eventType {
 	case "message.part.updated":
+		// 检查是否是 step-finish 事件
+		if jsonData := event.JSON.RawJSON(); jsonData != "" {
+			var partData struct {
+				Properties struct {
+					Part struct {
+						Type string `json:"type"`
+					} `json:"part"`
+				} `json:"properties"`
+			}
+			if err := json.Unmarshal([]byte(jsonData), &partData); err == nil {
+				if partData.Properties.Part.Type == "step-finish" {
+					s.receivedStepFinish = true
+					s.stepFinishTime = time.Now()
+					log.Printf("opencode: 🏁 received step-finish for session %s", s.sessionID[:8])
+				}
+			}
+		}
+
 		// 提取增量内容并发送
 		incremental := s.extractContentFromEvent(event)
 		if incremental != "" {
@@ -164,6 +169,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			if err := s.callback(incremental); err != nil {
 				log.Printf("opencode: streaming callback error: %v", err)
 			} else {
+				if !s.contentSent {
+					s.stopWaitingTimer()
+				}
 				s.contentSent = true
 			}
 			s.lastUpdateTime = time.Now()
@@ -208,36 +216,11 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			s.contentSent = true
 		}
 
-	case "message.completed":
-		// 完成事件，处理最终内容
-		finalContent := s.extractCompleteContent(event)
-		if finalContent != "" && finalContent != s.lastContent {
-			if strings.HasPrefix(finalContent, s.lastContent) {
-				incremental := strings.TrimPrefix(finalContent, s.lastContent)
-				if incremental != "" {
-					if err := s.callback(incremental); err != nil {
-						log.Printf("opencode: streaming callback error: %v", err)
-					} else {
-						s.contentSent = true
-					}
-				}
-			} else {
-				if err := s.callback(finalContent); err != nil {
-					log.Printf("opencode: streaming callback error: %v", err)
-				} else {
-					s.contentSent = true
-				}
-			}
-			s.lastContent = finalContent
-		}
-		s.completed = true
-		s.notifyCompletion()
-		log.Printf("opencode: streaming session completed")
-
 	case "session.idle":
 		s.completed = true
 		s.notifyCompletion()
-		log.Printf("opencode: streaming session completed")
+		log.Printf("opencode: 🏁 streaming session completed (session=%s, contentSent=%t, lastContentLen=%d)",
+			s.sessionID[:8], s.contentSent, len(s.lastContent))
 
 	case "file.edited":
 		// 文件编辑事件，静默处理
@@ -309,135 +292,131 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 	return nil
 }
 
-// extractCompleteContent 从完成事件中提取完整内容
-func (s *StreamingSessionHandler) extractCompleteContent(event *opencode.EventListResponse) string {
-	if event == nil {
-		return ""
-	}
-
-	if event.Type == "message.completed" {
-		type MessageCompletedProps struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		}
-
-		if jsonData := event.JSON.RawJSON(); jsonData != "" {
-			var wrapper struct {
-				Properties MessageCompletedProps `json:"properties"`
-			}
-			if err := json.Unmarshal([]byte(jsonData), &wrapper); err == nil {
-				content := wrapper.Properties.Message.Content
-				if content != "" {
-					return content
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// extractContentFromEvent 从事件中提取内容
+// extractContentFromEvent 从 message.part.updated 事件中提取用户可见内容
 func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventListResponse) string {
-	if event == nil {
+	if event == nil || event.Type != "message.part.updated" {
 		return ""
 	}
 
-	// 尝试解析 message.part.updated 事件
-	if event.Type == "message.part.updated" {
-		type ToolInput struct {
-			Command     string `json:"command"`
-			Description string `json:"description"`
-			Filepath    string `json:"filepath"`
-			Pattern     string `json:"pattern"`
-			URL         string `json:"url"`
-			Query       string `json:"query"`
-			Content     string `json:"content"`
-		}
+	type ToolInput struct {
+		Command     string `json:"command"`
+		Description string `json:"description"`
+		Filepath    string `json:"filepath"`
+		URL         string `json:"url"`
+	}
 
-		type ToolState struct {
-			Status string    `json:"status"`
-			Input  ToolInput `json:"input"`
-			Output string    `json:"output"`
-			Error  string    `json:"error"`
-		}
+	type ToolState struct {
+		Status string    `json:"status"`
+		Input  ToolInput `json:"input"`
+		Output string    `json:"output"`
+		Error  string    `json:"error"`
+	}
 
-		type PartUpdateProps struct {
-			Delta string `json:"delta"`
-			Part  struct {
-				Type   string    `json:"type"`
-				Tool   string    `json:"tool"`
-				State  ToolState `json:"state"`
-				Text   string    `json:"text"`
-				Reason string    `json:"reason"`
-			} `json:"part"`
-		}
+	type PartUpdateProps struct {
+		Delta string `json:"delta"`
+		Part  struct {
+			Type  string    `json:"type"`
+			Tool  string    `json:"tool"`
+			State ToolState `json:"state"`
+			Text  string    `json:"text"`
+		} `json:"part"`
+		Message struct {
+			Role string `json:"role"`
+		} `json:"message"`
+	}
 
-		if jsonData := event.JSON.RawJSON(); jsonData != "" {
-			var wrapper struct {
-				Properties PartUpdateProps `json:"properties"`
+	jsonData := event.JSON.RawJSON()
+	if jsonData == "" {
+		log.Printf("opencode: 🔍 extractContent - empty JSON data for session %s", s.sessionID[:8])
+		return ""
+	}
+
+	var wrapper struct {
+		Properties PartUpdateProps `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(jsonData), &wrapper); err != nil {
+		log.Printf("opencode: failed to unmarshal message.part.updated: %v, JSON preview: %.200s", err, jsonData)
+		return ""
+	}
+
+	props := wrapper.Properties
+
+	// 🔍 详细诊断日志
+	log.Printf("opencode: 🔍 extractContent - session=%s, role=%s, partType=%s, delta_len=%d, text_len=%d",
+		s.sessionID[:8], props.Message.Role, props.Part.Type, len(props.Delta), len(props.Part.Text))
+
+	// 忽略用户角色的消息
+	if props.Message.Role == "user" {
+		log.Printf("opencode: 🔍 extractContent - ignoring user role message")
+		return ""
+	}
+
+	partType := props.Part.Type
+
+	switch partType {
+	case "text":
+		// 文本增量 - 只转发有 delta 的事件
+		if props.Delta != "" {
+			log.Printf("opencode: 🔍 extractContent - returning text delta (%d chars)", len(props.Delta))
+			return props.Delta
+		}
+		log.Printf("opencode: 🔍 extractContent - text type but delta is empty, text=%s", props.Part.Text)
+
+	case "tool":
+		// 工具调用事件
+		toolName := props.Part.Tool
+		state := props.Part.State
+		log.Printf("opencode: 🔍 extractContent - tool event: name=%s, status=%s", toolName, state.Status)
+
+		switch state.Status {
+		case "running":
+			desc := state.Input.Description
+			if desc == "" {
+				desc = state.Input.Command
 			}
-			if err := json.Unmarshal([]byte(jsonData), &wrapper); err == nil {
-				props := wrapper.Properties
-				partType := props.Part.Type
-
-				switch partType {
-				case "text":
-					// 文本增量内容
-					if props.Delta != "" {
-						return props.Delta
-					}
-
-				case "tool":
-					// 工具调用事件：仅在 running 和 completed/error 时通知
-					toolName := props.Part.Tool
-					state := props.Part.State
-
-					switch state.Status {
-					case "running":
-						// 工具开始执行，发送简洁通知
-						desc := state.Input.Description
-						if desc == "" {
-							desc = state.Input.Command
-						}
-						if desc == "" {
-							desc = state.Input.Filepath
-						}
-						if desc == "" {
-							desc = state.Input.URL
-						}
-						if desc != "" {
-							// 截断过长描述
-							if len([]rune(desc)) > 80 {
-								desc = string([]rune(desc)[:80]) + "..."
-							}
-							return fmt.Sprintf("🔧 [%s] %s\n", toolName, desc)
-						}
-						return fmt.Sprintf("🔧 正在执行 %s...\n", toolName)
-
-					case "completed":
-						// 工具完成，发送结果（如果有且简短）
-						output := strings.TrimSpace(state.Output)
-						if output != "" && len([]rune(output)) <= 200 {
-							return fmt.Sprintf("✅ [%s] %s\n", toolName, output)
-						}
-						// 输出过长或为空，不发送
-
-					case "error":
-						errMsg := strings.TrimSpace(state.Error)
-						if errMsg == "" {
-							errMsg = "执行失败"
-						}
-						if len([]rune(errMsg)) > 200 {
-							errMsg = string([]rune(errMsg)[:200]) + "..."
-						}
-						return fmt.Sprintf("❌ [%s] %s\n", toolName, errMsg)
-					}
-
-					// reasoning、step-start、step-finish 等不向用户发送
+			if desc == "" {
+				desc = state.Input.Filepath
+			}
+			if desc == "" {
+				desc = state.Input.URL
+			}
+			if desc != "" {
+				if len([]rune(desc)) > 80 {
+					desc = string([]rune(desc)[:80]) + "..."
 				}
+				return fmt.Sprintf("🔧 [%s] %s\n", toolName, desc)
 			}
+			return fmt.Sprintf("🔧 正在执行 %s...\n", toolName)
+
+		case "completed":
+			output := strings.TrimSpace(state.Output)
+			if output != "" && len([]rune(output)) <= 200 {
+				return fmt.Sprintf("✅ [%s] %s\n", toolName, output)
+			}
+			// 输出为空或过长，仍发送简短完成通知
+			return fmt.Sprintf("✅ [%s] 完成\n", toolName)
+
+		case "error":
+			errMsg := strings.TrimSpace(state.Error)
+			if errMsg == "" {
+				errMsg = "执行失败"
+			}
+			if len([]rune(errMsg)) > 200 {
+				errMsg = string([]rune(errMsg)[:200]) + "..."
+			}
+			return fmt.Sprintf("❌ [%s] %s\n", toolName, errMsg)
 		}
+
+	case "reasoning", "step-start", "step-finish", "snapshot", "patch", "compaction":
+		// 内部事件，不向用户发送
+		log.Printf("opencode: 🔍 extractContent - internal event type: %s (not sent to user)", partType)
+
+	case "":
+		log.Printf("opencode: 🔍 extractContent - empty part type, JSON preview: %.300s", jsonData)
+
+	default:
+		log.Printf("opencode: 🔍 extractContent - unhandled part type '%s' for session %s, JSON preview: %.300s",
+			partType, s.sessionID[:8], jsonData)
 	}
 
 	return ""
@@ -842,11 +821,18 @@ func (s *StreamingSessionHandler) HasSentContent() bool {
 	return s.contentSent
 }
 
-// IsWaitingForResponse 检查是否正在等待用户回复（如权限确认、问题回答）
-// 修改：总是返回 false，不再阻止事件处理
-func (s *StreamingSessionHandler) IsWaitingForResponse() bool {
-	// 不再检查 waitingForResponse 标志，让事件继续流动
-	return false
+// HasReceivedStepFinish 检查是否已收到 step-finish 事件
+func (s *StreamingSessionHandler) HasReceivedStepFinish() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.receivedStepFinish
+}
+
+// GetStepFinishTime 获取收到 step-finish 的时间
+func (s *StreamingSessionHandler) GetStepFinishTime() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stepFinishTime
 }
 
 // GetLastEventInfo 获取最后一次事件的时间和类型
@@ -877,8 +863,16 @@ func (s *StreamingSessionHandler) IsActivelyProcessing() bool {
 }
 
 func (s *StreamingSessionHandler) notifyCompletion() {
+	s.stopWaitingTimer()
 	if s.onComplete != nil {
 		go s.onComplete()
+	}
+}
+
+// stopWaitingTimer 取消等待提示定时器
+func (s *StreamingSessionHandler) stopWaitingTimer() {
+	if s.waitingTimer != nil {
+		s.waitingTimer.Stop()
 	}
 }
 
@@ -920,44 +914,4 @@ func extractSessionIDFromEvent(event *opencode.EventListResponse) string {
 		return wrapper.Properties.Info.ID
 	}
 	return ""
-}
-
-func (s *StreamingSessionHandler) belongsToSession(event *opencode.EventListResponse) bool {
-	if s.sessionID == "" || event == nil {
-		return true
-	}
-
-	raw := event.JSON.RawJSON()
-	if raw == "" {
-		return true
-	}
-
-	var wrapper struct {
-		Properties struct {
-			SessionID string `json:"sessionID"`
-			Message   struct {
-				SessionID string `json:"sessionID"`
-			} `json:"message"`
-			Part struct {
-				SessionID string `json:"sessionID"`
-			} `json:"part"`
-		} `json:"properties"`
-	}
-	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
-		return false
-	}
-
-	candidate := wrapper.Properties.SessionID
-	if candidate == "" {
-		candidate = wrapper.Properties.Message.SessionID
-	}
-	if candidate == "" {
-		candidate = wrapper.Properties.Part.SessionID
-	}
-
-	if candidate == "" {
-		return true
-	}
-
-	return candidate == s.sessionID
 }
