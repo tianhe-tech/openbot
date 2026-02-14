@@ -360,7 +360,23 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 			log.Printf("opencode: 🔍 extractContent - returning text delta (%d chars)", len(props.Delta))
 			return props.Delta
 		}
-		log.Printf("opencode: 🔍 extractContent - text type but delta is empty, text=%s", props.Part.Text)
+
+		// delta 为空时，记录诊断信息但不发送
+		// streaming 模式应该通过 delta 逐步发送，完整的 text 字段仅用于调试
+		if props.Part.Text != "" {
+			if s.lastContent == "" {
+				// 尚未发送任何内容，这可能是会话开始时的状态
+				log.Printf("opencode: 🔍 extractContent - text type but delta is empty (session start, text_len=%d)",
+					len(props.Part.Text))
+			} else if len(props.Part.Text) > len(s.lastContent) {
+				// 完整文本比已发送内容更长，可能遗漏了一些 delta
+				log.Printf("opencode: ⚠️ extractContent - text longer than lastContent (text_len=%d, sent_len=%d), possible delta loss",
+					len(props.Part.Text), len(s.lastContent))
+			} else {
+				log.Printf("opencode: 🔍 extractContent - text type but delta is empty (text_len=%d, sent_len=%d)",
+					len(props.Part.Text), len(s.lastContent))
+			}
+		}
 
 	case "tool":
 		// 工具调用事件
