@@ -1,9 +1,11 @@
 package dingtalk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -48,6 +50,10 @@ type Handler struct {
 	cronScheduler   *scheduler.CronScheduler // 定时任务调度器
 	processedMsgIDs sync.Map                 // map[string]time.Time - 已处理的消息ID及其时间戳
 	cleanupOnce     sync.Once                // 确保清理goroutine只启动一次
+	// access token 缓存（避免每次都获取）
+	accessToken       string
+	accessTokenExpiry time.Time
+	accessTokenMu     sync.Mutex
 }
 
 // NewHandler wires the adapter with an OpenCode client.
@@ -243,6 +249,26 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return nil, nil
 	}
 
+	// Handle /fork command to fork the current session
+	if content == "/fork" {
+		return h.handleFork(ctx, data, userID)
+	}
+
+	// Handle /compact command to compact/summarize the current session
+	if content == "/compact" || content == "/summarize" || content == "总结" {
+		return h.handleCompact(ctx, data, userID)
+	}
+
+	// Handle /todo command to show current todo list
+	if content == "/todo" || content == "/todos" || content == "任务" {
+		return h.handleTodo(ctx, data, userID)
+	}
+
+	// Handle /diff command to show current file changes
+	if content == "/diff" || content == "/changes" || content == "变更" {
+		return h.handleDiff(ctx, data, userID)
+	}
+
 	// Handle /crontask command for scheduled tasks
 	if strings.HasPrefix(content, "/crontask") {
 		return h.handleCronTask(ctx, data, userID, content)
@@ -282,8 +308,6 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	// Send to OpenCode with streaming
-	replier := chatbot.NewChatbotReplier()
-
 	// 使用独立的context，避免被钉钉SDK的context超时影响
 	// 给予充足的超时时间，让OpenCode能够完成复杂任务
 	timeout := 20 * time.Minute // 默认20分钟
@@ -298,7 +322,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 	var fullReply strings.Builder
 	var lastSentLength int
-	var lastUpdateTime time.Time
+	lastUpdateTime := time.Now()              // 初始化为当前时间，确保5秒冷却期从消息接收时开始计算
 	const minUpdateInterval = 5 * time.Second // 最小更新间隔：5秒
 	const minUpdateChars = 300                // 最小更新字符数：300字符（减少频率）
 
@@ -345,6 +369,21 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 		sessionMappingMu.Unlock()
 
+		// FlushSignal: session 结束，立即发送所有尚未发送的内容
+		if chunk == opencode.FlushSignal {
+			toSend := fullReply.String()[lastSentLength:]
+			if len(toSend) > 0 {
+				log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
+				if err := h.sendReplyRobot(sendCtx, conversationID, userID, toSend); err != nil {
+					log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
+				} else {
+					lastSentLength = len(fullReply.String())
+					log.Printf("dingtalk stream: ✅ flush send done")
+				}
+			}
+			return nil
+		}
+
 		// 🔍 诊断：记录内容 callback
 		if len(chunk) > 0 && !strings.HasPrefix(chunk, "ses_") {
 			log.Printf("dingtalk stream: 🔍 CONTENT CALLBACK - len=%d, prefix='%s'",
@@ -352,12 +391,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 
 		// 处理特殊消息：权限请求、问题确认、等待提示等需要立即发送的消息
+		// 使用 Robot API（sendReplyRobot），不依赖过期的 sessionWebhook
 		if strings.HasPrefix(chunk, "⏳") || strings.HasPrefix(chunk, "⏱️") ||
 			strings.HasPrefix(chunk, "🔐") || strings.HasPrefix(chunk, "❓") ||
 			strings.HasPrefix(chunk, "🤔💭") {
 			// 这些是需要立即发送的提示消息
 			log.Printf("dingtalk stream: 📤 sending immediate message: %s", chunk[:min(50, len(chunk))])
-			if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(chunk)); err != nil {
+			if err := h.sendReplyRobot(sendCtx, conversationID, userID, chunk); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send immediate message: %v", err)
 				// 发送失败时的处理：
 				// - 对于"正在处理中"提示：只返回error保持waiting timer活跃，不加入fullReply（避免污染最终内容）
@@ -390,9 +430,8 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			log.Printf("dingtalk stream: 📤 sending intermediate update (new content: %d chars, interval: %v)",
 				newContentLength, timeSinceLastUpdate)
 
-			// 直接发送累积的内容，不添加额外的"中间结果"标记
-			// 用户会看到内容逐步累积，更自然
-			if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fullReply.String())); err != nil {
+			// 直接发送累积的内容，使用 Robot API（不依赖过期的 sessionWebhook）
+			if err := h.sendReplyRobot(sendCtx, conversationID, userID, fullReply.String()); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send intermediate update: %v", err)
 				// 不返回错误，继续累积内容，下次再试或最后发送
 			} else {
@@ -445,7 +484,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			errMsg = fmt.Sprintf("❌ 处理失败: %v", err)
 			log.Printf("dingtalk stream: error for user %s: %v", userID, err)
 		}
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		_ = h.sendReplyRobot(sendCtx, conversationID, userID, errMsg)
 		return nil, err
 	}
 
@@ -472,7 +511,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Send final complete reply (only if we have synchronous content)
 	// For async mode, the SSE callbacks already sent the content
 	if response.Reply != "" {
-		if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(response.Reply)); err != nil {
+		if err := h.sendReplyRobot(sendCtx, conversationID, userID, response.Reply); err != nil {
 			log.Printf("dingtalk stream: failed to reply: %v", err)
 			return nil, err
 		}
@@ -486,9 +525,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				log.Printf("dingtalk stream: 📤 sending final message (%d total chars, %d unsent)",
 					len(accumulatedContent), unsentLength)
 
-				// 🔧 修复：只发送未发送的部分，避免重复
+				// 🔧 修复：只发送未发送的部分，避免重复，使用 Robot API
 				unsentContent := accumulatedContent[lastSentLength:]
-				if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(unsentContent)); err != nil {
+				if err := h.sendReplyRobot(sendCtx, conversationID, userID, unsentContent); err != nil {
 					log.Printf("dingtalk stream: ❌ failed to send final message: %v", err)
 					// 不返回错误，避免影响session映射
 				} else {
@@ -751,7 +790,13 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /status 或 状态 - 查看当前会话状态
 /new 或 /reset - 创建新会话
 /clear 或 清除 - 删除当前会话
+/fork - 派生(fork)当前会话（保留历史，创建新分支）
+/compact 或 总结 - 压缩会话历史（减少上下文占用）
 /sessions 或 /list - 列出所有会话
+
+📋 任务追踪（对应 TUI 实时看板）：
+/todo 或 任务 - 查看 AI 当前的任务进度
+/diff 或 变更 - 查看本次会话的文件变更摘要
 
 🤖 模型配置：
 /model - 查看当前模型
@@ -762,35 +807,24 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 
 1️⃣ Chat模式（默认）
    - 直接对话，立即响应
-   - 适合：日常问答、代码解释
 
 2️⃣ Plan模式
-   - AI会先制定计划再执行
-   - 适合：复杂任务规划
+   - AI先制定计划再执行
 
 3️⃣ Build模式（需要确认）
-   - AI会生成操作计划并等待您确认
-   - ⚠️ 需要在OpenCode界面手动确认
-   - 确认后结果会自动回复到钉钉
-   - 适合：文件修改、代码生成等
+   - AI生成操作计划并等待确认
+   - 回复 '允许' 或序号确认授权
 
 💡 使用技巧：
-• 使用 @agent_name 调用特定技能
-  例如：@build 帮我创建一个Python脚本
-• Build模式请求会提示您去OpenCode确认
-• 请勿在30秒内重复发送相同消息
-• 使用 /model 可以切换不同的AI模型
+• @agent_name 消息 - 调用特定技能
+• 任务进行中可发 /todo 查看进度
+• 完成后自动显示文件变更摘要
+• /fork 创建当前上下文的副本继续探索
 
 🛠️ 高级命令：
 /cmd <command> - 执行技能脚本
-/answer <question_id> <answer> - 回答待确认的问题
-/crontask - 管理定时任务
-
-❓ 问题排查：
-• 如果提示"请求处理中"：请等待当前请求完成
-• 如果收到确认请求：使用 /answer 命令回复
-• 如果超时：可能是build模式等待确认
-• 如果失败：稍后重试或简化问题`
+/answer <question_id> <answer> - 回答待确认问题
+/crontask - 管理定时任务`
 
 	replier := chatbot.NewChatbotReplier()
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(helpText)); err != nil {
@@ -1490,8 +1524,12 @@ func (h *Handler) sendGroupMessage(ctx context.Context, conversationId, content 
 	// 钉钉 Stream 模式下，使用机器人发送群消息 API
 	// API文档: https://open.dingtalk.com/document/orgapp/chatbots-send-one-on-one-chat-messages-in-batches
 
+	// 使用独立 context，避免父 context 取消影响消息发送
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer httpCancel()
+
 	// 获取 access_token
-	accessToken, err := h.getAccessToken(ctx)
+	accessToken, err := h.getAccessToken(httpCtx)
 	if err != nil {
 		log.Printf("dingtalk: failed to get access token: %v", err)
 		return fmt.Errorf("get access token: %w", err)
@@ -1499,7 +1537,7 @@ func (h *Handler) sendGroupMessage(ctx context.Context, conversationId, content 
 
 	// 使用机器人发送普通消息接口
 	// 注意：这个接口需要机器人在群里，并且使用 openConversationId
-	apiURL := fmt.Sprintf("https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend")
+	apiURL := "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
 
 	payload := map[string]interface{}{
 		"robotCode":           h.cfg.ClientID,
@@ -1513,7 +1551,7 @@ func (h *Handler) sendGroupMessage(ctx context.Context, conversationId, content 
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(string(data)))
+	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, apiURL, strings.NewReader(string(data)))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -1528,8 +1566,7 @@ func (h *Handler) sendGroupMessage(ctx context.Context, conversationId, content 
 	}
 	defer resp.Body.Close()
 
-	// 读取响应内容用于调试
-	bodyBytes, _ := json.Marshal(resp.Body)
+	bodyBytes, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("dingtalk: API returned status %d, body: %s", resp.StatusCode, string(bodyBytes))
@@ -1537,7 +1574,7 @@ func (h *Handler) sendGroupMessage(ctx context.Context, conversationId, content 
 	}
 
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 
@@ -1561,9 +1598,17 @@ func escapeJSON(s string) string {
 	return s
 }
 
-// getAccessToken 获取访问令牌
+// getAccessToken 获取访问令牌（带缓存，避免频繁请求）
 func (h *Handler) getAccessToken(ctx context.Context) (string, error) {
-	// 使用 v1.0 API 获取 access token
+	h.accessTokenMu.Lock()
+	defer h.accessTokenMu.Unlock()
+
+	// 如果缓存的 token 还有超过5分钟有效期，直接返回
+	if h.accessToken != "" && time.Now().Add(5*time.Minute).Before(h.accessTokenExpiry) {
+		return h.accessToken, nil
+	}
+
+	// 重新获取 access token，使用独立 context 避免父 context 取消
 	apiURL := "https://api.dingtalk.com/v1.0/oauth2/accessToken"
 
 	payload := map[string]string{
@@ -1576,34 +1621,113 @@ func (h *Handler) getAccessToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("marshal payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(string(data)))
+	// 使用独立的 context，避免父 context 取消时影响 token 获取
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer reqCancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, apiURL, bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
-
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
 	var result struct {
 		AccessToken string `json:"accessToken"`
 		ExpireIn    int    `json:"expireIn"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("decode response: %w, body: %s", err, string(body))
 	}
-
 	if result.AccessToken == "" {
-		return "", fmt.Errorf("access token is empty")
+		return "", fmt.Errorf("access token is empty, body: %s", string(body))
 	}
 
-	return result.AccessToken, nil
+	// 缓存 token
+	h.accessToken = result.AccessToken
+	expireIn := result.ExpireIn
+	if expireIn <= 0 {
+		expireIn = 7200 // 默认2小时
+	}
+	h.accessTokenExpiry = time.Now().Add(time.Duration(expireIn) * time.Second)
+	log.Printf("dingtalk: got new access token, expires in %ds", expireIn)
+
+	return h.accessToken, nil
+}
+
+// sendReplyRobot 通过钉钉 Robot API 发送消息（不依赖过期的 sessionWebhook）
+// 使用接口：POST /v1.0/robot/oToMessages/batchSend
+func (h *Handler) sendReplyRobot(ctx context.Context, conversationID, userID, content string) error {
+	if content == "" {
+		return nil
+	}
+
+	// 使用独立的 context，避免父 context 取消时影响消息发送
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer httpCancel()
+
+	accessToken, err := h.getAccessToken(httpCtx)
+	if err != nil {
+		return fmt.Errorf("get access token: %w", err)
+	}
+
+	apiURL := "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+	payload := map[string]interface{}{
+		"robotCode":           h.cfg.ClientID,
+		"msgKey":              "sampleText",
+		"msgParam":            fmt.Sprintf(`{"content":%s}`, jsonStringEscape(content)),
+		"userIds":             []string{userID},
+		"openConversationIds": []string{conversationID},
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, apiURL, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", accessToken)
+
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("dingtalk robot API status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("dingtalk stream: ✅ sent via robot API (%d chars) to conversation %s",
+		len(content), conversationID[:min(8, len(conversationID))])
+	return nil
+}
+
+// jsonStringEscape 将字符串编码为 JSON 字符串值（含引号）
+func jsonStringEscape(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // ========== New Command Handlers ==========
@@ -1902,10 +2026,157 @@ func (h *Handler) handleConfig(ctx context.Context, data *chatbot.BotCallbackDat
 	msgBuilder.WriteString("  /status - 查看会话状态\n")
 	msgBuilder.WriteString("  /new - 创建新会话\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
+	msgBuilder.WriteString("  /fork - 派生(fork)当前会话\n")
+	msgBuilder.WriteString("  /compact - 压缩/总结当前会话\n")
+	msgBuilder.WriteString("  /todo - 查看当前任务进度\n")
+	msgBuilder.WriteString("  /diff - 查看文件变更\n")
 	msgBuilder.WriteString("  /sessions - 列出所有会话\n")
 	msgBuilder.WriteString("  /skills - 查看可用技能\n")
 	msgBuilder.WriteString("  /help - 查看帮助")
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+	return nil, nil
+}
+
+// handleFork 处理派生会话命令
+// 对应 TUI 中的 session.fork 操作
+func (h *Handler) handleFork(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	newSessionID, err := h.client.ForkSession(ctx, sessionID)
+	if err != nil {
+		msg := fmt.Sprintf("❌ 派生会话失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	// 更新用户的 session 映射到新派生的 session
+	h.adapter.MapUserToSession(userID, newSessionID)
+	h.client.ResetSession(data.ConversationId)
+	// 存储新 session 到 thread 映射
+	if data.ConversationId != "" {
+		h.adapter.MapSessionData(newSessionID, "channel", data.SessionWebhook)
+	}
+
+	msg := fmt.Sprintf("🔀 已派生新会话\n\n原会话: %s\n新会话: %s\n\n继续对话将使用新的派生会话（与原会话历史相同）",
+		sessionID[:min(8, len(sessionID))], newSessionID[:min(8, len(newSessionID))])
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	log.Printf("dingtalk: forked session %s -> %s for user %s", sessionID[:8], newSessionID[:8], userID)
+	return nil, nil
+}
+
+// handleCompact 处理压缩/总结会话命令
+// 对应 TUI 中的 session.compact 操作（调用 summarize API）
+func (h *Handler) handleCompact(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 正在压缩会话历史..."))
+
+	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
+		msg := fmt.Sprintf("❌ 压缩会话失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf("✅ 会话 %s 已压缩总结\n\n会话历史已被 AI 摘要，上下文占用将减少。\n后续对话将延续本次会话。", sessionID[:min(8, len(sessionID))])
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return nil, nil
+}
+
+// handleTodo 处理查看任务进度命令
+// 对应 TUI 中的 todo.updated 事件展示
+func (h *Handler) handleTodo(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	todos := h.client.GetTodosForSession(sessionID)
+	if len(todos) == 0 {
+		msg := "📋 当前没有进行中的任务\n\n当 AI 处理复杂请求时，这里会显示任务进度。"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📋 当前任务进度:\n\n")
+	pending, inProgress, completed := 0, 0, 0
+	for _, todo := range todos {
+		var icon string
+		switch todo.Status {
+		case "completed":
+			icon = "✅"
+			completed++
+		case "in_progress":
+			icon = "🔄"
+			inProgress++
+		case "cancelled":
+			icon = "❌"
+		default:
+			icon = "⬜"
+			pending++
+		}
+		sb.WriteString(fmt.Sprintf("%s %s\n", icon, todo.Task))
+	}
+	sb.WriteString(fmt.Sprintf("\n进度: %d 完成, %d 进行中, %d 待处理", completed, inProgress, pending))
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(sb.String()))
+	return nil, nil
+}
+
+// handleDiff 处理查看文件变更命令
+// 对应 TUI 中的 session.diff 事件展示
+func (h *Handler) handleDiff(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	diff := h.client.GetDiffForSession(sessionID)
+	if len(diff) == 0 {
+		msg := "📁 本次会话暂无文件变更\n\n当 AI 修改文件时，这里会显示变更摘要。"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📁 文件变更摘要:\n\n")
+	totalAdded, totalRemoved := 0, 0
+	for _, f := range diff {
+		icon := "📝"
+		if f.Added > 0 && f.Removed == 0 {
+			icon = "🆕"
+		} else if f.Added == 0 && f.Removed > 0 {
+			icon = "🗑️"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s (+%d/-%d)\n", icon, f.Path, f.Added, f.Removed))
+		totalAdded += f.Added
+		totalRemoved += f.Removed
+	}
+	sb.WriteString(fmt.Sprintf("\n共 %d 个文件，+%d/-%d 行", len(diff), totalAdded, totalRemoved))
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(sb.String()))
 	return nil, nil
 }

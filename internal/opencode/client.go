@@ -118,6 +118,23 @@ type QuestionItem struct {
 	Options  []QuestionOption `json:"options"`
 }
 
+// TodoItem represents a single TODO item tracked by OpenCode during a session.
+// Mirrors the "todo.updated" SSE event structure from the OpenCode server.
+type TodoItem struct {
+	ID       string `json:"id"`
+	Task     string `json:"task"`
+	Status   string `json:"status"`   // "pending", "in_progress", "completed", "cancelled"
+	Priority string `json:"priority"` // "high", "medium", "low"
+}
+
+// FileDiff represents changes to a single file within a session.
+// Mirrors the "session.diff" SSE event structure from the OpenCode server.
+type FileDiff struct {
+	Path    string `json:"path"`
+	Added   int    `json:"added"`
+	Removed int    `json:"removed"`
+}
+
 // Question represents a pending question that needs user confirmation
 type Question struct {
 	ID           string         `json:"id"`
@@ -140,7 +157,9 @@ type Client struct {
 	eventHandlers    []EventHandler
 	eventListenerMu  sync.RWMutex
 	sessionHandlers  sync.Map     // map[sessionID]EventHandler for fast lookup
+	activeHandlers   sync.Map     // map[sessionID]*StreamingSessionHandler for todo/diff access
 	messageToSession sync.Map     // map[messageID]sessionID for events with only messageID
+	messageRoles     sync.Map     // map[messageID]role ("user"/"assistant") for filtering user message delta events
 	sessionMu        sync.RWMutex // 用于保护 session 相关操作
 	sessions         sync.Map     // map[threadID]sessionID
 	sessionLocks     sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
@@ -697,6 +716,50 @@ func (c *Client) AbortSession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// ForkSession forks an existing session, creating a new independent session
+// branching from the forked session's history. Uses the HTTP API directly
+// since the Go SDK may not expose this endpoint.
+func (c *Client) ForkSession(ctx context.Context, sessionID string) (string, error) {
+	if c.endpoint == "" {
+		return "", fmt.Errorf("opencode: fork session unavailable: missing endpoint")
+	}
+	log.Printf("opencode: forking session %s", sessionID[:min(8, len(sessionID))])
+
+	forkURL := fmt.Sprintf("%s/session/%s/fork", strings.TrimRight(c.endpoint, "/"), sessionID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, forkURL, http.NoBody)
+	if err != nil {
+		return "", fmt.Errorf("opencode: fork session request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("opencode: fork session do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("opencode: fork session status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("opencode: fork session decode response: %w", err)
+	}
+	if result.ID == "" {
+		return "", fmt.Errorf("opencode: fork session returned empty ID")
+	}
+
+	log.Printf("opencode: forked session %s -> %s", sessionID[:min(8, len(sessionID))], result.ID[:min(8, len(result.ID))])
+	return result.ID, nil
+}
+
 // DeleteSession deletes a session.
 func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	log.Printf("opencode: deleting session %s", sessionID[:8])
@@ -858,13 +921,123 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 			// Extract session ID using shared helper
 			sessionID := extractSessionIDFromEvent(&event)
 
+			// Populate messageRoles for message.part.updated events (regardless of sessionID path)
+			// so that message.part.delta events for user messages can be filtered before broadcast.
+			if eventType == "message.part.updated" {
+				if raw := event.JSON.RawJSON(); raw != "" {
+					// Dump first 15 events for debugging
+					if eventCount <= 15 {
+						log.Printf("opencode: 🔍🔍 [message.part.updated #%d RAW] %.1000s", eventCount, raw)
+					}
+					var msgInfo struct {
+						Properties struct {
+							Message struct {
+								ID   string `json:"id"`
+								Role string `json:"role"`
+							} `json:"message"`
+						} `json:"properties"`
+					}
+					if json.Unmarshal([]byte(raw), &msgInfo) == nil {
+						if msgID := msgInfo.Properties.Message.ID; msgID != "" && msgInfo.Properties.Message.Role != "" {
+							c.messageRoles.Store(msgID, msgInfo.Properties.Message.Role)
+						}
+					}
+				}
+			}
+
+			// ALSO populate messageRoles from message.updated events (which DO contain role)
+			// NOTE: message.updated structure is properties.info.{id,role} NOT properties.message.{id,role}
+			if eventType == "message.updated" {
+				if raw := event.JSON.RawJSON(); raw != "" {
+					var msgInfo struct {
+						Properties struct {
+							Info struct {
+								ID   string `json:"id"`
+								Role string `json:"role"`
+							} `json:"info"`
+						} `json:"properties"`
+					}
+					if json.Unmarshal([]byte(raw), &msgInfo) == nil {
+						if msgID := msgInfo.Properties.Info.ID; msgID != "" && msgInfo.Properties.Info.Role != "" {
+							c.messageRoles.Store(msgID, msgInfo.Properties.Info.Role)
+							log.Printf("opencode: ✅ stored messageRole: msgID=%s, role=%s",
+								msgID[:min(8, len(msgID))], msgInfo.Properties.Info.Role)
+						}
+					}
+				}
+			}
+
+			// For message.part.updated / message.part.delta events the base extractor
+			// may return "" because the sessionID is nested in properties.message.
+			// Re-parse those two types and also build the messageID→sessionID reverse map
+			// so that subsequent delta events can be dispatched correctly.
+			if sessionID == "" && (eventType == "message.part.delta" || eventType == "message.part.updated") {
+				if raw := event.JSON.RawJSON(); raw != "" {
+					var probe struct {
+						Properties struct {
+							MessageID string `json:"messageID"` // present in message.part.delta
+							Message   struct {
+								ID        string `json:"id"`
+								SessionID string `json:"sessionID"`
+								Role      string `json:"role"` // "user" or "assistant"
+							} `json:"message"` // present in message.part.updated
+						} `json:"properties"`
+					}
+					if json.Unmarshal([]byte(raw), &probe) == nil {
+						if probe.Properties.Message.SessionID != "" {
+							// message.part.updated — record messageID→sessionID and messageID→role
+							sessionID = probe.Properties.Message.SessionID
+							if msgID := probe.Properties.Message.ID; msgID != "" {
+								c.messageToSession.Store(msgID, sessionID)
+								if role := probe.Properties.Message.Role; role != "" {
+									c.messageRoles.Store(msgID, role)
+								}
+							}
+						} else if probe.Properties.MessageID != "" {
+							// message.part.delta — look up sessionID via reverse map
+							if sid, ok := c.messageToSession.Load(probe.Properties.MessageID); ok {
+								sessionID = sid.(string)
+							}
+							// If still no sessionID, broadcast — but only for assistant messages
+							// with a KNOWN role. Unknown-role deltas are likely from old/other
+							// sessions being replayed; broadcasting them would echo stale content.
+							if sessionID == "" {
+								role, roleKnown := c.messageRoles.Load(probe.Properties.MessageID)
+								if !roleKnown {
+									log.Printf("opencode: dropping message.part.delta with unknown messageID (likely old session replay)")
+								} else if role.(string) == "user" {
+									log.Printf("opencode: skipping user message.part.delta broadcast (msgID=%s)", probe.Properties.MessageID[:min(8, len(probe.Properties.MessageID))])
+								} else {
+									// Known assistant message — broadcast to all session handlers
+									dispatched := 0
+									c.sessionHandlers.Range(func(k, v interface{}) bool {
+										if err := v.(EventHandler)(ctx, &event); err != nil {
+											log.Printf("opencode: message.part.delta broadcast error (session %v): %v", k, err)
+										}
+										dispatched++
+										return true
+									})
+									if dispatched == 0 {
+										log.Printf("opencode: message.part.delta broadcast - no session handlers registered")
+									}
+								}
+							}
+						}
+					}
+					// Dump first few events for structure verification
+					if eventCount <= 5 {
+						log.Printf("opencode: [raw %s #%d] %.300s", eventType, eventCount, raw)
+					}
+				}
+			}
+
 			if sessionID != "" && len(sessionID) > 8 {
 				log.Printf("opencode: processing event type=%s, sessionID=%s", eventType, sessionID[:8])
-			} else if eventType != "server.heartbeat" && eventType != "server.connected" {
+			} else if eventType != "server.heartbeat" && eventType != "server.connected" && sessionID == "" {
 				log.Printf("opencode: processing event type=%s (no sessionID)", eventType)
 			}
 
-			// Fast path: if session ID found, call the specific session handler
+			// Dispatch to the specific session handler (when sessionID is known)
 			if sessionID != "" {
 				if handler, ok := c.sessionHandlers.Load(sessionID); ok {
 					if err := handler.(EventHandler)(ctx, &event); err != nil {
@@ -872,6 +1045,10 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 					}
 				} else {
 					log.Printf("opencode: no session handler found for %s", sessionID[:8])
+					c.sessionHandlers.Range(func(k, v interface{}) bool {
+						log.Printf("opencode:   registered handler: %v", k)
+						return true
+					})
 				}
 			}
 
@@ -965,6 +1142,25 @@ func (c *Client) RegisterSessionHandler(sessionID string, handler EventHandler) 
 // UnregisterSessionHandler removes an event handler for a specific session.
 func (c *Client) UnregisterSessionHandler(sessionID string) {
 	c.sessionHandlers.Delete(sessionID)
+	c.activeHandlers.Delete(sessionID)
+}
+
+// GetTodosForSession returns the current todo list for a running session.
+// Returns nil if the session has no active handler or no todos.
+func (c *Client) GetTodosForSession(sessionID string) []TodoItem {
+	if h, ok := c.activeHandlers.Load(sessionID); ok {
+		return h.(*StreamingSessionHandler).GetTodos()
+	}
+	return nil
+}
+
+// GetDiffForSession returns the accumulated file-change diff for a session.
+// Returns nil if the session has no active handler or no diff yet.
+func (c *Client) GetDiffForSession(sessionID string) []FileDiff {
+	if h, ok := c.activeHandlers.Load(sessionID); ok {
+		return h.(*StreamingSessionHandler).GetDiff()
+	}
+	return nil
 }
 
 var _ MessageSender = (*Client)(nil)
@@ -1213,6 +1409,7 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		c.UnregisterSessionHandler(sessionID)
 	}, c, c)
 	c.RegisterSessionHandler(sessionID, handler.HandleEvent)
+	c.activeHandlers.Store(sessionID, handler)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
 
 	// 4. 使用goroutine异步发送消息
