@@ -41,6 +41,11 @@ type StreamingSessionHandler struct {
 	onComplete         func()
 	client             *Client       // 用于存储问题
 	messageSender      MessageSender // 用于主动推送消息到用户
+	// 增量内容追踪（对照 TUI sync.tsx 中 message.part.delta / message.part.updated 机制）
+	partTextCache sync.Map   // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
+	partRoles     sync.Map   // partID -> string: 每个 part 所属 message 的 role（"user"/"assistant"），用于过滤用户消息
+	sessionTodos  []TodoItem // 当前 todo 列表（来自 todo.updated 事件）
+	sessionDiff   []FileDiff // 本次会话的文件变更（来自 session.diff 事件）
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -144,17 +149,31 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 	// 只处理 message.part.updated 事件获取增量内容
 	switch eventType {
 	case "message.part.updated":
-		// 检查是否是 step-finish 事件
+		// 先解析 partID 和 role，记录到 partRoles（供 message.part.delta 过滤用户消息）
 		if jsonData := event.JSON.RawJSON(); jsonData != "" {
-			var partData struct {
+			// 🔍 输出原始 JSON 用于诊断
+			log.Printf("opencode: 🔍 message.part.updated RAW JSON (first 800 chars): %.800s", jsonData)
+
+			var partMeta struct {
 				Properties struct {
 					Part struct {
+						ID   string `json:"id"`
 						Type string `json:"type"`
 					} `json:"part"`
+					Message struct {
+						Role string `json:"role"`
+					} `json:"message"`
 				} `json:"properties"`
 			}
-			if err := json.Unmarshal([]byte(jsonData), &partData); err == nil {
-				if partData.Properties.Part.Type == "step-finish" {
+			if err := json.Unmarshal([]byte(jsonData), &partMeta); err == nil {
+				partID := partMeta.Properties.Part.ID
+				role := partMeta.Properties.Message.Role
+				log.Printf("opencode: 🔍 message.part.updated parsed - partID=%s, role=%s, partType=%s",
+					partID[:min(8, len(partID))], role, partMeta.Properties.Part.Type)
+				if partID != "" && role != "" {
+					s.partRoles.Store(partID, role)
+				}
+				if partMeta.Properties.Part.Type == "step-finish" {
 					s.receivedStepFinish = true
 					s.stepFinishTime = time.Now()
 					log.Printf("opencode: 🏁 received step-finish for session %s", s.sessionID[:8])
@@ -162,13 +181,25 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			}
 		}
 
-		// 提取增量内容并发送
-		incremental := s.extractContentFromEvent(event)
+		// 提取增量内容并发送（extractContentFromEvent 内部已检查 role=user 则跳过）
+		// 注意：extractContentFromEvent 内部会更新 partTextCache，但只有 callback 成功后
+		// 才能认为内容已送达；若 callback 失败则需由后续快照重新补发
+		incremental, partID, newCacheText := s.extractContentFromEvent(event)
 		if incremental != "" {
-			s.lastContent += incremental
 			if err := s.callback(incremental); err != nil {
 				log.Printf("opencode: streaming callback error: %v", err)
+				// callback 失败：撤销 extractContentFromEvent 中已做的缓存更新，让下个快照重试
+				if partID != "" && newCacheText != "" {
+					// 回退到快照前的状态（即去掉刚才 store 进去的新内容）
+					prevText := newCacheText[:len(newCacheText)-len(incremental)]
+					if prevText == "" {
+						s.partTextCache.Delete(partID)
+					} else {
+						s.partTextCache.Store(partID, prevText)
+					}
+				}
 			} else {
+				s.lastContent += incremental
 				if !s.contentSent {
 					s.stopWaitingTimer()
 				}
@@ -261,9 +292,115 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			log.Printf("opencode: session.error retry prompt error: %v", err)
 		}
 
+	case "message.part.delta":
+		// 来自 TUI sync.tsx: message.part.delta 是增量文本的主要来源
+		// 结构: {properties: {messageID, partID, field, delta}}
+		// 修复：
+		//   1. 通过 partRoles 过滤 role=user 的消息（避免把用户输入回传给用户）
+		//   2. 同步更新 partTextCache，防止后续 message.part.updated 重复计算 delta
+		if raw := event.JSON.RawJSON(); raw != "" {
+			var d struct {
+				Properties struct {
+					MessageID string `json:"messageID"`
+					PartID    string `json:"partID"`
+					Field     string `json:"field"`
+					Delta     string `json:"delta"`
+				} `json:"properties"`
+			}
+			if err := json.Unmarshal([]byte(raw), &d); err == nil &&
+				d.Properties.Field == "text" && d.Properties.Delta != "" {
+				partID := d.Properties.PartID
+				delta := d.Properties.Delta
+
+				log.Printf("opencode: message.part.delta - session=%s, msgID=%s, partID=%s, delta_len=%d",
+					s.sessionID[:8],
+					d.Properties.MessageID[:min(8, len(d.Properties.MessageID))],
+					partID[:min(8, len(partID))],
+					len(delta))
+
+				// 过滤用户消息：先查 partRoles（由 message.part.updated 填充），
+				// 再查 client.messageRoles（全局 messageID→role 映射，更早可用）
+				if role, ok := s.partRoles.Load(partID); ok && role.(string) == "user" {
+					log.Printf("opencode: 🚫 message.part.delta FILTERED via partRoles (user message, partID=%s)",
+						partID[:min(8, len(partID))])
+					break
+				}
+				if s.client != nil && d.Properties.MessageID != "" {
+					if role, ok := s.client.messageRoles.Load(d.Properties.MessageID); ok && role.(string) == "user" {
+						log.Printf("opencode: 🚫 message.part.delta FILTERED via messageRoles (user message, msgID=%s)",
+							d.Properties.MessageID[:min(8, len(d.Properties.MessageID))])
+						break
+					}
+				}
+
+				// 必须在 callback 成功后才更新 partTextCache；
+				// 若先更新缓存再调 callback，一旦 callback 失败，
+				// 后续 message.part.updated 快照 delta=0 会永久丢丢内容。
+				if err := s.callback(delta); err != nil {
+					log.Printf("opencode: message.part.delta callback error: %v", err)
+					// 不更新缓存：让下一个 message.part.updated 快照把这部分内容补发
+				} else {
+					// callback 成功后才提交缓存，确保"缓存 == 已送达"
+					if partID != "" {
+						existing, _ := s.partTextCache.Load(partID)
+						existingStr, _ := existing.(string)
+						s.partTextCache.Store(partID, existingStr+delta)
+					}
+					s.lastContent += delta
+					if !s.contentSent {
+						s.stopWaitingTimer()
+					}
+					s.contentSent = true
+				}
+				s.lastUpdateTime = time.Now()
+			}
+		}
+
+	case "todo.updated":
+		// TUI sync.tsx: todo.updated 含 {sessionID, todos[]}
+		todos := extractTodosFromEvent(event)
+		if todos != nil {
+			s.sessionTodos = todos
+			log.Printf("opencode: todos updated for session %s (%d items)", s.sessionID[:8], len(todos))
+		}
+
 	case "session.diff":
-		// Session 差异事件，静默处理
-		log.Printf("opencode: session diff for session %s", s.sessionID[:8])
+		// 文件变更事件，存储后在 session.idle 时汇总发送
+		diff := extractDiffFromEvent(event)
+		if len(diff) > 0 {
+			s.sessionDiff = diff
+			log.Printf("opencode: session diff updated for session %s (%d files)", s.sessionID[:8], len(diff))
+		}
+
+	case "message.part.removed":
+		// 清理 partTextCache 中对应的 part 缓存
+		if raw := event.JSON.RawJSON(); raw != "" {
+			var w struct {
+				Properties struct {
+					PartID string `json:"partID"`
+				} `json:"properties"`
+			}
+			if err := json.Unmarshal([]byte(raw), &w); err == nil && w.Properties.PartID != "" {
+				s.partTextCache.Delete(w.Properties.PartID)
+			}
+		}
+		log.Printf("opencode: message part removed for session %s", s.sessionID[:8])
+
+	case "message.removed":
+		log.Printf("opencode: message removed for session %s", s.sessionID[:8])
+
+	case "server.instance.disposed":
+		// 服务器重启，事件监听器主循环负责重连
+		log.Printf("opencode: ⚠️ server instance disposed (session=%s)", s.sessionID[:8])
+
+	case "session.deleted":
+		// 如果被删除的是当前 session，标记为完成
+		deletedID := extractSessionIDFromEvent(event)
+		if deletedID == s.sessionID {
+			log.Printf("opencode: session %s was deleted", s.sessionID[:8])
+			s.completed = true
+			s.notifyCompletion()
+		}
 
 	case "session.created":
 		// Session 创建事件，静默处理
@@ -292,10 +429,17 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 	return nil
 }
 
-// extractContentFromEvent 从 message.part.updated 事件中提取用户可见内容
-func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventListResponse) string {
+// extractContentFromEvent 从 message.part.updated 事件中提取用户可见内容。
+// 返回 (delta, partID, newCacheText)：
+//   - delta：需要发送给用户的增量文本
+//   - partID：对应的 partID（仅 text 类型有值）
+//   - newCacheText：cache 更新后的完整文本（用于 caller 在 callback 失败时回滚）
+//
+// 注意：函数内部会立即更新 partTextCache。若 caller 的 callback 失败，
+// 应将 partTextCache[partID] 回退到 newCacheText[:len(newCacheText)-len(delta)]。
+func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventListResponse) (string, string, string) {
 	if event == nil || event.Type != "message.part.updated" {
-		return ""
+		return "", "", ""
 	}
 
 	type ToolInput struct {
@@ -315,20 +459,19 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 	type PartUpdateProps struct {
 		Delta string `json:"delta"`
 		Part  struct {
-			Type  string    `json:"type"`
-			Tool  string    `json:"tool"`
-			State ToolState `json:"state"`
-			Text  string    `json:"text"`
+			ID        string    `json:"id"`
+			MessageID string    `json:"messageID"` // messageID for role lookup via client.messageRoles
+			Type      string    `json:"type"`
+			Tool      string    `json:"tool"`
+			State     ToolState `json:"state"`
+			Text      string    `json:"text"`
 		} `json:"part"`
-		Message struct {
-			Role string `json:"role"`
-		} `json:"message"`
 	}
 
 	jsonData := event.JSON.RawJSON()
 	if jsonData == "" {
 		log.Printf("opencode: 🔍 extractContent - empty JSON data for session %s", s.sessionID[:8])
-		return ""
+		return "", "", ""
 	}
 
 	var wrapper struct {
@@ -336,50 +479,76 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 	}
 	if err := json.Unmarshal([]byte(jsonData), &wrapper); err != nil {
 		log.Printf("opencode: failed to unmarshal message.part.updated: %v, JSON preview: %.200s", err, jsonData)
-		return ""
+		return "", "", ""
 	}
 
 	props := wrapper.Properties
 
 	// 🔍 详细诊断日志
-	log.Printf("opencode: 🔍 extractContent - session=%s, role=%s, partType=%s, delta_len=%d, text_len=%d",
-		s.sessionID[:8], props.Message.Role, props.Part.Type, len(props.Delta), len(props.Part.Text))
+	log.Printf("opencode: 🔍 extractContent - session=%s, partType=%s, partID=%s, msgID=%s, delta_len=%d, text_len=%d",
+		s.sessionID[:8], props.Part.Type, props.Part.ID, props.Part.MessageID, len(props.Delta), len(props.Part.Text))
 
-	// 忽略用户角色的消息
-	if props.Message.Role == "user" {
-		log.Printf("opencode: 🔍 extractContent - ignoring user role message")
-		return ""
+	// ⚠️ 关键过滤：忽略用户角色的消息
+	var messageRole string
+	if s.client != nil && props.Part.MessageID != "" {
+		if role, ok := s.client.messageRoles.Load(props.Part.MessageID); ok {
+			messageRole = role.(string)
+		}
+	}
+
+	if messageRole == "user" {
+		msgIDPreview := props.Part.MessageID
+		if len(msgIDPreview) > 8 {
+			msgIDPreview = msgIDPreview[:8]
+		}
+		log.Printf("opencode: 🚫 extractContent - FILTERED user role message (partType=%s, partID=%s, msgID=%s)",
+			props.Part.Type, props.Part.ID, msgIDPreview)
+		return "", "", ""
 	}
 
 	partType := props.Part.Type
 
 	switch partType {
 	case "text":
-		// 文本增量 - 只转发有 delta 的事件
+		// 优先使用 delta 字段（部分 server 版本在 message.part.updated 中直接送 delta）
 		if props.Delta != "" {
-			log.Printf("opencode: 🔍 extractContent - returning text delta (%d chars)", len(props.Delta))
-			return props.Delta
+			if props.Part.ID != "" {
+				existing, _ := s.partTextCache.Load(props.Part.ID)
+				existingStr, _ := existing.(string)
+				newCache := existingStr + props.Delta
+				s.partTextCache.Store(props.Part.ID, newCache)
+				log.Printf("opencode: 🔍 extractContent - returning delta from part.updated (%d chars)", len(props.Delta))
+				return props.Delta, props.Part.ID, newCache
+			}
+			log.Printf("opencode: 🔍 extractContent - returning delta from part.updated (no partID, %d chars)", len(props.Delta))
+			return props.Delta, "", ""
 		}
 
-		// delta 为空时，记录诊断信息但不发送
-		// streaming 模式应该通过 delta 逐步发送，完整的 text 字段仅用于调试
-		if props.Part.Text != "" {
-			if s.lastContent == "" {
-				// 尚未发送任何内容，这可能是会话开始时的状态
-				log.Printf("opencode: 🔍 extractContent - text type but delta is empty (session start, text_len=%d)",
-					len(props.Part.Text))
-			} else if len(props.Part.Text) > len(s.lastContent) {
-				// 完整文本比已发送内容更长，可能遗漏了一些 delta
-				log.Printf("opencode: ⚠️ extractContent - text longer than lastContent (text_len=%d, sent_len=%d), possible delta loss",
-					len(props.Part.Text), len(s.lastContent))
-			} else {
-				log.Printf("opencode: 🔍 extractContent - text type but delta is empty (text_len=%d, sent_len=%d)",
-					len(props.Part.Text), len(s.lastContent))
+		// 没有 delta 时，利用 partTextCache 计算增量
+		// 这对应 TUI 中 message.part.updated 携带完整 part.text 而非 delta 的情况
+		if props.Part.Text != "" && props.Part.ID != "" {
+			existing, _ := s.partTextCache.Load(props.Part.ID)
+			existingStr, _ := existing.(string)
+			if len(props.Part.Text) > len(existingStr) {
+				delta := props.Part.Text[len(existingStr):]
+				s.partTextCache.Store(props.Part.ID, props.Part.Text)
+				log.Printf("opencode: 🔍 extractContent - computed delta from cached text (%d new chars, total=%d)",
+					len(delta), len(props.Part.Text))
+				return delta, props.Part.ID, props.Part.Text
+			}
+			// 文本与缓存相同或更短（可能是 snapshot 重置），不发送但仍更新缓存
+			s.partTextCache.Store(props.Part.ID, props.Part.Text)
+		} else if props.Part.Text != "" {
+			// 没有 partID 时，用 lastContent 估算增量（兼容旧行为）
+			if len(props.Part.Text) > len(s.lastContent) {
+				delta := props.Part.Text[len(s.lastContent):]
+				log.Printf("opencode: 🔍 extractContent - inferred delta (no partID, %d chars)", len(delta))
+				return delta, "", ""
 			}
 		}
 
 	case "tool":
-		// 工具调用事件
+		// 工具调用事件（不涉及 partTextCache，直接返回格式化文本）
 		toolName := props.Part.Tool
 		state := props.Part.State
 		log.Printf("opencode: 🔍 extractContent - tool event: name=%s, status=%s", toolName, state.Status)
@@ -400,17 +569,16 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 				if len([]rune(desc)) > 80 {
 					desc = string([]rune(desc)[:80]) + "..."
 				}
-				return fmt.Sprintf("🔧 [%s] %s\n", toolName, desc)
+				return fmt.Sprintf("🔧 [%s] %s\n", toolName, desc), "", ""
 			}
-			return fmt.Sprintf("🔧 正在执行 %s...\n", toolName)
+			return fmt.Sprintf("🔧 正在执行 %s...\n", toolName), "", ""
 
 		case "completed":
 			output := strings.TrimSpace(state.Output)
 			if output != "" && len([]rune(output)) <= 200 {
-				return fmt.Sprintf("✅ [%s] %s\n", toolName, output)
+				return fmt.Sprintf("✅ [%s] %s\n", toolName, output), "", ""
 			}
-			// 输出为空或过长，仍发送简短完成通知
-			return fmt.Sprintf("✅ [%s] 完成\n", toolName)
+			return fmt.Sprintf("✅ [%s] 完成\n", toolName), "", ""
 
 		case "error":
 			errMsg := strings.TrimSpace(state.Error)
@@ -420,7 +588,7 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 			if len([]rune(errMsg)) > 200 {
 				errMsg = string([]rune(errMsg)[:200]) + "..."
 			}
-			return fmt.Sprintf("❌ [%s] %s\n", toolName, errMsg)
+			return fmt.Sprintf("❌ [%s] %s\n", toolName, errMsg), "", ""
 		}
 
 	case "reasoning", "step-start", "step-finish", "snapshot", "patch", "compaction":
@@ -435,7 +603,7 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 			partType, s.sessionID[:8], jsonData)
 	}
 
-	return ""
+	return "", "", ""
 }
 
 // extractSessionError 从 session.error 事件中提取错误信息
@@ -878,8 +1046,29 @@ func (s *StreamingSessionHandler) IsActivelyProcessing() bool {
 	return time.Since(s.lastEventTime) < 30*time.Second
 }
 
+// FlushSignal is a special callback token that tells adapters to immediately
+// flush all accumulated-but-unsent content to the user.  It is sent by
+// notifyCompletion AFTER all regular callbacks so that the flush runs
+// synchronously inside the SSE goroutine (while s.mu is held), guaranteeing
+// that SendMessageStreaming cannot return before the final send completes.
+const FlushSignal = "\x00flush"
+
 func (s *StreamingSessionHandler) notifyCompletion() {
 	s.stopWaitingTimer()
+
+	// 如果有文件变更，在完成时追加摘要
+	if len(s.sessionDiff) > 0 {
+		diffMsg := s.FormatDiffSummary()
+		if diffMsg != "" {
+			_ = s.callback(diffMsg)
+		}
+	}
+
+	// 发送 flush 信号：让 adapter 立即把 fullReply 中尚未发送的内容全部发出去。
+	// 这发生在 SSE goroutine 持有 s.mu 期间，确保在 SendMessageStreaming 返回之前
+	// 最终内容已经发送完毕，避免任何竞态条件。
+	_ = s.callback(FlushSignal)
+
 	if s.onComplete != nil {
 		go s.onComplete()
 	}
@@ -890,6 +1079,167 @@ func (s *StreamingSessionHandler) stopWaitingTimer() {
 	if s.waitingTimer != nil {
 		s.waitingTimer.Stop()
 	}
+}
+
+// extractPartDelta 从 message.part.delta 事件中提取增量文本
+// 对照 TUI sync.tsx 中的 "message.part.delta" case 实现
+// 事件结构: {properties: {messageID, partID, field, delta}}
+func (s *StreamingSessionHandler) extractPartDelta(event *opencode.EventListResponse) string {
+	if event == nil || event.Type != "message.part.delta" {
+		return ""
+	}
+	raw := event.JSON.RawJSON()
+	if raw == "" {
+		return ""
+	}
+	var wrapper struct {
+		Properties struct {
+			MessageID string `json:"messageID"`
+			PartID    string `json:"partID"`
+			Field     string `json:"field"`
+			Delta     string `json:"delta"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
+		log.Printf("opencode: failed to parse message.part.delta: %v", err)
+		return ""
+	}
+	props := wrapper.Properties
+	// 只处理 text 字段的增量（忽略 reasoning、snapshot 等内部字段）
+	if props.Field != "text" {
+		log.Printf("opencode: message.part.delta field=%s (not text, ignored for session %s)", props.Field, s.sessionID[:8])
+		return ""
+	}
+	if props.Delta == "" {
+		return ""
+	}
+	// 更新 partTextCache 保持与全文状态同步
+	if props.PartID != "" {
+		existing, _ := s.partTextCache.Load(props.PartID)
+		existingStr, _ := existing.(string)
+		s.partTextCache.Store(props.PartID, existingStr+props.Delta)
+	}
+	log.Printf("opencode: message.part.delta: partID=%s, delta_len=%d for session %s",
+		props.PartID, len(props.Delta), s.sessionID[:8])
+	return props.Delta
+}
+
+// extractTodosFromEvent 从 todo.updated 事件中解析 todo 列表
+// 对照 TUI sync.tsx: {properties: {sessionID, todos[]}}
+func extractTodosFromEvent(event *opencode.EventListResponse) []TodoItem {
+	if event == nil || event.Type != "todo.updated" {
+		return nil
+	}
+	raw := event.JSON.RawJSON()
+	if raw == "" {
+		return nil
+	}
+	var wrapper struct {
+		Properties struct {
+			SessionID string     `json:"sessionID"`
+			Todos     []TodoItem `json:"todos"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
+		log.Printf("opencode: failed to parse todo.updated: %v", err)
+		return nil
+	}
+	return wrapper.Properties.Todos
+}
+
+// extractDiffFromEvent 从 session.diff 事件中解析文件变更列表
+// 对照 TUI sync.tsx: {properties: {sessionID, diff[]}}
+func extractDiffFromEvent(event *opencode.EventListResponse) []FileDiff {
+	if event == nil || event.Type != "session.diff" {
+		return nil
+	}
+	raw := event.JSON.RawJSON()
+	if raw == "" {
+		return nil
+	}
+	var wrapper struct {
+		Properties struct {
+			SessionID string     `json:"sessionID"`
+			Diff      []FileDiff `json:"diff"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
+		log.Printf("opencode: failed to parse session.diff: %v", err)
+		return nil
+	}
+	return wrapper.Properties.Diff
+}
+
+// GetTodos 返回本次会话当前的 todo 列表（线程安全）
+func (s *StreamingSessionHandler) GetTodos() []TodoItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]TodoItem, len(s.sessionTodos))
+	copy(result, s.sessionTodos)
+	return result
+}
+
+// GetDiff 返回本次会话的文件变更列表（线程安全）
+func (s *StreamingSessionHandler) GetDiff() []FileDiff {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]FileDiff, len(s.sessionDiff))
+	copy(result, s.sessionDiff)
+	return result
+}
+
+// FormatDiffSummary 将文件变更格式化为用户友好的文本摘要
+func (s *StreamingSessionHandler) FormatDiffSummary() string {
+	if len(s.sessionDiff) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n\n📁 **文件变更摘要**\n")
+	totalAdded, totalRemoved := 0, 0
+	for _, f := range s.sessionDiff {
+		icon := "📝"
+		if f.Added > 0 && f.Removed == 0 {
+			icon = "🆕"
+		} else if f.Added == 0 && f.Removed > 0 {
+			icon = "🗑️"
+		}
+		sb.WriteString(fmt.Sprintf("%s `%s`", icon, f.Path))
+		if f.Added > 0 || f.Removed > 0 {
+			sb.WriteString(fmt.Sprintf(" (+%d/-%d)", f.Added, f.Removed))
+		}
+		sb.WriteString("\n")
+		totalAdded += f.Added
+		totalRemoved += f.Removed
+	}
+	if len(s.sessionDiff) > 1 {
+		sb.WriteString(fmt.Sprintf("共 %d 个文件，+%d/-%d 行\n", len(s.sessionDiff), totalAdded, totalRemoved))
+	}
+	return sb.String()
+}
+
+// FormatTodoSummary 将 todo 列表格式化为用户友好的文本
+func (s *StreamingSessionHandler) FormatTodoSummary() string {
+	todos := s.GetTodos()
+	if len(todos) == 0 {
+		return "📋 暂无待办任务"
+	}
+	var sb strings.Builder
+	sb.WriteString("📋 **当前任务列表**\n")
+	for _, todo := range todos {
+		var icon string
+		switch todo.Status {
+		case "completed":
+			icon = "✅"
+		case "in_progress":
+			icon = "🔄"
+		case "cancelled":
+			icon = "❌"
+		default:
+			icon = "⬜"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s\n", icon, todo.Task))
+	}
+	return sb.String()
 }
 
 // extractSessionIDFromEvent 从事件中提取 sessionID

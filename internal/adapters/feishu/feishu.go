@@ -318,6 +318,26 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return "handled", nil
 	}
 
+	// Handle /fork command to fork the current session
+	if content == "/fork" {
+		return h.handleFork(ctx, target, msg.UserID)
+	}
+
+	// Handle /compact command to compact/summarize the current session
+	if content == "/compact" || content == "/summarize" || content == "总结" {
+		return h.handleCompact(ctx, target, msg.UserID)
+	}
+
+	// Handle /todo command to show current todo list
+	if content == "/todo" || content == "/todos" || content == "任务" {
+		return h.handleTodo(ctx, target, msg.UserID)
+	}
+
+	// Handle /diff command to show current file changes
+	if content == "/diff" || content == "/changes" || content == "变更" {
+		return h.handleDiff(ctx, target, msg.UserID)
+	}
+
 	// Handle /crontask command for scheduled tasks
 	if strings.HasPrefix(content, "/crontask") {
 		return h.handleCronTask(ctx, target, msg.UserID, content)
@@ -331,10 +351,43 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 	sessionID, _ = h.adapter.GetSessionForUser(msg.UserID)
 	var fullReply strings.Builder
+	var fullReplyMu sync.Mutex // 保护 fullReply / lastSentLength / lastUpdateTime 的并发访问
+
+	// 使用独立的 context，避免被飞书 SDK 的事件处理超时影响
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer sendCancel()
+
+	// 中间更新追踪（与 DingTalk 适配器保持一致，流式发送避免最终消息丢失）
+	var lastSentLength int
+	lastUpdateTime := time.Now()
+	const minUpdateInterval = 5 * time.Second
+	const minUpdateChars = 300
 
 	callback := func(chunk string) error {
 		raw := chunk
 		trimmed := strings.TrimSpace(chunk)
+
+		// FlushSignal: session 结束，立即发送所有尚未发送的内容
+		if chunk == opencode.FlushSignal {
+			fullReplyMu.Lock()
+			toSend := fullReply.String()[lastSentLength:]
+			sentUpTo := fullReply.Len()
+			fullReplyMu.Unlock()
+			if len(toSend) > 0 {
+				log.Printf("feishu: 📤 flush signal: sending final %d bytes", len(toSend))
+				if err := h.sendTextChunks(sendCtx, target, toSend); err != nil {
+					log.Printf("feishu: ⚠️ flush send failed: %v", err)
+					// don't update lastSentLength; safety-net final send will retry
+				} else {
+					fullReplyMu.Lock()
+					lastSentLength = sentUpTo
+					fullReplyMu.Unlock()
+					log.Printf("feishu: ✅ flush send done (%d bytes)", sentUpTo)
+				}
+			}
+			return nil
+		}
+
 		if trimmed == "" {
 			return nil
 		}
@@ -344,20 +397,51 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		}
 		if isImmediateChunk(trimmed) {
 			log.Printf("feishu: 📤 sending immediate message: %s", trimmed[:min(50, len(trimmed))])
-			if err := h.sendTextChunks(ctx, target, raw); err != nil {
+			if err := h.sendTextChunks(sendCtx, target, raw); err != nil {
 				log.Printf("feishu: ⚠️ failed to send immediate message: %v", err)
 				// 发送失败时的处理：
 				// - 对于"正在处理中"提示：只返回error保持waiting timer活跃，不加入fullReply（避免污染最终内容）
 				// - 对于其他重要消息（权限、问题等）：加入fullReply确保不丢失
+				fullReplyMu.Lock()
 				if !strings.Contains(trimmed, "正在努力处理中") && !strings.Contains(trimmed, "正在处理") {
 					fullReply.WriteString(raw)
 				}
+				fullReplyMu.Unlock()
 				return err
 			}
 			log.Printf("feishu: ✅ immediate message sent successfully")
 			return nil
 		}
+
+		fullReplyMu.Lock()
 		fullReply.WriteString(raw)
+
+		// 流式中间更新：每 5 秒且累积 300+ 新字符时发送一次，避免最终消息丢失
+		timeSinceLastUpdate := time.Since(lastUpdateTime)
+		currentLen := fullReply.Len()
+		newContentLen := currentLen - lastSentLength
+		var toSend string
+		var prevLastSent int
+		shouldSend := newContentLen >= minUpdateChars && timeSinceLastUpdate >= minUpdateInterval
+		if shouldSend {
+			toSend = fullReply.String()[lastSentLength:]
+			prevLastSent = lastSentLength
+			_ = prevLastSent
+		}
+		fullReplyMu.Unlock()
+
+		if shouldSend {
+			log.Printf("feishu: 📤 sending intermediate update (%d new chars, interval: %s)", newContentLen, timeSinceLastUpdate)
+			if err := h.sendTextChunks(sendCtx, target, toSend); err != nil {
+				log.Printf("feishu: ⚠️ failed to send intermediate update: %v", err)
+				// 发送失败不中断流，下次会重试（包含这部分内容）
+			} else {
+				fullReplyMu.Lock()
+				lastSentLength = currentLen
+				lastUpdateTime = time.Now()
+				fullReplyMu.Unlock()
+			}
+		}
 		return nil
 	}
 
@@ -366,7 +450,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		threadID = msg.MessageID
 	}
 
-	response, err := h.client.SendMessageStreaming(ctx, opencode.MessagePayload{
+	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:   "feishu",
 		UserID:    msg.UserID,
 		ThreadID:  threadID,
@@ -388,7 +472,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 	if err != nil {
 		errMsg := fmt.Sprintf("❌ 处理失败: %v", err)
-		_ = h.sendTextChunks(ctx, target, errMsg)
+		_ = h.sendTextChunks(sendCtx, target, errMsg)
 		return "", err
 	}
 
@@ -401,25 +485,35 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// Send final reply - handle both sync and async modes
 	if response.Reply != "" {
 		// Sync mode - response.Reply contains the full response
-		if err := h.sendTextChunks(ctx, target, response.Reply); err != nil {
+		if err := h.sendTextChunks(sendCtx, target, response.Reply); err != nil {
 			log.Printf("feishu: failed to send sync reply: %v", err)
 			return response.Reply, err
 		}
 		log.Printf("feishu: sent sync reply to user %s (%d chars)", userLabel, len(response.Reply))
 	} else {
-		// Async mode - check accumulated content from streaming
+		// Async mode - send only the remaining unsent content
+		// 用 mutex 确保读到 callback goroutine 写入的完整内容
+		fullReplyMu.Lock()
 		accumulatedContent := fullReply.String()
-		if len(accumulatedContent) > 0 {
-			// We have accumulated content, send it as final message
-			finalMsg := fmt.Sprintf("✅ 处理完成\n\n%s", accumulatedContent)
-			if err := h.sendTextChunks(ctx, target, finalMsg); err != nil {
-				log.Printf("feishu: failed to send accumulated reply: %v", err)
+		sentSoFar := lastSentLength
+		fullReplyMu.Unlock()
+
+		unsentContent := accumulatedContent[sentSoFar:]
+		if len(unsentContent) > 0 {
+			log.Printf("feishu: 📤 sending final message (%d total bytes, %d unsent bytes)",
+				len(accumulatedContent), len(unsentContent))
+			if err := h.sendTextChunks(sendCtx, target, unsentContent); err != nil {
+				log.Printf("feishu: ❌ failed to send final message: %v", err)
 				return accumulatedContent, err
 			}
-			log.Printf("feishu: sent accumulated reply to user %s (%d chars)", userLabel, len(accumulatedContent))
-		} else {
+			log.Printf("feishu: ✅ sent final message to user %s (%d bytes total, %d new)",
+				userLabel, len(accumulatedContent), len(unsentContent))
+		} else if len(accumulatedContent) == 0 {
 			// No accumulated content (might be interactive task like permission request)
 			log.Printf("feishu: async mode completed for user %s with no accumulated content", userLabel)
+		} else {
+			log.Printf("feishu: async mode completed for user %s, all content already sent (%d bytes)",
+				userLabel, len(accumulatedContent))
 		}
 	}
 
@@ -560,7 +654,11 @@ func (h *Handler) sendTextMessage(ctx context.Context, target chatTarget, conten
 		target.receiveIDType = "open_id"
 	}
 
-	token, err := h.getAccessToken(ctx)
+	// 使用独立 context，避免父 context 取消时中断消息发送
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer httpCancel()
+
+	token, err := h.getAccessToken(httpCtx)
 	if err != nil {
 		return fmt.Errorf("feishu: get access token: %w", err)
 	}
@@ -581,7 +679,7 @@ func (h *Handler) sendTextMessage(ctx context.Context, target chatTarget, conten
 	}
 
 	apiURL := fmt.Sprintf("%s/im/v1/messages?receive_id_type=%s", FeiShuAPIEndpoint, target.receiveIDType)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, apiURL, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("feishu: create message request: %w", err)
 	}
@@ -649,7 +747,12 @@ func (h *Handler) getAccessToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("feishu: marshal token payload: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(data))
+
+	// 使用独立 context，避免父 context 取消时影响 token 获取
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer reqCancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, apiURL, bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("feishu: create token request: %w", err)
 	}
@@ -851,7 +954,10 @@ func isImmediateChunk(text string) bool {
 	if trimmed == "" {
 		return false
 	}
-	for _, prefix := range []string{"⏳", "⏱️", "🔐", "❓", "⚠️"} {
+	// 立即发送的消息类型：
+	// - 状态提示（⏳⏱️🔐❓⚠️）
+	// - 工具调用实时反馈（🔧 正在执行... / ✅ 完成 / ❌ 失败）
+	for _, prefix := range []string{"⏳", "⏱️", "🔐", "❓", "⚠️", "🔧", "✅ [", "❌ ["} {
 		if strings.HasPrefix(trimmed, prefix) {
 			return true
 		}
@@ -1008,6 +1114,10 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 /abort 或 /stop - 中止当前任务
 /refresh - 刷新技能缓存
 /answer <question_id> <answer> - 回答待确认的问题
+/fork 或 派生 - 派生当前会话（保留历史，开启新分支）
+/compact 或 总结 - 压缩会话历史，减少上下文占用
+/todo 或 任务 - 查看当前任务进度列表
+/diff 或 变更 - 查看本次会话的文件变更摘要
 
 ❓ 问题排查：
 • 如果提示"请求处理中"：请等待当前请求完成
@@ -1486,6 +1596,125 @@ func (h *Handler) sendCronTaskHelp(ctx context.Context, target chatTarget) (stri
 💡 提示: 任务会在指定时间自动执行，结果会发送到当前会话`
 
 	_ = h.sendTextChunks(ctx, target, helpMsg)
+	return "handled", nil
+}
+
+// handleFork 处理派生会话命令（对应 TUI session.fork）
+func (h *Handler) handleFork(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话")
+		return "handled", nil
+	}
+
+	newSessionID, err := h.client.ForkSession(ctx, sessionID)
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 派生会话失败: %v", err))
+		return "", err
+	}
+
+	h.adapter.MapUserToSession(userID, newSessionID)
+	h.adapter.MapSessionData(newSessionID, "receive_id", target.receiveID)
+	h.adapter.MapSessionData(newSessionID, "receive_id_type", target.receiveIDType)
+
+	msg := fmt.Sprintf("🔀 已派生新会话\n\n原会话: %s\n新会话: %s\n\n继续对话将使用新的派生会话（与原会话历史相同）",
+		sessionID[:min(8, len(sessionID))], newSessionID[:min(8, len(newSessionID))])
+	_ = h.sendTextChunks(ctx, target, msg)
+	log.Printf("feishu: forked session %s -> %s for user %s", sessionID[:8], newSessionID[:8], userID)
+	return "handled", nil
+}
+
+// handleCompact 处理压缩/总结会话命令（对应 TUI session.compact）
+func (h *Handler) handleCompact(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话")
+		return "handled", nil
+	}
+
+	_ = h.sendTextChunks(ctx, target, "⏳ 正在压缩会话历史...")
+
+	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 压缩会话失败: %v", err))
+		return "", err
+	}
+
+	msg := fmt.Sprintf("✅ 会话 %s 已压缩总结\n\n会话历史已被 AI 摘要，上下文占用将减少。", sessionID[:min(8, len(sessionID))])
+	_ = h.sendTextChunks(ctx, target, msg)
+	return "handled", nil
+}
+
+// handleTodo 处理查看任务进度命令（对应 TUI todo.updated 事件展示）
+func (h *Handler) handleTodo(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话")
+		return "handled", nil
+	}
+
+	todos := h.client.GetTodosForSession(sessionID)
+	if len(todos) == 0 {
+		_ = h.sendTextChunks(ctx, target, "📋 当前没有进行中的任务\n\n当 AI 处理复杂请求时，这里会显示任务进度。")
+		return "handled", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📋 当前任务进度:\n\n")
+	pending, inProgress, completed := 0, 0, 0
+	for _, todo := range todos {
+		var icon string
+		switch todo.Status {
+		case "completed":
+			icon = "✅"
+			completed++
+		case "in_progress":
+			icon = "🔄"
+			inProgress++
+		case "cancelled":
+			icon = "❌"
+		default:
+			icon = "⬜"
+			pending++
+		}
+		sb.WriteString(fmt.Sprintf("%s %s\n", icon, todo.Task))
+	}
+	sb.WriteString(fmt.Sprintf("\n进度: %d 完成, %d 进行中, %d 待处理", completed, inProgress, pending))
+
+	_ = h.sendTextChunks(ctx, target, sb.String())
+	return "handled", nil
+}
+
+// handleDiff 处理查看文件变更命令（对应 TUI session.diff 事件展示）
+func (h *Handler) handleDiff(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话")
+		return "handled", nil
+	}
+
+	diff := h.client.GetDiffForSession(sessionID)
+	if len(diff) == 0 {
+		_ = h.sendTextChunks(ctx, target, "📁 本次会话暂无文件变更\n\n当 AI 修改文件时，这里会显示变更摘要。")
+		return "handled", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📁 文件变更摘要:\n\n")
+	totalAdded, totalRemoved := 0, 0
+	for _, f := range diff {
+		icon := "📝"
+		if f.Added > 0 && f.Removed == 0 {
+			icon = "🆕"
+		} else if f.Added == 0 && f.Removed > 0 {
+			icon = "🗑️"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s (+%d/-%d)\n", icon, f.Path, f.Added, f.Removed))
+		totalAdded += f.Added
+		totalRemoved += f.Removed
+	}
+	sb.WriteString(fmt.Sprintf("\n共 %d 个文件，+%d/-%d 行", len(diff), totalAdded, totalRemoved))
+
+	_ = h.sendTextChunks(ctx, target, sb.String())
 	return "handled", nil
 }
 
