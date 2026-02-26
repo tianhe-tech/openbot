@@ -13,6 +13,8 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,6 +99,14 @@ type ModelConfig struct {
 	LastUpdated   time.Time
 }
 
+// ModelCapability stores model input/output modality capabilities.
+type ModelCapability struct {
+	ProviderID       string
+	ModelID          string
+	InputModalities  map[string]bool
+	OutputModalities map[string]bool
+}
+
 // RequestRecord 记录已处理的请求用于去重
 type RequestRecord struct {
 	Hash      string
@@ -159,36 +169,42 @@ type Question struct {
 
 // Client knows how to talk to the remote OpenCode service using the official SDK.
 type Client struct {
-	sdk              *opencode.Client
-	endpoint         string
-	apiKey           string
-	httpClient       *http.Client
-	eventHandlers    []EventHandler
-	eventListenerMu  sync.RWMutex
-	sessionHandlers  sync.Map     // map[sessionID]EventHandler for fast lookup
-	activeHandlers   sync.Map     // map[sessionID]*StreamingSessionHandler for todo/diff access
-	messageToSession sync.Map     // map[messageID]sessionID for events with only messageID
-	messageRoles     sync.Map     // map[messageID]role ("user"/"assistant") for filtering user message delta events
-	sessionMu        sync.RWMutex // 用于保护 session 相关操作
-	sessions         sync.Map     // map[threadID]sessionID
-	sessionLocks     sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
-	sessionsMu       sync.RWMutex // 保护 sessions 的读写
-	messageCount     sync.Map     // map[sessionID]int tracks messages per session
-	tokenCount       sync.Map     // map[sessionID]int tracks estimated tokens per session
-	sessionSummary   sync.Map     // map[sessionID]string stores session summaries
-	modelConfig      sync.Map     // map[sessionID]*ModelConfig caches model config per session
-	requestCache     sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
-	runningSessions  sync.Map     // map[sessionID]bool 跟踪正在运行的session
-	pendingQuestions sync.Map     // map[questionID]*Question 待回答的问题
-	directory        string
-	timeout          time.Duration // 默认超时时间
-	retryConfig      RetryConfig   // 重试配置
-	enableSkillHint  bool          // 是否在消息中添加skill提示
-	skillHintCache   []string      // 缓存的可用skill列表
-	skillCacheMu     sync.RWMutex
-	lastHealthCheck  time.Time    // 最后一次健康检查时间
-	isHealthy        bool         // OpenCode server是否健康
-	healthCheckMu    sync.RWMutex // 保护健康状态
+	sdk               *opencode.Client
+	endpoint          string
+	apiKey            string
+	httpClient        *http.Client
+	eventHandlers     []EventHandler
+	eventListenerMu   sync.RWMutex
+	sessionHandlers   sync.Map     // map[sessionID]EventHandler for fast lookup
+	activeHandlers    sync.Map     // map[sessionID]*StreamingSessionHandler for todo/diff access
+	messageToSession  sync.Map     // map[messageID]sessionID for events with only messageID
+	messageRoles      sync.Map     // map[messageID]role ("user"/"assistant") for filtering user message delta events
+	sessionMu         sync.RWMutex // 用于保护 session 相关操作
+	sessions          sync.Map     // map[threadID]sessionID
+	sessionLocks      sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
+	sessionsMu        sync.RWMutex // 保护 sessions 的读写
+	messageCount      sync.Map     // map[sessionID]int tracks messages per session
+	tokenCount        sync.Map     // map[sessionID]int tracks estimated tokens per session
+	sessionSummary    sync.Map     // map[sessionID]string stores session summaries
+	modelConfig       sync.Map     // map[sessionID]*ModelConfig caches model config per session
+	sessionModel      sync.Map     // map[sessionID]*ModelConfig tracks latest provider/model seen in assistant replies
+	requestCache      sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
+	runningSessions   sync.Map     // map[sessionID]bool 跟踪正在运行的session
+	pendingQuestions  sync.Map     // map[questionID]*Question 待回答的问题
+	modelCatalogMu    sync.RWMutex
+	modelCatalog      map[string]*ModelCapability // key: providerID/modelID
+	defaultModelMu    sync.RWMutex
+	defaultModel      *ModelConfig
+	directory         string
+	timeout           time.Duration // 默认超时时间
+	retryConfig       RetryConfig   // 重试配置
+	debugMediaRouting bool          // 是否启用多模态路由调试日志
+	enableSkillHint   bool          // 是否在消息中添加skill提示
+	skillHintCache    []string      // 缓存的可用skill列表
+	skillCacheMu      sync.RWMutex
+	lastHealthCheck   time.Time    // 最后一次健康检查时间
+	isHealthy         bool         // OpenCode server是否健康
+	healthCheckMu     sync.RWMutex // 保护健康状态
 
 }
 
@@ -230,6 +246,30 @@ func WithSkillHint(enable bool) Option {
 	}
 }
 
+// WithDebugMediaRouting enables detailed media routing debug logs.
+func WithDebugMediaRouting(enable bool) Option {
+	return func(c *Client) {
+		c.debugMediaRouting = enable
+	}
+}
+
+func parseEnvBool(key string) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err == nil {
+		return b
+	}
+	switch strings.ToLower(v) {
+	case "1", "y", "yes", "on", "enable", "enabled":
+		return true
+	default:
+		return false
+	}
+}
+
 // NewClient builds a Client instance using the official OpenCode SDK.
 func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 	client := &Client{
@@ -260,9 +300,11 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 				"500",
 			},
 		},
-		enableSkillHint: false,       // 默认禁用skill提示
-		isHealthy:       false,       // 初始状态未知
-		lastHealthCheck: time.Time{}, // 未检查过
+		enableSkillHint:   false, // 默认禁用skill提示
+		debugMediaRouting: parseEnvBool("OPENBOT_DEBUG_MEDIA_ROUTING"),
+		modelCatalog:      make(map[string]*ModelCapability),
+		isHealthy:         false,       // 初始状态未知
+		lastHealthCheck:   time.Time{}, // 未检查过
 	}
 
 	for _, opt := range opts {
@@ -280,6 +322,11 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 			log.Printf("opencode: initial health check failed: %v", err)
 		} else {
 			log.Printf("opencode: initial health check succeeded")
+			if err := client.refreshModelCatalog(ctx); err != nil {
+				log.Printf("opencode: initial model catalog fetch failed: %v", err)
+			} else {
+				log.Printf("opencode: initial model catalog loaded")
+			}
 		}
 	}()
 
@@ -561,6 +608,15 @@ sendMessage:
 	// ========== 增强消息内容 ==========
 	// 添加skill提示（仅在session开始时）
 	enhancedContent := c.enhanceContentWithSkillHint(payload.Content, sessionID)
+	effectiveContent := enhancedContent
+
+	// ========== 多模态兼容处理 ==========
+	// 若当前会话模型不支持图片/视频，则使用支持模型先识别媒体，再将识别结果转为文本发给当前会话模型。
+	if processed, err := c.preprocessAttachmentsForSession(ctx, sessionID, &payload, &effectiveContent); err != nil {
+		log.Printf("opencode: media preprocessing failed for session %s: %v", sessionID[:8], err)
+	} else if processed {
+		log.Printf("opencode: media preprocessing applied for session %s", sessionID[:8])
+	}
 
 	// Build message parts
 	parts := []opencode.SessionPromptParamsPartUnion{}
@@ -580,7 +636,7 @@ sendMessage:
 
 	// Add text content (使用增强后的内容)
 	parts = append(parts, opencode.TextPartInputParam{
-		Text: opencode.F(enhancedContent),
+		Text: opencode.F(effectiveContent),
 		Type: opencode.F(opencode.TextPartInputTypeText),
 	})
 
@@ -614,7 +670,7 @@ sendMessage:
 		// 仅统计用户消息本身的tokens，回复在事件流中获取
 		count, _ := c.messageCount.LoadOrStore(sessionID, 0)
 		c.messageCount.Store(sessionID, count.(int)+1)
-		estimatedMsgTokens := estimateTokens(payload.Content)
+		estimatedMsgTokens := estimateTokens(effectiveContent)
 		tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
 		c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens)
 
@@ -633,7 +689,7 @@ sendMessage:
 	// 标记session为运行状态
 	c.runningSessions.Store(sessionID, true)
 
-	result, err := c.sendPromptWithRetry(ctx, sessionID, parts)
+	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, nil)
 
 	// 清除运行状态
 	c.runningSessions.Delete(sessionID)
@@ -651,10 +707,13 @@ sendMessage:
 	c.messageCount.Store(sessionID, count.(int)+1)
 
 	// 更新token计数（估算用户消息 + AI回复）
-	estimatedMsgTokens := estimateTokens(payload.Content)
+	estimatedMsgTokens := estimateTokens(effectiveContent)
 	estimatedReplyTokens := estimateTokens(reply)
 	tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
 	c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens+estimatedReplyTokens)
+
+	// 缓存本次实际使用的模型信息（若SDK返回）
+	c.updateSessionModel(sessionID, result.Info.ProviderID, result.Info.ModelID)
 
 	response := Response{
 		Reply:     reply,
@@ -804,15 +863,101 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 }
 
 // GetProviders retrieves the list of available providers.
-// Note: This may require direct API call as SDK may not support it yet
+// Uses SDK App.Providers endpoint (/config/providers).
 func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
 	if !c.Ready() {
 		return nil, fmt.Errorf("opencode: client not configured")
 	}
 
-	// For now, return empty list - would need direct HTTP call to /config/providers
-	log.Printf("opencode: GetProviders not fully implemented in SDK yet")
-	return []Provider{}, nil
+	params := opencode.AppProvidersParams{}
+	if c.directory != "" {
+		params.Directory = opencode.F(c.directory)
+	}
+
+	result, err := c.sdk.App.Providers(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: list providers: %w", err)
+	}
+	if result == nil || len(result.Providers) == 0 {
+		c.modelCatalogMu.Lock()
+		c.modelCatalog = map[string]*ModelCapability{}
+		c.modelCatalogMu.Unlock()
+		return []Provider{}, nil
+	}
+
+	for _, v := range result.Default {
+		parts := strings.SplitN(strings.TrimSpace(v), "/", 2)
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			c.defaultModelMu.Lock()
+			c.defaultModel = &ModelConfig{ProviderID: parts[0], ModelID: parts[1], LastUpdated: time.Now()}
+			c.defaultModelMu.Unlock()
+			break
+		}
+	}
+
+	providers := make([]Provider, 0, len(result.Providers))
+	newCatalog := make(map[string]*ModelCapability)
+	for _, p := range result.Providers {
+		models := make([]Model, 0, len(p.Models))
+		for modelKey, m := range p.Models {
+			modelID := m.ID
+			if modelID == "" {
+				modelID = modelKey
+			}
+
+			inputModalities := make([]string, 0, len(m.Modalities.Input))
+			inputMap := make(map[string]bool)
+			for _, in := range m.Modalities.Input {
+				s := string(in)
+				if s == "" {
+					continue
+				}
+				inputModalities = append(inputModalities, s)
+				inputMap[s] = true
+			}
+
+			outputModalities := make([]string, 0, len(m.Modalities.Output))
+			outputMap := make(map[string]bool)
+			for _, out := range m.Modalities.Output {
+				s := string(out)
+				if s == "" {
+					continue
+				}
+				outputModalities = append(outputModalities, s)
+				outputMap[s] = true
+			}
+
+			models = append(models, Model{
+				ID:               modelID,
+				Name:             m.Name,
+				InputModalities:  inputModalities,
+				OutputModalities: outputModalities,
+			})
+
+			newCatalog[modelCatalogKey(p.ID, modelID)] = &ModelCapability{
+				ProviderID:       p.ID,
+				ModelID:          modelID,
+				InputModalities:  inputMap,
+				OutputModalities: outputMap,
+			}
+		}
+
+		sort.Slice(models, func(i, j int) bool {
+			return models[i].ID < models[j].ID
+		})
+
+		providers = append(providers, Provider{
+			ID:     p.ID,
+			Name:   p.Name,
+			Models: models,
+		})
+	}
+
+	c.modelCatalogMu.Lock()
+	c.modelCatalog = newCatalog
+	c.modelCatalogMu.Unlock()
+
+	return providers, nil
 }
 
 // Provider represents a model provider
@@ -824,8 +969,10 @@ type Provider struct {
 
 // Model represents an AI model
 type Model struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
 }
 
 // GetCurrentProvider retrieves the current provider and model for a session.
@@ -1678,7 +1825,7 @@ func (c *Client) calculateBackoff(attempt int) time.Duration {
 }
 
 // sendPromptWithRetry 带重试的发送消息
-func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion) (*opencode.SessionPromptResponse, error) {
+func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, model *opencode.SessionPromptParamsModel) (*opencode.SessionPromptResponse, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= c.retryConfig.MaxRetries; attempt++ {
@@ -1694,9 +1841,14 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 		// 为每次尝试创建独立的context，避免前一次超时影响下一次
 		attemptCtx, cancel := context.WithTimeout(context.Background(), c.timeout)
 
-		result, err := c.sdk.Session.Prompt(attemptCtx, sessionID, opencode.SessionPromptParams{
+		params := opencode.SessionPromptParams{
 			Parts: opencode.F(parts),
-		})
+		}
+		if model != nil {
+			params.Model = opencode.F(*model)
+		}
+
+		result, err := c.sdk.Session.Prompt(attemptCtx, sessionID, params)
 		cancel()
 
 		if err == nil {
@@ -1734,6 +1886,278 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 	}
 
 	return nil, fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
+}
+
+func modelCatalogKey(providerID, modelID string) string {
+	return strings.ToLower(strings.TrimSpace(providerID)) + "/" + strings.ToLower(strings.TrimSpace(modelID))
+}
+
+func (c *Client) mediaDebugf(format string, args ...interface{}) {
+	if c == nil || !c.debugMediaRouting {
+		return
+	}
+	log.Printf("opencode[media]: "+format, args...)
+}
+
+func (c *Client) refreshModelCatalog(ctx context.Context) error {
+	providers, err := c.GetProviders(ctx)
+	if err != nil {
+		return err
+	}
+	log.Printf("opencode: model catalog refreshed, providers=%d", len(providers))
+	return nil
+}
+
+func (c *Client) ensureModelCatalog(ctx context.Context) {
+	c.modelCatalogMu.RLock()
+	empty := len(c.modelCatalog) == 0
+	c.modelCatalogMu.RUnlock()
+	c.mediaDebugf("ensure catalog: empty=%t", empty)
+	if !empty {
+		return
+	}
+	if err := c.refreshModelCatalog(ctx); err != nil {
+		log.Printf("opencode: ensure model catalog failed: %v", err)
+		c.mediaDebugf("catalog refresh failed: %v", err)
+	}
+}
+
+func (c *Client) updateSessionModel(sessionID, providerID, modelID string) {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
+		return
+	}
+
+	cfg := &ModelConfig{
+		ProviderID:  providerID,
+		ModelID:     modelID,
+		LastUpdated: time.Now(),
+	}
+	c.sessionModel.Store(sessionID, cfg)
+
+	if v, ok := c.modelConfig.Load(sessionID); ok {
+		existing := v.(*ModelConfig)
+		existing.ProviderID = providerID
+		existing.ModelID = modelID
+		existing.LastUpdated = time.Now()
+		c.modelConfig.Store(sessionID, existing)
+	}
+}
+
+func (c *Client) getCurrentSessionModel(ctx context.Context, sessionID string) (*ModelConfig, bool) {
+	if v, ok := c.sessionModel.Load(sessionID); ok {
+		cfg := v.(*ModelConfig)
+		if cfg.ProviderID != "" && cfg.ModelID != "" {
+			return cfg, true
+		}
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	messages, err := c.sdk.Session.Messages(lookupCtx, sessionID, opencode.SessionMessagesParams{})
+	if err != nil || messages == nil || len(*messages) == 0 {
+		c.defaultModelMu.RLock()
+		defer c.defaultModelMu.RUnlock()
+		if c.defaultModel != nil {
+			return c.defaultModel, true
+		}
+		return nil, false
+	}
+
+	for i := len(*messages) - 1; i >= 0; i-- {
+		msg := (*messages)[i].Info
+		if msg.ProviderID == "" || msg.ModelID == "" {
+			continue
+		}
+		cfg := &ModelConfig{
+			ProviderID:  msg.ProviderID,
+			ModelID:     msg.ModelID,
+			LastUpdated: time.Now(),
+		}
+		c.sessionModel.Store(sessionID, cfg)
+		return cfg, true
+	}
+
+	c.defaultModelMu.RLock()
+	defer c.defaultModelMu.RUnlock()
+	if c.defaultModel != nil {
+		return c.defaultModel, true
+	}
+	return nil, false
+}
+
+func hasAttachmentType(att Attachment, prefix string) bool {
+	m := strings.ToLower(strings.TrimSpace(att.Mime))
+	return strings.HasPrefix(m, prefix)
+}
+
+func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID string, payload *MessagePayload, effectiveContent *string) (bool, error) {
+	if payload == nil || len(payload.Attachments) == 0 {
+		return false, nil
+	}
+	c.mediaDebugf("preprocess start: session=%s attachments=%d", sessionID[:min(8, len(sessionID))], len(payload.Attachments))
+
+	needImage := false
+	needVideo := false
+	mediaAttachments := make([]Attachment, 0)
+	for _, att := range payload.Attachments {
+		if hasAttachmentType(att, "image/") {
+			needImage = true
+			mediaAttachments = append(mediaAttachments, att)
+			continue
+		}
+		if hasAttachmentType(att, "video/") {
+			needVideo = true
+			mediaAttachments = append(mediaAttachments, att)
+		}
+	}
+
+	if !needImage && !needVideo {
+		c.mediaDebugf("no image/video attachments, skip preprocess")
+		return false, nil
+	}
+	c.mediaDebugf("media detected: needImage=%t needVideo=%t mediaCount=%d", needImage, needVideo, len(mediaAttachments))
+
+	c.ensureModelCatalog(ctx)
+
+	currentCfg, ok := c.getCurrentSessionModel(ctx, sessionID)
+	if !ok {
+		// 无法确定当前模型，保持现有行为。
+		c.mediaDebugf("current session model unknown, keep original flow")
+		return false, nil
+	}
+	c.mediaDebugf("current session model: %s/%s", currentCfg.ProviderID, currentCfg.ModelID)
+
+	c.modelCatalogMu.RLock()
+	capability, hasCapability := c.modelCatalog[modelCatalogKey(currentCfg.ProviderID, currentCfg.ModelID)]
+	c.modelCatalogMu.RUnlock()
+	if !hasCapability {
+		// 当前模型能力未知，保持现有行为。
+		c.mediaDebugf("capability unknown for %s/%s, keep original flow", currentCfg.ProviderID, currentCfg.ModelID)
+		return false, nil
+	}
+
+	if (!needImage || capability.InputModalities["image"]) && (!needVideo || capability.InputModalities["video"]) {
+		// 当前模型已支持所需模态，保持现有代码路径。
+		c.mediaDebugf("current model supports required modalities, keep original flow")
+		return false, nil
+	}
+	c.mediaDebugf("current model lacks required modalities, try fallback recognizer")
+
+	recognized, err := c.recognizeMediaWithFallbackModel(ctx, mediaAttachments, needImage, needVideo)
+	if err != nil {
+		c.mediaDebugf("fallback recognizer failed: %v", err)
+		return false, err
+	}
+	if strings.TrimSpace(recognized) == "" {
+		c.mediaDebugf("fallback recognizer returned empty text, keep original flow")
+		return false, nil
+	}
+
+	*effectiveContent = fmt.Sprintf("[多模态预处理结果]\n%s\n\n[用户请求]\n%s", recognized, *effectiveContent)
+
+	filtered := make([]Attachment, 0, len(payload.Attachments))
+	for _, att := range payload.Attachments {
+		if hasAttachmentType(att, "image/") || hasAttachmentType(att, "video/") {
+			continue
+		}
+		filtered = append(filtered, att)
+	}
+	payload.Attachments = filtered
+	c.mediaDebugf("preprocess done: converted media to text, remaining attachments=%d", len(filtered))
+
+	return true, nil
+}
+
+func (c *Client) selectFallbackVisionModel(needImage, needVideo bool) (*ModelConfig, bool) {
+	c.modelCatalogMu.RLock()
+	keys := make([]string, 0, len(c.modelCatalog))
+	for k := range c.modelCatalog {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		cap := c.modelCatalog[k]
+		if cap == nil {
+			continue
+		}
+		if !cap.InputModalities["text"] {
+			continue
+		}
+		if needImage && !cap.InputModalities["image"] {
+			continue
+		}
+		if needVideo && !cap.InputModalities["video"] {
+			continue
+		}
+		cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
+		c.mediaDebugf("selected fallback model: %s/%s", cfg.ProviderID, cfg.ModelID)
+		c.modelCatalogMu.RUnlock()
+		return cfg, true
+	}
+
+	c.modelCatalogMu.RUnlock()
+	c.mediaDebugf("no fallback model found for needImage=%t needVideo=%t", needImage, needVideo)
+	return nil, false
+}
+
+func (c *Client) recognizeMediaWithFallbackModel(ctx context.Context, attachments []Attachment, needImage, needVideo bool) (string, error) {
+	visionModel, ok := c.selectFallbackVisionModel(needImage, needVideo)
+	if !ok {
+		return "", fmt.Errorf("no fallback model supports required media modalities (image=%t, video=%t)", needImage, needVideo)
+	}
+	c.mediaDebugf("recognize with fallback model: %s/%s attachments=%d", visionModel.ProviderID, visionModel.ModelID, len(attachments))
+
+	prepCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	tmpSession, err := c.sdk.Session.New(prepCtx, opencode.SessionNewParams{
+		Title: opencode.F("[media-preprocess]"),
+	})
+	if err != nil {
+		return "", fmt.Errorf("create media preprocess session: %w", err)
+	}
+	c.mediaDebugf("media preprocess temp session created: %s", tmpSession.ID[:min(8, len(tmpSession.ID))])
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if _, delErr := c.sdk.Session.Delete(cleanupCtx, tmpSession.ID, opencode.SessionDeleteParams{}); delErr != nil {
+			log.Printf("opencode: cleanup media preprocess session %s failed: %v", tmpSession.ID[:min(8, len(tmpSession.ID))], delErr)
+		}
+	}()
+
+	parts := []opencode.SessionPromptParamsPartUnion{
+		opencode.TextPartInputParam{
+			Type: opencode.F(opencode.TextPartInputTypeText),
+			Text: opencode.F("请识别以下媒体内容（图片/视频），并输出简洁中文摘要，重点提取可用于回答用户问题的关键信息。"),
+		},
+	}
+
+	for _, att := range attachments {
+		if att.URL == "" || att.Mime == "" {
+			continue
+		}
+		parts = append(parts, opencode.FilePartInputParam{
+			Type: opencode.F(opencode.FilePartInputTypeFile),
+			Mime: opencode.F(att.Mime),
+			URL:  opencode.F(att.URL),
+		})
+	}
+
+	modelOverride := &opencode.SessionPromptParamsModel{
+		ProviderID: opencode.F(visionModel.ProviderID),
+		ModelID:    opencode.F(visionModel.ModelID),
+	}
+
+	resp, err := c.sendPromptWithRetry(prepCtx, tmpSession.ID, parts, modelOverride)
+	if err != nil {
+		return "", fmt.Errorf("media recognize with %s/%s: %w", visionModel.ProviderID, visionModel.ModelID, err)
+	}
+	recognized := strings.TrimSpace(extractReplyFromMessage(resp))
+	c.mediaDebugf("media recognize completed: textLen=%d", len(recognized))
+
+	return recognized, nil
 }
 
 // sendPromptAsync 调用 OpenCode 的 prompt_async 接口，立即返回，由事件流提供结果

@@ -1119,7 +1119,7 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /diff 或 变更 - 查看本次会话的文件变更摘要
 
 🤖 模型配置：
-/model - 查看当前模型
+/model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
 /config 或 配置 - 查看完整配置
 
@@ -2223,7 +2223,7 @@ func (h *Handler) handleModel(ctx context.Context, data *chatbot.BotCallbackData
 		return h.handleModelSet(ctx, data, userID, parts[1:])
 	}
 
-	msg := "❌ 命令格式错误\n\n使用方法:\n/model - 查看当前模型\n/model <provider>/<model> - 设置模型\n/model <provider> <model> - 设置模型\n\n例如:\n/model anthropic/claude-3-opus\n/model openai gpt-4"
+	msg := "❌ 命令格式错误\n\n使用方法:\n/model - 查看可用模型\n/model <provider>/<model> - 设置模型\n/model <provider> <model> - 设置模型\n\n例如:\n/model anthropic/claude-3-opus\n/model openai gpt-4"
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 	return nil, nil
 }
@@ -2235,13 +2235,40 @@ func (h *Handler) handleModelQuery(ctx context.Context, data *chatbot.BotCallbac
 	// 获取当前session
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
-		// 没有session，提示用户
-		msg := "ℹ️ 当前没有活跃的会话\n\n" +
-			"💡 模型配置功能需要OpenCode SDK的支持\n" +
-			"目前的SDK版本可能不包含模型配置 API\n\n" +
-			"您可以在OpenCode的Web界面中配置模型\n" +
-			"或等待SDK更新支持此功能"
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		var msgBuilder strings.Builder
+		msgBuilder.WriteString("ℹ️ 当前没有活跃的会话\n")
+
+		providers, err := h.client.GetProviders(ctx)
+		if err != nil {
+			msgBuilder.WriteString("\n💡 可用模型列表获取失败，请稍后重试或在 OpenCode Web 界面查看\n")
+			msgBuilder.WriteString(fmt.Sprintf("错误: %v", err))
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+			return nil, nil
+		}
+
+		if len(providers) == 0 {
+			msgBuilder.WriteString("\n💡 未获取到可用模型，请在 OpenCode Web 界面查看")
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+			return nil, nil
+		}
+
+		msgBuilder.WriteString("\n\n📚 可用模型（示例）:\n")
+		for _, p := range providers {
+			msgBuilder.WriteString(fmt.Sprintf("\n【%s】\n", p.ID))
+			if len(p.Models) == 0 {
+				msgBuilder.WriteString("  (无模型)\n")
+				continue
+			}
+			maxShow := min(8, len(p.Models))
+			for i := 0; i < maxShow; i++ {
+				msgBuilder.WriteString(fmt.Sprintf("  /model %s/%s\n", p.ID, p.Models[i].ID))
+			}
+			if len(p.Models) > maxShow {
+				msgBuilder.WriteString(fmt.Sprintf("  ... 还有 %d 个\n", len(p.Models)-maxShow))
+			}
+		}
+
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
 		return nil, nil
 	}
 
@@ -2258,8 +2285,37 @@ func (h *Handler) handleModelQuery(ctx context.Context, data *chatbot.BotCallbac
 	var msgBuilder strings.Builder
 	msgBuilder.WriteString("🤖 当前会话配置:\n\n")
 	msgBuilder.WriteString(fmt.Sprintf("会话: %s\n", sessionID[:8]))
-	msgBuilder.WriteString("\n💡 模型信息在当前SDK版本中不可用\n")
-	msgBuilder.WriteString("请在OpenCode Web界面中查看和配置模型")
+	msgBuilder.WriteString("\n💡 当前会话的默认模型信息在SDK中不可直接读取\n")
+
+	providers, err := h.client.GetProviders(ctx)
+	if err != nil {
+		msgBuilder.WriteString("\n可用模型列表获取失败，请稍后重试或在 OpenCode Web 界面查看\n")
+		msgBuilder.WriteString(fmt.Sprintf("错误: %v", err))
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+		return nil, nil
+	}
+
+	if len(providers) == 0 {
+		msgBuilder.WriteString("\n未获取到可用模型，请在 OpenCode Web 界面查看")
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+		return nil, nil
+	}
+
+	msgBuilder.WriteString("\n📚 可用模型（示例）:\n")
+	for _, p := range providers {
+		msgBuilder.WriteString(fmt.Sprintf("\n【%s】\n", p.ID))
+		if len(p.Models) == 0 {
+			msgBuilder.WriteString("  (无模型)\n")
+			continue
+		}
+		maxShow := min(8, len(p.Models))
+		for i := 0; i < maxShow; i++ {
+			msgBuilder.WriteString(fmt.Sprintf("  /model %s/%s\n", p.ID, p.Models[i].ID))
+		}
+		if len(p.Models) > maxShow {
+			msgBuilder.WriteString(fmt.Sprintf("  ... 还有 %d 个\n", len(p.Models)-maxShow))
+		}
+	}
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
 	return nil, nil
@@ -2302,16 +2358,15 @@ func (h *Handler) handleModelSet(ctx context.Context, data *chatbot.BotCallbackD
 	// 更新session的provider和model
 	if err := h.client.UpdateSessionProvider(ctx, sessionID, providerID, modelID); err != nil {
 		msg := fmt.Sprintf("❌ 更新模型失败: %v\n\n"+
-			"💡 模型配置功能需要OpenCode SDK的支持\n"+
-			"目前的SDK版本可能不包含此API\n"+
-			"请在OpenCode Web界面中配置模型", err)
+			"💡 SDK 当前不支持通过 Session.Update 直接设置 provider/model\n"+
+			"请优先在 OpenCode Web 界面设置默认模型", err)
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 		return nil, err
 	}
 
 	msg := fmt.Sprintf("✅ 已尝试更新模型配置\n\n提供商: %s\n模型: %s\n会话: %s\n\n"+
-		"💡 注意：当前SDK版本可能不完全支持此功能\n"+
-		"如果需要详细配置，请访问OpenCode Web界面",
+		"💡 注意：该操作未必会改变会话默认模型（取决于服务端能力）\n"+
+		"如需稳定生效，请在 OpenCode Web 界面设置默认模型",
 		providerID, modelID, sessionID[:8])
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 	return nil, nil
