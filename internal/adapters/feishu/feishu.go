@@ -303,6 +303,36 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleAbort(ctx, target, msg.UserID)
 	}
 
+	// Handle /new or /reset command to create new session
+	if content == "/new" || content == "/reset" || content == "新会话" {
+		return h.handleNewSession(ctx, target, msg.UserID, msg.ChatID)
+	}
+
+	// Handle /sessions or /list command to list sessions
+	if content == "/sessions" || content == "/list" {
+		return h.handleListSessions(ctx, target)
+	}
+
+	// Handle /status command to check session status
+	if content == "/status" || content == "状态" {
+		return h.handleStatus(ctx, target, msg.UserID)
+	}
+
+	// Handle /clear command to clear/delete current session
+	if content == "/clear" || content == "清除" {
+		return h.handleClear(ctx, target, msg.UserID, msg.ChatID)
+	}
+
+	// Handle /model command to get/set model
+	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
+		return h.handleModel(ctx, target, msg.UserID, content)
+	}
+
+	// Handle /config command to view configuration
+	if content == "/config" || content == "配置" {
+		return h.handleConfig(ctx, target, msg.UserID)
+	}
+
 	// Handle /cmd command to execute skill scripts directly
 	if strings.HasPrefix(content, "/cmd ") {
 		command := strings.TrimPrefix(content, "/cmd ")
@@ -1241,49 +1271,51 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 🤖 基本对话：
 直接发送消息即可与AI对话
 
-🔧 可用命令：
+🔧 基本命令：
 /help 或 帮助 - 显示此帮助信息
 /skills 或 /agents - 查看可用的技能列表
+/abort 或 /stop - 中止正在运行的任务
+/refresh - 刷新技能缓存
+
+📊 会话管理：
+/status 或 状态 - 查看当前会话状态
+/new 或 /reset - 创建新会话
+/clear 或 清除 - 删除当前会话
+/fork - 派生(fork)当前会话（保留历史，创建新分支）
+/compact 或 总结 - 压缩会话历史（减少上下文占用）
+/sessions 或 /list - 列出所有会话
+
+📋 任务追踪（对应 TUI 实时看板）：
+/todo 或 任务 - 查看 AI 当前的任务进度
+/diff 或 变更 - 查看本次会话的文件变更摘要
+
+🤖 模型配置：
+/model - 查看当前模型
+/model <provider>/<model> - 设置模型
+/config 或 配置 - 查看完整配置
 
 📋 OpenCode 模式说明：
 
 1️⃣ Chat模式（默认）
    - 直接对话，立即响应
-   - 适合：日常问答、代码解释
 
 2️⃣ Plan模式
-   - AI会先制定计划再执行
-   - 适合：复杂任务规划
+   - AI先制定计划再执行
 
 3️⃣ Build模式（需要确认）
-   - AI会生成操作计划并等待您确认
-   - ⚠️ 需要在OpenCode界面手动确认
-   - 确认后结果会自动回复到飞书
-   - 适合：文件修改、代码生成等
+   - AI生成操作计划并等待确认
+   - 回复 '允许' 或序号确认授权
 
 💡 使用技巧：
-• 使用 @agent_name 调用特定技能
-  例如：@build 帮我创建一个Python脚本
-• Build模式请求会提示您去OpenCode确认
-• 请勿在短时间内重复发送相同消息
-• 发送 /abort 或 /stop 可以中止正在运行的任务
+• @agent_name 消息 - 调用特定技能
+• 任务进行中可发 /todo 查看进度
+• 完成后自动显示文件变更摘要
+• /fork 创建当前上下文的副本继续探索
 
-🛠️ 可用命令：
-/help 或 帮助 - 显示帮助
-/skills - 查看可用技能
-/abort 或 /stop - 中止当前任务
-/refresh - 刷新技能缓存
-/answer <question_id> <answer> - 回答待确认的问题
-/fork 或 派生 - 派生当前会话（保留历史，开启新分支）
-/compact 或 总结 - 压缩会话历史，减少上下文占用
-/todo 或 任务 - 查看当前任务进度列表
-/diff 或 变更 - 查看本次会话的文件变更摘要
-
-❓ 问题排查：
-• 如果提示"请求处理中"：请等待当前请求完成
-• 如果收到确认请求：使用 /answer 命令回复
-• 如果超时：可能是build模式等待确认
-• 如果失败：稍后重试或简化问题`
+🛠️ 高级命令：
+/cmd <command> - 执行技能脚本
+/answer <question_id> <answer> - 回答待确认问题
+/crontask - 管理定时任务`
 
 	_ = h.sendTextChunks(ctx, target, helpText)
 	return "handled", nil
@@ -1314,6 +1346,251 @@ func (h *Handler) handleAbort(ctx context.Context, target chatTarget, userID str
 	}
 
 	_ = h.sendTextChunks(ctx, target, "✅ 任务已中止")
+	return "handled", nil
+}
+
+// handleNewSession 处理创建新会话命令
+func (h *Handler) handleNewSession(ctx context.Context, target chatTarget, userID, threadID string) (string, error) {
+	var oldSessionID string
+	if sid, ok := h.adapter.GetSessionForUser(userID); ok {
+		oldSessionID = sid
+	}
+
+	if threadID != "" {
+		h.client.ResetSession(threadID)
+	}
+	h.adapter.ClearSessionForUser(userID)
+
+	msg := "✅ 已重置会话\n\n"
+	if oldSessionID != "" {
+		msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:min(8, len(oldSessionID))])
+	}
+	msg += "下次发送消息将创建新会话"
+
+	_ = h.sendTextChunks(ctx, target, msg)
+	return "handled", nil
+}
+
+// handleListSessions 处理列出所有会话命令
+func (h *Handler) handleListSessions(ctx context.Context, target chatTarget) (string, error) {
+	sessions, err := h.client.ListSessions(ctx)
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 获取会话列表失败: %v", err))
+		return "", err
+	}
+
+	if len(sessions) == 0 {
+		_ = h.sendTextChunks(ctx, target, "📝 当前没有活跃的会话")
+		return "handled", nil
+	}
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString(fmt.Sprintf("📝 会话列表 (%d个):\n\n", len(sessions)))
+
+	maxShow := 10
+	if len(sessions) > maxShow {
+		sessions = sessions[:maxShow]
+	}
+
+	for i, session := range sessions {
+		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", i+1, session.Title))
+		msgBuilder.WriteString(fmt.Sprintf("   ID: %s\n", session.ID[:min(8, len(session.ID))]))
+		msgBuilder.WriteString(fmt.Sprintf("   目录: %s\n", session.Directory))
+		updatedTime := time.Unix(int64(session.Time.Updated), 0).Format("2006-01-02 15:04")
+		msgBuilder.WriteString(fmt.Sprintf("   更新: %s\n", updatedTime))
+		msgBuilder.WriteString("\n")
+	}
+
+	if len(sessions) == maxShow {
+		msgBuilder.WriteString(fmt.Sprintf("\n💡 只显示最近%d个会话", maxShow))
+	}
+
+	_ = h.sendTextChunks(ctx, target, msgBuilder.String())
+	return "handled", nil
+}
+
+// handleStatus 处理查看会话状态命令
+func (h *Handler) handleStatus(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话")
+		return "handled", nil
+	}
+
+	info, err := h.client.GetSessionInfo(ctx, sessionID)
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 获取会话信息失败: %v", err))
+		return "", err
+	}
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString("📊 当前会话状态:\n\n")
+	msgBuilder.WriteString(fmt.Sprintf("会话ID: %s\n", info.SessionID[:min(8, len(info.SessionID))]))
+	msgBuilder.WriteString(fmt.Sprintf("标题: %s\n", info.Title))
+	msgBuilder.WriteString(fmt.Sprintf("目录: %s\n", info.Directory))
+	msgBuilder.WriteString(fmt.Sprintf("消息数: %d\n", info.MessageCount))
+	msgBuilder.WriteString(fmt.Sprintf("Token数: %d\n", info.TokenCount))
+	if info.ContextLength > 0 {
+		msgBuilder.WriteString(fmt.Sprintf("上下文: %d/%d (%.1f%%)\n",
+			info.TokenCount, info.ContextLength, info.ContextUsage*100))
+	}
+	msgBuilder.WriteString(fmt.Sprintf("创建时间: %s", info.Created))
+
+	_ = h.sendTextChunks(ctx, target, msgBuilder.String())
+	return "handled", nil
+}
+
+// handleClear 处理清除会话命令
+func (h *Handler) handleClear(ctx context.Context, target chatTarget, userID, threadID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话")
+		return "handled", nil
+	}
+
+	if err := h.client.DeleteSession(ctx, sessionID); err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 删除会话失败: %v", err))
+		return "", err
+	}
+
+	h.adapter.ClearSessionForUser(userID)
+	if threadID != "" {
+		h.client.ResetSession(threadID)
+	}
+
+	_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ 已删除会话 %s\n\n下次发送消息将创建新会话", sessionID[:min(8, len(sessionID))]))
+	return "handled", nil
+}
+
+// handleModel 处理模型配置命令
+func (h *Handler) handleModel(ctx context.Context, target chatTarget, userID, content string) (string, error) {
+	parts := strings.Fields(content)
+
+	if len(parts) == 1 {
+		return h.handleModelQuery(ctx, target, userID)
+	}
+
+	if len(parts) >= 2 {
+		return h.handleModelSet(ctx, target, userID, parts[1:])
+	}
+
+	msg := "❌ 命令格式错误\n\n使用方法:\n/model - 查看当前模型\n/model <provider>/<model> - 设置模型\n/model <provider> <model> - 设置模型\n\n例如:\n/model anthropic/claude-3-opus\n/model openai gpt-4"
+	_ = h.sendTextChunks(ctx, target, msg)
+	return "handled", nil
+}
+
+// handleModelQuery 查询当前模型
+func (h *Handler) handleModelQuery(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话\n\n" +
+			"💡 模型配置功能需要OpenCode SDK的支持\n" +
+			"目前的SDK版本可能不包含模型配置 API\n\n" +
+			"您可以在OpenCode的Web界面中配置模型\n" +
+			"或等待SDK更新支持此功能"
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+
+	_, _, err := h.client.GetCurrentProvider(ctx, sessionID)
+	if err != nil {
+		msg := fmt.Sprintf("❌ 获取当前模型失败: %v\n\n"+
+			"💡 模型配置功能需要OpenCode SDK的支持\n"+
+			"目前的SDK版本可能不包含此API", err)
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "", err
+	}
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString("🤖 当前会话配置:\n\n")
+	msgBuilder.WriteString(fmt.Sprintf("会话: %s\n", sessionID[:min(8, len(sessionID))]))
+	msgBuilder.WriteString("\n💡 模型信息在当前SDK版本中不可用\n")
+	msgBuilder.WriteString("请在OpenCode Web界面中查看和配置模型")
+
+	_ = h.sendTextChunks(ctx, target, msgBuilder.String())
+	return "handled", nil
+}
+
+// handleModelSet 设置模型
+func (h *Handler) handleModelSet(ctx context.Context, target chatTarget, userID string, args []string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "❌ 当前没有活跃的会话\n\n请先发送消息创建会话，然后再设置模型")
+		return "handled", nil
+	}
+
+	var providerID, modelID string
+
+	if strings.Contains(args[0], "/") {
+		parts := strings.SplitN(args[0], "/", 2)
+		providerID = parts[0]
+		if len(parts) > 1 {
+			modelID = parts[1]
+		}
+	} else {
+		providerID = args[0]
+		if len(args) > 1 {
+			modelID = args[1]
+		}
+	}
+
+	if providerID == "" {
+		_ = h.sendTextChunks(ctx, target, "❌ 提供商ID不能为空")
+		return "handled", nil
+	}
+
+	if err := h.client.UpdateSessionProvider(ctx, sessionID, providerID, modelID); err != nil {
+		msg := fmt.Sprintf("❌ 更新模型失败: %v\n\n"+
+			"💡 模型配置功能需要OpenCode SDK的支持\n"+
+			"目前的SDK版本可能不包含此API\n"+
+			"请在OpenCode Web界面中配置模型", err)
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "", err
+	}
+
+	msg := fmt.Sprintf("✅ 已尝试更新模型配置\n\n提供商: %s\n模型: %s\n会话: %s\n\n"+
+		"💡 注意：当前SDK版本可能不完全支持此功能\n"+
+		"如果需要详细配置，请访问OpenCode Web界面",
+		providerID, modelID, sessionID[:min(8, len(sessionID))])
+	_ = h.sendTextChunks(ctx, target, msg)
+	return "handled", nil
+}
+
+// handleConfig 处理配置查看命令
+func (h *Handler) handleConfig(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString("⚙️ 当前配置:\n\n")
+
+	if ok {
+		info, err := h.client.GetSessionInfo(ctx, sessionID)
+		if err == nil {
+			msgBuilder.WriteString("📊 会话信息:\n")
+			msgBuilder.WriteString(fmt.Sprintf("  ID: %s\n", info.SessionID[:min(8, len(info.SessionID))]))
+			msgBuilder.WriteString(fmt.Sprintf("  标题: %s\n", info.Title))
+			msgBuilder.WriteString(fmt.Sprintf("  目录: %s\n", info.Directory))
+			msgBuilder.WriteString(fmt.Sprintf("  消息数: %d\n", info.MessageCount))
+			msgBuilder.WriteString(fmt.Sprintf("  Token: %d/%d\n", info.TokenCount, info.ContextLength))
+		}
+	} else {
+		msgBuilder.WriteString("📊 会话信息: 无活跃会话\n")
+	}
+
+	msgBuilder.WriteString("\n🔧 可用命令:\n")
+	msgBuilder.WriteString("  /model - 查看/设置模型\n")
+	msgBuilder.WriteString("  /status - 查看会话状态\n")
+	msgBuilder.WriteString("  /new - 创建新会话\n")
+	msgBuilder.WriteString("  /clear - 清除当前会话\n")
+	msgBuilder.WriteString("  /fork - 派生(fork)当前会话\n")
+	msgBuilder.WriteString("  /compact - 压缩/总结当前会话\n")
+	msgBuilder.WriteString("  /todo - 查看当前任务进度\n")
+	msgBuilder.WriteString("  /diff - 查看文件变更\n")
+	msgBuilder.WriteString("  /sessions - 列出所有会话\n")
+	msgBuilder.WriteString("  /skills - 查看可用技能\n")
+	msgBuilder.WriteString("  /help - 查看帮助")
+
+	_ = h.sendTextChunks(ctx, target, msgBuilder.String())
 	return "handled", nil
 }
 
