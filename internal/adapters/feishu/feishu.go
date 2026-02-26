@@ -3,6 +3,7 @@ package feishu
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -451,12 +452,13 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	}
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:   "feishu",
-		UserID:    msg.UserID,
-		ThreadID:  threadID,
-		SessionID: sessionID,
-		Content:   msg.Content,
-		Streaming: true,
+		Channel:     "feishu",
+		UserID:      msg.UserID,
+		ThreadID:    threadID,
+		SessionID:   sessionID,
+		Content:     msg.Content,
+		Streaming:   true,
+		Attachments: msg.Attachments,
 		Metadata: map[string]string{
 			"message_id":      msg.MessageID,
 			"message_type":    msg.MessageType,
@@ -550,13 +552,18 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 		return nil
 	}
 
-	content, err := parseFeishuText(*event.Event.Message.Content)
+	messageType := "text"
+	if event.Event.Message.MessageType != nil && *event.Event.Message.MessageType != "" {
+		messageType = *event.Event.Message.MessageType
+	}
+
+	content, attachments, err := h.parseFeishuMessageContent(ctx, messageType, *event.Event.Message.Content, messageID)
 	if err != nil {
 		log.Printf("❌ feishu: 解析消息内容失败: %v", err)
 		return fmt.Errorf("feishu: parse content: %w", err)
 	}
 	if content == "" {
-		log.Printf("⚠️  feishu: 消息内容为空")
+		log.Printf("⚠️  feishu: 消息内容为空 (type=%s)", messageType)
 		return nil
 	}
 
@@ -578,10 +585,6 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 	if event.Event.Message.ChatType != nil && *event.Event.Message.ChatType != "" {
 		chatType = *event.Event.Message.ChatType
 	}
-	messageType := "text"
-	if event.Event.Message.MessageType != nil && *event.Event.Message.MessageType != "" {
-		messageType = *event.Event.Message.MessageType
-	}
 
 	if h.debugMode {
 		log.Printf("👤 发送者: %s", userID[:min(12, len(userID))])
@@ -596,6 +599,7 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 		MessageID:   messageID,
 		Content:     content,
 		MessageType: messageType,
+		Attachments: attachments,
 	})
 
 	if err != nil {
@@ -727,6 +731,129 @@ func (h *Handler) sendTextMessage(ctx context.Context, target chatTarget, conten
 	return nil
 }
 
+// downloadFeishuMediaAsDataURI \u4e0b\u8f7d\u98de\u4e66\u56fe\u7247\u6216\u6587\u4ef6\uff0c\u8fd4\u56de base64 data URI\u3002
+// fileType: "image" \u6216 "file"
+func (h *Handler) downloadFeishuMediaAsDataURI(ctx context.Context, messageID, fileKey, fileType string) (string, string, error) {
+	token, err := h.getAccessToken(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("feishu: get token for download: %w", err)
+	}
+	apiURL := fmt.Sprintf("%s/im/v1/messages/%s/resources/%s?type=%s", FeiShuAPIEndpoint, messageID, fileKey, fileType)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("feishu: create media request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("feishu: download media: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("feishu: download media status=%d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("feishu: read media body: %w", err)
+	}
+
+	mime := resp.Header.Get("Content-Type")
+	if idx := strings.Index(mime, ";"); idx != -1 {
+		mime = strings.TrimSpace(mime[:idx])
+	}
+	if mime == "" {
+		mime = "image/jpeg"
+	}
+	dataURI := fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data))
+	return dataURI, mime, nil
+}
+
+// parseFeishuMessageContent \u6839\u636e\u6d88\u606f\u7c7b\u578b\u89e3\u6790\u98de\u4e66\u6d88\u606f\uff0c\u8fd4\u56de\u6587\u5b57\u5185\u5bb9\u548c\u9644\u4ef6\u5217\u8868\u3002
+func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawContent, messageID string) (string, []opencode.Attachment, error) {
+	switch msgType {
+	case "text":
+		text, err := parseFeishuText(rawContent)
+		return text, nil, err
+
+	case "image":
+		var img feishuImageContent
+		if err := json.Unmarshal([]byte(rawContent), &img); err != nil || img.ImageKey == "" {
+			return "[图片消息]", nil, nil
+		}
+		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, img.ImageKey, "image")
+		if err != nil {
+			log.Printf("feishu: ⚠️ image download failed: %v", err)
+			return "[图片消息]", nil, nil
+		}
+		log.Printf("feishu: ✅ image downloaded (mime=%s, len=%d)", mime, len(dataURI))
+		return "[图片消息]", []opencode.Attachment{{Mime: mime, URL: dataURI}}, nil
+
+	case "audio", "voice":
+		var aud feishuAudioContent
+		if err := json.Unmarshal([]byte(rawContent), &aud); err != nil {
+			return "[语音消息]", nil, nil
+		}
+		durMs, _ := strconv.Atoi(aud.Duration)
+		durSec := durMs / 1000
+		if durSec == 0 && durMs > 0 {
+			durSec = 1
+		}
+		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil
+
+	case "post":
+		var post feishuPostContent
+		if err := json.Unmarshal([]byte(rawContent), &post); err != nil {
+			return "[图文消息]", nil, nil
+		}
+		lang := post.ZhCN
+		if lang == nil {
+			lang = post.EnUS
+		}
+		if lang == nil {
+			return "[图文消息]", nil, nil
+		}
+		var textParts []string
+		var attachments []opencode.Attachment
+		if lang.Title != "" {
+			textParts = append(textParts, lang.Title)
+		}
+		imgIdx := 0
+		for _, row := range lang.Content {
+			for _, elem := range row {
+				switch elem.Tag {
+				case "text", "a":
+					if t := strings.TrimSpace(elem.Text); t != "" {
+						textParts = append(textParts, t)
+					}
+				case "img":
+					if elem.ImageKey == "" {
+						continue
+					}
+					imgIdx++
+					dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, elem.ImageKey, "image")
+					if err != nil {
+						log.Printf("feishu: ⚠️ post image #%d download failed: %v", imgIdx, err)
+						textParts = append(textParts, fmt.Sprintf("[图片%d]", imgIdx))
+						continue
+					}
+					textParts = append(textParts, fmt.Sprintf("[图片%d]", imgIdx))
+					attachments = append(attachments, opencode.Attachment{Mime: mime, URL: dataURI})
+				}
+			}
+		}
+		text := strings.Join(textParts, "\n")
+		if text == "" {
+			text = "[图文消息]"
+		}
+		return text, attachments, nil
+
+	default:
+		return fmt.Sprintf("[%s消息]", msgType), nil, nil
+	}
+}
+
 func (h *Handler) getAccessToken(ctx context.Context) (string, error) {
 	h.tokenMu.Lock()
 	defer h.tokenMu.Unlock()
@@ -843,13 +970,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if envelope.Event.Message.MessageType != nil && *envelope.Event.Message.MessageType != "" {
 		msgType = *envelope.Event.Message.MessageType
 	}
-	if msgType != "text" {
-		http.Error(w, "unsupported type", http.StatusNotImplemented)
-		return
-	}
 
-	content, err := parseFeishuText(envelope.Event.Message.Content)
-	if err != nil {
+	content, attachments, parseErr := h.parseFeishuMessageContent(r.Context(), msgType, envelope.Event.Message.Content,
+		func() string {
+			if envelope.Event.Message.MessageID != nil {
+				return *envelope.Event.Message.MessageID
+			}
+			return ""
+		}())
+	if parseErr != nil {
 		http.Error(w, "invalid content", http.StatusBadRequest)
 		return
 	}
@@ -879,6 +1008,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		MessageID:   messageID,
 		Content:     content,
 		MessageType: msgType,
+		Attachments: attachments,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("forward failed: %v", err), http.StatusBadGateway)
@@ -927,6 +1057,35 @@ type messageTextBlock struct {
 	Text string `json:"text"`
 }
 
+// feishuImageContent 图片消息
+type feishuImageContent struct {
+	ImageKey string `json:"image_key"`
+}
+
+// feishuAudioContent 语音消息
+type feishuAudioContent struct {
+	FileKey  string `json:"file_key"`
+	Duration string `json:"duration"` // 毫秒
+}
+
+// feishuPostContent 富文本消息（图文混排）
+type feishuPostContent struct {
+	ZhCN *feishuPostLang `json:"zh_cn"`
+	EnUS *feishuPostLang `json:"en_us"`
+}
+
+type feishuPostLang struct {
+	Title   string             `json:"title"`
+	Content [][]feishuPostElem `json:"content"`
+}
+
+type feishuPostElem struct {
+	Tag      string `json:"tag"`
+	Text     string `json:"text,omitempty"`
+	ImageKey string `json:"image_key,omitempty"`
+	Href     string `json:"href,omitempty"`
+}
+
 type chatTarget struct {
 	receiveID     string
 	receiveIDType string
@@ -939,6 +1098,7 @@ type incomingMessage struct {
 	MessageID   string
 	Content     string
 	MessageType string
+	Attachments []opencode.Attachment // 图片/音频等附件
 }
 
 func parseFeishuText(raw string) (string, error) {

@@ -62,16 +62,25 @@ type Response struct {
 	Raw       map[string]interface{} `json:"raw,omitempty"`
 }
 
+// Attachment 表示附件（图片、语音、视频等媒体文件）
+// URL 必须是 data URI 格式：data:<mime>;base64,<base64data>
+type Attachment struct {
+	Mime     string `json:"mime"`               // MIME 类型，如 image/jpeg、image/png
+	URL      string `json:"url"`                // data URI: data:<mime>;base64,<base64>
+	Filename string `json:"filename,omitempty"` // 可选文件名
+}
+
 // MessagePayload collects the metadata adapters send to OpenCode.
 type MessagePayload struct {
-	Channel   string            `json:"channel"`
-	UserID    string            `json:"user_id"`
-	ThreadID  string            `json:"thread_id,omitempty"`
-	SessionID string            `json:"session_id,omitempty"`
-	Content   string            `json:"content"`
-	Agent     string            `json:"agent,omitempty"`     // 可选：指定使用的agent/skill名称
-	Streaming bool              `json:"streaming,omitempty"` // 是否使用流式返回
-	Metadata  map[string]string `json:"metadata,omitempty"`
+	Channel     string            `json:"channel"`
+	UserID      string            `json:"user_id"`
+	ThreadID    string            `json:"thread_id,omitempty"`
+	SessionID   string            `json:"session_id,omitempty"`
+	Content     string            `json:"content"`
+	Agent       string            `json:"agent,omitempty"`     // 可选：指定使用的agent/skill名称
+	Streaming   bool              `json:"streaming,omitempty"` // 是否使用流式返回
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	Attachments []Attachment      `json:"attachments,omitempty"` // 附件（图片/语音/视频）
 }
 
 // StreamCallback defines a callback for streaming responses.
@@ -574,6 +583,24 @@ sendMessage:
 		Text: opencode.F(enhancedContent),
 		Type: opencode.F(opencode.TextPartInputTypeText),
 	})
+
+	// Add file attachments (images, audio, video as data URIs)
+	for _, att := range payload.Attachments {
+		if att.URL == "" || att.Mime == "" {
+			continue
+		}
+		fp := opencode.FilePartInputParam{
+			Type: opencode.F(opencode.FilePartInputTypeFile),
+			Mime: opencode.F(att.Mime),
+			URL:  opencode.F(att.URL),
+		}
+		if att.Filename != "" {
+			fp.Filename = opencode.F(att.Filename)
+		}
+		parts = append(parts, fp)
+		log.Printf("opencode: added %s attachment (%s, %d bytes data URI) to session %s",
+			att.Mime, att.Filename, len(att.URL), sessionID[:8])
+	}
 
 	// 流式模式下改用异步 prompt_async，避免长任务导致 context deadline
 	if payload.Streaming {

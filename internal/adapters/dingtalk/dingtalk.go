@@ -1,8 +1,9 @@
-package dingtalk
+﻿package dingtalk
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,12 +14,62 @@ import (
 	"sync"
 	"time"
 
+	nls "github.com/aliyun/alibabacloud-nls-go-sdk"
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
 	"github.com/user/opencode-gateway/internal/scheduler"
 )
+
+// pictureContent 图片消息内容
+type pictureContent struct {
+	DownloadCode        string `json:"downloadCode"`
+	PictureDownloadCode string `json:"pictureDownloadCode"`
+}
+
+// flexInt 可以接受 JSON 数字或字符串形式的整数（钉钉 API 有时返回 "3" 也有时返回 3）
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	// 去掉引号后当成 int 解析
+	s := strings.Trim(string(b), `"`)
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return err
+	}
+	*f = flexInt(n)
+	return nil
+}
+
+// audioContent 语音消息内容
+type audioContent struct {
+	DownloadCode string  `json:"downloadCode"`
+	Duration     flexInt `json:"duration"`    // 毫秒，钉钉可能返回字符串或数字
+	Format       string  `json:"format"`      // 音频格式，如 "amr"
+	SampleRate   flexInt `json:"sampleRate"`  // 采样率，钉钉 AMR 为 8000
+	Recognition  string  `json:"recognition"` // 钉钉服务端已识别的文字（直接可用）
+}
+
+// videoContent 视频消息内容
+type videoContent struct {
+	DownloadCode string  `json:"downloadCode"`
+	Duration     flexInt `json:"duration"` // 毫秒，钉钉可能返回字符串或数字
+	VideoType    string  `json:"videoType"`
+}
+
+// richTextItem 图文消息中的单个元素
+type richTextItem struct {
+	Type                string `json:"type"`                          // "text" or "picture"
+	Text                string `json:"text,omitempty"`                // type=text 时有值
+	DownloadCode        string `json:"downloadCode,omitempty"`        // type=picture 时有值
+	PictureDownloadCode string `json:"pictureDownloadCode,omitempty"` // type=picture 时有值（旧版API专用）
+}
+
+// richTextContent 图文混合消息内容
+type richTextContent struct {
+	RichText []richTextItem `json:"richText"`
+}
 
 const (
 	// MessageDeduplicationWindow 消息去重时间窗口
@@ -38,6 +89,10 @@ type Config struct {
 	SigningSecret     string
 	UseStream         bool // 是否使用 Stream 模式
 	AutoAnswer        bool // 是否自动回答问题（选择首选选项）
+	// 阿里云 NLS 语音识别配置（可选，不填则语音消息以占位文本转发）
+	AliyunNLSAkID   string // 阿里云 AccessKey ID
+	AliyunNLSAkKey  string // 阿里云 AccessKey Secret
+	AliyunNLSAppKey string // NLS 控制台 AppKey
 }
 
 // Handler processes DingTalk callbacks and proxies them to OpenCode.
@@ -179,14 +234,277 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	content := strings.TrimSpace(data.Text.Content)
-	if content == "" {
-		return nil, fmt.Errorf("empty message")
-	}
-
 	userID := data.SenderStaffId
 	conversationID := data.ConversationId
 
-	log.Printf("dingtalk stream: received message from %s: %s", userID, content)
+	// 处理不同类型的消息
+	msgType := data.Msgtype
+	var mediaInfo map[string]interface{}
+	var extraAttachments []opencode.Attachment // 用于 richText 等多附件场景
+
+	log.Printf("dingtalk stream: 🔍 [DEBUG] Message received:")
+	log.Printf("  - MsgID: %s", msgID)
+	log.Printf("  - UserID: %s", userID)
+	log.Printf("  - ConversationID: %s", conversationID)
+	log.Printf("  - MsgType: %s", msgType)
+	log.Printf("  - Text.Content: %s", data.Text.Content)
+	log.Printf("  - Content (interface{}): %+v", data.Content)
+	log.Printf("  - SenderNick: %s", data.SenderNick)
+
+	switch msgType {
+	case "", "text":
+		// 文本消息（Msgtype 为空时也是文本）
+		log.Printf("dingtalk stream: 📝 [TEXT] received from %s: %s", userID, content)
+
+	case "picture":
+		// 图片消息
+		log.Printf("dingtalk stream: 🖼️ [PICTURE] received from %s", userID)
+		var picContent pictureContent
+		if data.Content != nil {
+			contentBytes, _ := json.Marshal(data.Content)
+			log.Printf("  - Picture content JSON: %s", string(contentBytes))
+			if err := json.Unmarshal(contentBytes, &picContent); err != nil {
+				log.Printf("  - ⚠️ Failed to parse picture content: %v", err)
+			} else {
+				log.Printf("  - DownloadCode: %s", picContent.DownloadCode)
+				log.Printf("  - PictureDownloadCode: %s", picContent.PictureDownloadCode)
+				// 新版 v1.0 API 使用 downloadCode；pictureDownloadCode 是旧版 oapi 专用
+				picCode := picContent.DownloadCode
+				if picCode == "" {
+					picCode = picContent.PictureDownloadCode
+				}
+				dataURI, mime, err := h.downloadMediaAsDataURI(ctx, picCode, "image/jpeg")
+				if err != nil && picContent.PictureDownloadCode != "" && picCode != picContent.PictureDownloadCode {
+					log.Printf("  - ↩️ Retrying with pictureDownloadCode after error: %v", err)
+					dataURI, mime, err = h.downloadMediaAsDataURI(ctx, picContent.PictureDownloadCode, "image/jpeg")
+				}
+				if err != nil {
+					log.Printf("  - ⚠️ Failed to download image: %v", err)
+				} else {
+					log.Printf("  - ✅ Image downloaded as data URI (mime=%s, len=%d)", mime, len(dataURI))
+					mediaInfo = map[string]interface{}{
+						"type": "image",
+						"url":  dataURI,
+						"mime": mime,
+					}
+				}
+			}
+		}
+		content = "[图片消息]"
+		if data.Text.Content != "" {
+			content = data.Text.Content
+		}
+
+	case "audio", "voice":
+		// 语音消息：优先使用阿里云 NLS 语音识别转文字
+		log.Printf("dingtalk stream: 🎤 [AUDIO] received from %s", userID)
+		var audContent audioContent
+		if data.Content != nil {
+			contentBytes, _ := json.Marshal(data.Content)
+			log.Printf("  - Audio content JSON: %s", string(contentBytes))
+			if err := json.Unmarshal(contentBytes, &audContent); err != nil {
+				log.Printf("  - ⚠️ Failed to parse audio content: %v", err)
+			} else if audContent.Recognition != "" {
+				// 钉钉已内置语音识别，直接使用结果，无需调用 NLS
+				log.Printf("  - ✅ 使用钉钉内置识别结果: %s", audContent.Recognition)
+				content = fmt.Sprintf("[语音转文字] %s", audContent.Recognition)
+			} else if audContent.DownloadCode != "" {
+				if h.cfg.AliyunNLSAkID != "" && h.cfg.AliyunNLSAkKey != "" && h.cfg.AliyunNLSAppKey != "" {
+					// DingTalk 语音时长：v1.0 Stream API 返回秒数（小值），旧版返回毫秒
+					durRaw := int(audContent.Duration)
+					durSec := durRaw
+					if durRaw >= 1000 {
+						durSec = durRaw / 1000
+					}
+					// 从钉钉消息内容读取格式，默认 amr/8000
+					audioFmt := audContent.Format
+					if audioFmt == "" {
+						audioFmt = "amr"
+					}
+					audioRate := int(audContent.SampleRate)
+					if audioRate == 0 {
+						audioRate = 8000
+					}
+					log.Printf("  - 🎤 NLS 语音识别中（时长=%ds, raw=%d, fmt=%s, rate=%d）...", durSec, durRaw, audioFmt, audioRate)
+					audioBytes, _, dlErr := h.downloadMediaBytes(ctx, audContent.DownloadCode, "audio/amr")
+					if dlErr != nil {
+						log.Printf("  - ⚠️ Failed to download audio: %v", dlErr)
+					} else {
+						if len(audioBytes) >= 8 {
+							log.Printf("  - 🔍 Audio first 8 bytes: %X", audioBytes[:min(8, len(audioBytes))])
+						}
+						// 根据文件魔数自动识别真实格式
+						var text string
+						var srErr error
+						switch {
+						case len(audioBytes) >= 4 && string(audioBytes[:4]) == "OggS":
+							// OGG/Opus 容器：解封装为裸 Opus 包列表，format=opus 逐包发送
+							opusPkts, oErr := extractOpusFromOGG(audioBytes)
+							if oErr != nil {
+								log.Printf("  - ⚠️ OGG demux failed: %v", oErr)
+								srErr = oErr
+							} else {
+								log.Printf("  - ℹ️ OGG/Opus demuxed: %d packets, format=opus", len(opusPkts))
+								text, srErr = h.transcribeOpusPackets(ctx, opusPkts, 16000)
+							}
+						case strings.HasPrefix(string(audioBytes), "#!AMR-WB\n"):
+							audioBytes = audioBytes[len("#!AMR-WB\n"):]
+							audioFmt = "amr-wb"
+							audioRate = 16000
+							log.Printf("  - ℹ️ Stripped AMR-WB file header (%d bytes remain)", len(audioBytes))
+							text, srErr = h.transcribeAudioBytes(ctx, audioBytes, audioFmt, audioRate)
+						case strings.HasPrefix(string(audioBytes), "#!AMR\n"):
+							audioBytes = audioBytes[len("#!AMR\n"):]
+							log.Printf("  - ℹ️ Stripped AMR-NB file header (%d bytes remain)", len(audioBytes))
+							text, srErr = h.transcribeAudioBytes(ctx, audioBytes, audioFmt, audioRate)
+						default:
+							text, srErr = h.transcribeAudioBytes(ctx, audioBytes, audioFmt, audioRate)
+						}
+						if srErr != nil {
+							log.Printf("  - ⚠️ NLS transcription failed: %v", srErr)
+						} else if text != "" {
+							log.Printf("  - ✅ NLS result: %s", text)
+							content = fmt.Sprintf("[语音转文字] %s", text)
+						} else {
+							log.Printf("  - ⚠️ NLS returned empty text")
+						}
+					}
+				} else {
+					log.Printf("  - ℹ️ Aliyun NLS 未配置，跳过语音识别（ALIYUN_NLS_AKID/AKKEY/APPKEY）")
+				}
+			}
+		}
+		if content == "" {
+			durRaw2 := int(audContent.Duration)
+			durSec2 := durRaw2
+			if durRaw2 >= 1000 {
+				durSec2 = durRaw2 / 1000
+			}
+			content = fmt.Sprintf("[语音消息，时长: %d秒，请配置 ALIYUN_NLS_* 环境变量以启用语音识别]", durSec2)
+		}
+
+	case "video":
+		// 视频消息暂不支持
+		log.Printf("dingtalk stream: 🎬 [VIDEO] received from %s (unsupported, replying)", userID)
+		replier := chatbot.NewChatbotReplier()
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("暂不支持视频消息，请发送文本或图片。"))
+		return nil, nil
+
+	case "richText":
+		// 图文混合消息
+		log.Printf("dingtalk stream: 📝🖼️ [RICHTEXT] received from %s", userID)
+		var rtContent richTextContent
+		if data.Content != nil {
+			contentBytes, _ := json.Marshal(data.Content)
+			log.Printf("  - RichText content JSON: %s", string(contentBytes))
+			if err := json.Unmarshal(contentBytes, &rtContent); err != nil {
+				log.Printf("  - ⚠️ Failed to parse richText content: %v", err)
+			} else {
+				var textParts []string
+				imgIndex := 0
+				failedImages := 0
+				for _, item := range rtContent.RichText {
+					switch item.Type {
+					case "text":
+						if t := strings.TrimSpace(item.Text); t != "" {
+							textParts = append(textParts, t)
+						}
+					case "picture":
+						imgIndex++
+						// 新版 v1.0 API 使用 downloadCode；pictureDownloadCode 是旧版 oapi 专用，作为 fallback
+						picCode := item.DownloadCode
+						if picCode == "" {
+							picCode = item.PictureDownloadCode
+						}
+						if picCode == "" {
+							log.Printf("  - ⚠️ RichText image #%d: no download code", imgIndex)
+							failedImages++
+							continue
+						}
+						log.Printf("  - 📷 图片 #%d，downloadCode=%s, pictureCode=%s",
+							imgIndex,
+							func() string {
+								if item.DownloadCode != "" {
+									return item.DownloadCode[:min(20, len(item.DownloadCode))]
+								}
+								return "(empty)"
+							}(),
+							func() string {
+								if item.PictureDownloadCode != "" {
+									return item.PictureDownloadCode[:min(20, len(item.PictureDownloadCode))]
+								}
+								return "(empty)"
+							}(),
+						)
+						dataURI, mime, err := h.downloadMediaAsDataURI(ctx, picCode, "image/jpeg")
+						if err != nil && item.PictureDownloadCode != "" && picCode != item.PictureDownloadCode {
+							// 用 downloadCode 失败，尝试 pictureDownloadCode
+							log.Printf("  - ↩️ RichText image #%d: retrying with pictureDownloadCode after error: %v", imgIndex, err)
+							dataURI, mime, err = h.downloadMediaAsDataURI(ctx, item.PictureDownloadCode, "image/jpeg")
+						}
+						if err != nil {
+							log.Printf("  - ⚠️ Failed to download richText image #%d: %v", imgIndex, err)
+							failedImages++
+						} else {
+							log.Printf("  - ✅ RichText image #%d downloaded (mime=%s, len=%d)", imgIndex, mime, len(dataURI))
+							extraAttachments = append(extraAttachments, opencode.Attachment{
+								Mime:     mime,
+								URL:      dataURI,
+								Filename: fmt.Sprintf("dingtalk_image_%d.jpg", imgIndex),
+							})
+						}
+					default:
+						log.Printf("  - ⚠️ Unknown richText item type: %s", item.Type)
+					}
+				}
+				if failedImages > 0 {
+					log.Printf("  - ⚠️ %d/%d images failed to download", failedImages, imgIndex)
+				}
+				content = strings.Join(textParts, " ")
+			}
+		}
+		if content == "" && len(extraAttachments) > 0 {
+			content = fmt.Sprintf("[图文消息，含 %d 张图片]", len(extraAttachments))
+		} else if content == "" {
+			content = "[图文消息]"
+		}
+
+	default:
+		// 其他类型暂不支持
+		log.Printf("dingtalk stream: ⚠️ [UNSUPPORTED] message type '%s' from %s", msgType, userID)
+		replier := chatbot.NewChatbotReplier()
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook,
+			[]byte(fmt.Sprintf("暂不支持 %s 类型的消息，请发送文本、图片或语音消息。", msgType)))
+		return nil, nil
+	}
+
+	if content == "" {
+		return nil, fmt.Errorf("empty message content")
+	}
+
+	// 构建附件列表
+	var attachments []opencode.Attachment
+	attachments = append(attachments, extraAttachments...)
+	if mediaInfo != nil {
+		if url, ok := mediaInfo["url"].(string); ok && strings.HasPrefix(url, "data:") {
+			mime, _ := mediaInfo["mime"].(string)
+			filename := ""
+			switch mediaInfo["type"] {
+			case "image":
+				filename = "dingtalk_image.jpg"
+			case "audio":
+				filename = "dingtalk_audio.amr"
+			case "video":
+				filename = "dingtalk_video.mp4"
+			}
+			attachments = append(attachments, opencode.Attachment{
+				Mime:     mime,
+				URL:      url,
+				Filename: filename,
+			})
+			log.Printf("dingtalk stream: 📎 attached %s to OpenCode message (mime=%s, dataURI_len=%d)", filename, mime, len(url))
+		}
+	}
 
 	// Handle special commands
 	if content == "/skills" || content == "/agents" {
@@ -334,16 +652,18 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	callbackCalled := false
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:   "dingtalk",
-		UserID:    userID,
-		ThreadID:  conversationID,
-		SessionID: sessionID, // Pass existing session if available
-		Content:   content,
-		Agent:     agentName,
-		Streaming: true,
+		Channel:     "dingtalk",
+		UserID:      userID,
+		ThreadID:    conversationID,
+		SessionID:   sessionID, // Pass existing session if available
+		Content:     content,
+		Agent:       agentName,
+		Streaming:   true,
+		Attachments: attachments,
 		Metadata: map[string]string{
 			"conversation_type": data.ConversationType,
 			"sender_nick":       data.SenderNick,
+			"message_type":      msgType,
 		},
 	}, func(chunk string) error {
 		// 🔍 诊断：记录第一个 callback
@@ -2179,4 +2499,464 @@ func (h *Handler) handleDiff(ctx context.Context, data *chatbot.BotCallbackDataM
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(sb.String()))
 	return nil, nil
+}
+
+// downloadMediaAsDataURI 通过钉钉 v1.0 API 下载媒体文件并返回 data URI
+// 使用 POST https://api.dingtalk.com/v1.0/robot/messageFiles/download
+func (h *Handler) downloadMediaAsDataURI(ctx context.Context, downloadCode string, defaultMime string) (string, string, error) {
+	if downloadCode == "" {
+		return "", "", fmt.Errorf("downloadCode is empty")
+	}
+
+	token, err := h.getAccessToken(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	reqBody := map[string]string{
+		"downloadCode": downloadCode,
+		"robotCode":    h.cfg.ClientID,
+	}
+	reqBytes, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"https://api.dingtalk.com/v1.0/robot/messageFiles/download",
+		bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create download request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("download API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, _ := io.ReadAll(resp.Body)
+	log.Printf("dingtalk: downloadMediaAsDataURI response status=%d, body=%s", resp.StatusCode, string(respBytes))
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("download API returned status=%d, body=%s", resp.StatusCode, string(respBytes))
+	}
+
+	var downloadResp struct {
+		DownloadURL string `json:"downloadUrl"`
+	}
+	if err := json.Unmarshal(respBytes, &downloadResp); err != nil {
+		return "", "", fmt.Errorf("failed to parse download response: %w", err)
+	}
+	if downloadResp.DownloadURL == "" {
+		return "", "", fmt.Errorf("download API returned empty downloadUrl, body=%s", string(respBytes))
+	}
+
+	log.Printf("dingtalk: downloadMediaAsDataURI got downloadUrl=%s", downloadResp.DownloadURL[:min(80, len(downloadResp.DownloadURL))])
+	return h.downloadURLAsDataURI(ctx, downloadResp.DownloadURL, defaultMime)
+}
+
+// downloadURLAsDataURI 下载指定 URL 的文件并返回 data URI 和 MIME 类型
+func (h *Handler) downloadURLAsDataURI(ctx context.Context, rawURL string, defaultMime string) (string, string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create URL request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to fetch media URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("media URL returned status=%d", resp.StatusCode)
+	}
+
+	fileBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read media content: %w", err)
+	}
+
+	mime := resp.Header.Get("Content-Type")
+	if mime == "" || mime == "application/octet-stream" {
+		mime = defaultMime
+	}
+	// 去掉 "; charset=..." 等参数
+	if idx := strings.Index(mime, ";"); idx != -1 {
+		mime = strings.TrimSpace(mime[:idx])
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(fileBytes)
+	dataURI := fmt.Sprintf("data:%s;base64,%s", mime, b64)
+	return dataURI, mime, nil
+}
+
+// downloadMediaBytes 通过钉钉 v1.0 API 下载媒体文件并返回原始字节（不经过 base64 编码）
+func (h *Handler) downloadMediaBytes(ctx context.Context, downloadCode string, defaultMime string) ([]byte, string, error) {
+	if downloadCode == "" {
+		return nil, "", fmt.Errorf("downloadCode is empty")
+	}
+
+	token, err := h.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	reqBody := map[string]string{
+		"downloadCode": downloadCode,
+		"robotCode":    h.cfg.ClientID,
+	}
+	reqBytes, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"https://api.dingtalk.com/v1.0/robot/messageFiles/download",
+		bytes.NewReader(reqBytes))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create download request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("download API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, _ := io.ReadAll(resp.Body)
+	log.Printf("dingtalk: downloadMediaBytes response status=%d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("download API returned status=%d, body=%s", resp.StatusCode, string(respBytes))
+	}
+
+	var downloadResp struct {
+		DownloadURL string `json:"downloadUrl"`
+	}
+	if err := json.Unmarshal(respBytes, &downloadResp); err != nil || downloadResp.DownloadURL == "" {
+		return nil, "", fmt.Errorf("failed to get downloadUrl, body=%s", string(respBytes))
+	}
+
+	// 获取原始字节
+	urlReq, err := http.NewRequestWithContext(ctx, "GET", downloadResp.DownloadURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create URL request: %w", err)
+	}
+	urlClient := &http.Client{Timeout: 60 * time.Second}
+	urlResp, err := urlClient.Do(urlReq)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to fetch media URL: %w", err)
+	}
+	defer urlResp.Body.Close()
+	if urlResp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("media URL returned status=%d", urlResp.StatusCode)
+	}
+	fileBytes, err := io.ReadAll(urlResp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read media content: %w", err)
+	}
+	mime := urlResp.Header.Get("Content-Type")
+	if mime == "" || mime == "application/octet-stream" {
+		mime = defaultMime
+	}
+	if idx := strings.Index(mime, ";"); idx != -1 {
+		mime = strings.TrimSpace(mime[:idx])
+	}
+	return fileBytes, mime, nil
+}
+
+// extractOpusFromOGG 解析 OGG/Opus 容器，返回裸 Opus 包列表（跳过 OpusHead/OpusTags 页）。
+// 每个元素是一个完整 Opus 包，可直接传给 NLS SendAudioData (format=opus)。
+func extractOpusFromOGG(data []byte) ([][]byte, error) {
+	var packets [][]byte
+	pos := 0
+	pageIndex := 0
+
+	for pos+27 <= len(data) {
+		// OGG 页魔数 "OggS"
+		if data[pos] != 'O' || data[pos+1] != 'g' || data[pos+2] != 'g' || data[pos+3] != 'S' {
+			break
+		}
+		nsegments := int(data[pos+26])
+		if pos+27+nsegments > len(data) {
+			break
+		}
+		segTable := data[pos+27 : pos+27+nsegments]
+		pageDataSize := 0
+		for _, s := range segTable {
+			pageDataSize += int(s)
+		}
+		pageHeaderSize := 27 + nsegments
+		if pos+pageHeaderSize+pageDataSize > len(data) {
+			break
+		}
+		pageData := data[pos+pageHeaderSize : pos+pageHeaderSize+pageDataSize]
+		pos += pageHeaderSize + pageDataSize
+		pageIndex++
+
+		// 跳过前两页 OpusHead / OpusTags
+		if pageIndex <= 2 {
+			continue
+		}
+		if len(pageData) >= 8 {
+			magic := string(pageData[:8])
+			if magic == "OpusHead" || magic == "OpusTags" {
+				continue
+			}
+		}
+
+		// 按 OGG lacing 重组 Opus 包：segment 长度 < 255 表示包结束
+		dataPos := 0
+		var pkt []byte
+		for _, segLen := range segTable {
+			hi := dataPos + int(segLen)
+			if hi > len(pageData) {
+				hi = len(pageData)
+			}
+			pkt = append(pkt, pageData[dataPos:hi]...)
+			dataPos += int(segLen)
+			if segLen < 255 {
+				// 包结束：复制出来追加到列表
+				out := make([]byte, len(pkt))
+				copy(out, pkt)
+				packets = append(packets, out)
+				pkt = pkt[:0]
+			}
+		}
+		// 跨页不完整包丢弃
+	}
+	return packets, nil
+}
+
+// transcribeOpusPackets 使用阿里云 NLS 将裸 Opus 包列表转为文字。
+// format=opus：每次 SendAudioData 传入一个裸 Opus 包（无长度前缀）。
+func (h *Handler) transcribeOpusPackets(ctx context.Context, packets [][]byte, sampleRate int) (string, error) {
+	config, err := nls.NewConnectionConfigWithAKInfoDefault(
+		nls.DEFAULT_URL,
+		h.cfg.AliyunNLSAppKey,
+		h.cfg.AliyunNLSAkID,
+		h.cfg.AliyunNLSAkKey,
+	)
+	if err != nil {
+		return "", fmt.Errorf("NLS connection config error: %w", err)
+	}
+
+	type nlsCbParam struct {
+		resultCh chan string
+		errCh    chan error
+	}
+	cbp := &nlsCbParam{
+		resultCh: make(chan string, 1),
+		errCh:    make(chan error, 1),
+	}
+
+	nlsLogger := nls.NewNlsLogger(io.Discard, "nls", log.LstdFlags)
+	nlsLogger.SetLogSil(true)
+
+	sr, err := nls.NewSpeechRecognition(config, nlsLogger,
+		func(text string, p interface{}) { // taskFailed
+			cp := p.(*nlsCbParam)
+			select {
+			case cp.errCh <- fmt.Errorf("NLS task failed: %s", text):
+			default:
+			}
+		},
+		nil, nil, // started, resultChanged
+		func(text string, p interface{}) { // completed
+			cp := p.(*nlsCbParam)
+			log.Printf("dingtalk: NLS completed raw JSON: %.800s", text)
+			var result struct {
+				Payload struct {
+					Result string `json:"result"`
+				} `json:"payload"`
+			}
+			recognized := ""
+			if err := json.Unmarshal([]byte(text), &result); err != nil {
+				log.Printf("dingtalk: NLS completed JSON parse error: %v", err)
+			} else {
+				recognized = result.Payload.Result
+				log.Printf("dingtalk: NLS recognized text: %q", recognized)
+			}
+			select {
+			case cp.resultCh <- recognized:
+			default:
+			}
+		},
+		func(p interface{}) {}, // closed
+		cbp,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create NLS SpeechRecognition: %w", err)
+	}
+	defer sr.Shutdown()
+
+	srParam := nls.DefaultSpeechRecognitionParam()
+	srParam.Format = "opus"
+	srParam.SampleRate = sampleRate
+
+	ready, err := sr.Start(srParam, nil)
+	if err != nil {
+		return "", fmt.Errorf("NLS SR Start error: %w", err)
+	}
+	select {
+	case ok := <-ready:
+		if !ok {
+			return "", fmt.Errorf("NLS SR Start failed")
+		}
+	case <-time.After(15 * time.Second):
+		return "", fmt.Errorf("NLS SR Start timeout")
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+
+	// 每个 Opus 包单独发送一次（format=opus 要求每次 SendAudioData 是一个完整 Opus 帧）
+	for _, pkt := range packets {
+		select {
+		case ferr := <-cbp.errCh:
+			return "", ferr
+		default:
+		}
+		if err := sr.SendAudioData(pkt); err != nil {
+			return "", fmt.Errorf("NLS SendAudioData error: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err = sr.Stop(); err != nil {
+		return "", fmt.Errorf("NLS SR Stop error: %w", err)
+	}
+
+	select {
+	case text := <-cbp.resultCh:
+		return text, nil
+	case ferr := <-cbp.errCh:
+		return "", ferr
+	case <-time.After(30 * time.Second):
+		return "", fmt.Errorf("NLS result timeout")
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// format: 音频格式，"amr"、"pcm"、"wav" 等；sampleRate: 采样率，AMR 为 8000
+func (h *Handler) transcribeAudioBytes(ctx context.Context, audioBytes []byte, format string, sampleRate int) (string, error) {
+	config, err := nls.NewConnectionConfigWithAKInfoDefault(
+		nls.DEFAULT_URL,
+		h.cfg.AliyunNLSAppKey,
+		h.cfg.AliyunNLSAkID,
+		h.cfg.AliyunNLSAkKey,
+	)
+	if err != nil {
+		return "", fmt.Errorf("NLS connection config error: %w", err)
+	}
+
+	type nlsCbParam struct {
+		resultCh chan string
+		errCh    chan error
+	}
+	cbp := &nlsCbParam{
+		resultCh: make(chan string, 1),
+		errCh:    make(chan error, 1),
+	}
+
+	nlsLogger := nls.NewNlsLogger(io.Discard, "nls", log.LstdFlags)
+	nlsLogger.SetLogSil(true)
+
+	sr, err := nls.NewSpeechRecognition(config, nlsLogger,
+		func(text string, p interface{}) { // taskFailed
+			cp := p.(*nlsCbParam)
+			select {
+			case cp.errCh <- fmt.Errorf("NLS task failed: %s", text):
+			default:
+			}
+		},
+		nil, // started
+		nil, // resultChanged
+		func(text string, p interface{}) { // completed
+			cp := p.(*nlsCbParam)
+			log.Printf("dingtalk: NLS completed raw JSON: %.800s", text)
+			var result struct {
+				Payload struct {
+					Result string `json:"result"`
+				} `json:"payload"`
+			}
+			recognized := ""
+			if err := json.Unmarshal([]byte(text), &result); err != nil {
+				log.Printf("dingtalk: NLS completed JSON parse error: %v", err)
+			} else {
+				recognized = result.Payload.Result
+				log.Printf("dingtalk: NLS recognized text: %q", recognized)
+			}
+			select {
+			case cp.resultCh <- recognized:
+			default:
+			}
+		},
+		func(p interface{}) {}, // closed
+		cbp,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create NLS SpeechRecognition: %w", err)
+	}
+	defer sr.Shutdown()
+
+	srParam := nls.DefaultSpeechRecognitionParam()
+	srParam.Format = format
+	srParam.SampleRate = sampleRate
+
+	ready, err := sr.Start(srParam, nil)
+	if err != nil {
+		return "", fmt.Errorf("NLS SR Start error: %w", err)
+	}
+	select {
+	case ok := <-ready:
+		if !ok {
+			return "", fmt.Errorf("NLS SR Start failed")
+		}
+	case <-time.After(15 * time.Second):
+		return "", fmt.Errorf("NLS SR Start timeout")
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+
+	// 发送音频数据
+	// opu 模式：直接发送 OGG/Opus 容器字节，NLS 服务端解封装；其他格式按固定分块发送
+	const chunkSize = 3200
+	for i := 0; i < len(audioBytes); i += chunkSize {
+		// 如果 NLS 已返回错误（TaskFailed 等），提前中止发送
+		select {
+		case ferr := <-cbp.errCh:
+			return "", ferr
+		default:
+		}
+		end := i + chunkSize
+		if end > len(audioBytes) {
+			end = len(audioBytes)
+		}
+		if err := sr.SendAudioData(audioBytes[i:end]); err != nil {
+			return "", fmt.Errorf("NLS SendAudioData error: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Stop() creates sr.stopCh under a lock, but RecognitionCompleted may arrive before
+	// that lock is acquired — in which case the handler sees stopCh==nil and never signals it.
+	// To avoid that race entirely we discard the stop channel and wait only on resultCh/errCh.
+	if _, err = sr.Stop(); err != nil {
+		return "", fmt.Errorf("NLS SR Stop error: %w", err)
+	}
+
+	// 等待识别结果（completed 回调会发送结果）
+	select {
+	case text := <-cbp.resultCh:
+		return text, nil
+	case ferr := <-cbp.errCh:
+		return "", ferr
+	case <-time.After(30 * time.Second):
+		return "", fmt.Errorf("NLS result timeout")
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
