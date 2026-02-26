@@ -287,9 +287,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		s.notifyCompletion()
 		log.Printf("opencode: session error handled for session %s", s.sessionID[:8])
 
-		retryMsg := "\n\n是否需要建立新的连接继续操作？\n•回复 '是' 或 'yes' 继续使用旧session\n•回复 '新' 或 'new' 创建新session"
-		if err := s.callback(retryMsg); err != nil {
-			log.Printf("opencode: session.error retry prompt error: %v", err)
+		// 通知用户下一条消息会自动建立新会话（session 映射由 main.go 的全局事件处理器清除）
+		newSessionMsg := "\n\n💡 会话已重置，发送新消息即可自动开始新的对话。"
+		if err := s.callback(newSessionMsg); err != nil {
+			log.Printf("opencode: session.error new-session hint error: %v", err)
 		}
 
 	case "message.part.delta":
