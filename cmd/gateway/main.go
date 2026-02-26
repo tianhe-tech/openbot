@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	opencodesdk "github.com/sst/opencode-sdk-go"
@@ -57,6 +58,11 @@ func main() {
 	adapterRegistry.Register(wecomHandler.GetAdapter())
 	adapterRegistry.Register(feishuHandler.GetAdapter())
 	adapterRegistry.Register(dingtalkHandler.GetAdapter())
+
+	// erroredSessions tracks sessions that were deliberately cleared after session.error.
+	// The title-recovery logic must not re-map these, otherwise the user gets stuck on
+	// the broken session forever.
+	var erroredSessions sync.Map // map[sessionID]struct{}
 
 	// Register event handler for OpenCode -> Adapter communication
 	ocClient.RegisterEventHandler(func(ctx context.Context, event *opencodesdk.EventListResponse) error {
@@ -126,6 +132,11 @@ func main() {
 		}
 
 		if foundAdapter == nil {
+			// 跳过已被清除（session.error 后）的会话，避免 title 恢复逻辑把坏 session 重新绑定给用户
+			if _, banned := erroredSessions.Load(sessionID); banned {
+				return nil
+			}
+
 			// 尝试从 session Title 中恢复映射关系
 			// Title 格式: [adapter:userId] threadId
 			if session, err := ocClient.GetSession(ctx, sessionID); err == nil && session.Title != "" {
@@ -198,7 +209,18 @@ func main() {
 			foundChannel, sessionID[:min(8, len(sessionID))], foundUserID, len(content), content)
 
 		// Route to adapter
-		return adapterRegistry.RouteEventToAdapter(ctx, foundChannel, sessionID, content)
+		routeErr := adapterRegistry.RouteEventToAdapter(ctx, foundChannel, sessionID, content)
+
+		// 会话出错后清除 session 映射，使下一条消息自动建立新会话
+		// 同时将该 sessionID 加入黑名单，防止 title 恢复逻辑把坏 session 重新绑定
+		if eventType == "session.error" && !isCronSession {
+			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
+				sessionID[:min(8, len(sessionID))], foundUserID)
+			foundAdapter.ClearSessionForUser(foundUserID)
+			erroredSessions.Store(sessionID, struct{}{})
+		}
+
+		return routeErr
 	})
 
 	// Start event listener for bidirectional communication

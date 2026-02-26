@@ -57,6 +57,10 @@ func Load() (Config, error) {
 			VerificationToken: os.Getenv("DINGTALK_VERIFICATION_TOKEN"),
 			EncryptKey:        os.Getenv("DINGTALK_ENCRYPT_KEY"),
 			SigningSecret:     os.Getenv("DINGTALK_SIGNING_SECRET"),
+			// 阿里云 NLS 语音识别（可选）
+			AliyunNLSAkID:   os.Getenv("ALIYUN_NLS_AKID"),
+			AliyunNLSAkKey:  os.Getenv("ALIYUN_NLS_AKKEY"),
+			AliyunNLSAppKey: os.Getenv("ALIYUN_NLS_APPKEY"),
 		},
 	}
 
