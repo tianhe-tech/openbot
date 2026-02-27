@@ -3,6 +3,7 @@ module github.com/user/opencode-gateway
 go 1.24.3
 
 require (
+	github.com/aliyun/alibabacloud-nls-go-sdk v1.1.1
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
 	github.com/robfig/cron/v3 v3.0.1
@@ -11,7 +12,6 @@ require (
 
 require (
 	github.com/aliyun/alibaba-cloud-sdk-go v1.61.1376 // indirect
-	github.com/aliyun/alibabacloud-nls-go-sdk v1.1.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
