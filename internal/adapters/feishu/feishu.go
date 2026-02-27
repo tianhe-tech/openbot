@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	nls "github.com/aliyun/alibabacloud-nls-go-sdk"
+
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
@@ -38,6 +40,9 @@ type Config struct {
 	VerificationToken string
 	EncryptKey        string
 	UseWebSocket      bool
+	AliyunNLSAkID     string
+	AliyunNLSAkKey    string
+	AliyunNLSAppKey   string
 }
 
 type Handler struct {
@@ -328,6 +333,21 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleModel(ctx, target, msg.UserID, content)
 	}
 
+	// Handle /thinking command to toggle reasoning output
+	if strings.HasPrefix(content, "/thinking") {
+		return h.handleThinking(ctx, target, content)
+	}
+
+	// Handle /final command to toggle final-only output mode
+	if strings.HasPrefix(content, "/final") {
+		return h.handleFinal(ctx, target, content)
+	}
+
+	// Handle /steps command to toggle step visibility
+	if strings.HasPrefix(content, "/steps") || strings.HasPrefix(content, "/step") {
+		return h.handleSteps(ctx, target, content)
+	}
+
 	// Handle /config command to view configuration
 	if content == "/config" || content == "配置" {
 		return h.handleConfig(ctx, target, msg.UserID)
@@ -393,13 +413,90 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	lastUpdateTime := time.Now()
 	const minUpdateInterval = 5 * time.Second
 	const minUpdateChars = 300
+	var thinkingBuffer strings.Builder
+	thinkingSent := false
+	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled()
+
+	formatThinkingBlock := func(content string) string {
+		trimmed := strings.TrimSpace(content)
+		if trimmed == "" {
+			return ""
+		}
+		return "思考过程：\n" + trimmed + "\n思考结束"
+	}
 
 	callback := func(chunk string) error {
 		raw := chunk
 		trimmed := strings.TrimSpace(chunk)
 
+		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+			thinkingDelta := strings.TrimPrefix(chunk, opencode.ThinkingSignalPrefix)
+			if strings.TrimSpace(thinkingDelta) == "" {
+				return nil
+			}
+			fullReplyMu.Lock()
+			thinkingBuffer.WriteString(thinkingDelta)
+			fullReplyMu.Unlock()
+			log.Printf("feishu: 🧠 buffered thinking chunk (len=%d)", len(thinkingDelta))
+			return nil
+		}
+
+		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) {
+			toolMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.ToolSignalPrefix))
+			if toolMsg == "" {
+				return nil
+			}
+			if err := h.sendTextChunks(sendCtx, target, toolMsg); err != nil {
+				log.Printf("feishu: ⚠️ failed to send tool message: %v", err)
+				return err
+			}
+			return nil
+		}
+
+		if strings.HasPrefix(chunk, opencode.StepSignalPrefix) {
+			stepMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.StepSignalPrefix))
+			if stepMsg == "" {
+				return nil
+			}
+			if err := h.sendTextChunks(sendCtx, target, stepMsg); err != nil {
+				log.Printf("feishu: ⚠️ failed to send step message: %v", err)
+				return err
+			}
+			return nil
+		}
+
+		if strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
+			todoMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.TodoSignalPrefix))
+			if todoMsg == "" {
+				return nil
+			}
+			if err := h.sendTextChunks(sendCtx, target, todoMsg); err != nil {
+				log.Printf("feishu: ⚠️ failed to send todo progress: %v", err)
+				return err
+			}
+			return nil
+		}
+
 		// FlushSignal: session 结束，立即发送所有尚未发送的内容
 		if chunk == opencode.FlushSignal {
+			fullReplyMu.Lock()
+			thinkingMsg := ""
+			if !thinkingSent {
+				thinkingMsg = formatThinkingBlock(thinkingBuffer.String())
+			}
+			fullReplyMu.Unlock()
+
+			if thinkingMsg != "" {
+				log.Printf("feishu: 📤 flush signal: sending thinking block (%d bytes)", len(thinkingMsg))
+				if err := h.sendTextChunks(sendCtx, target, thinkingMsg); err != nil {
+					log.Printf("feishu: ⚠️ flush thinking send failed: %v", err)
+				} else {
+					fullReplyMu.Lock()
+					thinkingSent = true
+					fullReplyMu.Unlock()
+				}
+			}
+
 			fullReplyMu.Lock()
 			toSend := fullReply.String()[lastSentLength:]
 			sentUpTo := fullReply.Len()
@@ -453,7 +550,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		newContentLen := currentLen - lastSentLength
 		var toSend string
 		var prevLastSent int
-		shouldSend := newContentLen >= minUpdateChars && timeSinceLastUpdate >= minUpdateInterval
+		shouldSend := !bufferFinalUntilFlush && newContentLen >= minUpdateChars && timeSinceLastUpdate >= minUpdateInterval
 		if shouldSend {
 			toSend = fullReply.String()[lastSentLength:]
 			prevLastSent = lastSentLength
@@ -517,6 +614,20 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// Send final reply - handle both sync and async modes
 	if response.Reply != "" {
 		// Sync mode - response.Reply contains the full response
+		fullReplyMu.Lock()
+		thinkingMsg := ""
+		if !thinkingSent {
+			thinkingMsg = formatThinkingBlock(thinkingBuffer.String())
+			thinkingSent = thinkingMsg != ""
+		}
+		fullReplyMu.Unlock()
+
+		if thinkingMsg != "" {
+			if err := h.sendTextChunks(sendCtx, target, thinkingMsg); err != nil {
+				log.Printf("feishu: failed to send thinking block: %v", err)
+			}
+		}
+
 		if err := h.sendTextChunks(sendCtx, target, response.Reply); err != nil {
 			log.Printf("feishu: failed to send sync reply: %v", err)
 			return response.Reply, err
@@ -526,9 +637,20 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		// Async mode - send only the remaining unsent content
 		// 用 mutex 确保读到 callback goroutine 写入的完整内容
 		fullReplyMu.Lock()
+		thinkingMsg := ""
+		if !thinkingSent {
+			thinkingMsg = formatThinkingBlock(thinkingBuffer.String())
+			thinkingSent = thinkingMsg != ""
+		}
 		accumulatedContent := fullReply.String()
 		sentSoFar := lastSentLength
 		fullReplyMu.Unlock()
+
+		if thinkingMsg != "" {
+			if err := h.sendTextChunks(sendCtx, target, thinkingMsg); err != nil {
+				log.Printf("feishu: failed to send thinking block: %v", err)
+			}
+		}
 
 		unsentContent := accumulatedContent[sentSoFar:]
 		if len(unsentContent) > 0 {
@@ -800,6 +922,215 @@ func (h *Handler) downloadFeishuMediaAsDataURI(ctx context.Context, messageID, f
 	return dataURI, mime, nil
 }
 
+func (h *Handler) downloadFeishuMediaBytes(ctx context.Context, messageID, fileKey, fileType string) ([]byte, string, error) {
+	token, err := h.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("feishu: get token for download: %w", err)
+	}
+
+	apiURL := fmt.Sprintf("%s/im/v1/messages/%s/resources/%s?type=%s", FeiShuAPIEndpoint, messageID, fileKey, fileType)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("feishu: create media request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("feishu: download media: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("feishu: download media status=%d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("feishu: read media body: %w", err)
+	}
+
+	mime := resp.Header.Get("Content-Type")
+	if idx := strings.Index(mime, ";"); idx != -1 {
+		mime = strings.TrimSpace(mime[:idx])
+	}
+	return data, strings.ToLower(strings.TrimSpace(mime)), nil
+}
+
+func detectAliyunAudioFormat(audioBytes []byte, mime string) (string, int, []byte) {
+	mime = strings.ToLower(strings.TrimSpace(mime))
+	switch {
+	case len(audioBytes) >= 4 && string(audioBytes[:4]) == "OggS":
+		return "opu", 16000, audioBytes
+	case strings.HasPrefix(string(audioBytes), "#!AMR-WB\n"):
+		return "amr-wb", 16000, audioBytes[len("#!AMR-WB\n"):]
+	case strings.HasPrefix(string(audioBytes), "#!AMR\n"):
+		return "amr", 8000, audioBytes[len("#!AMR\n"):]
+	case strings.Contains(mime, "wav"):
+		return "wav", 16000, audioBytes
+	case strings.Contains(mime, "amr"):
+		return "amr", 8000, audioBytes
+	default:
+		return "pcm", 16000, audioBytes
+	}
+}
+
+func (h *Handler) transcribeAudioBytes(ctx context.Context, audioBytes []byte, format string, sampleRate int) (string, error) {
+	config, err := nls.NewConnectionConfigWithAKInfoDefault(
+		nls.DEFAULT_URL,
+		h.cfg.AliyunNLSAppKey,
+		h.cfg.AliyunNLSAkID,
+		h.cfg.AliyunNLSAkKey,
+	)
+	if err != nil {
+		return "", fmt.Errorf("NLS connection config error: %w", err)
+	}
+
+	type nlsCbParam struct {
+		resultCh chan string
+		errCh    chan error
+		latest   string
+		mu       sync.Mutex
+	}
+	cbp := &nlsCbParam{resultCh: make(chan string, 1), errCh: make(chan error, 1)}
+
+	nlsLogger := nls.NewNlsLogger(io.Discard, "nls", log.LstdFlags)
+	nlsLogger.SetLogSil(true)
+
+	sr, err := nls.NewSpeechRecognition(config, nlsLogger,
+		func(text string, p interface{}) { // taskFailed
+			cp := p.(*nlsCbParam)
+			select {
+			case cp.errCh <- fmt.Errorf("NLS task failed: %s", text):
+			default:
+			}
+		},
+		nil,
+		func(text string, p interface{}) { // resultChanged
+			cp := p.(*nlsCbParam)
+			if recognized := extractNLSRecognizedText(text); recognized != "" {
+				cp.mu.Lock()
+				cp.latest = recognized
+				cp.mu.Unlock()
+			}
+		},
+		func(text string, p interface{}) { // completed
+			cp := p.(*nlsCbParam)
+			log.Printf("feishu: NLS completed raw JSON: %.800s", text)
+			recognized := extractNLSRecognizedText(text)
+			if recognized == "" {
+				cp.mu.Lock()
+				recognized = cp.latest
+				cp.mu.Unlock()
+			}
+			log.Printf("feishu: NLS recognized text: %q", recognized)
+			select {
+			case cp.resultCh <- recognized:
+			default:
+			}
+		},
+		func(p interface{}) {},
+		cbp,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create NLS SpeechRecognition: %w", err)
+	}
+	defer sr.Shutdown()
+
+	srParam := nls.DefaultSpeechRecognitionParam()
+	srParam.Format = format
+	srParam.SampleRate = sampleRate
+
+	ready, err := sr.Start(srParam, nil)
+	if err != nil {
+		return "", fmt.Errorf("NLS SR Start error: %w", err)
+	}
+	select {
+	case ok := <-ready:
+		if !ok {
+			return "", fmt.Errorf("NLS SR Start failed")
+		}
+	case <-time.After(15 * time.Second):
+		return "", fmt.Errorf("NLS SR Start timeout")
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+
+	const chunkSize = 3200
+	for i := 0; i < len(audioBytes); i += chunkSize {
+		select {
+		case ferr := <-cbp.errCh:
+			return "", ferr
+		default:
+		}
+		end := i + chunkSize
+		if end > len(audioBytes) {
+			end = len(audioBytes)
+		}
+		if err := sr.SendAudioData(audioBytes[i:end]); err != nil {
+			return "", fmt.Errorf("NLS SendAudioData error: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err = sr.Stop(); err != nil {
+		return "", fmt.Errorf("NLS SR Stop error: %w", err)
+	}
+
+	select {
+	case text := <-cbp.resultCh:
+		return text, nil
+	case ferr := <-cbp.errCh:
+		return "", ferr
+	case <-time.After(30 * time.Second):
+		return "", fmt.Errorf("NLS result timeout")
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func extractNLSRecognizedText(raw string) string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return ""
+	}
+
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &obj); err != nil {
+		return ""
+	}
+
+	lookup := func(m map[string]interface{}, keys ...string) string {
+		cur := interface{}(m)
+		for _, k := range keys {
+			next, ok := cur.(map[string]interface{})
+			if !ok {
+				return ""
+			}
+			cur, ok = next[k]
+			if !ok {
+				return ""
+			}
+		}
+		s, _ := cur.(string)
+		return strings.TrimSpace(s)
+	}
+
+	candidates := []string{
+		lookup(obj, "payload", "result"),
+		lookup(obj, "payload", "text"),
+		lookup(obj, "result"),
+		lookup(obj, "text"),
+		lookup(obj, "payload", "output", "text"),
+		lookup(obj, "payload", "output", "sentence"),
+	}
+	for _, v := range candidates {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // parseFeishuMessageContent \u6839\u636e\u6d88\u606f\u7c7b\u578b\u89e3\u6790\u98de\u4e66\u6d88\u606f\uff0c\u8fd4\u56de\u6587\u5b57\u5185\u5bb9\u548c\u9644\u4ef6\u5217\u8868\u3002
 func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawContent, messageID string) (string, []opencode.Attachment, error) {
 	switch msgType {
@@ -822,7 +1153,14 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 
 	case "audio", "voice":
 		var aud feishuAudioContent
+		asrMime := ""
+		asrFormat := ""
+		asrRate := 0
+		asrTextLen := 0
+		asrStatus := "init"
 		if err := json.Unmarshal([]byte(rawContent), &aud); err != nil {
+			asrStatus = "parse_failed"
+			log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
 			return "[语音消息]", nil, nil
 		}
 		durMs, _ := strconv.Atoi(aud.Duration)
@@ -830,6 +1168,39 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		if durSec == 0 && durMs > 0 {
 			durSec = 1
 		}
+
+		if aud.FileKey != "" && h.cfg.AliyunNLSAkID != "" && h.cfg.AliyunNLSAkKey != "" && h.cfg.AliyunNLSAppKey != "" {
+			audioBytes, mime, err := h.downloadFeishuMediaBytes(ctx, messageID, aud.FileKey, "audio")
+			asrMime = mime
+			if err != nil {
+				log.Printf("feishu: ⚠️ audio download failed: %v", err)
+				asrStatus = "download_failed"
+			} else {
+				format, sampleRate, normalized := detectAliyunAudioFormat(audioBytes, mime)
+				asrFormat = format
+				asrRate = sampleRate
+				log.Printf("feishu: 🎤 audio downloaded for ASR (mime=%s, bytes=%d, format=%s, rate=%d)", mime, len(normalized), format, sampleRate)
+				text, srErr := h.transcribeAudioBytes(ctx, normalized, format, sampleRate)
+				if srErr != nil {
+					log.Printf("feishu: ⚠️ NLS transcription failed: %v", srErr)
+					asrStatus = "nls_failed"
+				} else if strings.TrimSpace(text) != "" {
+					log.Printf("feishu: ✅ NLS result: %s", text)
+					asrTextLen = len(text)
+					asrStatus = "ok"
+					log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
+					return fmt.Sprintf("[语音转文字] %s", text), nil, nil
+				} else {
+					log.Printf("feishu: ⚠️ NLS returned empty text")
+					asrStatus = "empty"
+				}
+			}
+		} else {
+			asrStatus = "nls_not_configured"
+		}
+
+		log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
+
 		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil
 
 	case "post":
@@ -1292,6 +1663,12 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 🤖 模型配置：
 /model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
+/thinking - 查看 thinking 开关状态
+/thinking on|off - 开关 thinking 返回
+/final - 查看最终返回模式
+/final on|off - 开关仅结束时返回最终结果
+/steps - 查看步骤显示状态
+/steps on|off - 开关步骤显示
 /config 或 配置 - 查看完整配置
 
 📋 OpenCode 模式说明：
@@ -1314,11 +1691,104 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 
 🛠️ 高级命令：
 /cmd <command> - 执行技能脚本
-/answer <question_id> <answer> - 回答待确认问题
+/answer <answer> - 回答最近的待确认问题（可选：/answer <question_id> <answer>）
 /crontask - 管理定时任务`
 
 	_ = h.sendTextChunks(ctx, target, helpText)
 	return "handled", nil
+}
+
+// handleThinking 处理 thinking 输出开关命令（全局）
+func (h *Handler) handleThinking(ctx context.Context, target chatTarget, content string) (string, error) {
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	if len(parts) == 1 {
+		status := "off"
+		if h.client.IsThinkingEnabled() {
+			status = "on"
+		}
+		msg := fmt.Sprintf("🧠 Thinking 返回状态: %s\n\n使用方法:\n/thinking on  - 开启\n/thinking off - 关闭", status)
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		h.client.SetThinkingEnabled(true)
+		_ = h.sendTextChunks(ctx, target, "✅ 已开启 thinking 返回（将按 'Thinking:' 分段输出）")
+		return "handled", nil
+	case "off", "false", "0":
+		h.client.SetThinkingEnabled(false)
+		_ = h.sendTextChunks(ctx, target, "✅ 已关闭 thinking 返回（仅返回最终正文）")
+		return "handled", nil
+	default:
+		msg := "❌ 命令格式错误\n\n使用方法:\n/thinking - 查看状态\n/thinking on - 开启\n/thinking off - 关闭"
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+}
+
+// handleFinal 处理最终输出模式开关命令（全局）
+func (h *Handler) handleFinal(ctx context.Context, target chatTarget, content string) (string, error) {
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	if len(parts) == 1 {
+		status := "off"
+		if h.client.IsFinalOnlyEnabled() {
+			status = "on"
+		}
+		msg := fmt.Sprintf("📦 Final-only 模式: %s\n\n使用方法:\n/final on  - 开启（仅结束时返回最终结果）\n/final off - 关闭（允许中间增量）", status)
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		h.client.SetFinalOnlyEnabled(true)
+		_ = h.sendTextChunks(ctx, target, "✅ 已开启 final-only 模式（正文与thinking均在结束后分段返回）")
+		return "handled", nil
+	case "off", "false", "0":
+		h.client.SetFinalOnlyEnabled(false)
+		_ = h.sendTextChunks(ctx, target, "✅ 已关闭 final-only 模式（允许中间增量返回）")
+		return "handled", nil
+	default:
+		msg := "❌ 命令格式错误\n\n使用方法:\n/final - 查看状态\n/final on - 开启\n/final off - 关闭"
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+}
+
+// handleSteps 处理步骤显示开关命令（全局）
+func (h *Handler) handleSteps(ctx context.Context, target chatTarget, content string) (string, error) {
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	if len(parts) == 1 {
+		status := "off"
+		if h.client.IsStepEnabled() {
+			status = "on"
+		}
+		msg := fmt.Sprintf("🪜 步骤显示状态: %s\n\n使用方法:\n/steps on  - 开启\n/steps off - 关闭", status)
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		h.client.SetStepEnabled(true)
+		_ = h.sendTextChunks(ctx, target, "✅ 已开启步骤显示（会显示步骤开始/完成）")
+		return "handled", nil
+	case "off", "false", "0":
+		h.client.SetStepEnabled(false)
+		_ = h.sendTextChunks(ctx, target, "✅ 已关闭步骤显示")
+		return "handled", nil
+	default:
+		msg := "❌ 命令格式错误\n\n使用方法:\n/steps - 查看状态\n/steps on - 开启\n/steps off - 关闭"
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
 }
 
 // handleAbort handles abort command to abort running session
@@ -1595,18 +2065,51 @@ func (h *Handler) handleModelSet(ctx context.Context, target chatTarget, userID 
 		_ = h.sendTextChunks(ctx, target, "❌ 提供商ID不能为空")
 		return "handled", nil
 	}
+	if modelID == "" {
+		_ = h.sendTextChunks(ctx, target, "❌ 模型ID不能为空\n\n使用方法:\n/model <provider>/<model>\n例如:\n/model TH-AI/Kimi-K2.5")
+		return "handled", nil
+	}
+
+	providers, err := h.client.GetProviders(ctx)
+	if err != nil {
+		log.Printf("feishu: failed to fetch providers for case-insensitive model resolve: %v", err)
+	} else if len(providers) > 0 {
+		providerMatched := false
+		modelMatched := false
+		for _, p := range providers {
+			if !strings.EqualFold(strings.TrimSpace(p.ID), strings.TrimSpace(providerID)) {
+				continue
+			}
+			providerMatched = true
+			providerID = p.ID
+			for _, m := range p.Models {
+				if strings.EqualFold(strings.TrimSpace(m.ID), strings.TrimSpace(modelID)) {
+					modelMatched = true
+					modelID = m.ID
+					break
+				}
+			}
+			break
+		}
+
+		if !providerMatched {
+			_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 未找到提供商: %s\n\n请先执行 /model 查看可用 provider/model", providerID))
+			return "handled", nil
+		}
+		if !modelMatched {
+			_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 提供商 %s 下未找到模型: %s\n\n请先执行 /model 查看可用模型", providerID, modelID))
+			return "handled", nil
+		}
+	}
 
 	if err := h.client.UpdateSessionProvider(ctx, sessionID, providerID, modelID); err != nil {
-		msg := fmt.Sprintf("❌ 更新模型失败: %v\n\n"+
-			"💡 SDK 当前不支持通过 Session.Update 直接设置 provider/model\n"+
-			"请优先在 OpenCode Web 界面设置默认模型", err)
+		msg := fmt.Sprintf("❌ 更新模型失败: %v", err)
 		_ = h.sendTextChunks(ctx, target, msg)
 		return "", err
 	}
 
-	msg := fmt.Sprintf("✅ 已尝试更新模型配置\n\n提供商: %s\n模型: %s\n会话: %s\n\n"+
-		"💡 注意：该操作未必会改变会话默认模型（取决于服务端能力）\n"+
-		"如需稳定生效，请在 OpenCode Web 界面设置默认模型",
+	msg := fmt.Sprintf("✅ 已设置会话模型\n\n提供商: %s\n模型: %s\n会话: %s\n\n"+
+		"该设置会由 gateway 在后续请求中强制携带。",
 		providerID, modelID, sessionID[:min(8, len(sessionID))])
 	_ = h.sendTextChunks(ctx, target, msg)
 	return "handled", nil
@@ -1635,6 +2138,9 @@ func (h *Handler) handleConfig(ctx context.Context, target chatTarget, userID st
 
 	msgBuilder.WriteString("\n🔧 可用命令:\n")
 	msgBuilder.WriteString("  /model - 查看/设置模型\n")
+	msgBuilder.WriteString("  /thinking - 查看/设置 thinking 返回\n")
+	msgBuilder.WriteString("  /final - 查看/设置 final-only 输出\n")
+	msgBuilder.WriteString("  /steps - 查看/设置步骤显示\n")
 	msgBuilder.WriteString("  /status - 查看会话状态\n")
 	msgBuilder.WriteString("  /new - 创建新会话\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
@@ -1696,16 +2202,40 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, target chatTarget, u
 
 // handleAnswer handles the /answer command to answer pending questions
 func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, content string) (string, error) {
-	// 解析命令: /answer <questionID> <answer>
+	// 解析命令:
+	// 1) /answer <answer>
+	// 2) /answer <questionID> <answer>
 	parts := strings.Fields(content)
-	if len(parts) < 3 {
-		msg := "❌ 命令格式错误\n\n使用方法:\n/answer <question_id> <answer>\n\n例如:\n/answer q_123456 1\n/answer q_123456 yes"
+	if len(parts) < 2 {
+		msg := h.buildPendingRequirementHint(userID)
+		if msg == "" {
+			msg = "❌ 当前没有待确认问题。请先等待 OpenCode 提问后直接回复选项内容（如：1、允许、yes）。"
+		}
 		_ = h.sendTextChunks(ctx, target, msg)
 		return "handled", nil
 	}
 
-	questionID := parts[1]
-	answer := strings.Join(parts[2:], " ")
+	var questionID, answer string
+	if len(parts) >= 3 && (strings.HasPrefix(parts[1], "q_") || strings.HasPrefix(parts[1], "que_") || strings.HasPrefix(parts[1], "per_")) {
+		questionID = parts[1]
+		answer = strings.Join(parts[2:], " ")
+	} else {
+		sessionID, ok := h.adapter.GetSessionForUser(userID)
+		if !ok {
+			_ = h.sendTextChunks(ctx, target, "❌ 当前没有活跃会话，无法定位待确认问题")
+			return "handled", nil
+		}
+
+		if permission, ok := h.client.GetLatestPendingPermission(sessionID); ok {
+			questionID = permission.ID
+		} else if question, ok := h.client.GetLatestPendingQuestion(sessionID); ok {
+			questionID = question.ID
+		} else {
+			_ = h.sendTextChunks(ctx, target, "❌ 当前会话没有待确认问题")
+			return "handled", nil
+		}
+		answer = strings.Join(parts[1:], " ")
+	}
 
 	// 获取问题
 	question, ok := h.client.GetPendingQuestion(questionID)
@@ -1744,6 +2274,49 @@ func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, c
 	log.Printf("feishu: answered question %s successfully", questionID)
 
 	return "handled", nil
+}
+
+func (h *Handler) buildPendingRequirementHint(userID string) string {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		return ""
+	}
+
+	if permission, ok := h.client.GetLatestPendingPermission(sessionID); ok {
+		return fmt.Sprintf("OpenCode 需要确认：\n%s\n\n请直接回复：允许 / 拒绝 / 始终允许", permission.Text)
+	}
+	if question, ok := h.client.GetLatestPendingQuestion(sessionID); ok {
+		var b strings.Builder
+		b.WriteString("OpenCode 需要选择：\n")
+		if question.Text != "" {
+			b.WriteString(question.Text)
+			b.WriteString("\n")
+		}
+		if len(question.Questions) > 0 {
+			for _, q := range question.Questions {
+				if q.Header != "" {
+					b.WriteString("\n")
+					b.WriteString(q.Header)
+					b.WriteString("\n")
+				}
+				if q.Question != "" {
+					b.WriteString(q.Question)
+					b.WriteString("\n")
+				}
+				for i, opt := range q.Options {
+					b.WriteString(fmt.Sprintf("%d. %s\n", i+1, opt.Label))
+				}
+			}
+		} else if len(question.Options) > 0 {
+			for i, opt := range question.Options {
+				b.WriteString(fmt.Sprintf("%d. %s\n", i+1, opt))
+			}
+		}
+		b.WriteString("\n请直接回复选项内容（无需输入 /answer）")
+		return b.String()
+	}
+
+	return ""
 }
 
 // handleCronTask handles the /crontask command for scheduled tasks

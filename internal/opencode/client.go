@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sst/opencode-sdk-go"
@@ -188,6 +189,7 @@ type Client struct {
 	sessionSummary    sync.Map     // map[sessionID]string stores session summaries
 	modelConfig       sync.Map     // map[sessionID]*ModelConfig caches model config per session
 	sessionModel      sync.Map     // map[sessionID]*ModelConfig tracks latest provider/model seen in assistant replies
+	sessionOverride   sync.Map     // map[sessionID]*ModelConfig stores user-selected model via /model
 	requestCache      sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
 	runningSessions   sync.Map     // map[sessionID]bool 跟踪正在运行的session
 	pendingQuestions  sync.Map     // map[questionID]*Question 待回答的问题
@@ -205,6 +207,9 @@ type Client struct {
 	lastHealthCheck   time.Time    // 最后一次健康检查时间
 	isHealthy         bool         // OpenCode server是否健康
 	healthCheckMu     sync.RWMutex // 保护健康状态
+	thinkingEnabled   atomic.Bool  // 是否输出 reasoning/thinking 内容
+	finalOnlyEnabled  atomic.Bool  // 是否仅在结束时发送最终回复
+	stepEnabled       atomic.Bool  // 是否显示 step-start/step-finish 中间步骤
 
 }
 
@@ -311,6 +316,13 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 		opt(client)
 	}
 
+	client.thinkingEnabled.Store(parseEnvBool("OPENBOT_SHOW_THINKING"))
+	log.Printf("opencode: thinking output enabled=%t (env OPENBOT_SHOW_THINKING)", client.thinkingEnabled.Load())
+	client.finalOnlyEnabled.Store(parseEnvBool("OPENBOT_FINAL_ONLY"))
+	log.Printf("opencode: final-only output enabled=%t (env OPENBOT_FINAL_ONLY)", client.finalOnlyEnabled.Load())
+	client.stepEnabled.Store(parseEnvBool("OPENBOT_SHOW_STEPS"))
+	log.Printf("opencode: step output enabled=%t (env OPENBOT_SHOW_STEPS)", client.stepEnabled.Load())
+
 	// 启动后台清理协程
 	go client.cleanupRequestCache()
 
@@ -336,6 +348,39 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 // Ready reports if the client has enough data to operate.
 func (c *Client) Ready() bool {
 	return c.sdk != nil
+}
+
+// SetThinkingEnabled toggles whether reasoning/thinking stream is emitted to adapters.
+func (c *Client) SetThinkingEnabled(enabled bool) {
+	c.thinkingEnabled.Store(enabled)
+	log.Printf("opencode: thinking output toggled to %t", enabled)
+}
+
+// IsThinkingEnabled reports whether reasoning/thinking stream emission is enabled.
+func (c *Client) IsThinkingEnabled() bool {
+	return c.thinkingEnabled.Load()
+}
+
+// SetFinalOnlyEnabled toggles whether adapters should buffer final output until completion.
+func (c *Client) SetFinalOnlyEnabled(enabled bool) {
+	c.finalOnlyEnabled.Store(enabled)
+	log.Printf("opencode: final-only output toggled to %t", enabled)
+}
+
+// IsFinalOnlyEnabled reports whether final-only output mode is enabled.
+func (c *Client) IsFinalOnlyEnabled() bool {
+	return c.finalOnlyEnabled.Load()
+}
+
+// SetStepEnabled toggles whether step lifecycle messages are emitted to adapters.
+func (c *Client) SetStepEnabled(enabled bool) {
+	c.stepEnabled.Store(enabled)
+	log.Printf("opencode: step output toggled to %t", enabled)
+}
+
+// IsStepEnabled reports whether step lifecycle messages are enabled.
+func (c *Client) IsStepEnabled() bool {
+	return c.stepEnabled.Load()
 }
 
 // CheckHealth checks if the OpenCode server is running and accessible.
@@ -614,8 +659,19 @@ sendMessage:
 	// 若当前会话模型不支持图片/视频，则使用支持模型先识别媒体，再将识别结果转为文本发给当前会话模型。
 	if processed, err := c.preprocessAttachmentsForSession(ctx, sessionID, &payload, &effectiveContent); err != nil {
 		log.Printf("opencode: media preprocessing failed for session %s: %v", sessionID[:8], err)
+		c.failRequest(requestHash)
+		return Response{}, fmt.Errorf("opencode: media preprocessing: %w", err)
 	} else if processed {
 		log.Printf("opencode: media preprocessing applied for session %s", sessionID[:8])
+	}
+
+	mainModelOverride := c.getSessionModelOverride(sessionID)
+	if mainModelOverride != nil {
+		log.Printf("opencode: request route - session=%s mainModel=%s/%s attachments=%d",
+			sessionID[:8], mainModelOverride.ProviderID.Value, mainModelOverride.ModelID.Value, len(payload.Attachments))
+	} else {
+		log.Printf("opencode: request route - session=%s mainModel=<default/session> attachments=%d",
+			sessionID[:8], len(payload.Attachments))
 	}
 
 	// Build message parts
@@ -661,7 +717,7 @@ sendMessage:
 	// 流式模式下改用异步 prompt_async，避免长任务导致 context deadline
 	if payload.Streaming {
 		c.runningSessions.Store(sessionID, true)
-		if err := c.sendPromptAsync(ctx, sessionID, parts); err != nil {
+		if err := c.sendPromptAsync(ctx, sessionID, parts, mainModelOverride); err != nil {
 			c.runningSessions.Delete(sessionID)
 			c.failRequest(requestHash)
 			return Response{}, fmt.Errorf("opencode: prompt_async: %w", err)
@@ -689,7 +745,7 @@ sendMessage:
 	// 标记session为运行状态
 	c.runningSessions.Store(sessionID, true)
 
-	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, nil)
+	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, mainModelOverride)
 
 	// 清除运行状态
 	c.runningSessions.Delete(sessionID)
@@ -908,7 +964,7 @@ func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
 			inputModalities := make([]string, 0, len(m.Modalities.Input))
 			inputMap := make(map[string]bool)
 			for _, in := range m.Modalities.Input {
-				s := string(in)
+				s := strings.ToLower(strings.TrimSpace(string(in)))
 				if s == "" {
 					continue
 				}
@@ -919,7 +975,7 @@ func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
 			outputModalities := make([]string, 0, len(m.Modalities.Output))
 			outputMap := make(map[string]bool)
 			for _, out := range m.Modalities.Output {
-				s := string(out)
+				s := strings.ToLower(strings.TrimSpace(string(out)))
 				if s == "" {
 					continue
 				}
@@ -994,13 +1050,28 @@ func (c *Client) GetCurrentProvider(ctx context.Context, sessionID string) (*Pro
 func (c *Client) UpdateSessionProvider(ctx context.Context, sessionID, providerID, modelID string) error {
 	log.Printf("opencode: updating session %s provider to %s/%s", sessionID[:8], providerID, modelID)
 
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if providerID == "" || modelID == "" {
+		return fmt.Errorf("opencode: provider/model cannot be empty")
+	}
+
+	override := &ModelConfig{
+		ProviderID:  providerID,
+		ModelID:     modelID,
+		LastUpdated: time.Now(),
+	}
+	c.sessionOverride.Store(sessionID, override)
+	c.sessionModel.Store(sessionID, override)
+	log.Printf("opencode: session %s model override set to %s/%s", sessionID[:8], providerID, modelID)
+
 	// SDK SessionUpdateParams may not have ProviderID/ModelID fields
 	// Try using Update with available params
 	_, err := c.sdk.Session.Update(ctx, sessionID, opencode.SessionUpdateParams{
 		// Use available fields only
 	})
 	if err != nil {
-		return fmt.Errorf("opencode: update session: %w", err)
+		log.Printf("opencode: session update API ignored (local override remains active): %v", err)
 	}
 
 	// Invalidate cached model config
@@ -1008,7 +1079,23 @@ func (c *Client) UpdateSessionProvider(ctx context.Context, sessionID, providerI
 	// Fetch new config
 	go c.fetchAndCacheModelConfig(context.Background(), sessionID)
 
-	log.Printf("opencode: note - provider/model update may not be fully supported by SDK")
+	log.Printf("opencode: note - provider/model update may not be fully supported by SDK, using gateway override")
+	return nil
+}
+
+func (c *Client) getSessionModelOverride(sessionID string) *opencode.SessionPromptParamsModel {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	if v, ok := c.sessionOverride.Load(sessionID); ok {
+		cfg := v.(*ModelConfig)
+		if strings.TrimSpace(cfg.ProviderID) != "" && strings.TrimSpace(cfg.ModelID) != "" {
+			return &opencode.SessionPromptParamsModel{
+				ProviderID: opencode.F(cfg.ProviderID),
+				ModelID:    opencode.F(cfg.ModelID),
+			}
+		}
+	}
 	return nil
 }
 
@@ -1518,6 +1605,7 @@ func (c *Client) GetSessionInfo(ctx context.Context, sessionID string) (*Session
 // SendMessageStreaming sends a message and calls the callback for each chunk of the response.
 // 真正的流式实现：注册StreamingSessionHandler监听实时事件
 func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayload, callback StreamCallback) (Response, error) {
+	//fmt.Println("payload is______________________________:", payload.)
 	if callback == nil {
 		// 如果没有回调，直接使用普通模式
 		return c.SendMessage(ctx, payload)
@@ -1581,7 +1669,7 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 	handler := NewStreamingSessionHandler(sessionID, callback, func() {
 		c.runningSessions.Delete(sessionID)
 		c.UnregisterSessionHandler(sessionID)
-	}, c, c)
+	}, c, c, c.IsThinkingEnabled(), c.IsStepEnabled())
 	c.RegisterSessionHandler(sessionID, handler.HandleEvent)
 	c.activeHandlers.Store(sessionID, handler)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
@@ -1991,6 +2079,45 @@ func hasAttachmentType(att Attachment, prefix string) bool {
 	return strings.HasPrefix(m, prefix)
 }
 
+func capabilitySupportsModality(cap *ModelCapability, modality string) bool {
+	if cap == nil {
+		return false
+	}
+	modality = strings.ToLower(strings.TrimSpace(modality))
+	if modality == "" {
+		return false
+	}
+	if cap.InputModalities[modality] {
+		return true
+	}
+	if modality == "text" {
+		return cap.InputModalities["input_text"] || cap.InputModalities["prompt"]
+	}
+	if modality == "image" {
+		return cap.InputModalities["vision"] || cap.InputModalities["input_image"]
+	}
+	if modality == "video" {
+		return cap.InputModalities["input_video"]
+	}
+	if modality == "audio" {
+		return cap.InputModalities["voice"] || cap.InputModalities["speech"] || cap.InputModalities["input_audio"]
+	}
+	return false
+}
+
+func maybeVisionCapableByModelID(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	if id == "" {
+		return false
+	}
+	for _, hint := range []string{"kimi", "gpt-4o", "gemini", "qwen-vl", "qvq", "claude-3-5-sonnet", "claude-3-7-sonnet", "vision", "vl"} {
+		if strings.Contains(id, hint) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID string, payload *MessagePayload, effectiveContent *string) (bool, error) {
 	if payload == nil || len(payload.Attachments) == 0 {
 		return false, nil
@@ -1999,6 +2126,7 @@ func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID 
 
 	needImage := false
 	needVideo := false
+	needAudio := false
 	mediaAttachments := make([]Attachment, 0)
 	for _, att := range payload.Attachments {
 		if hasAttachmentType(att, "image/") {
@@ -2009,48 +2137,35 @@ func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID 
 		if hasAttachmentType(att, "video/") {
 			needVideo = true
 			mediaAttachments = append(mediaAttachments, att)
+			continue
+		}
+		if hasAttachmentType(att, "audio/") {
+			needAudio = true
+			mediaAttachments = append(mediaAttachments, att)
 		}
 	}
 
-	if !needImage && !needVideo {
-		c.mediaDebugf("no image/video attachments, skip preprocess")
+	if !needImage && !needVideo && !needAudio {
+		c.mediaDebugf("no image/video/audio attachments, skip preprocess")
 		return false, nil
 	}
-	c.mediaDebugf("media detected: needImage=%t needVideo=%t mediaCount=%d", needImage, needVideo, len(mediaAttachments))
+	c.mediaDebugf("media detected: needImage=%t needVideo=%t needAudio=%t mediaCount=%d", needImage, needVideo, needAudio, len(mediaAttachments))
 
 	c.ensureModelCatalog(ctx)
-
-	currentCfg, ok := c.getCurrentSessionModel(ctx, sessionID)
+	recognizerModel, ok := c.selectFallbackMediaModel(needImage, needVideo, needAudio)
 	if !ok {
-		// 无法确定当前模型，保持现有行为。
-		c.mediaDebugf("current session model unknown, keep original flow")
+		c.mediaDebugf("no matched recognizer model for media, skip preprocessing")
 		return false, nil
 	}
-	c.mediaDebugf("current session model: %s/%s", currentCfg.ProviderID, currentCfg.ModelID)
+	c.mediaDebugf("matched recognizer model: %s/%s", recognizerModel.ProviderID, recognizerModel.ModelID)
 
-	c.modelCatalogMu.RLock()
-	capability, hasCapability := c.modelCatalog[modelCatalogKey(currentCfg.ProviderID, currentCfg.ModelID)]
-	c.modelCatalogMu.RUnlock()
-	if !hasCapability {
-		// 当前模型能力未知，保持现有行为。
-		c.mediaDebugf("capability unknown for %s/%s, keep original flow", currentCfg.ProviderID, currentCfg.ModelID)
-		return false, nil
-	}
-
-	if (!needImage || capability.InputModalities["image"]) && (!needVideo || capability.InputModalities["video"]) {
-		// 当前模型已支持所需模态，保持现有代码路径。
-		c.mediaDebugf("current model supports required modalities, keep original flow")
-		return false, nil
-	}
-	c.mediaDebugf("current model lacks required modalities, try fallback recognizer")
-
-	recognized, err := c.recognizeMediaWithFallbackModel(ctx, mediaAttachments, needImage, needVideo)
+	recognized, err := c.recognizeMediaWithModel(ctx, mediaAttachments, recognizerModel)
 	if err != nil {
-		c.mediaDebugf("fallback recognizer failed: %v", err)
+		c.mediaDebugf("media recognizer failed: %v", err)
 		return false, err
 	}
 	if strings.TrimSpace(recognized) == "" {
-		c.mediaDebugf("fallback recognizer returned empty text, keep original flow")
+		c.mediaDebugf("media recognizer returned empty text, keep original flow")
 		return false, nil
 	}
 
@@ -2058,7 +2173,7 @@ func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID 
 
 	filtered := make([]Attachment, 0, len(payload.Attachments))
 	for _, att := range payload.Attachments {
-		if hasAttachmentType(att, "image/") || hasAttachmentType(att, "video/") {
+		if hasAttachmentType(att, "image/") || hasAttachmentType(att, "video/") || hasAttachmentType(att, "audio/") {
 			continue
 		}
 		filtered = append(filtered, att)
@@ -2069,7 +2184,7 @@ func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID 
 	return true, nil
 }
 
-func (c *Client) selectFallbackVisionModel(needImage, needVideo bool) (*ModelConfig, bool) {
+func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) (*ModelConfig, bool) {
 	c.modelCatalogMu.RLock()
 	keys := make([]string, 0, len(c.modelCatalog))
 	for k := range c.modelCatalog {
@@ -2077,35 +2192,55 @@ func (c *Client) selectFallbackVisionModel(needImage, needVideo bool) (*ModelCon
 	}
 	sort.Strings(keys)
 
+	// Pass 1: strict capability matching based on provider metadata.
 	for _, k := range keys {
 		cap := c.modelCatalog[k]
 		if cap == nil {
 			continue
 		}
-		if !cap.InputModalities["text"] {
+		if !capabilitySupportsModality(cap, "text") {
 			continue
 		}
-		if needImage && !cap.InputModalities["image"] {
+		if needImage && !capabilitySupportsModality(cap, "image") {
 			continue
 		}
-		if needVideo && !cap.InputModalities["video"] {
+		if needVideo && !capabilitySupportsModality(cap, "video") {
+			continue
+		}
+		if needAudio && !capabilitySupportsModality(cap, "audio") {
 			continue
 		}
 		cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
-		c.mediaDebugf("selected fallback model: %s/%s", cfg.ProviderID, cfg.ModelID)
+		c.mediaDebugf("selected media recognizer model: %s/%s", cfg.ProviderID, cfg.ModelID)
 		c.modelCatalogMu.RUnlock()
 		return cfg, true
 	}
 
+	// Pass 2: metadata-missing fallback (common in some OpenAI-compatible providers).
+	// For image/video recognition, prefer known vision-capable model IDs (e.g., Kimi).
+	if (needImage || needVideo) && !needAudio {
+		for _, k := range keys {
+			cap := c.modelCatalog[k]
+			if cap == nil {
+				continue
+			}
+			if maybeVisionCapableByModelID(cap.ModelID) {
+				cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
+				c.mediaDebugf("selected media recognizer model by heuristic: %s/%s", cfg.ProviderID, cfg.ModelID)
+				c.modelCatalogMu.RUnlock()
+				return cfg, true
+			}
+		}
+	}
+
 	c.modelCatalogMu.RUnlock()
-	c.mediaDebugf("no fallback model found for needImage=%t needVideo=%t", needImage, needVideo)
+	c.mediaDebugf("no media recognizer model found for needImage=%t needVideo=%t needAudio=%t", needImage, needVideo, needAudio)
 	return nil, false
 }
 
-func (c *Client) recognizeMediaWithFallbackModel(ctx context.Context, attachments []Attachment, needImage, needVideo bool) (string, error) {
-	visionModel, ok := c.selectFallbackVisionModel(needImage, needVideo)
-	if !ok {
-		return "", fmt.Errorf("no fallback model supports required media modalities (image=%t, video=%t)", needImage, needVideo)
+func (c *Client) recognizeMediaWithModel(ctx context.Context, attachments []Attachment, visionModel *ModelConfig) (string, error) {
+	if visionModel == nil {
+		return "", fmt.Errorf("media recognizer model is nil")
 	}
 	c.mediaDebugf("recognize with fallback model: %s/%s attachments=%d", visionModel.ProviderID, visionModel.ModelID, len(attachments))
 
@@ -2130,7 +2265,7 @@ func (c *Client) recognizeMediaWithFallbackModel(ctx context.Context, attachment
 	parts := []opencode.SessionPromptParamsPartUnion{
 		opencode.TextPartInputParam{
 			Type: opencode.F(opencode.TextPartInputTypeText),
-			Text: opencode.F("请识别以下媒体内容（图片/视频），并输出简洁中文摘要，重点提取可用于回答用户问题的关键信息。"),
+			Text: opencode.F("请识别以下媒体内容（图片/视频/语音），其中语音请转写关键内容；输出简洁中文摘要，重点提取可用于回答用户问题的关键信息。"),
 		},
 	}
 
@@ -2161,13 +2296,16 @@ func (c *Client) recognizeMediaWithFallbackModel(ctx context.Context, attachment
 }
 
 // sendPromptAsync 调用 OpenCode 的 prompt_async 接口，立即返回，由事件流提供结果
-func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion) error {
+func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, model *opencode.SessionPromptParamsModel) error {
 	if c.endpoint == "" {
 		return fmt.Errorf("opencode: prompt_async unavailable: missing endpoint")
 	}
 
 	params := opencode.SessionPromptParams{
 		Parts: opencode.F(parts),
+	}
+	if model != nil {
+		params.Model = opencode.F(*model)
 	}
 	if c.directory != "" {
 		params.Directory = opencode.F(c.directory)

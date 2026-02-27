@@ -41,15 +41,20 @@ type StreamingSessionHandler struct {
 	onComplete         func()
 	client             *Client       // 用于存储问题
 	messageSender      MessageSender // 用于主动推送消息到用户
+	showThinking       bool          // 是否输出 reasoning/thinking 内容
+	showSteps          bool          // 是否输出 step-start/step-finish 步骤提示
+	lastTodoSummary    string        // 最近一次自动推送的 todo 文本（用于去重）
+	lastTodoPushTime   time.Time     // 最近一次自动推送 todo 的时间
 	// 增量内容追踪（对照 TUI sync.tsx 中 message.part.delta / message.part.updated 机制）
-	partTextCache sync.Map   // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
-	partRoles     sync.Map   // partID -> string: 每个 part 所属 message 的 role（"user"/"assistant"），用于过滤用户消息
-	sessionTodos  []TodoItem // 当前 todo 列表（来自 todo.updated 事件）
-	sessionDiff   []FileDiff // 本次会话的文件变更（来自 session.diff 事件）
+	partTextCache   sync.Map   // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
+	toolSignalCache sync.Map   // partID -> string: 最近一次已发送的工具状态签名，避免重复推送
+	partRoles       sync.Map   // partID -> string: 每个 part 所属 message 的 role（"user"/"assistant"），用于过滤用户消息
+	sessionTodos    []TodoItem // 当前 todo 列表（来自 todo.updated 事件）
+	sessionDiff     []FileDiff // 本次会话的文件变更（来自 session.diff 事件）
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
-func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onComplete func(), client *Client, messageSender MessageSender) *StreamingSessionHandler {
+func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool) *StreamingSessionHandler {
 	h := &StreamingSessionHandler{
 		sessionID:      sessionID,
 		callback:       callback,
@@ -57,6 +62,8 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onCom
 		onComplete:     onComplete,
 		client:         client,
 		messageSender:  messageSender,
+		showThinking:   showThinking,
+		showSteps:      showSteps,
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
@@ -308,8 +315,29 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					Delta     string `json:"delta"`
 				} `json:"properties"`
 			}
-			if err := json.Unmarshal([]byte(raw), &d); err == nil &&
-				d.Properties.Field == "text" && d.Properties.Delta != "" {
+			if err := json.Unmarshal([]byte(raw), &d); err == nil && d.Properties.Delta != "" {
+				if d.Properties.Field == "reasoning" {
+					if !s.showThinking {
+						break
+					}
+					reasoningChunk := ThinkingSignalPrefix + d.Properties.Delta
+					if err := s.callback(reasoningChunk); err != nil {
+						log.Printf("opencode: message.part.delta reasoning callback error: %v", err)
+					} else {
+						s.lastContent += reasoningChunk
+						if !s.contentSent {
+							s.stopWaitingTimer()
+						}
+						s.contentSent = true
+					}
+					s.lastUpdateTime = time.Now()
+					break
+				}
+
+				if d.Properties.Field != "text" {
+					break
+				}
+
 				partID := d.Properties.PartID
 				delta := d.Properties.Delta
 
@@ -363,6 +391,23 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		if todos != nil {
 			s.sessionTodos = todos
 			log.Printf("opencode: todos updated for session %s (%d items)", s.sessionID[:8], len(todos))
+
+			summary := formatTodoSummaryFromTodos(todos)
+			if summary != "" {
+				now := time.Now()
+				if summary != s.lastTodoSummary && (s.lastTodoPushTime.IsZero() || now.Sub(s.lastTodoPushTime) >= TodoAutoPushInterval) {
+					if err := s.callback(TodoSignalPrefix + summary); err != nil {
+						log.Printf("opencode: todo auto-push callback error: %v", err)
+					} else {
+						s.lastTodoSummary = summary
+						s.lastTodoPushTime = now
+						if !s.contentSent {
+							s.stopWaitingTimer()
+						}
+						s.contentSent = true
+					}
+				}
+			}
 		}
 
 	case "session.diff":
@@ -383,6 +428,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			}
 			if err := json.Unmarshal([]byte(raw), &w); err == nil && w.Properties.PartID != "" {
 				s.partTextCache.Delete(w.Properties.PartID)
+				s.toolSignalCache.Delete(w.Properties.PartID)
 			}
 		}
 		log.Printf("opencode: message part removed for session %s", s.sessionID[:8])
@@ -549,9 +595,10 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 		}
 
 	case "tool":
-		// 工具调用事件（不涉及 partTextCache，直接返回格式化文本）
+		// 工具调用事件：通过专用信号下发给 adapter，和正文分轨。
 		toolName := props.Part.Tool
 		state := props.Part.State
+		partID := props.Part.ID
 		log.Printf("opencode: 🔍 extractContent - tool event: name=%s, status=%s", toolName, state.Status)
 
 		switch state.Status {
@@ -567,33 +614,106 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 				desc = state.Input.URL
 			}
 			if desc != "" {
-				if len([]rune(desc)) > 80 {
-					desc = string([]rune(desc)[:80]) + "..."
+				if len([]rune(desc)) > 120 {
+					desc = string([]rune(desc)[:120]) + "..."
 				}
-				return fmt.Sprintf("🔧 [%s] %s\n", toolName, desc), "", ""
+				msg := fmt.Sprintf("🔧 工具 %s：%s", toolName, desc)
+				if partID != "" {
+					signature := "running|" + msg
+					if prev, ok := s.toolSignalCache.Load(partID); ok && prev.(string) == signature {
+						return "", "", ""
+					}
+					s.toolSignalCache.Store(partID, signature)
+				}
+				return ToolSignalPrefix + msg, "", ""
 			}
-			return fmt.Sprintf("🔧 正在执行 %s...\n", toolName), "", ""
+			msg := fmt.Sprintf("🔧 工具 %s：执行中", toolName)
+			if partID != "" {
+				signature := "running|" + msg
+				if prev, ok := s.toolSignalCache.Load(partID); ok && prev.(string) == signature {
+					return "", "", ""
+				}
+				s.toolSignalCache.Store(partID, signature)
+			}
+			return ToolSignalPrefix + msg, "", ""
 
 		case "completed":
 			output := strings.TrimSpace(state.Output)
-			if output != "" && len([]rune(output)) <= 200 {
-				return fmt.Sprintf("✅ [%s] %s\n", toolName, output), "", ""
+			if output != "" {
+				if len([]rune(output)) > 160 {
+					output = string([]rune(output)[:160]) + "..."
+				}
+				msg := fmt.Sprintf("✅ 工具 %s：已完成（%s）", toolName, output)
+				if partID != "" {
+					signature := "completed|" + msg
+					if prev, ok := s.toolSignalCache.Load(partID); ok && prev.(string) == signature {
+						return "", "", ""
+					}
+					s.toolSignalCache.Store(partID, signature)
+				}
+				return ToolSignalPrefix + msg, "", ""
 			}
-			return fmt.Sprintf("✅ [%s] 完成\n", toolName), "", ""
+			msg := fmt.Sprintf("✅ 工具 %s：已完成", toolName)
+			if partID != "" {
+				signature := "completed|" + msg
+				if prev, ok := s.toolSignalCache.Load(partID); ok && prev.(string) == signature {
+					return "", "", ""
+				}
+				s.toolSignalCache.Store(partID, signature)
+			}
+			return ToolSignalPrefix + msg, "", ""
 
 		case "error":
 			errMsg := strings.TrimSpace(state.Error)
 			if errMsg == "" {
 				errMsg = "执行失败"
 			}
-			if len([]rune(errMsg)) > 200 {
-				errMsg = string([]rune(errMsg)[:200]) + "..."
+			if len([]rune(errMsg)) > 160 {
+				errMsg = string([]rune(errMsg)[:160]) + "..."
 			}
-			return fmt.Sprintf("❌ [%s] %s\n", toolName, errMsg), "", ""
+			msg := fmt.Sprintf("❌ 工具 %s：失败（%s）", toolName, errMsg)
+			if partID != "" {
+				signature := "error|" + msg
+				if prev, ok := s.toolSignalCache.Load(partID); ok && prev.(string) == signature {
+					return "", "", ""
+				}
+				s.toolSignalCache.Store(partID, signature)
+			}
+			return ToolSignalPrefix + msg, "", ""
 		}
+		return "", "", ""
 
 	case "reasoning", "step-start", "step-finish", "snapshot", "patch", "compaction":
-		// 内部事件，不向用户发送
+		if partType == "reasoning" && s.showThinking {
+			if props.Delta != "" {
+				return ThinkingSignalPrefix + props.Delta, "", ""
+			}
+			if props.Part.Text != "" && props.Part.ID != "" {
+				existing, _ := s.partTextCache.Load(props.Part.ID)
+				existingStr, _ := existing.(string)
+				if len(props.Part.Text) > len(existingStr) {
+					delta := props.Part.Text[len(existingStr):]
+					s.partTextCache.Store(props.Part.ID, props.Part.Text)
+					return ThinkingSignalPrefix + delta, props.Part.ID, props.Part.Text
+				}
+				s.partTextCache.Store(props.Part.ID, props.Part.Text)
+			}
+		}
+
+		if partType == "step-start" {
+			if s.showSteps {
+				return StepSignalPrefix + "步骤开始", "", ""
+			}
+			return "", "", ""
+		}
+		if partType == "step-finish" {
+			if s.showSteps {
+				return StepSignalPrefix + "步骤完成", "", ""
+			}
+			return "", "", ""
+		}
+
+		// 其他内部事件，不向用户发送
 		log.Printf("opencode: 🔍 extractContent - internal event type: %s (not sent to user)", partType)
 
 	case "":
@@ -1054,6 +1174,23 @@ func (s *StreamingSessionHandler) IsActivelyProcessing() bool {
 // that SendMessageStreaming cannot return before the final send completes.
 const FlushSignal = "\x00flush"
 
+// ThinkingSignalPrefix is a special callback token that marks reasoning/thinking
+// chunks. Adapters should route these chunks as independent "thinking" output
+// and MUST NOT append them into final answer accumulation buffers.
+const ThinkingSignalPrefix = "\x00thinking:"
+
+// ToolSignalPrefix marks tool lifecycle messages (running/completed/error).
+const ToolSignalPrefix = "\x00tool:"
+
+// StepSignalPrefix marks step lifecycle messages.
+const StepSignalPrefix = "\x00step:"
+
+// TodoSignalPrefix marks auto-pushed todo progress updates.
+const TodoSignalPrefix = "\x00todo:"
+
+// TodoAutoPushInterval controls minimum interval between auto todo updates.
+const TodoAutoPushInterval = 5 * time.Second
+
 func (s *StreamingSessionHandler) notifyCompletion() {
 	s.stopWaitingTimer()
 
@@ -1221,24 +1358,33 @@ func (s *StreamingSessionHandler) FormatDiffSummary() string {
 // FormatTodoSummary 将 todo 列表格式化为用户友好的文本
 func (s *StreamingSessionHandler) FormatTodoSummary() string {
 	todos := s.GetTodos()
+	return formatTodoSummaryFromTodos(todos)
+}
+
+func formatTodoSummaryFromTodos(todos []TodoItem) string {
 	if len(todos) == 0 {
-		return "📋 暂无待办任务"
+		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("📋 **当前任务列表**\n")
+	sb.WriteString("📋 任务进度更新\n")
 	for _, todo := range todos {
 		var icon string
+		var statusText string
 		switch todo.Status {
 		case "completed":
 			icon = "✅"
+			statusText = "已完成"
 		case "in_progress":
 			icon = "🔄"
+			statusText = "进行中"
 		case "cancelled":
 			icon = "❌"
+			statusText = "已取消"
 		default:
 			icon = "⬜"
+			statusText = "待处理"
 		}
-		sb.WriteString(fmt.Sprintf("%s %s\n", icon, todo.Task))
+		sb.WriteString(fmt.Sprintf("%s [%s] %s\n", icon, statusText, todo.Task))
 	}
 	return sb.String()
 }
