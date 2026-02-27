@@ -45,6 +45,9 @@ func Load() (Config, error) {
 			VerificationToken: os.Getenv("FEISHU_VERIFICATION_TOKEN"),
 			EncryptKey:        os.Getenv("FEISHU_ENCRYPT_KEY"),
 			UseWebSocket:      getBool("FEISHU_USE_WEBSOCKET", true), // 默认启用WebSocket模式
+			AliyunNLSAkID:     os.Getenv("ALIYUN_NLS_AKID"),
+			AliyunNLSAkKey:    os.Getenv("ALIYUN_NLS_AKKEY"),
+			AliyunNLSAppKey:   os.Getenv("ALIYUN_NLS_APPKEY"),
 		},
 		DingTalk: dingtalk.Config{
 			// Stream mode (preferred)

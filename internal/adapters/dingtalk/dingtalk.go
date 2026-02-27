@@ -298,16 +298,24 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	case "audio", "voice":
 		// 语音消息：优先使用阿里云 NLS 语音识别转文字
 		log.Printf("dingtalk stream: 🎤 [AUDIO] received from %s", userID)
+		asrMime := ""
+		asrFormat := ""
+		asrRate := 0
+		asrTextLen := 0
+		asrStatus := "init"
 		var audContent audioContent
 		if data.Content != nil {
 			contentBytes, _ := json.Marshal(data.Content)
 			log.Printf("  - Audio content JSON: %s", string(contentBytes))
 			if err := json.Unmarshal(contentBytes, &audContent); err != nil {
 				log.Printf("  - ⚠️ Failed to parse audio content: %v", err)
+				asrStatus = "parse_failed"
 			} else if audContent.Recognition != "" {
 				// 钉钉已内置语音识别，直接使用结果，无需调用 NLS
 				log.Printf("  - ✅ 使用钉钉内置识别结果: %s", audContent.Recognition)
 				content = fmt.Sprintf("[语音转文字] %s", audContent.Recognition)
+				asrTextLen = len(audContent.Recognition)
+				asrStatus = "builtin_recognition"
 			} else if audContent.DownloadCode != "" {
 				if h.cfg.AliyunNLSAkID != "" && h.cfg.AliyunNLSAkKey != "" && h.cfg.AliyunNLSAppKey != "" {
 					// DingTalk 语音时长：v1.0 Stream API 返回秒数（小值），旧版返回毫秒
@@ -325,10 +333,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 					if audioRate == 0 {
 						audioRate = 8000
 					}
+					asrFormat = audioFmt
+					asrRate = audioRate
 					log.Printf("  - 🎤 NLS 语音识别中（时长=%ds, raw=%d, fmt=%s, rate=%d）...", durSec, durRaw, audioFmt, audioRate)
-					audioBytes, _, dlErr := h.downloadMediaBytes(ctx, audContent.DownloadCode, "audio/amr")
+					audioBytes, dlMime, dlErr := h.downloadMediaBytes(ctx, audContent.DownloadCode, "audio/amr")
+					asrMime = dlMime
 					if dlErr != nil {
 						log.Printf("  - ⚠️ Failed to download audio: %v", dlErr)
+						asrStatus = "download_failed"
 					} else {
 						if len(audioBytes) >= 8 {
 							log.Printf("  - 🔍 Audio first 8 bytes: %X", audioBytes[:min(8, len(audioBytes))])
@@ -362,18 +374,24 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 						}
 						if srErr != nil {
 							log.Printf("  - ⚠️ NLS transcription failed: %v", srErr)
+							asrStatus = "nls_failed"
 						} else if text != "" {
 							log.Printf("  - ✅ NLS result: %s", text)
 							content = fmt.Sprintf("[语音转文字] %s", text)
+							asrTextLen = len(text)
+							asrStatus = "ok"
 						} else {
 							log.Printf("  - ⚠️ NLS returned empty text")
+							asrStatus = "empty"
 						}
 					}
 				} else {
 					log.Printf("  - ℹ️ Aliyun NLS 未配置，跳过语音识别（ALIYUN_NLS_AKID/AKKEY/APPKEY）")
+					asrStatus = "nls_not_configured"
 				}
 			}
 		}
+		log.Printf("asr-summary platform=dingtalk mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
 		if content == "" {
 			durRaw2 := int(audContent.Duration)
 			durSec2 := durRaw2
@@ -506,6 +524,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 	}
 
+	// 先尝试把非命令文本当作“待确认问题”的直接回复（无需 /answer）。
+	if !strings.HasPrefix(strings.TrimSpace(content), "/") {
+		if result, err := h.handleQuickReply(ctx, data, userID, content); result != nil || err != nil {
+			return result, err
+		}
+	}
+
 	// Handle special commands
 	if content == "/skills" || content == "/agents" {
 		return h.handleListSkills(ctx, data)
@@ -543,6 +568,21 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Handle /model command to get/set model
 	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
 		return h.handleModel(ctx, data, userID, content)
+	}
+
+	// Handle /thinking command to toggle reasoning output
+	if strings.HasPrefix(content, "/thinking") {
+		return h.handleThinking(ctx, data, content)
+	}
+
+	// Handle /final command to toggle final-only output mode
+	if strings.HasPrefix(content, "/final") {
+		return h.handleFinal(ctx, data, content)
+	}
+
+	// Handle /steps command to toggle step visibility
+	if strings.HasPrefix(content, "/steps") || strings.HasPrefix(content, "/step") {
+		return h.handleSteps(ctx, data, content)
 	}
 
 	// Handle /config command to view configuration
@@ -597,14 +637,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleAnswer(ctx, data, userID, content)
 	}
 
-	// 检查是否是快捷回复（权限回复、问题选项等）
-	if h.isQuickReply(content) {
-		result, err := h.handleQuickReply(ctx, data, userID, content)
-		if result != nil || err != nil {
-			return result, err
-		}
-		// 如果没有待处理的问题，继续处理为普通消息
-	}
+	// 如果是命令形式的回复，走 /answer 命令处理。
 
 	// Parse agent specification: @agent_name message content
 	var agentName string
@@ -650,6 +683,17 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 	// 第一个 callback 是 sessionID (特殊信号)
 	callbackCalled := false
+	var thinkingBuffer strings.Builder
+	thinkingSent := false
+	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled()
+
+	formatThinkingBlock := func(content string) string {
+		trimmed := strings.TrimSpace(content)
+		if trimmed == "" {
+			return ""
+		}
+		return "思考过程：\n" + trimmed + "\n思考结束"
+	}
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:     "dingtalk",
@@ -689,8 +733,65 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 		sessionMappingMu.Unlock()
 
+		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+			thinkingDelta := strings.TrimPrefix(chunk, opencode.ThinkingSignalPrefix)
+			if strings.TrimSpace(thinkingDelta) == "" {
+				return nil
+			}
+			thinkingBuffer.WriteString(thinkingDelta)
+			log.Printf("dingtalk stream: 🧠 buffered thinking chunk (len=%d)", len(thinkingDelta))
+			return nil
+		}
+
+		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) {
+			toolMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.ToolSignalPrefix))
+			if toolMsg == "" {
+				return nil
+			}
+			if err := h.sendReplyRobot(sendCtx, conversationID, userID, toolMsg); err != nil {
+				log.Printf("dingtalk stream: ⚠️ failed to send tool message: %v", err)
+				return err
+			}
+			return nil
+		}
+
+		if strings.HasPrefix(chunk, opencode.StepSignalPrefix) {
+			stepMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.StepSignalPrefix))
+			if stepMsg == "" {
+				return nil
+			}
+			if err := h.sendReplyRobot(sendCtx, conversationID, userID, stepMsg); err != nil {
+				log.Printf("dingtalk stream: ⚠️ failed to send step message: %v", err)
+				return err
+			}
+			return nil
+		}
+
+		if strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
+			todoMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.TodoSignalPrefix))
+			if todoMsg == "" {
+				return nil
+			}
+			if err := h.sendReplyRobot(sendCtx, conversationID, userID, todoMsg); err != nil {
+				log.Printf("dingtalk stream: ⚠️ failed to send todo progress: %v", err)
+				return err
+			}
+			return nil
+		}
+
 		// FlushSignal: session 结束，立即发送所有尚未发送的内容
 		if chunk == opencode.FlushSignal {
+			if !thinkingSent {
+				if thinkingMsg := formatThinkingBlock(thinkingBuffer.String()); thinkingMsg != "" {
+					log.Printf("dingtalk stream: 📤 flush signal: sending thinking block (%d bytes)", len(thinkingMsg))
+					if err := h.sendReplyRobot(sendCtx, conversationID, userID, thinkingMsg); err != nil {
+						log.Printf("dingtalk stream: ⚠️ flush thinking send failed: %v", err)
+					} else {
+						thinkingSent = true
+					}
+				}
+			}
+
 			toSend := fullReply.String()[lastSentLength:]
 			if len(toSend) > 0 {
 				log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
@@ -744,7 +845,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		// 1. 累积了足够多的新内容（至少300字符）
 		// 2. 距离上次更新已经过了至少5秒
 		// 3. 这样可以避免过于频繁的更新，同时保证用户能及时看到进度
-		shouldUpdate := newContentLength >= minUpdateChars && timeSinceLastUpdate >= minUpdateInterval
+		shouldUpdate := !bufferFinalUntilFlush && newContentLength >= minUpdateChars && timeSinceLastUpdate >= minUpdateInterval
 
 		if shouldUpdate {
 			log.Printf("dingtalk stream: 📤 sending intermediate update (new content: %d chars, interval: %v)",
@@ -831,6 +932,15 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Send final complete reply (only if we have synchronous content)
 	// For async mode, the SSE callbacks already sent the content
 	if response.Reply != "" {
+		if !thinkingSent {
+			if thinkingMsg := formatThinkingBlock(thinkingBuffer.String()); thinkingMsg != "" {
+				if err := h.sendReplyRobot(sendCtx, conversationID, userID, thinkingMsg); err != nil {
+					log.Printf("dingtalk stream: failed to send thinking block: %v", err)
+				}
+				thinkingSent = true
+			}
+		}
+
 		if err := h.sendReplyRobot(sendCtx, conversationID, userID, response.Reply); err != nil {
 			log.Printf("dingtalk stream: failed to reply: %v", err)
 			return nil, err
@@ -838,6 +948,15 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		log.Printf("dingtalk stream: ✅ sent sync reply to user %s (%d chars)", userID, len(response.Reply))
 	} else {
 		// Async mode - 检查是否有未发送的内容
+		if !thinkingSent {
+			if thinkingMsg := formatThinkingBlock(thinkingBuffer.String()); thinkingMsg != "" {
+				if err := h.sendReplyRobot(sendCtx, conversationID, userID, thinkingMsg); err != nil {
+					log.Printf("dingtalk stream: failed to send thinking block: %v", err)
+				}
+				thinkingSent = true
+			}
+		}
+
 		if len(accumulatedContent) > 0 {
 			// 有内容但可能没有全部发送（因为中间更新有间隔和字符数限制）
 			unsentLength := len(accumulatedContent) - lastSentLength
@@ -1119,8 +1238,14 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /diff 或 变更 - 查看本次会话的文件变更摘要
 
 🤖 模型配置：
-/model - 查看当前模型
+/model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
+/thinking - 查看 thinking 开关状态
+/thinking on|off - 开关 thinking 返回
+/final - 查看最终返回模式
+/final on|off - 开关仅结束时返回最终结果
+/steps - 查看步骤显示状态
+/steps on|off - 开关步骤显示
 /config 或 配置 - 查看完整配置
 
 📋 OpenCode 模式说明：
@@ -1143,7 +1268,7 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 
 🛠️ 高级命令：
 /cmd <command> - 执行技能脚本
-/answer <question_id> <answer> - 回答待确认问题
+/answer <answer> - 回答最近的待确认问题（可选：/answer <question_id> <answer>）
 /crontask - 管理定时任务`
 
 	replier := chatbot.NewChatbotReplier()
@@ -1155,20 +1280,140 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 	return nil, nil
 }
 
-// handleAnswer 处理回答问题命令
-func (h *Handler) handleAnswer(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
+// handleThinking 处理 thinking 输出开关命令（全局）
+func (h *Handler) handleThinking(ctx context.Context, data *chatbot.BotCallbackDataModel, content string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
+	parts := strings.Fields(strings.TrimSpace(content))
 
-	// 解析命令: /answer <questionID> <answer>
-	parts := strings.Fields(content)
-	if len(parts) < 3 {
-		msg := "❌ 命令格式错误\n\n使用方法:\n/answer <question_id> <answer>\n\n例如:\n/answer q_123456 1\n/answer q_123456 yes"
+	if len(parts) == 1 {
+		status := "off"
+		if h.client.IsThinkingEnabled() {
+			status = "on"
+		}
+		msg := fmt.Sprintf("🧠 Thinking 返回状态: %s\n\n使用方法:\n/thinking on  - 开启\n/thinking off - 关闭", status)
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 		return nil, nil
 	}
 
-	questionID := parts[1]
-	answer := strings.Join(parts[2:], " ")
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		h.client.SetThinkingEnabled(true)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已开启 thinking 返回（将按 'Thinking:' 分段输出）"))
+		return nil, nil
+	case "off", "false", "0":
+		h.client.SetThinkingEnabled(false)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已关闭 thinking 返回（仅返回最终正文）"))
+		return nil, nil
+	default:
+		msg := "❌ 命令格式错误\n\n使用方法:\n/thinking - 查看状态\n/thinking on - 开启\n/thinking off - 关闭"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+}
+
+// handleFinal 处理最终输出模式开关命令（全局）
+func (h *Handler) handleFinal(ctx context.Context, data *chatbot.BotCallbackDataModel, content string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	if len(parts) == 1 {
+		status := "off"
+		if h.client.IsFinalOnlyEnabled() {
+			status = "on"
+		}
+		msg := fmt.Sprintf("📦 Final-only 模式: %s\n\n使用方法:\n/final on  - 开启（仅结束时返回最终结果）\n/final off - 关闭（允许中间增量）", status)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		h.client.SetFinalOnlyEnabled(true)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已开启 final-only 模式（正文与thinking均在结束后分段返回）"))
+		return nil, nil
+	case "off", "false", "0":
+		h.client.SetFinalOnlyEnabled(false)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已关闭 final-only 模式（允许中间增量返回）"))
+		return nil, nil
+	default:
+		msg := "❌ 命令格式错误\n\n使用方法:\n/final - 查看状态\n/final on - 开启\n/final off - 关闭"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+}
+
+// handleSteps 处理步骤显示开关命令（全局）
+func (h *Handler) handleSteps(ctx context.Context, data *chatbot.BotCallbackDataModel, content string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	if len(parts) == 1 {
+		status := "off"
+		if h.client.IsStepEnabled() {
+			status = "on"
+		}
+		msg := fmt.Sprintf("🪜 步骤显示状态: %s\n\n使用方法:\n/steps on  - 开启\n/steps off - 关闭", status)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		h.client.SetStepEnabled(true)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已开启步骤显示（会显示步骤开始/完成）"))
+		return nil, nil
+	case "off", "false", "0":
+		h.client.SetStepEnabled(false)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已关闭步骤显示"))
+		return nil, nil
+	default:
+		msg := "❌ 命令格式错误\n\n使用方法:\n/steps - 查看状态\n/steps on - 开启\n/steps off - 关闭"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+}
+
+// handleAnswer 处理回答问题命令
+func (h *Handler) handleAnswer(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 解析命令:
+	// 1) /answer <answer>
+	// 2) /answer <questionID> <answer>
+	parts := strings.Fields(content)
+	if len(parts) < 2 {
+		msg := h.buildPendingRequirementHint(userID)
+		if msg == "" {
+			msg = "❌ 当前没有待确认问题。请先等待 OpenCode 提问后直接回复选项内容（如：1、允许、yes）。"
+		}
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	var questionID, answer string
+	if len(parts) >= 3 && (strings.HasPrefix(parts[1], "q_") || strings.HasPrefix(parts[1], "que_") || strings.HasPrefix(parts[1], "per_")) {
+		questionID = parts[1]
+		answer = strings.Join(parts[2:], " ")
+	} else {
+		sessionID, ok := h.adapter.GetSessionForUser(userID)
+		if !ok {
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 当前没有活跃会话，无法定位待确认问题"))
+			return nil, nil
+		}
+
+		if permission, ok := h.client.GetLatestPendingPermission(sessionID); ok {
+			questionID = permission.ID
+		} else if question, ok := h.client.GetLatestPendingQuestion(sessionID); ok {
+			questionID = question.ID
+		} else {
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 当前会话没有待确认问题"))
+			return nil, nil
+		}
+		answer = strings.Join(parts[1:], " ")
+	}
 
 	// 获取问题
 	question, ok := h.client.GetPendingQuestion(questionID)
@@ -1207,6 +1452,49 @@ func (h *Handler) handleAnswer(ctx context.Context, data *chatbot.BotCallbackDat
 	log.Printf("dingtalk: answered question %s successfully", questionID)
 
 	return nil, nil
+}
+
+func (h *Handler) buildPendingRequirementHint(userID string) string {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		return ""
+	}
+
+	if permission, ok := h.client.GetLatestPendingPermission(sessionID); ok {
+		return fmt.Sprintf("OpenCode 需要确认：\n%s\n\n请直接回复：允许 / 拒绝 / 始终允许", permission.Text)
+	}
+	if question, ok := h.client.GetLatestPendingQuestion(sessionID); ok {
+		var b strings.Builder
+		b.WriteString("OpenCode 需要选择：\n")
+		if question.Text != "" {
+			b.WriteString(question.Text)
+			b.WriteString("\n")
+		}
+		if len(question.Questions) > 0 {
+			for _, q := range question.Questions {
+				if q.Header != "" {
+					b.WriteString("\n")
+					b.WriteString(q.Header)
+					b.WriteString("\n")
+				}
+				if q.Question != "" {
+					b.WriteString(q.Question)
+					b.WriteString("\n")
+				}
+				for i, opt := range q.Options {
+					b.WriteString(fmt.Sprintf("%d. %s\n", i+1, opt.Label))
+				}
+			}
+		} else if len(question.Options) > 0 {
+			for i, opt := range question.Options {
+				b.WriteString(fmt.Sprintf("%d. %s\n", i+1, opt))
+			}
+		}
+		b.WriteString("\n请直接回复选项内容（无需输入 /answer）")
+		return b.String()
+	}
+
+	return ""
 }
 
 // isQuickReply 检查是否是快捷回复（权限回复或问题选项）
@@ -2223,7 +2511,7 @@ func (h *Handler) handleModel(ctx context.Context, data *chatbot.BotCallbackData
 		return h.handleModelSet(ctx, data, userID, parts[1:])
 	}
 
-	msg := "❌ 命令格式错误\n\n使用方法:\n/model - 查看当前模型\n/model <provider>/<model> - 设置模型\n/model <provider> <model> - 设置模型\n\n例如:\n/model anthropic/claude-3-opus\n/model openai gpt-4"
+	msg := "❌ 命令格式错误\n\n使用方法:\n/model - 查看可用模型\n/model <provider>/<model> - 设置模型\n/model <provider> <model> - 设置模型\n\n例如:\n/model anthropic/claude-3-opus\n/model openai gpt-4"
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 	return nil, nil
 }
@@ -2235,13 +2523,40 @@ func (h *Handler) handleModelQuery(ctx context.Context, data *chatbot.BotCallbac
 	// 获取当前session
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
-		// 没有session，提示用户
-		msg := "ℹ️ 当前没有活跃的会话\n\n" +
-			"💡 模型配置功能需要OpenCode SDK的支持\n" +
-			"目前的SDK版本可能不包含模型配置 API\n\n" +
-			"您可以在OpenCode的Web界面中配置模型\n" +
-			"或等待SDK更新支持此功能"
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		var msgBuilder strings.Builder
+		msgBuilder.WriteString("ℹ️ 当前没有活跃的会话\n")
+
+		providers, err := h.client.GetProviders(ctx)
+		if err != nil {
+			msgBuilder.WriteString("\n💡 可用模型列表获取失败，请稍后重试或在 OpenCode Web 界面查看\n")
+			msgBuilder.WriteString(fmt.Sprintf("错误: %v", err))
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+			return nil, nil
+		}
+
+		if len(providers) == 0 {
+			msgBuilder.WriteString("\n💡 未获取到可用模型，请在 OpenCode Web 界面查看")
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+			return nil, nil
+		}
+
+		msgBuilder.WriteString("\n\n📚 可用模型（示例）:\n")
+		for _, p := range providers {
+			msgBuilder.WriteString(fmt.Sprintf("\n【%s】\n", p.ID))
+			if len(p.Models) == 0 {
+				msgBuilder.WriteString("  (无模型)\n")
+				continue
+			}
+			maxShow := min(8, len(p.Models))
+			for i := 0; i < maxShow; i++ {
+				msgBuilder.WriteString(fmt.Sprintf("  /model %s/%s\n", p.ID, p.Models[i].ID))
+			}
+			if len(p.Models) > maxShow {
+				msgBuilder.WriteString(fmt.Sprintf("  ... 还有 %d 个\n", len(p.Models)-maxShow))
+			}
+		}
+
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
 		return nil, nil
 	}
 
@@ -2258,8 +2573,37 @@ func (h *Handler) handleModelQuery(ctx context.Context, data *chatbot.BotCallbac
 	var msgBuilder strings.Builder
 	msgBuilder.WriteString("🤖 当前会话配置:\n\n")
 	msgBuilder.WriteString(fmt.Sprintf("会话: %s\n", sessionID[:8]))
-	msgBuilder.WriteString("\n💡 模型信息在当前SDK版本中不可用\n")
-	msgBuilder.WriteString("请在OpenCode Web界面中查看和配置模型")
+	msgBuilder.WriteString("\n💡 当前会话的默认模型信息在SDK中不可直接读取\n")
+
+	providers, err := h.client.GetProviders(ctx)
+	if err != nil {
+		msgBuilder.WriteString("\n可用模型列表获取失败，请稍后重试或在 OpenCode Web 界面查看\n")
+		msgBuilder.WriteString(fmt.Sprintf("错误: %v", err))
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+		return nil, nil
+	}
+
+	if len(providers) == 0 {
+		msgBuilder.WriteString("\n未获取到可用模型，请在 OpenCode Web 界面查看")
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+		return nil, nil
+	}
+
+	msgBuilder.WriteString("\n📚 可用模型（示例）:\n")
+	for _, p := range providers {
+		msgBuilder.WriteString(fmt.Sprintf("\n【%s】\n", p.ID))
+		if len(p.Models) == 0 {
+			msgBuilder.WriteString("  (无模型)\n")
+			continue
+		}
+		maxShow := min(8, len(p.Models))
+		for i := 0; i < maxShow; i++ {
+			msgBuilder.WriteString(fmt.Sprintf("  /model %s/%s\n", p.ID, p.Models[i].ID))
+		}
+		if len(p.Models) > maxShow {
+			msgBuilder.WriteString(fmt.Sprintf("  ... 还有 %d 个\n", len(p.Models)-maxShow))
+		}
+	}
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
 	return nil, nil
@@ -2298,20 +2642,55 @@ func (h *Handler) handleModelSet(ctx context.Context, data *chatbot.BotCallbackD
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 		return nil, nil
 	}
+	if modelID == "" {
+		msg := "❌ 模型ID不能为空\n\n使用方法:\n/model <provider>/<model>\n例如:\n/model TH-AI/Kimi-K2.5"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	providers, err := h.client.GetProviders(ctx)
+	if err != nil {
+		log.Printf("dingtalk: failed to fetch providers for case-insensitive model resolve: %v", err)
+	} else if len(providers) > 0 {
+		providerMatched := false
+		modelMatched := false
+		for _, p := range providers {
+			if !strings.EqualFold(strings.TrimSpace(p.ID), strings.TrimSpace(providerID)) {
+				continue
+			}
+			providerMatched = true
+			providerID = p.ID
+			for _, m := range p.Models {
+				if strings.EqualFold(strings.TrimSpace(m.ID), strings.TrimSpace(modelID)) {
+					modelMatched = true
+					modelID = m.ID
+					break
+				}
+			}
+			break
+		}
+
+		if !providerMatched {
+			msg := fmt.Sprintf("❌ 未找到提供商: %s\n\n请先执行 /model 查看可用 provider/model", providerID)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+			return nil, nil
+		}
+		if !modelMatched {
+			msg := fmt.Sprintf("❌ 提供商 %s 下未找到模型: %s\n\n请先执行 /model 查看可用模型", providerID, modelID)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+			return nil, nil
+		}
+	}
 
 	// 更新session的provider和model
 	if err := h.client.UpdateSessionProvider(ctx, sessionID, providerID, modelID); err != nil {
-		msg := fmt.Sprintf("❌ 更新模型失败: %v\n\n"+
-			"💡 模型配置功能需要OpenCode SDK的支持\n"+
-			"目前的SDK版本可能不包含此API\n"+
-			"请在OpenCode Web界面中配置模型", err)
+		msg := fmt.Sprintf("❌ 更新模型失败: %v", err)
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 		return nil, err
 	}
 
-	msg := fmt.Sprintf("✅ 已尝试更新模型配置\n\n提供商: %s\n模型: %s\n会话: %s\n\n"+
-		"💡 注意：当前SDK版本可能不完全支持此功能\n"+
-		"如果需要详细配置，请访问OpenCode Web界面",
+	msg := fmt.Sprintf("✅ 已设置会话模型\n\n提供商: %s\n模型: %s\n会话: %s\n\n"+
+		"该设置会由 gateway 在后续请求中强制携带。",
 		providerID, modelID, sessionID[:8])
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 	return nil, nil
@@ -2343,6 +2722,9 @@ func (h *Handler) handleConfig(ctx context.Context, data *chatbot.BotCallbackDat
 
 	msgBuilder.WriteString("\n🔧 可用命令:\n")
 	msgBuilder.WriteString("  /model - 查看/设置模型\n")
+	msgBuilder.WriteString("  /thinking - 查看/设置 thinking 返回\n")
+	msgBuilder.WriteString("  /final - 查看/设置 final-only 输出\n")
+	msgBuilder.WriteString("  /steps - 查看/设置步骤显示\n")
 	msgBuilder.WriteString("  /status - 查看会话状态\n")
 	msgBuilder.WriteString("  /new - 创建新会话\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
@@ -2746,6 +3128,8 @@ func (h *Handler) transcribeOpusPackets(ctx context.Context, packets [][]byte, s
 	type nlsCbParam struct {
 		resultCh chan string
 		errCh    chan error
+		latest   string
+		mu       sync.Mutex
 	}
 	cbp := &nlsCbParam{
 		resultCh: make(chan string, 1),
@@ -2763,22 +3147,25 @@ func (h *Handler) transcribeOpusPackets(ctx context.Context, packets [][]byte, s
 			default:
 			}
 		},
-		nil, nil, // started, resultChanged
+		nil,
+		func(text string, p interface{}) { // resultChanged
+			cp := p.(*nlsCbParam)
+			if recognized := extractNLSRecognizedText(text); recognized != "" {
+				cp.mu.Lock()
+				cp.latest = recognized
+				cp.mu.Unlock()
+			}
+		},
 		func(text string, p interface{}) { // completed
 			cp := p.(*nlsCbParam)
 			log.Printf("dingtalk: NLS completed raw JSON: %.800s", text)
-			var result struct {
-				Payload struct {
-					Result string `json:"result"`
-				} `json:"payload"`
+			recognized := extractNLSRecognizedText(text)
+			if recognized == "" {
+				cp.mu.Lock()
+				recognized = cp.latest
+				cp.mu.Unlock()
 			}
-			recognized := ""
-			if err := json.Unmarshal([]byte(text), &result); err != nil {
-				log.Printf("dingtalk: NLS completed JSON parse error: %v", err)
-			} else {
-				recognized = result.Payload.Result
-				log.Printf("dingtalk: NLS recognized text: %q", recognized)
-			}
+			log.Printf("dingtalk: NLS recognized text: %q", recognized)
 			select {
 			case cp.resultCh <- recognized:
 			default:
@@ -2855,6 +3242,8 @@ func (h *Handler) transcribeAudioBytes(ctx context.Context, audioBytes []byte, f
 	type nlsCbParam struct {
 		resultCh chan string
 		errCh    chan error
+		latest   string
+		mu       sync.Mutex
 	}
 	cbp := &nlsCbParam{
 		resultCh: make(chan string, 1),
@@ -2873,22 +3262,24 @@ func (h *Handler) transcribeAudioBytes(ctx context.Context, audioBytes []byte, f
 			}
 		},
 		nil, // started
-		nil, // resultChanged
+		func(text string, p interface{}) { // resultChanged
+			cp := p.(*nlsCbParam)
+			if recognized := extractNLSRecognizedText(text); recognized != "" {
+				cp.mu.Lock()
+				cp.latest = recognized
+				cp.mu.Unlock()
+			}
+		},
 		func(text string, p interface{}) { // completed
 			cp := p.(*nlsCbParam)
 			log.Printf("dingtalk: NLS completed raw JSON: %.800s", text)
-			var result struct {
-				Payload struct {
-					Result string `json:"result"`
-				} `json:"payload"`
+			recognized := extractNLSRecognizedText(text)
+			if recognized == "" {
+				cp.mu.Lock()
+				recognized = cp.latest
+				cp.mu.Unlock()
 			}
-			recognized := ""
-			if err := json.Unmarshal([]byte(text), &result); err != nil {
-				log.Printf("dingtalk: NLS completed JSON parse error: %v", err)
-			} else {
-				recognized = result.Payload.Result
-				log.Printf("dingtalk: NLS recognized text: %q", recognized)
-			}
+			log.Printf("dingtalk: NLS recognized text: %q", recognized)
 			select {
 			case cp.resultCh <- recognized:
 			default:
@@ -2959,4 +3350,49 @@ func (h *Handler) transcribeAudioBytes(ctx context.Context, audioBytes []byte, f
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+func extractNLSRecognizedText(raw string) string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return ""
+	}
+
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &obj); err != nil {
+		return ""
+	}
+
+	lookup := func(m map[string]interface{}, keys ...string) string {
+		cur := interface{}(m)
+		for _, k := range keys {
+			next, ok := cur.(map[string]interface{})
+			if !ok {
+				return ""
+			}
+			cur, ok = next[k]
+			if !ok {
+				return ""
+			}
+		}
+		s, _ := cur.(string)
+		return strings.TrimSpace(s)
+	}
+
+	candidates := []string{
+		lookup(obj, "payload", "result"),
+		lookup(obj, "payload", "text"),
+		lookup(obj, "result"),
+		lookup(obj, "text"),
+		lookup(obj, "payload", "output", "text"),
+		lookup(obj, "payload", "output", "sentence"),
+	}
+
+	for _, v := range candidates {
+		if v != "" {
+			return v
+		}
+	}
+
+	return ""
 }
