@@ -142,9 +142,35 @@ type QuestionItem struct {
 // Mirrors the "todo.updated" SSE event structure from the OpenCode server.
 type TodoItem struct {
 	ID       string `json:"id"`
-	Task     string `json:"task"`
+	Task     string `json:"task"`     // 兼容旧字段
+	Content  string `json:"content"`  // OpenCode SDK todo.updated 当前字段
 	Status   string `json:"status"`   // "pending", "in_progress", "completed", "cancelled"
 	Priority string `json:"priority"` // "high", "medium", "low"
+}
+
+// Text returns the human-readable todo text with backward/forward compatibility.
+func (t TodoItem) Text() string {
+	if strings.TrimSpace(t.Content) != "" {
+		return t.Content
+	}
+	return t.Task
+}
+
+// PriorityLabel returns a user-friendly priority label.
+func (t TodoItem) PriorityLabel() string {
+	switch strings.ToLower(strings.TrimSpace(t.Priority)) {
+	case "high":
+		return "高"
+	case "medium":
+		return "中"
+	case "low":
+		return "低"
+	default:
+		if strings.TrimSpace(t.Priority) == "" {
+			return "未设置"
+		}
+		return t.Priority
+	}
 }
 
 // FileDiff represents changes to a single file within a session.
@@ -570,10 +596,8 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		}
 
 		// 检查是否需要总结或创建新session
-		count, _ := c.messageCount.Load(sessionID)
-		msgCount := count.(int)
-		tokens, _ := c.tokenCount.Load(sessionID)
-		currentTokens := tokens.(int)
+		msgCount := c.loadCounter(&c.messageCount, sessionID)
+		currentTokens := c.loadCounter(&c.tokenCount, sessionID)
 
 		// 估算当前消息的token数
 		estimatedMsgTokens := estimateTokens(payload.Content)
@@ -724,11 +748,9 @@ sendMessage:
 		}
 
 		// 仅统计用户消息本身的tokens，回复在事件流中获取
-		count, _ := c.messageCount.LoadOrStore(sessionID, 0)
-		c.messageCount.Store(sessionID, count.(int)+1)
+		c.incrementCounter(&c.messageCount, sessionID, 1)
 		estimatedMsgTokens := estimateTokens(effectiveContent)
-		tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
-		c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens)
+		c.incrementCounter(&c.tokenCount, sessionID, estimatedMsgTokens)
 
 		response := Response{
 			Reply:     "",
@@ -759,14 +781,12 @@ sendMessage:
 	reply := extractReplyFromMessage(result)
 
 	// Increment message count and token count for this session
-	count, _ := c.messageCount.LoadOrStore(sessionID, 0)
-	c.messageCount.Store(sessionID, count.(int)+1)
+	c.incrementCounter(&c.messageCount, sessionID, 1)
 
 	// 更新token计数（估算用户消息 + AI回复）
 	estimatedMsgTokens := estimateTokens(effectiveContent)
 	estimatedReplyTokens := estimateTokens(reply)
-	tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
-	c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens+estimatedReplyTokens)
+	c.incrementCounter(&c.tokenCount, sessionID, estimatedMsgTokens+estimatedReplyTokens)
 
 	// 缓存本次实际使用的模型信息（若SDK返回）
 	c.updateSessionModel(sessionID, result.Info.ProviderID, result.Info.ModelID)
@@ -1539,11 +1559,7 @@ func truncateString(s string, maxLen int) string {
 
 // GetMessageCount 获取指定session的消息数量
 func (c *Client) GetMessageCount(sessionID string) int {
-	count, ok := c.messageCount.Load(sessionID)
-	if !ok {
-		return 0
-	}
-	return count.(int)
+	return c.loadCounter(&c.messageCount, sessionID)
 }
 
 // ResetSession 重置thread的session映射，强制创建新session
@@ -1868,11 +1884,67 @@ func guessContextLengthFromSession(session *opencode.Session) int {
 
 // GetTokenCount 获取指定session的token使用量
 func (c *Client) GetTokenCount(sessionID string) int {
-	tokens, ok := c.tokenCount.Load(sessionID)
-	if !ok {
+	return c.loadCounter(&c.tokenCount, sessionID)
+}
+
+// loadCounter safely loads an integer counter from sync.Map.
+// It auto-recovers missing or unexpected value types by normalizing to 0.
+func (c *Client) loadCounter(counterMap *sync.Map, key string) int {
+	v, ok := counterMap.Load(key)
+	if !ok || v == nil {
+		counterMap.Store(key, 0)
 		return 0
 	}
-	return tokens.(int)
+	if n, ok := v.(int); ok {
+		return n
+	}
+
+	// 兼容历史/异常值，避免 interface conversion panic
+	switch n := v.(type) {
+	case int8:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case int16:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case int32:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case int64:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint8:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint16:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint32:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint64:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case float32:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case float64:
+		counterMap.Store(key, int(n))
+		return int(n)
+	default:
+		log.Printf("opencode: counter type mismatch for key %s, got %T, reset to 0", key, v)
+		counterMap.Store(key, 0)
+		return 0
+	}
+}
+
+// incrementCounter adds delta to a counter with safe initialization.
+func (c *Client) incrementCounter(counterMap *sync.Map, key string, delta int) {
+	current := c.loadCounter(counterMap, key)
+	counterMap.Store(key, current+delta)
 }
 
 // GetContextUsage 获取session的上下文使用率
