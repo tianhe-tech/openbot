@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
@@ -2566,22 +2567,9 @@ func (c *Client) AnswerQuestion(ctx context.Context, questionID string, answer s
 
 // answerPermission 回答权限请求
 func (c *Client) answerPermission(ctx context.Context, q *Question, answer string) error {
-	// 解析用户选择：允许、拒绝、始终允许
-	var response opencode.SessionPermissionRespondParamsResponse
-	var responseStr string
-
-	answerLower := strings.TrimSpace(strings.ToLower(answer))
-	switch answerLower {
-	case "1", "allow", "yes", "允许", "y", "ok", "确认":
-		response = opencode.SessionPermissionRespondParamsResponseOnce
-		responseStr = "once"
-	case "2", "deny", "no", "拒绝", "n", "cancel", "取消":
-		response = opencode.SessionPermissionRespondParamsResponseReject
-		responseStr = "reject"
-	case "3", "always", "始终允许", "始终":
-		response = opencode.SessionPermissionRespondParamsResponseAlways
-		responseStr = "always"
-	default:
+	// 解析用户选择：允许、拒绝、始终允许（支持去标点与模糊匹配）
+	response, responseStr, ok := parsePermissionAnswer(answer)
+	if !ok {
 		return fmt.Errorf("无效的回复: %s (回复 '允许'、'拒绝' 或 '始终允许')", answer)
 	}
 
@@ -2620,6 +2608,61 @@ func (c *Client) answerPermission(ctx context.Context, q *Question, answer strin
 	c.DeletePendingQuestion(q.ID)
 	log.Printf("opencode: answered permission %s for session %s (response=%s)", q.ID, q.SessionID[:8], response)
 	return nil
+}
+
+// parsePermissionAnswer 解析权限请求回复，容错处理语音识别中的标点/空格噪音
+func parsePermissionAnswer(answer string) (opencode.SessionPermissionRespondParamsResponse, string, bool) {
+	normalized := normalizePermissionAnswer(answer)
+	if normalized == "" {
+		return "", "", false
+	}
+
+	allowTokens := []string{"1", "allow", "yes", "允许", "同意", "确认", "ok", "okay", "y", "可以", "行"}
+	rejectTokens := []string{"2", "deny", "no", "拒绝", "不同意", "取消", "n"}
+	alwaysTokens := []string{"3", "always", "始终允许", "始终", "一直允许", "总是允许"}
+
+	if containsAnyToken(normalized, alwaysTokens) {
+		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
+	}
+	if containsAnyToken(normalized, rejectTokens) {
+		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
+	}
+	if containsAnyToken(normalized, allowTokens) {
+		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
+	}
+
+	// 兜底：先判断明确否定，再判断允许，避免“不允许”被误判为允许
+	if strings.Contains(normalized, "不允许") || strings.Contains(normalized, "拒绝") || strings.Contains(normalized, "不同意") {
+		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
+	}
+	if strings.Contains(normalized, "始终") || strings.Contains(normalized, "always") {
+		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
+	}
+	if strings.Contains(normalized, "允许") || strings.Contains(normalized, "同意") || strings.Contains(normalized, "确认") {
+		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
+	}
+
+	return "", "", false
+}
+
+// normalizePermissionAnswer 标准化回复文本：转小写并移除空格、标点、符号
+func normalizePermissionAnswer(answer string) string {
+	answerLower := strings.TrimSpace(strings.ToLower(answer))
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			return -1
+		}
+		return r
+	}, answerLower)
+}
+
+func containsAnyToken(text string, tokens []string) bool {
+	for _, token := range tokens {
+		if text == token || strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
 }
 
 // answerPermissionViaHTTP 直接调用 HTTP API（与 Python 版本一致）

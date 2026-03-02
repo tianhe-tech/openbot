@@ -13,6 +13,7 @@ import (
 
 // Config captures all runtime configuration knobs for the gateway.
 type Config struct {
+	HTTPEnabled      bool
 	ServerAddr       string
 	ReadTimeout      time.Duration
 	WriteTimeout     time.Duration
@@ -27,6 +28,7 @@ type Config struct {
 // Load reads configuration from environment variables with sensible defaults.
 func Load() (Config, error) {
 	cfg := Config{
+		HTTPEnabled:      getBool("HTTP_ENABLED", false),
 		ServerAddr:       getEnv("SERVER_ADDR", ":8080"),
 		ReadTimeout:      getDuration("SERVER_READ_TIMEOUT", 30*time.Second),   // 增加读取超时
 		WriteTimeout:     getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
