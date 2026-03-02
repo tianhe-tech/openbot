@@ -347,8 +347,14 @@ func main() {
 	log.Printf("adapters registered: %v", adapters)
 	log.Printf("event listener: active")
 
-	if err := srv.Run(ctx); err != nil && err != context.Canceled {
-		log.Fatalf("server error: %v", err)
+	if cfg.HTTPEnabled {
+		log.Printf("HTTP server enabled: listening on %s", cfg.ServerAddr)
+		if err := srv.Run(ctx); err != nil && err != context.Canceled {
+			log.Fatalf("server error: %v", err)
+		}
+	} else {
+		log.Printf("HTTP server disabled by config (HTTP_ENABLED=false): skip listen on %s", cfg.ServerAddr)
+		<-ctx.Done()
 	}
 
 	log.Println("gateway stopped")

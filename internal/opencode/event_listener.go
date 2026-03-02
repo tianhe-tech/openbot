@@ -1384,7 +1384,7 @@ func formatTodoSummaryFromTodos(todos []TodoItem) string {
 			icon = "⬜"
 			statusText = "待处理"
 		}
-		sb.WriteString(fmt.Sprintf("%s [%s] %s\n", icon, statusText, todo.Task))
+		sb.WriteString(fmt.Sprintf("%s [%s][优先级:%s] %s\n", icon, statusText, todo.PriorityLabel(), todo.Text()))
 	}
 	return sb.String()
 }

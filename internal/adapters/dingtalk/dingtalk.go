@@ -2836,7 +2836,7 @@ func (h *Handler) handleTodo(ctx context.Context, data *chatbot.BotCallbackDataM
 			icon = "⬜"
 			pending++
 		}
-		sb.WriteString(fmt.Sprintf("%s %s\n", icon, todo.Task))
+		sb.WriteString(fmt.Sprintf("%s [优先级:%s] %s\n", icon, todo.PriorityLabel(), todo.Text()))
 	}
 	sb.WriteString(fmt.Sprintf("\n进度: %d 完成, %d 进行中, %d 待处理", completed, inProgress, pending))
 
