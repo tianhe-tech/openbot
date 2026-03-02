@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
@@ -142,9 +143,35 @@ type QuestionItem struct {
 // Mirrors the "todo.updated" SSE event structure from the OpenCode server.
 type TodoItem struct {
 	ID       string `json:"id"`
-	Task     string `json:"task"`
+	Task     string `json:"task"`     // 兼容旧字段
+	Content  string `json:"content"`  // OpenCode SDK todo.updated 当前字段
 	Status   string `json:"status"`   // "pending", "in_progress", "completed", "cancelled"
 	Priority string `json:"priority"` // "high", "medium", "low"
+}
+
+// Text returns the human-readable todo text with backward/forward compatibility.
+func (t TodoItem) Text() string {
+	if strings.TrimSpace(t.Content) != "" {
+		return t.Content
+	}
+	return t.Task
+}
+
+// PriorityLabel returns a user-friendly priority label.
+func (t TodoItem) PriorityLabel() string {
+	switch strings.ToLower(strings.TrimSpace(t.Priority)) {
+	case "high":
+		return "高"
+	case "medium":
+		return "中"
+	case "low":
+		return "低"
+	default:
+		if strings.TrimSpace(t.Priority) == "" {
+			return "未设置"
+		}
+		return t.Priority
+	}
 }
 
 // FileDiff represents changes to a single file within a session.
@@ -570,10 +597,8 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		}
 
 		// 检查是否需要总结或创建新session
-		count, _ := c.messageCount.Load(sessionID)
-		msgCount := count.(int)
-		tokens, _ := c.tokenCount.Load(sessionID)
-		currentTokens := tokens.(int)
+		msgCount := c.loadCounter(&c.messageCount, sessionID)
+		currentTokens := c.loadCounter(&c.tokenCount, sessionID)
 
 		// 估算当前消息的token数
 		estimatedMsgTokens := estimateTokens(payload.Content)
@@ -724,11 +749,9 @@ sendMessage:
 		}
 
 		// 仅统计用户消息本身的tokens，回复在事件流中获取
-		count, _ := c.messageCount.LoadOrStore(sessionID, 0)
-		c.messageCount.Store(sessionID, count.(int)+1)
+		c.incrementCounter(&c.messageCount, sessionID, 1)
 		estimatedMsgTokens := estimateTokens(effectiveContent)
-		tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
-		c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens)
+		c.incrementCounter(&c.tokenCount, sessionID, estimatedMsgTokens)
 
 		response := Response{
 			Reply:     "",
@@ -759,14 +782,12 @@ sendMessage:
 	reply := extractReplyFromMessage(result)
 
 	// Increment message count and token count for this session
-	count, _ := c.messageCount.LoadOrStore(sessionID, 0)
-	c.messageCount.Store(sessionID, count.(int)+1)
+	c.incrementCounter(&c.messageCount, sessionID, 1)
 
 	// 更新token计数（估算用户消息 + AI回复）
 	estimatedMsgTokens := estimateTokens(effectiveContent)
 	estimatedReplyTokens := estimateTokens(reply)
-	tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
-	c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens+estimatedReplyTokens)
+	c.incrementCounter(&c.tokenCount, sessionID, estimatedMsgTokens+estimatedReplyTokens)
 
 	// 缓存本次实际使用的模型信息（若SDK返回）
 	c.updateSessionModel(sessionID, result.Info.ProviderID, result.Info.ModelID)
@@ -1539,11 +1560,7 @@ func truncateString(s string, maxLen int) string {
 
 // GetMessageCount 获取指定session的消息数量
 func (c *Client) GetMessageCount(sessionID string) int {
-	count, ok := c.messageCount.Load(sessionID)
-	if !ok {
-		return 0
-	}
-	return count.(int)
+	return c.loadCounter(&c.messageCount, sessionID)
 }
 
 // ResetSession 重置thread的session映射，强制创建新session
@@ -1868,11 +1885,67 @@ func guessContextLengthFromSession(session *opencode.Session) int {
 
 // GetTokenCount 获取指定session的token使用量
 func (c *Client) GetTokenCount(sessionID string) int {
-	tokens, ok := c.tokenCount.Load(sessionID)
-	if !ok {
+	return c.loadCounter(&c.tokenCount, sessionID)
+}
+
+// loadCounter safely loads an integer counter from sync.Map.
+// It auto-recovers missing or unexpected value types by normalizing to 0.
+func (c *Client) loadCounter(counterMap *sync.Map, key string) int {
+	v, ok := counterMap.Load(key)
+	if !ok || v == nil {
+		counterMap.Store(key, 0)
 		return 0
 	}
-	return tokens.(int)
+	if n, ok := v.(int); ok {
+		return n
+	}
+
+	// 兼容历史/异常值，避免 interface conversion panic
+	switch n := v.(type) {
+	case int8:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case int16:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case int32:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case int64:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint8:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint16:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint32:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case uint64:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case float32:
+		counterMap.Store(key, int(n))
+		return int(n)
+	case float64:
+		counterMap.Store(key, int(n))
+		return int(n)
+	default:
+		log.Printf("opencode: counter type mismatch for key %s, got %T, reset to 0", key, v)
+		counterMap.Store(key, 0)
+		return 0
+	}
+}
+
+// incrementCounter adds delta to a counter with safe initialization.
+func (c *Client) incrementCounter(counterMap *sync.Map, key string, delta int) {
+	current := c.loadCounter(counterMap, key)
+	counterMap.Store(key, current+delta)
 }
 
 // GetContextUsage 获取session的上下文使用率
@@ -2494,22 +2567,9 @@ func (c *Client) AnswerQuestion(ctx context.Context, questionID string, answer s
 
 // answerPermission 回答权限请求
 func (c *Client) answerPermission(ctx context.Context, q *Question, answer string) error {
-	// 解析用户选择：允许、拒绝、始终允许
-	var response opencode.SessionPermissionRespondParamsResponse
-	var responseStr string
-
-	answerLower := strings.TrimSpace(strings.ToLower(answer))
-	switch answerLower {
-	case "1", "allow", "yes", "允许", "y", "ok", "确认":
-		response = opencode.SessionPermissionRespondParamsResponseOnce
-		responseStr = "once"
-	case "2", "deny", "no", "拒绝", "n", "cancel", "取消":
-		response = opencode.SessionPermissionRespondParamsResponseReject
-		responseStr = "reject"
-	case "3", "always", "始终允许", "始终":
-		response = opencode.SessionPermissionRespondParamsResponseAlways
-		responseStr = "always"
-	default:
+	// 解析用户选择：允许、拒绝、始终允许（支持去标点与模糊匹配）
+	response, responseStr, ok := parsePermissionAnswer(answer)
+	if !ok {
 		return fmt.Errorf("无效的回复: %s (回复 '允许'、'拒绝' 或 '始终允许')", answer)
 	}
 
@@ -2548,6 +2608,61 @@ func (c *Client) answerPermission(ctx context.Context, q *Question, answer strin
 	c.DeletePendingQuestion(q.ID)
 	log.Printf("opencode: answered permission %s for session %s (response=%s)", q.ID, q.SessionID[:8], response)
 	return nil
+}
+
+// parsePermissionAnswer 解析权限请求回复，容错处理语音识别中的标点/空格噪音
+func parsePermissionAnswer(answer string) (opencode.SessionPermissionRespondParamsResponse, string, bool) {
+	normalized := normalizePermissionAnswer(answer)
+	if normalized == "" {
+		return "", "", false
+	}
+
+	allowTokens := []string{"1", "allow", "yes", "允许", "同意", "确认", "ok", "okay", "y", "可以", "行"}
+	rejectTokens := []string{"2", "deny", "no", "拒绝", "不同意", "取消", "n"}
+	alwaysTokens := []string{"3", "always", "始终允许", "始终", "一直允许", "总是允许"}
+
+	if containsAnyToken(normalized, alwaysTokens) {
+		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
+	}
+	if containsAnyToken(normalized, rejectTokens) {
+		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
+	}
+	if containsAnyToken(normalized, allowTokens) {
+		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
+	}
+
+	// 兜底：先判断明确否定，再判断允许，避免“不允许”被误判为允许
+	if strings.Contains(normalized, "不允许") || strings.Contains(normalized, "拒绝") || strings.Contains(normalized, "不同意") {
+		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
+	}
+	if strings.Contains(normalized, "始终") || strings.Contains(normalized, "always") {
+		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
+	}
+	if strings.Contains(normalized, "允许") || strings.Contains(normalized, "同意") || strings.Contains(normalized, "确认") {
+		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
+	}
+
+	return "", "", false
+}
+
+// normalizePermissionAnswer 标准化回复文本：转小写并移除空格、标点、符号
+func normalizePermissionAnswer(answer string) string {
+	answerLower := strings.TrimSpace(strings.ToLower(answer))
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			return -1
+		}
+		return r
+	}, answerLower)
+}
+
+func containsAnyToken(text string, tokens []string) bool {
+	for _, token := range tokens {
+		if text == token || strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
 }
 
 // answerPermissionViaHTTP 直接调用 HTTP API（与 Python 版本一致）

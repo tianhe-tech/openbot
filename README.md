@@ -77,6 +77,7 @@ cp .env.example .env
 |----------|----------|---------|-------------|
 | `OPENCODE_ENDPOINT` | ✅ | - | OpenCode Server URL |
 | `OPENCODE_API_KEY` | ✅ | - | OpenCode API Key |
+| `HTTP_ENABLED` | ❌ | `false` | Enable built-in HTTP server |
 | `SERVER_ADDR` | ❌ | `:8080` | Service listen address |
 | `DINGTALK_USE_STREAM` | ❌ | `false` | Enable DingTalk Stream mode |
 | `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID |
@@ -238,6 +239,7 @@ See [API.md](docs/API.md) for complete API documentation.
 |----------|----------|-------------|
 | `OPENCODE_ENDPOINT` | ✅ | OpenCode Server URL |
 | `OPENCODE_API_KEY` | ✅ | OpenCode API Key |
+| `HTTP_ENABLED` | ❌ | Enable built-in HTTP server (`false` by default) |
 | `SERVER_ADDR` | ❌ | Service listen address (`:8080`) |
 | `READ_TIMEOUT` | ❌ | HTTP read timeout (`30s`) |
 | `WRITE_TIMEOUT` | ❌ | HTTP write timeout (`30s`) |
