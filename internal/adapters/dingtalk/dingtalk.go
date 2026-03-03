@@ -20,7 +20,6 @@ import (
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
-	"github.com/user/opencode-gateway/internal/persistence"
 	"github.com/user/opencode-gateway/internal/scheduler"
 )
 
@@ -263,11 +262,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	if !h.isUserAllowed(userID) {
 		log.Printf("dingtalk stream: blocked user %s by whitelist", userID)
 		replier := chatbot.NewChatbotReplier()
-		ownerUserID := h.currentOwnerUserID()
+		//ownerUserID := h.currentOwnerUserID()
 		msg := fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人开通权限。", userID)
-		if ownerUserID != "" {
-			msg = fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人（%s）开通权限。", userID, ownerUserID)
-		}
+		// if ownerUserID != "" {
+		// 	msg = fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人（%s）开通权限。", userID, data.SenderNick)
+		// }
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 		return nil, nil
 	}
@@ -627,6 +626,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 	// Handle /cmd command to execute skill scripts directly
 	if strings.HasPrefix(content, "/cmd ") {
+		if h.isNonOwnerReadOnly(userID) {
+			replier := chatbot.NewChatbotReplier()
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 当前为只读模式（非 owner），禁止执行 /cmd"))
+			return nil, nil
+		}
 		command := strings.TrimPrefix(content, "/cmd ")
 		return h.handleExecuteCommand(ctx, data, userID, command)
 	}
@@ -688,6 +692,10 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			content = parts[1]
 			log.Printf("dingtalk stream: using agent '%s' for message", agentName)
 		}
+	}
+
+	if h.isNonOwnerReadOnly(userID) {
+		content = h.withReadOnlyGuard(content)
 	}
 
 	// Get or create session for user BEFORE sending message
@@ -1148,10 +1156,6 @@ func (h *Handler) handleWhitelistAdd(ctx context.Context, data *chatbot.BotCallb
 	}
 	msg.WriteString(fmt.Sprintf("当前总数: %d\n", total))
 	msg.WriteString("ℹ️ 重启后会恢复为环境变量配置")
-	if err := h.persistAccessControl(); err != nil {
-		msg.WriteString("\n⚠️ 持久化失败: ")
-		msg.WriteString(err.Error())
-	}
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg.String()))
 	log.Printf("dingtalk: whitelist add done, added=%d existed=%d total=%d", len(added), len(existed), total)
@@ -1199,10 +1203,6 @@ func (h *Handler) handleWhitelistDelete(ctx context.Context, data *chatbot.BotCa
 		msg.WriteString("⚠️ 当前白名单为空，表示不做白名单限制\n")
 	}
 	msg.WriteString("ℹ️ 重启后会恢复为环境变量配置")
-	if err := h.persistAccessControl(); err != nil {
-		msg.WriteString("\n⚠️ 持久化失败: ")
-		msg.WriteString(err.Error())
-	}
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg.String()))
 	log.Printf("dingtalk: whitelist delete done, removed=%d notFound=%d total=%d", len(removed), len(notFound), total)
@@ -1289,26 +1289,17 @@ func (h *Handler) currentOwnerUserID() string {
 	return strings.TrimSpace(h.cfg.OwnerUserID)
 }
 
-func (h *Handler) snapshotWhitelist() []string {
-	h.whitelistMu.RLock()
-	defer h.whitelistMu.RUnlock()
-	ids := make([]string, 0, len(h.allowedUserSet))
-	for id := range h.allowedUserSet {
-		ids = append(ids, id)
+func (h *Handler) isNonOwnerReadOnly(userID string) bool {
+	ownerUserID := h.currentOwnerUserID()
+	if ownerUserID == "" {
+		return false
 	}
-	sort.Strings(ids)
-	return ids
+	return strings.TrimSpace(userID) != ownerUserID
 }
 
-func (h *Handler) persistAccessControl() error {
-	cfg := persistence.DingTalkRuntimeConfig{
-		UserWhitelist: h.snapshotWhitelist(),
-	}
-	if err := persistence.SaveDingTalkRuntimeConfig(cfg); err != nil {
-		log.Printf("dingtalk: persist access control failed: %v", err)
-		return err
-	}
-	return nil
+func (h *Handler) withReadOnlyGuard(content string) string {
+	guard := "[系统约束-只读模式]\n当前用户不是机器人 owner。你只能执行只读操作：分析、解释、检索、列出信息、给出修改建议。\n严格禁止任何写操作和副作用操作，包括但不限于：创建/修改/删除文件，执行会改变环境或数据的命令，安装/卸载依赖，提交代码。\n若用户要求写操作，请明确拒绝并改为提供可执行方案。\n\n"
+	return guard + content
 }
 
 // handleExecuteCommand handles direct command execution like skill scripts
@@ -1714,6 +1705,17 @@ func (h *Handler) handleAnswer(ctx context.Context, data *chatbot.BotCallbackDat
 		return nil, nil
 	}
 
+	if h.isNonOwnerReadOnly(userID) && strings.HasPrefix(questionID, "per_") {
+		log.Printf("dingtalk: read-only user %s attempted to answer permission %s with '%s', force reject", userID, questionID, answer)
+		if err := h.client.AnswerQuestion(ctx, questionID, "拒绝"); err != nil {
+			msg := fmt.Sprintf("❌ 只读策略拒绝权限时失败: %v", err)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+			return nil, err
+		}
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("🔒 当前为只读模式（非 owner），已自动拒绝本次写权限请求"))
+		return nil, nil
+	}
+
 	// 如果有选项，验证答案
 	if len(question.Options) > 0 {
 		// 尝试解析为数字索引
@@ -1881,6 +1883,17 @@ func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbac
 	if ok {
 		log.Printf("dingtalk: user %s replied '%s' to permission %s (session: %s)",
 			userID, content, permission.ID, sessionID[:min(8, len(sessionID))])
+
+		if h.isNonOwnerReadOnly(userID) {
+			log.Printf("dingtalk: read-only user %s quick-replied permission %s, force reject", userID, permission.ID)
+			if err := h.client.AnswerQuestion(ctx, permission.ID, "拒绝"); err != nil {
+				msg := fmt.Sprintf("❌ 只读策略拒绝权限时失败: %v", err)
+				_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+				return nil, err
+			}
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("🔒 当前为只读模式（非 owner），已自动拒绝本次写权限请求"))
+			return []byte("handled"), nil
+		}
 
 		if err := h.client.AnswerQuestion(ctx, permission.ID, content); err != nil {
 			msg := fmt.Sprintf("❌ 权限回复失败: %v", err)

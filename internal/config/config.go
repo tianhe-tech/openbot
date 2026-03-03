@@ -10,7 +10,6 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
-	"github.com/user/opencode-gateway/internal/persistence"
 )
 
 // Config captures all runtime configuration knobs for the gateway.
@@ -64,7 +63,7 @@ func Load() (Config, error) {
 			VerificationToken: os.Getenv("DINGTALK_VERIFICATION_TOKEN"),
 			EncryptKey:        os.Getenv("DINGTALK_ENCRYPT_KEY"),
 			SigningSecret:     os.Getenv("DINGTALK_SIGNING_SECRET"),
-			UserWhitelist:     splitAndTrim(os.Getenv("DINGTALK_USER_WHITELIST")),
+			UserWhitelist:     nil,
 			OwnerUserID:       strings.TrimSpace(os.Getenv("DINGTALK_OWNER_USERID")),
 			// 阿里云 NLS 语音识别（可选）
 			AliyunNLSAkID:   os.Getenv("ALIYUN_NLS_AKID"),
@@ -81,13 +80,10 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("missing OPENCODE_API_KEY")
 	}
 
-	runtimeCfg, found, err := persistence.LoadDingTalkRuntimeConfig()
-	if err != nil {
-		return cfg, err
+	if cfg.DingTalk.OwnerUserID == "" {
+		return cfg, fmt.Errorf("missing DINGTALK_OWNER_USERID")
 	}
-	if found {
-		cfg.DingTalk.UserWhitelist = runtimeCfg.UserWhitelist
-	}
+	cfg.DingTalk.UserWhitelist = []string{cfg.DingTalk.OwnerUserID}
 
 	return cfg, nil
 }
