@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
+	"github.com/user/opencode-gateway/internal/persistence"
 )
 
 // Config captures all runtime configuration knobs for the gateway.
@@ -62,6 +64,8 @@ func Load() (Config, error) {
 			VerificationToken: os.Getenv("DINGTALK_VERIFICATION_TOKEN"),
 			EncryptKey:        os.Getenv("DINGTALK_ENCRYPT_KEY"),
 			SigningSecret:     os.Getenv("DINGTALK_SIGNING_SECRET"),
+			UserWhitelist:     splitAndTrim(os.Getenv("DINGTALK_USER_WHITELIST")),
+			OwnerUserID:       strings.TrimSpace(os.Getenv("DINGTALK_OWNER_USERID")),
 			// 阿里云 NLS 语音识别（可选）
 			AliyunNLSAkID:   os.Getenv("ALIYUN_NLS_AKID"),
 			AliyunNLSAkKey:  os.Getenv("ALIYUN_NLS_AKKEY"),
@@ -75,6 +79,14 @@ func Load() (Config, error) {
 
 	if cfg.OpenCodeAPIKey == "" {
 		return cfg, fmt.Errorf("missing OPENCODE_API_KEY")
+	}
+
+	runtimeCfg, found, err := persistence.LoadDingTalkRuntimeConfig()
+	if err != nil {
+		return cfg, err
+	}
+	if found {
+		cfg.DingTalk.UserWhitelist = runtimeCfg.UserWhitelist
 	}
 
 	return cfg, nil
@@ -106,4 +118,22 @@ func getBool(key string, fallback bool) bool {
 		}
 	}
 	return fallback
+}
+
+func splitAndTrim(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

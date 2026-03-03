@@ -395,7 +395,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			summary := formatTodoSummaryFromTodos(todos)
 			if summary != "" {
 				now := time.Now()
-				if summary != s.lastTodoSummary && (s.lastTodoPushTime.IsZero() || now.Sub(s.lastTodoPushTime) >= TodoAutoPushInterval) {
+				if summary != s.lastTodoSummary {
 					if err := s.callback(TodoSignalPrefix + summary); err != nil {
 						log.Printf("opencode: todo auto-push callback error: %v", err)
 					} else {
