@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/persistence"
 	"github.com/user/opencode-gateway/internal/scheduler"
 )
 
@@ -89,6 +91,8 @@ type Config struct {
 	SigningSecret     string
 	UseStream         bool // 是否使用 Stream 模式
 	AutoAnswer        bool // 是否自动回答问题（选择首选选项）
+	UserWhitelist     []string
+	OwnerUserID       string
 	// 阿里云 NLS 语音识别配置（可选，不填则语音消息以占位文本转发）
 	AliyunNLSAkID   string // 阿里云 AccessKey ID
 	AliyunNLSAkKey  string // 阿里云 AccessKey Secret
@@ -109,13 +113,32 @@ type Handler struct {
 	accessToken       string
 	accessTokenExpiry time.Time
 	accessTokenMu     sync.Mutex
+	allowedUserSet    map[string]struct{}
+	whitelistMu       sync.RWMutex
 }
 
 // NewHandler wires the adapter with an OpenCode client.
 func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	h := &Handler{
-		client: client,
-		cfg:    cfg,
+		client:         client,
+		cfg:            cfg,
+		allowedUserSet: make(map[string]struct{}),
+	}
+
+	for _, uid := range cfg.UserWhitelist {
+		normalized := strings.TrimSpace(uid)
+		if normalized == "" {
+			continue
+		}
+		h.allowedUserSet[normalized] = struct{}{}
+	}
+
+	ownerUserID := strings.TrimSpace(cfg.OwnerUserID)
+	if ownerUserID != "" {
+		h.allowedUserSet[ownerUserID] = struct{}{}
+	}
+	if len(h.allowedUserSet) > 0 {
+		log.Printf("dingtalk: user whitelist enabled (%d users)", len(h.allowedUserSet))
 	}
 
 	h.adapter = base.NewBidirectionalAdapter("dingtalk", h)
@@ -236,6 +259,18 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	content := strings.TrimSpace(data.Text.Content)
 	userID := data.SenderStaffId
 	conversationID := data.ConversationId
+
+	if !h.isUserAllowed(userID) {
+		log.Printf("dingtalk stream: blocked user %s by whitelist", userID)
+		replier := chatbot.NewChatbotReplier()
+		ownerUserID := h.currentOwnerUserID()
+		msg := fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人开通权限。", userID)
+		if ownerUserID != "" {
+			msg = fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人（%s）开通权限。", userID, ownerUserID)
+		}
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
 
 	// 处理不同类型的消息
 	msgType := data.Msgtype
@@ -632,6 +667,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleCronTask(ctx, data, userID, content)
 	}
 
+	// Handle /whitelist command for runtime whitelist management
+	if strings.HasPrefix(content, "/whitelist") {
+		return h.handleWhitelist(ctx, data, userID, content)
+	}
+
 	// Handle /answer command to answer pending questions
 	if strings.HasPrefix(content, "/answer ") {
 		return h.handleAnswer(ctx, data, userID, content)
@@ -695,6 +735,10 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return "思考过程：\n" + trimmed + "\n思考结束"
 	}
 
+	sendReply := func(msg string) error {
+		return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+	}
+
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:     "dingtalk",
 		UserID:      userID,
@@ -748,7 +792,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			if toolMsg == "" {
 				return nil
 			}
-			if err := h.sendReplyRobot(sendCtx, conversationID, userID, toolMsg); err != nil {
+			if err := sendReply(toolMsg); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send tool message: %v", err)
 				return err
 			}
@@ -760,7 +804,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			if stepMsg == "" {
 				return nil
 			}
-			if err := h.sendReplyRobot(sendCtx, conversationID, userID, stepMsg); err != nil {
+			if err := sendReply(stepMsg); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send step message: %v", err)
 				return err
 			}
@@ -772,7 +816,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			if todoMsg == "" {
 				return nil
 			}
-			if err := h.sendReplyRobot(sendCtx, conversationID, userID, todoMsg); err != nil {
+			if err := sendReply(todoMsg); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send todo progress: %v", err)
 				return err
 			}
@@ -784,7 +828,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			if !thinkingSent {
 				if thinkingMsg := formatThinkingBlock(thinkingBuffer.String()); thinkingMsg != "" {
 					log.Printf("dingtalk stream: 📤 flush signal: sending thinking block (%d bytes)", len(thinkingMsg))
-					if err := h.sendReplyRobot(sendCtx, conversationID, userID, thinkingMsg); err != nil {
+					if err := sendReply(thinkingMsg); err != nil {
 						log.Printf("dingtalk stream: ⚠️ flush thinking send failed: %v", err)
 					} else {
 						thinkingSent = true
@@ -795,7 +839,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			toSend := fullReply.String()[lastSentLength:]
 			if len(toSend) > 0 {
 				log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
-				if err := h.sendReplyRobot(sendCtx, conversationID, userID, toSend); err != nil {
+				if err := sendReply(toSend); err != nil {
 					log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
 				} else {
 					lastSentLength = len(fullReply.String())
@@ -818,7 +862,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			strings.HasPrefix(chunk, "🤔💭") {
 			// 这些是需要立即发送的提示消息
 			log.Printf("dingtalk stream: 📤 sending immediate message: %s", chunk[:min(50, len(chunk))])
-			if err := h.sendReplyRobot(sendCtx, conversationID, userID, chunk); err != nil {
+			if err := sendReply(chunk); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send immediate message: %v", err)
 				// 发送失败时的处理：
 				// - 对于"正在处理中"提示：只返回error保持waiting timer活跃，不加入fullReply（避免污染最终内容）
@@ -852,7 +896,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				newContentLength, timeSinceLastUpdate)
 
 			// 直接发送累积的内容，使用 Robot API（不依赖过期的 sessionWebhook）
-			if err := h.sendReplyRobot(sendCtx, conversationID, userID, fullReply.String()); err != nil {
+			if err := sendReply(fullReply.String()); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send intermediate update: %v", err)
 				// 不返回错误，继续累积内容，下次再试或最后发送
 			} else {
@@ -905,7 +949,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			errMsg = fmt.Sprintf("❌ 处理失败: %v", err)
 			log.Printf("dingtalk stream: error for user %s: %v", userID, err)
 		}
-		_ = h.sendReplyRobot(sendCtx, conversationID, userID, errMsg)
+		_ = sendReply(errMsg)
 		return nil, err
 	}
 
@@ -934,14 +978,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	if response.Reply != "" {
 		if !thinkingSent {
 			if thinkingMsg := formatThinkingBlock(thinkingBuffer.String()); thinkingMsg != "" {
-				if err := h.sendReplyRobot(sendCtx, conversationID, userID, thinkingMsg); err != nil {
+				if err := sendReply(thinkingMsg); err != nil {
 					log.Printf("dingtalk stream: failed to send thinking block: %v", err)
 				}
 				thinkingSent = true
 			}
 		}
 
-		if err := h.sendReplyRobot(sendCtx, conversationID, userID, response.Reply); err != nil {
+		if err := sendReply(response.Reply); err != nil {
 			log.Printf("dingtalk stream: failed to reply: %v", err)
 			return nil, err
 		}
@@ -950,7 +994,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		// Async mode - 检查是否有未发送的内容
 		if !thinkingSent {
 			if thinkingMsg := formatThinkingBlock(thinkingBuffer.String()); thinkingMsg != "" {
-				if err := h.sendReplyRobot(sendCtx, conversationID, userID, thinkingMsg); err != nil {
+				if err := sendReply(thinkingMsg); err != nil {
 					log.Printf("dingtalk stream: failed to send thinking block: %v", err)
 				}
 				thinkingSent = true
@@ -966,7 +1010,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 				// 🔧 修复：只发送未发送的部分，避免重复，使用 Robot API
 				unsentContent := accumulatedContent[lastSentLength:]
-				if err := h.sendReplyRobot(sendCtx, conversationID, userID, unsentContent); err != nil {
+				if err := sendReply(unsentContent); err != nil {
 					log.Printf("dingtalk stream: ❌ failed to send final message: %v", err)
 					// 不返回错误，避免影响session映射
 				} else {
@@ -985,6 +1029,17 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	return nil, nil
+}
+
+func (h *Handler) isUserAllowed(userID string) bool {
+	h.whitelistMu.RLock()
+	defer h.whitelistMu.RUnlock()
+
+	if len(h.allowedUserSet) == 0 {
+		return true
+	}
+	_, ok := h.allowedUserSet[strings.TrimSpace(userID)]
+	return ok
 }
 
 // handleListSkills handles the /skills command to list available agents.
@@ -1027,6 +1082,233 @@ func (h *Handler) handleListSkills(ctx context.Context, data *chatbot.BotCallbac
 	}
 
 	return nil, nil
+}
+
+// handleWhitelist 处理白名单管理命令（运行时生效，不持久化）
+func (h *Handler) handleWhitelist(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	ownerUserID := h.currentOwnerUserID()
+	if ownerUserID != "" && strings.TrimSpace(userID) != ownerUserID {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 仅机器人主人可管理白名单"))
+		return nil, nil
+	}
+
+	parts := strings.Fields(strings.TrimSpace(content))
+	if len(parts) < 2 {
+		return h.sendWhitelistHelp(ctx, data)
+	}
+
+	subCommand := strings.ToLower(parts[1])
+	switch subCommand {
+	case "add", "create", "新增":
+		return h.handleWhitelistAdd(ctx, data, parts[2:])
+	case "delete", "del", "rm", "remove", "删除":
+		return h.handleWhitelistDelete(ctx, data, parts[2:])
+	case "list", "ls", "列表":
+		return h.handleWhitelistList(ctx, data)
+	case "help", "帮助":
+		return h.sendWhitelistHelp(ctx, data)
+	default:
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 未知子命令，使用 /whitelist help 查看帮助"))
+		return nil, nil
+	}
+}
+
+func (h *Handler) handleWhitelistAdd(ctx context.Context, data *chatbot.BotCallbackDataModel, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+	if len(args) == 0 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 请指定 userID\n\n格式: /whitelist add <userID> [更多userID]"))
+		return nil, nil
+	}
+
+	ids := flattenWhitelistArgs(args)
+	added := make([]string, 0, len(ids))
+	existed := make([]string, 0, len(ids))
+
+	h.whitelistMu.Lock()
+	for _, id := range ids {
+		if _, ok := h.allowedUserSet[id]; ok {
+			existed = append(existed, id)
+			continue
+		}
+		h.allowedUserSet[id] = struct{}{}
+		added = append(added, id)
+	}
+	total := len(h.allowedUserSet)
+	h.whitelistMu.Unlock()
+
+	var msg strings.Builder
+	msg.WriteString("✅ 白名单已更新（运行时生效）\n")
+	if len(added) > 0 {
+		msg.WriteString(fmt.Sprintf("新增: %s\n", strings.Join(added, ", ")))
+	}
+	if len(existed) > 0 {
+		msg.WriteString(fmt.Sprintf("已存在: %s\n", strings.Join(existed, ", ")))
+	}
+	msg.WriteString(fmt.Sprintf("当前总数: %d\n", total))
+	msg.WriteString("ℹ️ 重启后会恢复为环境变量配置")
+	if err := h.persistAccessControl(); err != nil {
+		msg.WriteString("\n⚠️ 持久化失败: ")
+		msg.WriteString(err.Error())
+	}
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg.String()))
+	log.Printf("dingtalk: whitelist add done, added=%d existed=%d total=%d", len(added), len(existed), total)
+	return nil, nil
+}
+
+func (h *Handler) handleWhitelistDelete(ctx context.Context, data *chatbot.BotCallbackDataModel, args []string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+	if len(args) == 0 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 请指定 userID\n\n格式: /whitelist delete <userID> [更多userID]"))
+		return nil, nil
+	}
+
+	ids := flattenWhitelistArgs(args)
+	removed := make([]string, 0, len(ids))
+	notFound := make([]string, 0, len(ids))
+	ownerUserID := h.currentOwnerUserID()
+
+	h.whitelistMu.Lock()
+	for _, id := range ids {
+		if ownerUserID != "" && id == ownerUserID {
+			notFound = append(notFound, id+"(owner，禁止删除)")
+			continue
+		}
+		if _, ok := h.allowedUserSet[id]; ok {
+			delete(h.allowedUserSet, id)
+			removed = append(removed, id)
+		} else {
+			notFound = append(notFound, id)
+		}
+	}
+	total := len(h.allowedUserSet)
+	h.whitelistMu.Unlock()
+
+	var msg strings.Builder
+	msg.WriteString("✅ 白名单已更新（运行时生效）\n")
+	if len(removed) > 0 {
+		msg.WriteString(fmt.Sprintf("删除: %s\n", strings.Join(removed, ", ")))
+	}
+	if len(notFound) > 0 {
+		msg.WriteString(fmt.Sprintf("未找到: %s\n", strings.Join(notFound, ", ")))
+	}
+	msg.WriteString(fmt.Sprintf("当前总数: %d\n", total))
+	if total == 0 {
+		msg.WriteString("⚠️ 当前白名单为空，表示不做白名单限制\n")
+	}
+	msg.WriteString("ℹ️ 重启后会恢复为环境变量配置")
+	if err := h.persistAccessControl(); err != nil {
+		msg.WriteString("\n⚠️ 持久化失败: ")
+		msg.WriteString(err.Error())
+	}
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg.String()))
+	log.Printf("dingtalk: whitelist delete done, removed=%d notFound=%d total=%d", len(removed), len(notFound), total)
+	return nil, nil
+}
+
+func (h *Handler) handleWhitelistList(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	h.whitelistMu.RLock()
+	ids := make([]string, 0, len(h.allowedUserSet))
+	for id := range h.allowedUserSet {
+		ids = append(ids, id)
+	}
+	h.whitelistMu.RUnlock()
+
+	sort.Strings(ids)
+
+	if len(ids) == 0 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("📋 当前白名单为空（不做白名单限制）"))
+		return nil, nil
+	}
+
+	var msg strings.Builder
+	msg.WriteString(fmt.Sprintf("📋 白名单用户（共 %d 个）:\n", len(ids)))
+	for i, id := range ids {
+		msg.WriteString(fmt.Sprintf("%d. %s\n", i+1, id))
+	}
+	msg.WriteString("\nℹ️ 运行时修改，重启后恢复环境变量配置")
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg.String()))
+	return nil, nil
+}
+
+func (h *Handler) sendWhitelistHelp(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	helpMsg := `📋 白名单命令帮助
+
+🔹 查看白名单
+/whitelist list
+
+🔹 新增用户
+/whitelist add <userID>
+/whitelist add <userID1> <userID2>
+
+🔹 删除用户
+/whitelist delete <userID>
+/whitelist del <userID1> <userID2>
+
+💡 说明：
+• 仅机器人主人可管理（配置了 DINGTALK_OWNER_USERID 时）
+• ownerID 仅支持启动时通过环境变量 DINGTALK_OWNER_USERID 设置
+• 命令会持久化白名单，本次更新后重启仍生效
+• 当前实现按 userID 精确匹配`
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(helpMsg))
+	return nil, nil
+}
+
+func flattenWhitelistArgs(args []string) []string {
+	set := make(map[string]struct{})
+	for _, arg := range args {
+		for _, item := range strings.Split(arg, ",") {
+			id := strings.TrimSpace(item)
+			if id == "" {
+				continue
+			}
+			set[id] = struct{}{}
+		}
+	}
+
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (h *Handler) currentOwnerUserID() string {
+	h.whitelistMu.RLock()
+	defer h.whitelistMu.RUnlock()
+	return strings.TrimSpace(h.cfg.OwnerUserID)
+}
+
+func (h *Handler) snapshotWhitelist() []string {
+	h.whitelistMu.RLock()
+	defer h.whitelistMu.RUnlock()
+	ids := make([]string, 0, len(h.allowedUserSet))
+	for id := range h.allowedUserSet {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (h *Handler) persistAccessControl() error {
+	cfg := persistence.DingTalkRuntimeConfig{
+		UserWhitelist: h.snapshotWhitelist(),
+	}
+	if err := persistence.SaveDingTalkRuntimeConfig(cfg); err != nil {
+		log.Printf("dingtalk: persist access control failed: %v", err)
+		return err
+	}
+	return nil
 }
 
 // handleExecuteCommand handles direct command execution like skill scripts
@@ -1269,7 +1551,16 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 🛠️ 高级命令：
 /cmd <command> - 执行技能脚本
 /answer <answer> - 回答最近的待确认问题（可选：/answer <question_id> <answer>）
-/crontask - 管理定时任务`
+/crontask - 管理定时任务
+
+🔐 白名单命令：
+/whitelist list - 查看白名单
+/whitelist add <userID...> - 添加白名单用户
+/whitelist del <userID...> - 删除白名单用户
+
+⚠️ 白名单说明：
+• ownerID 仅启动时通过 DINGTALK_OWNER_USERID 设置
+• ownerID 会自动加入白名单且不可删除`
 
 	replier := chatbot.NewChatbotReplier()
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(helpText)); err != nil {
@@ -2330,6 +2621,44 @@ func (h *Handler) sendReplyRobot(ctx context.Context, conversationID, userID, co
 	log.Printf("dingtalk stream: ✅ sent via robot API (%d chars) to conversation %s",
 		len(content), conversationID[:min(8, len(conversationID))])
 	return nil
+}
+
+func (h *Handler) sendReplyBySource(ctx context.Context, sessionWebhook, conversationType, conversationID, userID, content string) error {
+	if content == "" {
+		return nil
+	}
+
+	routeToGroup := isGroupConversation(conversationType)
+	log.Printf("dingtalk stream: route reply conversationType=%q -> %s (content_len=%d)",
+		conversationType,
+		func() string {
+			if routeToGroup {
+				return "group(webhook)"
+			}
+			return "single(robot-api)"
+		}(),
+		len(content),
+	)
+
+	if routeToGroup {
+		if strings.TrimSpace(sessionWebhook) == "" {
+			return fmt.Errorf("group conversation but sessionWebhook is empty")
+		}
+		return h.sendViaWebhook(ctx, sessionWebhook, content)
+	}
+
+	return h.sendReplyRobot(ctx, conversationID, userID, content)
+}
+
+func isGroupConversation(conversationType string) bool {
+	t := strings.ToLower(strings.TrimSpace(conversationType))
+	if t == "" {
+		return false
+	}
+	if t == "2" || t == "group" || t == "group_chat" || t == "groupchat" {
+		return true
+	}
+	return strings.Contains(t, "group")
 }
 
 // jsonStringEscape 将字符串编码为 JSON 字符串值（含引号）
