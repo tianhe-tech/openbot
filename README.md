@@ -82,9 +82,8 @@ cp .env.example .env
 | `DINGTALK_USE_STREAM` | ❌ | `false` | Enable DingTalk Stream mode |
 | `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID |
 | `DINGTALK_CLIENT_SECRET` | ✅ Stream | DingTalk Client Secret |
-| `DINGTALK_USER_WHITELIST` | ❌ | - | Comma-separated allowed DingTalk user IDs |
-| `DINGTALK_OWNER_USERID` | ❌ | - | Owner user ID shown in permission prompt |
-| `DINGTALK_RUNTIME_CONFIG_FILE` | ❌ | `.opencode-gateway-dingtalk.json` | Runtime persistent file for whitelist + owner |
+| `DINGTALK_USER_WHITELIST` | ❌ | - | Ignored at startup (startup whitelist is owner only) |
+| `DINGTALK_OWNER_USERID` | ✅ | - | Required owner user ID; auto-added to whitelist |
 
 ### 4. Run
 
@@ -253,9 +252,8 @@ See [API.md](docs/API.md) for complete API documentation.
 | `DINGTALK_USE_STREAM` | ❌ | Enable DingTalk Stream mode |
 | `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID |
 | `DINGTALK_CLIENT_SECRET` | ✅ Stream | DingTalk Client Secret |
-| `DINGTALK_USER_WHITELIST` | ❌ | Comma-separated allowed DingTalk user IDs |
-| `DINGTALK_OWNER_USERID` | ❌ | Owner user ID shown in permission prompt |
-| `DINGTALK_RUNTIME_CONFIG_FILE` | ❌ | Runtime persistent file for whitelist + owner (`.opencode-gateway-dingtalk.json`) |
+| `DINGTALK_USER_WHITELIST` | ❌ | Ignored at startup (startup whitelist is owner only) |
+| `DINGTALK_OWNER_USERID` | ✅ | Required owner user ID; auto-added to whitelist |
 | `FEISHU_APP_ID` | ❌ | Feishu App ID |
 | `FEISHU_APP_SECRET` | ❌ | Feishu App Secret |
 | `WECOM_CORP_ID` | ❌ | WeCom Corp ID |
@@ -273,12 +271,10 @@ SERVER_ADDR=:8080
 DINGTALK_USE_STREAM=true
 DINGTALK_CLIENT_ID=your_client_id
 DINGTALK_CLIENT_SECRET=your_client_secret
-DINGTALK_USER_WHITELIST=054349580632603835
 DINGTALK_OWNER_USERID=054349580632603835
-DINGTALK_RUNTIME_CONFIG_FILE=.opencode-gateway-dingtalk.json
 ```
 
-Runtime updates made via `/whitelist` commands are persisted to `DINGTALK_RUNTIME_CONFIG_FILE` and reloaded on next startup.
+At startup, whitelist is initialized to owner only (`DINGTALK_OWNER_USERID`). Runtime `/whitelist` command changes are not persisted across restart.
 
 `DINGTALK_OWNER_USERID` is startup-only (environment variable). It cannot be changed by commands, and will be automatically included in whitelist.
 
