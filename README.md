@@ -113,6 +113,7 @@ curl http://localhost:8080/api/tasks/stats
 | **[QUICK_START_CRONTASK.md](docs/QUICK_START_CRONTASK.md)** | Cron task quick start |
 | **[CRONTASK_COMMAND.md](docs/CRONTASK_COMMAND.md)** | Cron command reference |
 | **[SCHEDULER_GUIDE.md](docs/SCHEDULER_GUIDE.md)** | Task scheduler guide |
+| **[PROXY_TUNNEL.md](docs/PROXY_TUNNEL.md)** | 远程 OpenCode 反向代理隧道（无需暴露4096端口） |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | System architecture |
 | **[DOCKER.md](DOCKER.md)** | Docker setup guide |
 

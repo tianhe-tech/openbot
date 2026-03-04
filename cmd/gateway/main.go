@@ -19,6 +19,7 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
 	"github.com/user/opencode-gateway/internal/config"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/proxy"
 	"github.com/user/opencode-gateway/internal/scheduler"
 	"github.com/user/opencode-gateway/internal/server"
 )
@@ -27,6 +28,25 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config error: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Println("cfg.ProxyHubWSURL:", cfg.ProxyHubWSURL)
+	if cfg.ProxyHubWSURL != "" {
+		proxyKey, err := proxy.PrepareRuntimeKey(cfg.ProxyKeyFile, cfg.ProxyHubWSURL)
+		if err != nil {
+			log.Fatalf("proxy key init error: %v", err)
+		}
+		log.Printf("proxy tunnel key generated, saved to %s", cfg.ProxyKeyFile)
+
+		if strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")) == "" {
+			cfg.OpenCodeAPIKey = proxyKey
+			log.Printf("OPENCODE_API_KEY not set, using generated proxy key")
+		}
+
+		go proxy.StartGatewayTunnel(ctx, cfg.ProxyHubWSURL, proxyKey, cfg.ProxyLocalAddr, cfg.ProxyReconnect)
 	}
 
 	// Create adapter registry for bidirectional communication
@@ -224,8 +244,6 @@ func main() {
 	})
 
 	// Start event listener for bidirectional communication
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// Register adapters to taskScheduler for sending results
 	taskScheduler.RegisterAdapter("dingtalk", dingtalkHandler)
