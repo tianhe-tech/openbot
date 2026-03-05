@@ -4,6 +4,11 @@
 
 OpenCode Gateway 是一个将消息平台（钉钉、飞书、企业微信）与 OpenCode AI 编程助手连接起来的网关服务。
 
+默认采用更安全的部署模式：
+- openbot 默认不开放 HTTP 监听端口（`HTTP_ENABLED=false`）
+- OpenCode 端口无需公网暴露
+- 通过集中式 `tools/http-gateway` + `tools/client-proxy` 建立隧道中转
+
 ---
 
 ## 系统要求
@@ -36,9 +41,12 @@ cp .env.example .env
 ```env
 # OpenCode Server 配置
 OPENCODE_ENDPOINT=http://localhost:4096
-OPENCODE_API_KEY=your_api_key_here
-# 或者使用 OpenCode Server 密码（与 OPENCODE_API_KEY 二选一）
-# OPENCODE_SERVER_PASSWORD=your_server_password
+# 认证模式A（API Key）
+# OPENCODE_API_KEY=your_api_key_here
+
+# 认证模式B（OpenCode Server Basic Auth）
+OPENCODE_SERVER_PASSWORD=your_server_password
+# OPENCODE_SERVER_USERNAME=opencode
 
 # 服务监听地址
 SERVER_ADDR=:8080
@@ -146,14 +154,40 @@ services:
 | 变量名 | 必需 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `OPENCODE_ENDPOINT` | 是 | - | OpenCode Server 地址 |
-| `OPENCODE_API_KEY` | 是* | - | OpenCode API 密钥 |
-| `OPENCODE_SERVER_PASSWORD` | 是* | - | OpenCode Server 密码（`OPENCODE_API_KEY` 为空时作为回退） |
+| `OPENCODE_API_KEY` | 是* | - | OpenCode API 密钥（Bearer / X-API-Key 模式） |
+| `OPENCODE_SERVER_PASSWORD` | 是* | - | OpenCode Server 密码（HTTP Basic Auth 模式） |
+| `OPENCODE_SERVER_USERNAME` | 否 | `opencode` | Basic Auth 用户名 |
 | `SERVER_ADDR` | 否 | `:8080` | 服务监听地址 |
 | `READ_TIMEOUT` | 否 | `30s` | 读取超时 |
 | `WRITE_TIMEOUT` | 否 | `30s` | 写入超时 |
 | `SHUTDOWN_GRACE` | 否 | `30s` | 优雅关闭超时 |
 
-\* `OPENCODE_API_KEY` 与 `OPENCODE_SERVER_PASSWORD` 至少配置一个。
+\* `OPENCODE_API_KEY` 与 `OPENCODE_SERVER_PASSWORD` 至少配置一个；若同时配置，openbot 优先使用 `OPENCODE_SERVER_PASSWORD`（Basic Auth）。
+
+### 安全隧道模式（推荐）
+
+当你不希望暴露 OpenCode `4096` 端口时，使用以下组件：
+- `tools/http-gateway`：集中式中继
+- `cmd/gateway`：openbot，主动连接中继并生成一次性 `proxy_key`
+- `tools/client-proxy`：本地桥接 TUI/attach 流量
+
+最小运行流程：
+
+```bash
+# 1) 中继服务
+go run ./tools/http-gateway -addr :18080
+
+# 2) openbot 侧（靠近 OpenCode）
+PROXY_HUB_WS_URL=http://<gateway-host>:18080 go run ./cmd/gateway/main.go
+
+# 3) 本地代理侧
+go run ./tools/client-proxy \
+   -hub ws://<gateway-host>:18080/ws \
+   -proxy-key <proxy_key> \
+   -listen 127.0.0.1:14096
+```
+
+详见 [PROXY_TUNNEL.md](./PROXY_TUNNEL.md)。
 
 ### 钉钉配置
 
@@ -369,6 +403,15 @@ curl http://localhost:8080/api/scheduled-tasks
 3. 端口是否被占用
 4. 环境变量配置是否正确
 
+### OpenCode 返回 401 Unauthorized
+
+检查：
+1. `OPENCODE_ENDPOINT` 是否正确
+2. OpenCode 是否启用了 `OPENCODE_SERVER_PASSWORD`
+3. 若启用密码，openbot 进程是否设置了 `OPENCODE_SERVER_PASSWORD`（可选 `OPENCODE_SERVER_USERNAME`）
+4. 若使用 API key 模式，是否仅设置了 `OPENCODE_API_KEY`
+5. 修改环境变量后是否已重启 openbot
+
 ### 钉钉/Webhook 不工作
 
 检查：
@@ -391,7 +434,7 @@ curl http://localhost:8080/api/scheduled-tasks
 ### 相关文档
 
 - [API 参考文档](./API.md)
-- [架构说明](../ARCHITECTURE.md)
+- [架构说明](./ARCHITECTURE.md)
 - [配置指南](./CONFIGURATION.md)
 - [定时任务指南](./SCHEDULER_GUIDE.md)
 

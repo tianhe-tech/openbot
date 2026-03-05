@@ -11,54 +11,59 @@ OpenCode Gateway 是一个企业级消息网关，实现了 OpenCode AI 服务�
 - ✅ SSE 事件流监听
 - ✅ 可扩展的 Adapter 架构
 
+项目关键差异点（相对常见直连部署）：
+- ✅ 默认不开放 openbot HTTP 端口（`HTTP_ENABLED=false`）
+- ✅ OpenCode `4096` 无需公网暴露
+- ✅ 使用集中式 `tools/http-gateway` + `tools/client-proxy` 建立代理隧道
+- ✅ openbot 只需具备到指定网络的出站访问能力
+
 ---
 
 ## 🏗️ 架构设计
 
 ### 核心组件
 
-```
-┌─────────────────┐          ┌──────────────────┐          ┌─────────────────┐
-│  消息平台       │          │  OpenCode        │          │  OpenCode       │
-│  (飞书/企微)    │◄────────►│  Gateway         │◄────────►│  Server         │
-│                 │  Webhook │                  │   SDK    │                 │
-└─────────────────┘          └──────────────────┘          └─────────────────┘
-      │                              │                              │
-      │                              │                              │
-      │    1. 用户发送消息           │     2. 转发到 Session        │
-      ├─────────────────────────────►│─────────────────────────────►│
-      │                              │                              │
-      │    4. 回复用户               │     3. AI 处理并返回         │
-      │◄─────────────────────────────│◄─────────────────────────────│
-      │                              │                              │
-      │                              │     SSE 事件推送 (异步)      │
-      │    6. 主动推送消息           │◄─────────────────────────────│
-      │◄─────────────────────────────│     5. 事件监听器处理        │
-      │                              │                              │
+```mermaid
+flowchart LR
+    U[用户\n钉钉/飞书/企微] -->|消息/命令| B[openbot\ncmd/gateway]
+    B -->|SDK/API| O[OpenCode Server]
+    O -->|SSE Event| B
+    B -->|适配器回推| U
+
+    T[本地 OpenCode TUI/attach] --> C[tools/client-proxy]
+    C -->|WS role=client| H[tools/http-gateway\n集中式中继]
+    B -->|WS role=control/data| H
+    B -->|TCP 127.0.0.1:4096| O
+
+    classDef safe fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+    class B,O safe;
 ```
 
 ### 目录结构
 
 ```
 opencode-gateway/
-├── cmd/gateway/
-│   └── main.go                    # 应用入口，集成双向通信
+├── cmd/
+│   ├── gateway/
+│   │   └── main.go                # openbot 主入口
+│   └── attach/
+│       └── main.go                # attach 客户端入口
 ├── internal/
+│   ├── adapters/                  # 钉钉/飞书/企微适配器
 │   ├── opencode/
 │   │   ├── client.go              # OpenCode SDK 客户端封装
-│   │   └── event_listener.go     # SSE 事件监听和分发
-│   ├── adapters/
-│   │   ├── base/
-│   │   │   └── adapter.go         # 双向 Adapter 基础设施
-│   │   ├── feishu/
-│   │   │   └── feishu.go          # 飞书适配器
-│   │   └── wecom/
-│   │       └── wecom.go           # 企业微信适配器
+│   │   └── event_listener.go      # SSE 事件监听和分发
 │   ├── config/
 │   │   └── config.go              # 配置管理
+│   ├── proxy/
+│   │   └── tunnel.go              # 反向代理隧道
+│   ├── scheduler/                 # 任务与 cron 调度
 │   └── server/
 │       └── server.go              # HTTP 服务器
-└── go.mod
+├── tools/
+│   ├── http-gateway/main.go       # 集中式中继网关
+│   └── client-proxy/main.go       # 本地代理桥接
+└── docs/PROXY_TUNNEL.md
 ```
 
 ---
@@ -175,8 +180,11 @@ go mod download
 3. **配置环境变量**
 ```bash
 # OpenCode 配置
-export OPENCODE_BASE_URL="http://localhost:54321"
-export OPENCODE_API_KEY="your-api-key"
+export OPENCODE_ENDPOINT="http://localhost:4096"
+# 二选一：
+# export OPENCODE_API_KEY="your-api-key"
+export OPENCODE_SERVER_PASSWORD="your-server-password"
+# export OPENCODE_SERVER_USERNAME="opencode"
 
 # 飞书配置
 export FEISHU_APP_ID="cli_xxx"
