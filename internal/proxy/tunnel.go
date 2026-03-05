@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,7 +46,60 @@ func WriteKeyFile(filePath, hubWSURL, key string) error {
 	return os.WriteFile(filePath, b, 0o600)
 }
 
+func ReadKeyFile(filePath string) (*KeyFile, error) {
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	var payload KeyFile
+	if err := json.Unmarshal(b, &payload); err != nil {
+		return nil, err
+	}
+	return &payload, nil
+}
+
+func normalizeHubWSURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return strings.TrimRight(strings.TrimSpace(raw), "/")
+	}
+	if u.Scheme == "http" {
+		u.Scheme = "ws"
+	} else if u.Scheme == "https" {
+		u.Scheme = "wss"
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/ws"
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
+}
+
+func sameHubWSURL(a, b string) bool {
+	na := normalizeHubWSURL(a)
+	nb := normalizeHubWSURL(b)
+	if na == "" || nb == "" {
+		return na == nb
+	}
+	return na == nb
+}
+
 func PrepareRuntimeKey(filePath, hubWSURL string) (string, error) {
+	if strings.TrimSpace(filePath) != "" {
+		if existing, err := ReadKeyFile(filePath); err == nil {
+			if strings.TrimSpace(existing.ProxyKey) != "" {
+				// 兼容旧 key 文件：HubWSURL 为空时默认复用。
+				if strings.TrimSpace(existing.HubWSURL) == "" || sameHubWSURL(existing.HubWSURL, hubWSURL) {
+					return existing.ProxyKey, nil
+				}
+				log.Printf("proxy tunnel: hub changed, rotating proxy key file=%s oldHub=%s newHub=%s", filePath, existing.HubWSURL, hubWSURL)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("proxy tunnel: read key file failed, will regenerate key: %v", err)
+		}
+	}
+
 	key, err := GenerateProxyKey()
 	if err != nil {
 		return "", err

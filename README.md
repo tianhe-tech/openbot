@@ -47,8 +47,8 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
 
 - **Secure Proxy Tunnel (Key Differentiator)** 🔐
   - By default, openbot does not expose HTTP service ports (`HTTP_ENABLED=false`)
-  - Uses centralized `tools/http-gateway` as transit hub
-  - Uses `tools/client-proxy` to bridge OpenCode TUI traffic through a one-time `proxy_key`
+  - Uses centralized `tools/http-server` as transit hub
+  - Uses `tools/client-proxy` to bridge OpenCode TUI traffic through a reusable `proxy_key`
   - openbot only needs outbound access to the designated network
   - Enables mobile bots (DingTalk/Feishu/WeCom) + OpenCode TUI in a relatively safer network model
 
@@ -114,20 +114,20 @@ curl http://localhost:8080/api/tasks/stats
 
 ---
 
-## 🔐 Secure Tunnel Mode (http-gateway + client-proxy)
+## 🔐 Secure Tunnel Mode (http-server + client-proxy)
 
 This is the core architecture difference from openclawd in this project: openbot does not require exposing OpenCode `4096` to the public network. It uses a centralized HTTP/WebSocket gateway for traffic relay.
 
 ### Components
 
-- `tools/http-gateway`: centralized relay server (publicly reachable)
+- `tools/http-server`: centralized relay server (publicly reachable)
 - `cmd/gateway` (openbot): runs near OpenCode and actively connects to relay
 - `tools/client-proxy`: local TCP bridge for OpenCode TUI / attach
 
 ### Typical flow
 
-1. Start `tools/http-gateway` on the central node.
-2. Start openbot with `PROXY_HUB_WS_URL`; openbot generates a one-time `proxy_key` and writes `.opencode-gateway-proxy.json`.
+1. Start `tools/http-server` on the central node.
+2. Start openbot with `PROXY_HUB_WS_URL`; openbot reads existing `proxy_key` from `.opencode-gateway-proxy.json` (or generates one if missing).
 3. Start `tools/client-proxy` locally with the same `proxy_key`.
 4. Connect OpenCode TUI/attach to local proxy address (for example `127.0.0.1:14096`), and traffic is relayed to remote OpenCode.
 
@@ -135,7 +135,7 @@ This is the core architecture difference from openclawd in this project: openbot
 
 ```bash
 # 1) central relay server
-go run ./tools/http-gateway -addr :18080
+go run ./tools/http-server -addr :18080
 
 # 2) openbot side (same host/network as OpenCode)
 PROXY_HUB_WS_URL=http://<gateway-host>:18080 go run ./cmd/gateway
@@ -410,7 +410,7 @@ opencode-gateway/
 │       ├── task.go             # Task model
 │       └── webhook.go          # HTTP API endpoints
 ├── tools/
-│   ├── http-gateway/
+│   ├── http-server/
 │   │   └── main.go             # Centralized relay gateway
 │   ├── client-proxy/
 │   │   └── main.go             # Local bridge for TUI/attach
@@ -476,7 +476,7 @@ The gateway automatically handles OpenCode permission requests and questions:
 ### v1.2.0 - Secure Tunnel & Auth/Health Diagnostics (2026-03-05)
 
 **What improved:**
-1. **Secure tunnel workflow clarified**: README now documents `tools/http-gateway` + `tools/client-proxy` as the default secure relay path.
+1. **Secure tunnel workflow clarified**: README now documents `tools/http-server` + `tools/client-proxy` as the default secure relay path.
 2. **Auth mode behavior aligned**: `OPENCODE_API_KEY` and `OPENCODE_SERVER_PASSWORD` modes are clearly separated, and startup checks provide actionable guidance.
 3. **Startup diagnostics enhanced**: health check errors now distinguish endpoint unreachable, timeout, `401`, `403`, and `404` with targeted hints.
 4. **Proxy key isolation fixed**: tunnel `proxy_key` is no longer reused as OpenCode API auth credentials.

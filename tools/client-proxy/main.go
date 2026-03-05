@@ -13,8 +13,8 @@ import (
 )
 
 func main() {
-	hubURL := flag.String("hub", "ws://127.0.0.1:18080/ws", "http gateway websocket url")
-	proxyKey := flag.String("proxy-key", "", "single-use proxy key")
+	hubURL := flag.String("hub", "ws://127.0.0.1:18080/ws", "http server websocket url")
+	proxyKey := flag.String("proxy-key", "", "proxy key (reusable while gateway key file stays unchanged)")
 	listenAddr := flag.String("listen", "127.0.0.1:14096", "local tcp listen address for tui/opencode client")
 	flag.Parse()
 

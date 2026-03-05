@@ -39,7 +39,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("proxy key init error: %v", err)
 		}
-		log.Printf("proxy tunnel key generated, saved to %s", cfg.ProxyKeyFile)
+		log.Printf("proxy tunnel key ready (reused or generated), file=%s", cfg.ProxyKeyFile)
 
 		go proxy.StartGatewayTunnel(ctx, cfg.ProxyHubWSURL, proxyKey, cfg.ProxyLocalAddr, cfg.ProxyReconnect)
 	}
