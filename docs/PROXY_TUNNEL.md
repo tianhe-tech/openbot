@@ -20,6 +20,26 @@
 
 > 当前实现中，`proxy_key` 为单次有效：客户端代理成功连接后即消费。
 
+## 架构图
+
+```mermaid
+flowchart LR
+  A[OpenCode TUI / attach\n本地开发机] -->|TCP 127.0.0.1:14096| B[tools/client-proxy]
+  B -->|WebSocket role=client\nproxy_key| C[tools/http-gateway\n集中式中继]
+  D[cmd/gateway\n远端 openbot] -->|WebSocket role=control/data\nproxy_key| C
+  D -->|TCP 127.0.0.1:4096| E[OpenCode Server\n远端内网]
+
+  F[钉钉 / 飞书 / 企微] --> D
+
+  classDef safe fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+  class E,D safe;
+```
+
+说明：
+- OpenCode `4096` 仅在远端内网可见，不需要公网暴露。
+- openbot 仅需出站连接到中继网关。
+- 本地 TUI/attach 通过 `client-proxy` 与远端 OpenCode 建立临时通道。
+
 ## 运行
 
 ### 1) 启动 HTTP 网关（公网机器）

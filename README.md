@@ -162,7 +162,7 @@ For full details, see [docs/PROXY_TUNNEL.md](docs/PROXY_TUNNEL.md).
 | **[CRONTASK_COMMAND.md](docs/CRONTASK_COMMAND.md)** | Cron command reference |
 | **[SCHEDULER_GUIDE.md](docs/SCHEDULER_GUIDE.md)** | Task scheduler guide |
 | **[PROXY_TUNNEL.md](docs/PROXY_TUNNEL.md)** | 远程 OpenCode 反向代理隧道（无需暴露4096端口） |
-| **[ARCHITECTURE.md](ARCHITECTURE.md)** | System architecture |
+| **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** | System architecture |
 | **[DOCKER.md](DOCKER.md)** | Docker setup guide |
 
 ---
@@ -287,50 +287,9 @@ See [API.md](docs/API.md) for complete API documentation.
 
 ## 🔧 Configuration
 
-### Environment Variables
+Environment variable definitions are listed in **Quick Start → Environment Variables** above to avoid duplication.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OPENCODE_ENDPOINT` | ✅ | OpenCode Server URL |
-| `OPENCODE_API_KEY` | ✅* | OpenCode API Key (Bearer/X-API-Key mode) |
-| `OPENCODE_SERVER_PASSWORD` | ✅* | OpenCode Server password (HTTP Basic Auth mode) |
-| `OPENCODE_SERVER_USERNAME` | ❌ | Basic Auth username (default `opencode`) |
-| `HTTP_ENABLED` | ❌ | Enable built-in HTTP server (`false` by default) |
-| `SERVER_ADDR` | ❌ | Service listen address (`:8080`) |
-| `READ_TIMEOUT` | ❌ | HTTP read timeout (`30s`) |
-| `WRITE_TIMEOUT` | ❌ | HTTP write timeout (`30s`) |
-| `SHUTDOWN_GRACE` | ❌ | Graceful shutdown timeout (`30s`) |
-| `DINGTALK_USE_STREAM` | ❌ | Enable DingTalk Stream mode |
-| `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID |
-| `DINGTALK_CLIENT_SECRET` | ✅ Stream | DingTalk Client Secret |
-| `DINGTALK_USER_WHITELIST` | ❌ | Ignored at startup (startup whitelist is owner only) |
-| `DINGTALK_OWNER_USERID` | ✅ | Required owner user ID; auto-added to whitelist |
-| `FEISHU_APP_ID` | ❌ | Feishu App ID |
-| `FEISHU_APP_SECRET` | ❌ | Feishu App Secret |
-| `WECOM_CORP_ID` | ❌ | WeCom Corp ID |
-| `WECOM_AGENT_ID` | ❌ | WeCom Agent ID |
-| `WECOM_TOKEN` | ❌ | WeCom Webhook Token |
-| `WECOM_AES_KEY` | ❌ | WeCom AES Key |
-
-Quick example (`.env` file):
-```env
-OPENCODE_ENDPOINT=http://localhost:4096
-# Mode A: API key auth
-# OPENCODE_API_KEY=your_api_key
-
-# Mode B: OpenCode server password auth (Basic)
-OPENCODE_SERVER_PASSWORD=your_server_password
-# OPENCODE_SERVER_USERNAME=opencode
-
-SERVER_ADDR=:8080
-
-DINGTALK_USE_STREAM=true
-DINGTALK_CLIENT_ID=your_client_id
-DINGTALK_CLIENT_SECRET=your_client_secret
-DINGTALK_OWNER_USERID=054349580632603835
-```
-
-Auth note: configure either `OPENCODE_API_KEY` or `OPENCODE_SERVER_PASSWORD`. Do not keep both in production unless you explicitly want Basic Auth to take precedence.
+Auth note: configure either `OPENCODE_API_KEY` or `OPENCODE_SERVER_PASSWORD`. If both are set, openbot prefers `OPENCODE_SERVER_PASSWORD` (Basic Auth).
 
 At startup, whitelist is initialized to owner only (`DINGTALK_OWNER_USERID`). Runtime `/whitelist` command changes are not persisted across restart.
 
@@ -418,7 +377,10 @@ Check logs in:
 
 ```
 opencode-gateway/
+├── bin/                          # Build outputs
 ├── cmd/
+│   ├── attach/
+│   │   └── main.go              # Attach entry (client side)
 │   └── gateway/
 │       └── main.go              # Entry point
 ├── internal/
@@ -436,6 +398,10 @@ opencode-gateway/
 │   ├── opencode/
 │   │   ├── client.go           # OpenCode client with session management
 │   │   └── event_listener.go   # SSE event handling
+│   ├── persistence/
+│   │   └── dingtalk_runtime.go # Runtime persistence helpers
+│   ├── proxy/
+│   │   └── tunnel.go           # Reverse proxy tunnel runtime
 │   ├── server/
 │   │   └── server.go           # HTTP server
 │   └── scheduler/
@@ -443,6 +409,16 @@ opencode-gateway/
 │       ├── scheduler.go        # Task scheduler
 │       ├── task.go             # Task model
 │       └── webhook.go          # HTTP API endpoints
+├── tools/
+│   ├── http-gateway/
+│   │   └── main.go             # Centralized relay gateway
+│   ├── client-proxy/
+│   │   └── main.go             # Local bridge for TUI/attach
+│   └── batch_get_userid.py
+├── skill-install/
+│   ├── README.md
+│   └── tot.py
+├── test/                        # Utility checks/debug tools
 ├── docs/                       # Documentation
 │   ├── API.md                  # API reference
 │   ├── DEPLOY.md               # Deployment guide
@@ -450,16 +426,14 @@ opencode-gateway/
 │   ├── QUICK_START_CRONTASK.md # Cron task quick start
 │   ├── CRONTASK_COMMAND.md     # Cron command reference
 │   ├── SCHEDULER_GUIDE.md      # Task scheduler guide
-│   └── README.md               # Documentation index
+│   └── PROXY_TUNNEL.md         # Proxy tunnel usage
 ├── .env.example                # Example environment variables
 ├── docker-compose.yml          # Docker Compose
 ├── Dockerfile                  # Docker image
 ├── go.mod                      # Go modules
 ├── go.sum                      # Go dependencies
-├── ARCHITECTURE.md             # System architecture
+├── docs/ARCHITECTURE.md        # System architecture
 ├── DOCKER.md                   # Docker setup guide
-├── DEPLOYMENT_CHECKLIST.md     # Deployment checklist
-├── SOLUTION_SUMMARY.md         # Solution overview
 └── README.md                   # This file
 ```
 
@@ -498,6 +472,19 @@ The gateway automatically handles OpenCode permission requests and questions:
 ---
 
 ## 🔧 Recent Improvements
+
+### v1.2.0 - Secure Tunnel & Auth/Health Diagnostics (2026-03-05)
+
+**What improved:**
+1. **Secure tunnel workflow clarified**: README now documents `tools/http-gateway` + `tools/client-proxy` as the default secure relay path.
+2. **Auth mode behavior aligned**: `OPENCODE_API_KEY` and `OPENCODE_SERVER_PASSWORD` modes are clearly separated, and startup checks provide actionable guidance.
+3. **Startup diagnostics enhanced**: health check errors now distinguish endpoint unreachable, timeout, `401`, `403`, and `404` with targeted hints.
+4. **Proxy key isolation fixed**: tunnel `proxy_key` is no longer reused as OpenCode API auth credentials.
+
+**Operational benefit:**
+- Safer default deployment (no public OpenCode port exposure)
+- Faster root-cause diagnosis at startup
+- Fewer auth misconfiguration regressions
 
 ### v1.1.0 - Session Mapping Enhancement (2026-02-13)
 
