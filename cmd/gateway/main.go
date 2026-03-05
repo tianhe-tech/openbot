@@ -41,11 +41,6 @@ func main() {
 		}
 		log.Printf("proxy tunnel key generated, saved to %s", cfg.ProxyKeyFile)
 
-		if strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")) == "" {
-			cfg.OpenCodeAPIKey = proxyKey
-			log.Printf("OPENCODE_API_KEY not set, using generated proxy key")
-		}
-
 		go proxy.StartGatewayTunnel(ctx, cfg.ProxyHubWSURL, proxyKey, cfg.ProxyLocalAddr, cfg.ProxyReconnect)
 	}
 

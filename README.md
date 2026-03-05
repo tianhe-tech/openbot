@@ -45,6 +45,13 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
   - Auto-reconnect mechanism
   - Easier deployment for internal networks
 
+- **Secure Proxy Tunnel (Key Differentiator)** 🔐
+  - By default, openbot does not expose HTTP service ports (`HTTP_ENABLED=false`)
+  - Uses centralized `tools/http-gateway` as transit hub
+  - Uses `tools/client-proxy` to bridge OpenCode TUI traffic through a one-time `proxy_key`
+  - openbot only needs outbound access to the designated network
+  - Enables mobile bots (DingTalk/Feishu/WeCom) + OpenCode TUI in a relatively safer network model
+
 ---
 
 ## 🚀 Quick Start
@@ -58,7 +65,7 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
 ### 2. Build
 
 ```bash
-go build -o bin/gateway cmd/gateway/main.go
+go build -o bin/openbot cmd/gateway/main.go
 ```
 
 ### 3. Configure
@@ -75,8 +82,10 @@ cp .env.example .env
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `OPENCODE_ENDPOINT` | ✅ | - | OpenCode Server URL |
-| `OPENCODE_API_KEY` | ✅ | - | OpenCode API Key |
+| `OPENCODE_ENDPOINT` | ❌ | http://127.0.0.1:4096 | OpenCode Server URL |
+| `OPENCODE_API_KEY` | ❌* | empty | OpenCode API Key (Bearer/X-API-Key mode) |
+| `OPENCODE_SERVER_PASSWORD` | ❌* | empty | OpenCode Server password (HTTP Basic Auth mode) |
+| `OPENCODE_SERVER_USERNAME` | ❌ | `opencode` | Username for HTTP Basic Auth when `OPENCODE_SERVER_PASSWORD` is set |
 | `HTTP_ENABLED` | ❌ | `false` | Enable built-in HTTP server |
 | `SERVER_ADDR` | ❌ | `:8080` | Service listen address |
 | `DINGTALK_USE_STREAM` | ❌ | `false` | Enable DingTalk Stream mode |
@@ -85,10 +94,12 @@ cp .env.example .env
 | `DINGTALK_USER_WHITELIST` | ❌ | - | Ignored at startup (startup whitelist is owner only) |
 | `DINGTALK_OWNER_USERID` | ✅ | - | Required owner user ID; auto-added to whitelist |
 
+\* `OPENCODE_API_KEY` and `OPENCODE_SERVER_PASSWORD` set either one. If both are set, openbot prefers `OPENCODE_SERVER_PASSWORD` (Basic Auth).
+
 ### 4. Run
 
 ```bash
-./bin/gateway
+./bin/openbot
 ```
 
 ### 5. Verify
@@ -100,6 +111,43 @@ curl http://localhost:8080/healthz
 # Task statistics
 curl http://localhost:8080/api/tasks/stats
 ```
+
+---
+
+## 🔐 Secure Tunnel Mode (http-gateway + client-proxy)
+
+This is the core architecture difference from openclawd in this project: openbot does not require exposing OpenCode `4096` to the public network. It uses a centralized HTTP/WebSocket gateway for traffic relay.
+
+### Components
+
+- `tools/http-gateway`: centralized relay server (publicly reachable)
+- `cmd/gateway` (openbot): runs near OpenCode and actively connects to relay
+- `tools/client-proxy`: local TCP bridge for OpenCode TUI / attach
+
+### Typical flow
+
+1. Start `tools/http-gateway` on the central node.
+2. Start openbot with `PROXY_HUB_WS_URL`; openbot generates a one-time `proxy_key` and writes `.opencode-gateway-proxy.json`.
+3. Start `tools/client-proxy` locally with the same `proxy_key`.
+4. Connect OpenCode TUI/attach to local proxy address (for example `127.0.0.1:14096`), and traffic is relayed to remote OpenCode.
+
+### Quick run
+
+```bash
+# 1) central relay server
+go run ./tools/http-gateway -addr :18080
+
+# 2) openbot side (same host/network as OpenCode)
+PROXY_HUB_WS_URL=http://<gateway-host>:18080 go run ./cmd/gateway
+
+# 3) local client bridge
+go run ./tools/client-proxy \
+  -hub ws://<gateway-host>:18080/ws \
+  -proxy-key <proxy_key_from_.opencode-gateway-proxy.json> \
+  -listen 127.0.0.1:14096
+```
+
+For full details, see [docs/PROXY_TUNNEL.md](docs/PROXY_TUNNEL.md).
 
 ---
 
@@ -244,7 +292,9 @@ See [API.md](docs/API.md) for complete API documentation.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `OPENCODE_ENDPOINT` | ✅ | OpenCode Server URL |
-| `OPENCODE_API_KEY` | ✅ | OpenCode API Key |
+| `OPENCODE_API_KEY` | ✅* | OpenCode API Key (Bearer/X-API-Key mode) |
+| `OPENCODE_SERVER_PASSWORD` | ✅* | OpenCode Server password (HTTP Basic Auth mode) |
+| `OPENCODE_SERVER_USERNAME` | ❌ | Basic Auth username (default `opencode`) |
 | `HTTP_ENABLED` | ❌ | Enable built-in HTTP server (`false` by default) |
 | `SERVER_ADDR` | ❌ | Service listen address (`:8080`) |
 | `READ_TIMEOUT` | ❌ | HTTP read timeout (`30s`) |
@@ -265,7 +315,12 @@ See [API.md](docs/API.md) for complete API documentation.
 Quick example (`.env` file):
 ```env
 OPENCODE_ENDPOINT=http://localhost:4096
-OPENCODE_API_KEY=your_api_key
+# Mode A: API key auth
+# OPENCODE_API_KEY=your_api_key
+
+# Mode B: OpenCode server password auth (Basic)
+OPENCODE_SERVER_PASSWORD=your_server_password
+# OPENCODE_SERVER_USERNAME=opencode
 
 SERVER_ADDR=:8080
 
@@ -274,6 +329,8 @@ DINGTALK_CLIENT_ID=your_client_id
 DINGTALK_CLIENT_SECRET=your_client_secret
 DINGTALK_OWNER_USERID=054349580632603835
 ```
+
+Auth note: configure either `OPENCODE_API_KEY` or `OPENCODE_SERVER_PASSWORD`. Do not keep both in production unless you explicitly want Basic Auth to take precedence.
 
 At startup, whitelist is initialized to owner only (`DINGTALK_OWNER_USERID`). Runtime `/whitelist` command changes are not persisted across restart.
 
@@ -339,6 +396,7 @@ docker-compose up -d
 | DingTalk Stream not connecting | Verify Client ID/Secret, check network |
 | Tasks not executing | Check Cron expression (5-6 fields), verify task is enabled |
 | Context timeout errors | Fixed automatically by session management |
+| `POST /session` returns `401 Unauthorized` | Check auth mode mismatch: `OPENCODE_SERVER_PASSWORD` requires HTTP Basic Auth (`OPENCODE_SERVER_USERNAME` + password). Restart gateway after changing env vars and avoid mixing both auth modes unintentionally. |
 
 ### Debug Mode
 

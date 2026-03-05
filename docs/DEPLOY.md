@@ -37,6 +37,8 @@ cp .env.example .env
 # OpenCode Server 配置
 OPENCODE_ENDPOINT=http://localhost:4096
 OPENCODE_API_KEY=your_api_key_here
+# 或者使用 OpenCode Server 密码（与 OPENCODE_API_KEY 二选一）
+# OPENCODE_SERVER_PASSWORD=your_server_password
 
 # 服务监听地址
 SERVER_ADDR=:8080
@@ -144,11 +146,14 @@ services:
 | 变量名 | 必需 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `OPENCODE_ENDPOINT` | 是 | - | OpenCode Server 地址 |
-| `OPENCODE_API_KEY` | 可选 | - | OpenCode API 密钥 |
+| `OPENCODE_API_KEY` | 是* | - | OpenCode API 密钥 |
+| `OPENCODE_SERVER_PASSWORD` | 是* | - | OpenCode Server 密码（`OPENCODE_API_KEY` 为空时作为回退） |
 | `SERVER_ADDR` | 否 | `:8080` | 服务监听地址 |
 | `READ_TIMEOUT` | 否 | `30s` | 读取超时 |
 | `WRITE_TIMEOUT` | 否 | `30s` | 写入超时 |
 | `SHUTDOWN_GRACE` | 否 | `30s` | 优雅关闭超时 |
+
+\* `OPENCODE_API_KEY` 与 `OPENCODE_SERVER_PASSWORD` 至少配置一个。
 
 ### 钉钉配置
 
