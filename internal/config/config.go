@@ -21,6 +21,10 @@ type Config struct {
 	ShutdownGrace    time.Duration
 	OpenCodeEndpoint string
 	OpenCodeAPIKey   string
+	ProxyHubWSURL    string
+	ProxyKeyFile     string
+	ProxyLocalAddr   string
+	ProxyReconnect   time.Duration
 	WeCom            wecom.Config
 	FeiShu           feishu.Config
 	DingTalk         dingtalk.Config
@@ -35,7 +39,11 @@ func Load() (Config, error) {
 		WriteTimeout:     getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
 		ShutdownGrace:    getDuration("SERVER_SHUTDOWN_GRACE", 30*time.Second),
 		OpenCodeEndpoint: getEnv("OPENCODE_ENDPOINT", "http://localhost:4096"),
-		OpenCodeAPIKey:   getEnv("OPENCODE_API_KEY", "123"),
+		OpenCodeAPIKey:   getOpenCodeAPIKey(),
+		ProxyHubWSURL:    strings.TrimSpace(os.Getenv("PROXY_HUB_WS_URL")),
+		ProxyKeyFile:     getEnv("PROXY_KEY_FILE", ".opencode-gateway-proxy.json"),
+		ProxyLocalAddr:   getEnv("PROXY_LOCAL_OPENCODE_ADDR", "127.0.0.1:4096"),
+		ProxyReconnect:   getDuration("PROXY_RECONNECT_DELAY", 5*time.Second),
 		WeCom: wecom.Config{
 			Token:          os.Getenv("WECOM_TOKEN"),
 			EncodingAESKey: os.Getenv("WECOM_AES_KEY"),
@@ -76,10 +84,6 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("missing OPENCODE_ENDPOINT")
 	}
 
-	if cfg.OpenCodeAPIKey == "" {
-		return cfg, fmt.Errorf("missing OPENCODE_API_KEY")
-	}
-
 	if cfg.DingTalk.OwnerUserID == "" {
 		return cfg, fmt.Errorf("missing DINGTALK_OWNER_USERID")
 	}
@@ -93,6 +97,13 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func getOpenCodeAPIKey() string {
+	if val := strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")); val != "" {
+		return val
+	}
+	return strings.TrimSpace(os.Getenv("OPENCODE_SERVER_PASSWORD"))
 }
 
 func getDuration(key string, fallback time.Duration) time.Duration {

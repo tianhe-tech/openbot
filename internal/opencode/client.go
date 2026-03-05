@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -200,6 +201,7 @@ type Client struct {
 	sdk               *opencode.Client
 	endpoint          string
 	apiKey            string
+	basicAuthHeader   string
 	httpClient        *http.Client
 	eventHandlers     []EventHandler
 	eventListenerMu   sync.RWMutex
@@ -304,13 +306,32 @@ func parseEnvBool(key string) bool {
 
 // NewClient builds a Client instance using the official OpenCode SDK.
 func NewClient(endpoint, apiKey string, opts ...Option) *Client {
+	sdkOptions := []option.RequestOption{
+		option.WithBaseURL(endpoint),
+	}
+	trimmedAPIKey := strings.TrimSpace(apiKey)
+	serverPassword := strings.TrimSpace(os.Getenv("OPENCODE_SERVER_PASSWORD"))
+	basicAuthHeader := ""
+	if serverPassword != "" {
+		username := strings.TrimSpace(os.Getenv("OPENCODE_SERVER_USERNAME"))
+		if username == "" {
+			username = "opencode"
+		}
+		encoded := base64.StdEncoding.EncodeToString([]byte(username + ":" + serverPassword))
+		basicAuthHeader = "Basic " + encoded
+		sdkOptions = append(sdkOptions, option.WithHeader("Authorization", basicAuthHeader))
+	} else if trimmedAPIKey != "" {
+		sdkOptions = append(sdkOptions,
+			option.WithHeader("Authorization", "Bearer "+trimmedAPIKey),
+			option.WithHeader("X-API-Key", trimmedAPIKey),
+		)
+	}
+
 	client := &Client{
-		sdk: opencode.NewClient(
-			option.WithBaseURL(endpoint),
-			// option.WithAPIKey(apiKey), // If SDK supports API key authentication
-		),
-		endpoint: strings.TrimRight(endpoint, "/"),
-		apiKey:   apiKey,
+		sdk:             opencode.NewClient(sdkOptions...),
+		endpoint:        strings.TrimRight(endpoint, "/"),
+		apiKey:          trimmedAPIKey,
+		basicAuthHeader: basicAuthHeader,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -370,6 +391,19 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 	}()
 
 	return client
+}
+
+func (c *Client) applyAuthHeaders(header http.Header) {
+	if c.basicAuthHeader != "" {
+		header.Set("Authorization", c.basicAuthHeader)
+		header.Del("X-API-Key")
+		return
+	}
+	if c.apiKey == "" {
+		return
+	}
+	header.Set("Authorization", "Bearer "+c.apiKey)
+	header.Set("X-API-Key", c.apiKey)
 }
 
 // Ready reports if the client has enough data to operate.
@@ -432,12 +466,39 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	if err != nil {
 		c.isHealthy = false
 		c.healthCheckMu.Unlock()
-		return fmt.Errorf("opencode server不可用: %w\n\n💡 请确保：\n1. OpenCode server已启动\n2. 服务地址配置正确 (%s)\n3. 网络连接正常", err, c.endpoint)
+		return c.formatHealthCheckError(err)
 	}
 	c.isHealthy = true
 	c.healthCheckMu.Unlock()
 
 	return nil
+}
+
+func (c *Client) formatHealthCheckError(err error) error {
+	var apiErr *opencode.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusUnauthorized:
+			return fmt.Errorf("opencode server认证失败(401): %w\n\n💡 请检查：\n1. OPENCODE_ENDPOINT 是否指向正确服务 (%s)\n2. 若 OpenCode 开启了 OPENCODE_SERVER_PASSWORD，请在 gateway 进程设置 OPENCODE_SERVER_PASSWORD（可选 OPENCODE_SERVER_USERNAME，默认 opencode）\n3. 若使用 API key 认证，请改为设置 OPENCODE_API_KEY\n4. 修改环境变量后请重启 gateway", err, c.endpoint)
+		case http.StatusForbidden:
+			return fmt.Errorf("opencode server拒绝访问(403): %w\n\n💡 请检查账号/权限配置以及服务端认证策略", err)
+		case http.StatusNotFound:
+			return fmt.Errorf("opencode server接口不存在(404): %w\n\n💡 请检查 OPENCODE_ENDPOINT 是否正确，当前: %s", err, c.endpoint)
+		default:
+			return fmt.Errorf("opencode server返回异常状态(%d): %w\n\n💡 请检查服务日志与 endpoint 配置 (%s)", apiErr.StatusCode, err, c.endpoint)
+		}
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("opencode server不可达: %w\n\n💡 请确保：\n1. OpenCode server 已启动\n2. OPENCODE_ENDPOINT 配置正确 (%s)\n3. 网络连通且端口可访问", err, c.endpoint)
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("opencode server健康检查超时: %w\n\n💡 请检查服务负载或网络延迟，并确认 endpoint 可达 (%s)", err, c.endpoint)
+	}
+
+	return fmt.Errorf("opencode server不可用: %w\n\n💡 请确保：\n1. OpenCode server已启动\n2. 服务地址配置正确 (%s)\n3. 网络连接正常", err, c.endpoint)
 }
 
 // IsHealthy returns the cached health status.
@@ -894,9 +955,7 @@ func (c *Client) ForkSession(ctx context.Context, sessionID string) (string, err
 		return "", fmt.Errorf("opencode: fork session request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	c.applyAuthHeaders(req.Header)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -2399,9 +2458,7 @@ func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []
 		return fmt.Errorf("opencode: prompt_async request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	c.applyAuthHeaders(req.Header)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -2699,9 +2756,7 @@ func (c *Client) answerPermissionViaHTTP(ctx context.Context, q *Question, respo
 		return fmt.Errorf("opencode: permission HTTP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	c.applyAuthHeaders(req.Header)
 	// 不在 query string 中发送 directory，Python 也没有这样做
 
 	log.Printf("opencode: HTTP permission request - URL=%s, method=POST, body=%s",
@@ -2810,9 +2865,7 @@ func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer s
 		return fmt.Errorf("opencode: answer request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	c.applyAuthHeaders(req.Header)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
