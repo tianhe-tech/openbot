@@ -14,7 +14,7 @@ OpenCode Gateway 是一个企业级消息网关，实现了 OpenCode AI 服务�
 项目关键差异点（相对常见直连部署）：
 - ✅ 默认不开放 openbot HTTP 端口（`HTTP_ENABLED=false`）
 - ✅ OpenCode `4096` 无需公网暴露
-- ✅ 使用集中式 `tools/http-gateway` + `tools/client-proxy` 建立代理隧道
+- ✅ 使用集中式 `tools/http-server` + `tools/client-proxy` 建立代理隧道
 - ✅ openbot 只需具备到指定网络的出站访问能力
 
 ---
@@ -31,7 +31,7 @@ flowchart LR
     B -->|适配器回推| U
 
     T[本地 OpenCode TUI/attach] --> C[tools/client-proxy]
-    C -->|WS role=client| H[tools/http-gateway\n集中式中继]
+    C -->|WS role=client| H[tools/http-server\n集中式中继]
     B -->|WS role=control/data| H
     B -->|TCP 127.0.0.1:4096| O
 
@@ -61,7 +61,7 @@ opencode-gateway/
 │   └── server/
 │       └── server.go              # HTTP 服务器
 ├── tools/
-│   ├── http-gateway/main.go       # 集中式中继网关
+│   ├── http-server/main.go       # 集中式中继网关
 │   └── client-proxy/main.go       # 本地代理桥接
 └── docs/PROXY_TUNNEL.md
 ```

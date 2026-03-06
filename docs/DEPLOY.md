@@ -7,7 +7,7 @@ OpenCode Gateway 是一个将消息平台（钉钉、飞书、企业微信）与
 默认采用更安全的部署模式：
 - openbot 默认不开放 HTTP 监听端口（`HTTP_ENABLED=false`）
 - OpenCode 端口无需公网暴露
-- 通过集中式 `tools/http-gateway` + `tools/client-proxy` 建立隧道中转
+- 通过集中式 `tools/http-server` + `tools/client-proxy` 建立隧道中转
 
 ---
 
@@ -167,15 +167,15 @@ services:
 ### 安全隧道模式（推荐）
 
 当你不希望暴露 OpenCode `4096` 端口时，使用以下组件：
-- `tools/http-gateway`：集中式中继
-- `cmd/gateway`：openbot，主动连接中继并生成一次性 `proxy_key`
+- `tools/http-server`：集中式中继
+- `cmd/gateway`：openbot，主动连接中继并读取或生成 `proxy_key`
 - `tools/client-proxy`：本地桥接 TUI/attach 流量
 
 最小运行流程：
 
 ```bash
 # 1) 中继服务
-go run ./tools/http-gateway -addr :18080
+go run ./tools/http-server -addr :18080
 
 # 2) openbot 侧（靠近 OpenCode）
 PROXY_HUB_WS_URL=http://<gateway-host>:18080 go run ./cmd/gateway/main.go
