@@ -20,15 +20,20 @@ type controlMsg struct {
 	Token  string `json:"token"`  // one-time session token
 }
 
+type controlConn struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
 type hub struct {
 	mu       sync.Mutex
-	controls map[string]*websocket.Conn      // proxy_key → persistent control WS (gateway→hub)
+	controls map[string]*controlConn         // proxy_key → persistent control WS (gateway→hub)
 	pending  map[string]chan *websocket.Conn // session token → channel waiting for data WS
 }
 
 func newHub() *hub {
 	return &hub{
-		controls: make(map[string]*websocket.Conn),
+		controls: make(map[string]*controlConn),
 		pending:  make(map[string]chan *websocket.Conn),
 	}
 }
@@ -48,9 +53,9 @@ func main() {
 	})
 	mux.HandleFunc("/ws", h.handleWS)
 
-	log.Printf("proxy http gateway listening on %s", *addr)
+	log.Printf("http server listening on %s", *addr)
 	if err := http.ListenAndServe(*addr, mux); err != nil {
-		log.Fatalf("http gateway stopped: %v", err)
+		log.Fatalf("http server stopped: %v", err)
 	}
 }
 
@@ -100,18 +105,21 @@ func (h *hub) handleControl(w http.ResponseWriter, r *http.Request, proxyKey str
 		return
 	}
 	defer conn.Close()
+	ctrl := &controlConn{conn: conn}
 
 	h.mu.Lock()
 	if old, ok := h.controls[proxyKey]; ok {
-		_ = old.Close()
+		_ = old.conn.Close()
 	}
-	h.controls[proxyKey] = conn
+	h.controls[proxyKey] = ctrl
 	h.mu.Unlock()
 
 	log.Printf("control registered: key=%s", shortKey(proxyKey))
 
 	// Keep the control conn alive with pong responses.
 	conn.SetPingHandler(func(data string) error {
+		ctrl.writeMu.Lock()
+		defer ctrl.writeMu.Unlock()
 		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(5*time.Second))
 	})
 
@@ -125,7 +133,7 @@ func (h *hub) handleControl(w http.ResponseWriter, r *http.Request, proxyKey str
 	}
 
 	h.mu.Lock()
-	if h.controls[proxyKey] == conn {
+	if h.controls[proxyKey] == ctrl {
 		delete(h.controls, proxyKey)
 	}
 	h.mu.Unlock()
@@ -180,7 +188,10 @@ func (h *hub) handleClient(w http.ResponseWriter, r *http.Request, proxyKey stri
 
 	// Send "connect" command to gateway.
 	msg, _ := json.Marshal(controlMsg{Action: "connect", Token: token})
-	if err := ctrlConn.WriteMessage(websocket.TextMessage, msg); err != nil {
+	ctrlConn.writeMu.Lock()
+	err := ctrlConn.conn.WriteMessage(websocket.TextMessage, msg)
+	ctrlConn.writeMu.Unlock()
+	if err != nil {
 		http.Error(w, "control write failed", http.StatusServiceUnavailable)
 		log.Printf("control write failed: key=%s %v", shortKey(proxyKey), err)
 		return

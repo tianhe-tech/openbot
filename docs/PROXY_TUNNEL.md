@@ -4,28 +4,28 @@
 
 ## 组件
 
-1. `tools/http-gateway`：公网可访问的 HTTP/WebSocket 中继网关
+1. `tools/http-server`：公网可访问的 HTTP/WebSocket 中继网关
 2. `cmd/gateway`：远端进程，启动时自动生成 `proxy_key`，并主动连接中继网关
 3. `tools/client-proxy`：本地客户端代理，使用同一 `proxy_key` 建立隧道并暴露本地 TCP 端口
 
 ## 工作流程
 
 1. 远端 `cmd/gateway` 启动后：
-   - 自动生成一次性 `proxy_key`
+  - 自动读取或生成 `proxy_key`
    - 写入当前运行目录文件（默认 `.opencode-gateway-proxy.json`）
    - 主动以 WebSocket 连接 `PROXY_HUB_WS_URL`
 2. 本地 `tools/client-proxy` 使用同一个 `proxy_key` 连接中继网关。
 3. 中继网关按 `proxy_key` 将两条 WebSocket 连接配对并双向转发。
 4. 远端 `cmd/gateway` 将 WebSocket 数据桥接到本机 OpenCode（默认 `127.0.0.1:4096`）。
 
-> 当前实现中，`proxy_key` 为单次有效：客户端代理成功连接后即消费。
+> 当前实现中，`proxy_key` 可重复使用（只要远端 key 文件未变更）。
 
 ## 架构图
 
 ```mermaid
 flowchart LR
   A[OpenCode TUI / attach\n本地开发机] -->|TCP 127.0.0.1:14096| B[tools/client-proxy]
-  B -->|WebSocket role=client\nproxy_key| C[tools/http-gateway\n集中式中继]
+  B -->|WebSocket role=client\nproxy_key| C[tools/http-server\n集中式中继]
   D[cmd/gateway\n远端 openbot] -->|WebSocket role=control/data\nproxy_key| C
   D -->|TCP 127.0.0.1:4096| E[OpenCode Server\n远端内网]
 
@@ -45,7 +45,7 @@ flowchart LR
 ### 1) 启动 HTTP 网关（公网机器）
 
 ```bash
-go run ./tools/http-gateway -addr :18080
+go run ./tools/http-server -addr :18080
 ```
 
 ### 2) 启动远端 gateway（与 OpenCode 同机）

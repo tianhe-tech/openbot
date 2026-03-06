@@ -436,11 +436,36 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 
 	case "video":
-		// 视频消息暂不支持
-		log.Printf("dingtalk stream: 🎬 [VIDEO] received from %s (unsupported, replying)", userID)
-		replier := chatbot.NewChatbotReplier()
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("暂不支持视频消息，请发送文本或图片。"))
-		return nil, nil
+		// 视频消息：下载为 data URI 并作为附件转发给 OpenCode
+		log.Printf("dingtalk stream: 🎬 [VIDEO] received from %s", userID)
+		var vidContent videoContent
+		if data.Content != nil {
+			contentBytes, _ := json.Marshal(data.Content)
+			log.Printf("  - Video content JSON: %s", string(contentBytes))
+			if err := json.Unmarshal(contentBytes, &vidContent); err != nil {
+				log.Printf("  - ⚠️ Failed to parse video content: %v", err)
+			} else if vidContent.DownloadCode != "" {
+				dataURI, mime, err := h.downloadMediaAsDataURI(ctx, vidContent.DownloadCode, "video/mp4")
+				if err != nil {
+					log.Printf("  - ⚠️ Failed to download video: %v", err)
+				} else {
+					log.Printf("  - ✅ Video downloaded as data URI (mime=%s, len=%d)", mime, len(dataURI))
+					mediaInfo = map[string]interface{}{
+						"type": "video",
+						"url":  dataURI,
+						"mime": mime,
+					}
+				}
+			}
+		}
+		if content == "" {
+			durRaw := int(vidContent.Duration)
+			durSec := durRaw
+			if durRaw >= 1000 {
+				durSec = durRaw / 1000
+			}
+			content = fmt.Sprintf("[视频消息，时长: %d秒]", durSec)
+		}
 
 	case "richText":
 		// 图文混合消息
@@ -526,7 +551,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		log.Printf("dingtalk stream: ⚠️ [UNSUPPORTED] message type '%s' from %s", msgType, userID)
 		replier := chatbot.NewChatbotReplier()
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook,
-			[]byte(fmt.Sprintf("暂不支持 %s 类型的消息，请发送文本、图片或语音消息。", msgType)))
+			[]byte(fmt.Sprintf("暂不支持 %s 类型的消息，请发送文本、图片、语音或视频消息。", msgType)))
 		return nil, nil
 	}
 
