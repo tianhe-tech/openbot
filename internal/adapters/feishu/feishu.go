@@ -883,8 +883,8 @@ func (h *Handler) sendTextMessage(ctx context.Context, target chatTarget, conten
 	return nil
 }
 
-// downloadFeishuMediaAsDataURI \u4e0b\u8f7d\u98de\u4e66\u56fe\u7247\u6216\u6587\u4ef6\uff0c\u8fd4\u56de base64 data URI\u3002
-// fileType: "image" \u6216 "file"
+// downloadFeishuMediaAsDataURI \u4e0b\u8f7d\u98de\u4e66\u5a92\u4f53\u8d44\u6e90\uff0c\u8fd4\u56de base64 data URI\u3002
+// fileType \u5e38\u89c1\u503c: "image"\u3001"audio"\u3001"video"\u3001"file"
 func (h *Handler) downloadFeishuMediaAsDataURI(ctx context.Context, messageID, fileKey, fileType string) (string, string, error) {
 	token, err := h.getAccessToken(ctx)
 	if err != nil {
@@ -1203,6 +1203,45 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 
 		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil
 
+	case "video":
+		var vid feishuVideoContent
+		if err := json.Unmarshal([]byte(rawContent), &vid); err != nil {
+			log.Printf("feishu: ⚠️ parse video content failed: %v", err)
+			return "[视频消息]", nil, nil
+		}
+
+		durMs, _ := strconv.Atoi(strings.TrimSpace(vid.Duration))
+		durSec := durMs / 1000
+		if durSec == 0 && durMs > 0 {
+			durSec = 1
+		}
+
+		if vid.FileKey == "" {
+			if durSec > 0 {
+				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil
+			}
+			return "[视频消息]", nil, nil
+		}
+
+		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, vid.FileKey, "video")
+		if err != nil {
+			log.Printf("feishu: ⚠️ video download with type=video failed: %v, retry with type=file", err)
+			dataURI, mime, err = h.downloadFeishuMediaAsDataURI(ctx, messageID, vid.FileKey, "file")
+		}
+		if err != nil {
+			log.Printf("feishu: ⚠️ video download failed: %v", err)
+			if durSec > 0 {
+				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil
+			}
+			return "[视频消息]", nil, nil
+		}
+
+		log.Printf("feishu: ✅ video downloaded (mime=%s, len=%d)", mime, len(dataURI))
+		if durSec > 0 {
+			return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, nil
+		}
+		return "[视频消息]", []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, nil
+
 	case "post":
 		var post feishuPostContent
 		if err := json.Unmarshal([]byte(rawContent), &post); err != nil {
@@ -1465,6 +1504,12 @@ type feishuImageContent struct {
 
 // feishuAudioContent 语音消息
 type feishuAudioContent struct {
+	FileKey  string `json:"file_key"`
+	Duration string `json:"duration"` // 毫秒
+}
+
+// feishuVideoContent 视频消息
+type feishuVideoContent struct {
 	FileKey  string `json:"file_key"`
 	Duration string `json:"duration"` // 毫秒
 }
