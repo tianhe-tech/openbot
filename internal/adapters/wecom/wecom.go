@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -146,6 +147,9 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 	if content == "/status" || content == "状态" {
 		return h.handleStatus(userID)
 	}
+	if strings.HasPrefix(content, "/memory") {
+		return h.handleMemory(userID, content)
+	}
 
 	// normal message  streaming session
 	sessionID, _ := h.adapter.GetSessionForUser(userID)
@@ -217,9 +221,147 @@ func (h *Handler) handleHelp() (string, error) {
 /diff 或 变更      - 查看本次会话的文件变更摘要
 /abort 或 停止     - 中止正在运行的任务
 /status 或 状态    - 查看当前会话状态
+/memory           - 查看长期记忆
+/memory pin <内容> - 固定一条高优先级记忆
+/memory pin <category> <内容> - 按分类固定记忆
+/memory unpin <关键词> - 按关键词删除记忆
+/memory unpin #<序号> - 按列表序号删除记忆
+/memory export       - 导出当前用户记忆快照
+/memory import <base64> - 导入记忆快照（覆盖）
+/memory merge-import <base64> - 合并导入记忆快照（不覆盖）
+/memory clear      - 清空当前用户记忆
+/memory compact    - 压缩去重当前用户记忆
 
  直接发送消息即可与 AI 对话`
 	return helpText, nil
+}
+
+func (h *Handler) handleMemory(userID, content string) (string, error) {
+	normalizeCategory := func(raw string) string {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "profile", "preference", "project", "environment", "model", "conversation":
+			return strings.ToLower(strings.TrimSpace(raw))
+		default:
+			return "preference"
+		}
+	}
+
+	parts := strings.Fields(strings.TrimSpace(content))
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
+		limit := 10
+		if len(parts) >= 3 {
+			if strings.EqualFold(parts[2], "all") {
+				limit = 0
+			} else if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		facts := h.client.ListUserMemory("wecom", userID, limit)
+		if len(facts) == 0 {
+			return "ℹ️ 当前没有已记录的长期记忆", nil
+		}
+		var b strings.Builder
+		b.WriteString("🧠 长期记忆（Top 10）\n")
+		for i, f := range facts {
+			b.WriteString(fmt.Sprintf("%d. [%s][P%d] %s\n", i+1, f.Category, f.Importance, f.Text))
+		}
+		return b.String(), nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "clear") {
+		if err := h.client.ClearUserMemory("wecom", userID); err != nil {
+			return "❌ 清空 memory 失败: " + err.Error(), nil
+		}
+		return "✅ 已清空当前用户长期记忆", nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "compact") {
+		removed, err := h.client.CompactUserMemory("wecom", userID)
+		if err != nil {
+			return "❌ 压缩 memory 失败: " + err.Error(), nil
+		}
+		return fmt.Sprintf("✅ memory 压缩完成，移除 %d 条冗余记录", removed), nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "pin") {
+		category := "preference"
+		text := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if len(parts) >= 4 {
+			candidate := normalizeCategory(parts[2])
+			if candidate == strings.ToLower(strings.TrimSpace(parts[2])) {
+				category = candidate
+				text = strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+			}
+		}
+		if text == "" {
+			return "❌ 用法: /memory pin <内容> 或 /memory pin <category> <内容>", nil
+		}
+		if err := h.client.PinUserMemory("wecom", userID, text, category); err != nil {
+			return "❌ 固定 memory 失败: " + err.Error(), nil
+		}
+		return "✅ 已固定高优先级记忆（category=" + category + "）", nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "unpin") {
+		keyword := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if keyword == "" {
+			return "❌ 用法: /memory unpin <关键词>", nil
+		}
+		if strings.HasPrefix(keyword, "#") {
+			rawRank := strings.TrimPrefix(keyword, "#")
+			rank, convErr := strconv.Atoi(rawRank)
+			if convErr != nil || rank <= 0 {
+				return "❌ 序号格式错误，用法: /memory unpin #<序号>", nil
+			}
+			ok, err := h.client.RemoveUserMemoryByRank("wecom", userID, rank)
+			if err != nil {
+				return "❌ 删除 memory 失败: " + err.Error(), nil
+			}
+			if ok {
+				return "✅ 已按序号删除记忆", nil
+			}
+			return "ℹ️ 未找到对应序号记忆", nil
+		}
+		removed, err := h.client.UnpinUserMemory("wecom", userID, keyword)
+		if err != nil {
+			return "❌ 删除 memory 失败: " + err.Error(), nil
+		}
+		return fmt.Sprintf("✅ 已删除 %d 条匹配记忆", removed), nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "export") {
+		snapshot, err := h.client.ExportUserMemory("wecom", userID)
+		if err != nil {
+			return "❌ 导出 memory 失败: " + err.Error(), nil
+		}
+		return "📦 memory 导出（base64）:\n" + snapshot, nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "import") {
+		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if payload == "" {
+			return "❌ 用法: /memory import <base64>", nil
+		}
+		count, err := h.client.ImportUserMemory("wecom", userID, payload)
+		if err != nil {
+			return "❌ 导入 memory 失败: " + err.Error(), nil
+		}
+		return fmt.Sprintf("✅ memory 导入完成，共 %d 条", count), nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "merge-import") {
+		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if payload == "" {
+			return "❌ 用法: /memory merge-import <base64>", nil
+		}
+		count, err := h.client.MergeImportUserMemory("wecom", userID, payload)
+		if err != nil {
+			return "❌ 合并导入 memory 失败: " + err.Error(), nil
+		}
+		return fmt.Sprintf("✅ memory 合并导入完成，共 %d 条", count), nil
+	}
+
+	return "❌ 命令格式错误\n\n用法:\n/memory\n/memory show [all|N]\n/memory pin <内容>\n/memory pin <category> <内容>\n/memory unpin <关键词>\n/memory unpin #<序号>\n/memory export\n/memory import <base64>\n/memory merge-import <base64>\n/memory clear\n/memory compact\n\ncategory: profile|preference|project|environment|model|conversation", nil
 }
 
 func (h *Handler) handleFork(ctx context.Context, userID string) (string, error) {

@@ -1,0 +1,54 @@
+{
+  "skill_name": "dingtalk-file-sender",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我将这个生成的报告发送到钉钉给田杨",
+      "files": ["/tmp/test_report.docx"],
+      "expected_output": "成功调用钉钉API发送文件给用户",
+      "assertions": [
+        "文件成功上传到钉钉服务器",
+        "消息成功发送给用户",
+        "返回成功的响应信息"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "通过钉钉把这份Excel表格发给用户1601434517956472",
+      "files": ["/tmp/data.xlsx"],
+      "expected_output": "将指定文件发送给指定的钉钉用户ID",
+      "assertions": [
+        "使用命令行参数指定的用户ID",
+        "文件正确发送"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "把视频分析报告推送到钉钉",
+      "files": ["/tmp/视频分析报告.docx"],
+      "expected_output": "发送中文文件名的文档到钉钉",
+      "assertions": [
+        "支持中文文件名",
+        "文件正确上传和发送"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "发送文件到钉钉",
+      "files": ["/tmp/image.png"],
+      "expected_output": "使用skill发送图片文件到钉钉",
+      "assertions": [
+        "图片文件成功发送"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "请将这份PDF文档分享给钉钉上的用户",
+      "files": ["/tmp/document.pdf"],
+      "expected_output": "发送PDF文件到钉钉",
+      "assertions": [
+        "PDF文件成功发送"
+      ]
+    }
+  ]
+}

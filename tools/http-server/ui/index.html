@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Openbot Console</title>
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/highlight.min.js"></script>
+  <style>
+    :root {
+      --bg: #f7f2e7;
+      --ink: #231d13;
+      --sub: #675c49;
+      --line: #d8ccb7;
+      --panel: #fffaf0;
+      --side: #2e2518;
+      --side2: #3b2f20;
+      --active: #f59e0b;
+      --primary: #0f766e;
+      --danger: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Trebuchet MS", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(140deg, #f9f6ef, #f2e8d6 55%, #ebdcc5);
+    }
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 260px 1fr;
+    }
+    .side {
+      background: linear-gradient(180deg, var(--side), var(--side2));
+      color: #efe3cf;
+      padding: 18px 14px;
+      border-right: 1px solid #2a2015;
+    }
+    .brand {
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: .4px;
+      margin: 0 0 4px;
+    }
+    .tag {
+      font-size: 12px;
+      color: #d8c6a8;
+      margin: 0 0 14px;
+    }
+    .status {
+      font-size: 12px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      word-break: break-all;
+    }
+    .nav-btn {
+      width: 100%;
+      text-align: left;
+      border: 1px solid rgba(255,255,255,.15);
+      border-radius: 10px;
+      background: transparent;
+      color: #efe3cf;
+      padding: 10px;
+      margin: 0 0 8px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .nav-btn.active {
+      border-color: var(--active);
+      background: rgba(245, 158, 11, .14);
+      color: #ffdfaa;
+    }
+    .main {
+      padding: 18px;
+    }
+    .panel {
+      display: none;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 8px 22px rgba(0,0,0,.05);
+    }
+    .panel.active { display: block; }
+    h2 { margin: 0 0 10px; }
+    label { font-size: 13px; color: var(--sub); display: block; margin: 8px 0 4px; }
+    input, textarea, button {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    .btns { display: flex; gap: 8px; }
+    .btns button { flex: 1; width: auto; }
+    button {
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--primary), #115e59);
+      color: #fff;
+      border: none;
+      font-weight: 600;
+    }
+    button.alt { background: linear-gradient(135deg, #b45309, #9a3412); }
+    .muted { color: var(--sub); font-size: 12px; }
+    .chat-box {
+      height: 420px;
+      overflow: auto;
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: rgba(255,255,255,.75);
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    .line { margin: 0 0 10px; }
+    .line.md { background: #fff; border: 1px solid #e8dcc7; border-radius: 8px; padding: 8px; }
+    .me { color: #0c4a6e; }
+    .bot { color: #166534; }
+    .err { color: var(--danger); }
+    .skills-list {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      max-height: 360px;
+      overflow: auto;
+    }
+    .skill-item {
+      padding: 8px 10px;
+      border-bottom: 1px solid #eee5d4;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .skill-item:last-child { border-bottom: none; }
+    .skill-name { font-weight: 700; }
+    .skill-desc { color: var(--sub); font-size: 12px; }
+    .skill-actions { display: flex; gap: 6px; }
+    .skill-actions button { width: auto; padding: 6px 10px; }
+    .model-list {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      max-height: 240px;
+      overflow: auto;
+      padding: 8px;
+      font-size: 13px;
+    }
+    .model-provider { font-weight: 700; margin-top: 6px; }
+    .req-log {
+      margin-top: 12px;
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      background: #fffdf7;
+      max-height: 220px;
+      overflow: auto;
+      padding: 8px;
+      white-space: pre-wrap;
+      font-size: 12px;
+      color: #4b4233;
+    }
+    .req-item { margin-bottom: 6px; }
+    .req-out { color: #0c4a6e; }
+    .req-in { color: #166534; }
+    .req-err { color: var(--danger); }
+    @media (max-width: 900px) {
+      .shell { grid-template-columns: 1fr; }
+      .side { border-right: none; border-bottom: 1px solid #2a2015; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="side">
+      <div class="brand">Openbot UI</div>
+      <p class="tag">Session-bound RPC Console</p>
+      <div class="status" id="connectStatus">未连接</div>
+      <button class="nav-btn active" data-target="panel-chat">对话</button>
+      <button class="nav-btn" data-target="panel-connect">连接 openbot</button>
+      <button class="nav-btn" data-target="panel-settings">设置</button>
+      <button class="nav-btn" data-target="panel-skills">Skills</button>
+    </aside>
+
+    <main class="main">
+      <section class="panel active" id="panel-chat">
+        <h2>对话框</h2>
+        <p class="muted">已连接后，本 session 的请求会自动走已绑定的 openbot websocket。</p>
+        <div class="chat-box" id="chatBox"></div>
+        <label>消息（支持 /help, /model, /provider, /soul, /skills, /reset）</label>
+        <textarea id="chatInput" placeholder="输入消息或 /命令"></textarea>
+        <div class="btns" style="margin-top:8px;">
+          <button id="sendChat">发送</button>
+        </div>
+        <h3 style="margin:12px 0 6px;">消息日志</h3>
+        <div class="req-log" id="requestLog"></div>
+      </section>
+
+      <section class="panel" id="panel-connect">
+        <h2>连接 openbot</h2>
+        <label>Proxy Key</label>
+        <input id="proxyKey" placeholder="输入 proxy-key">
+        <label>UI Session ID（自动生成）</label>
+        <input id="uiSessionId" readonly>
+        <div class="btns" style="margin-top:8px;">
+          <button id="connectBtn">连接</button>
+          <button id="checkKeys" class="alt">检查在线 Keys</button>
+        </div>
+        <p class="muted">点击连接后会在服务端建立 `session_id -> proxy_key` 绑定；后续请求只需携带 session_id。</p>
+      </section>
+
+      <section class="panel" id="panel-settings">
+        <h2>设置</h2>
+        <label>Provider Base URL (OpenAI 兼容)</label>
+        <input id="providerBaseUrl" placeholder="例如 https://api.openai.com/v1">
+        <label>API Key</label>
+        <input id="providerApiKey" placeholder="sk-...">
+        <label>模型</label>
+        <input id="providerModel" placeholder="gpt-4o-mini">
+        <label>灵魂</label>
+        <textarea id="soul" placeholder="例如：你是一个偏工程实战的中文助手，回答先给可执行结论，再给原因。"></textarea>
+        <div class="btns" style="margin-top:8px;">
+          <button id="saveSettings">保存设置</button>
+          <button id="loadState" class="alt">读取状态</button>
+          <button id="refreshModels" class="alt">刷新模型列表</button>
+          <button id="exampleSoul" class="alt">示例灵魂</button>
+        </div>
+        <div class="model-list" id="modelsList"></div>
+      </section>
+
+      <section class="panel" id="panel-skills">
+        <h2>Skills</h2>
+        <div class="btns" style="margin-bottom:8px;">
+          <input id="skillSearch" placeholder="search 本地 skills...">
+          <button id="refreshSkills">刷新列表</button>
+        </div>
+        <div class="btns" style="margin-bottom:8px;">
+          <input id="skillName" placeholder="输入 skill 名称用于安装/卸载">
+          <button id="installSkill">install</button>
+          <button id="uninstallSkill" class="alt">uninstall</button>
+        </div>
+        <div class="skills-list" id="skillsList"></div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    let boundSessionId = "";
+    let allSkills = [];
+
+    function genId() {
+      return "ui-" + Math.random().toString(16).slice(2, 10) + "-" + Date.now().toString(16);
+    }
+
+    function appendLine(cls, text) {
+      const box = $("#chatBox");
+      box.append($("<div>").addClass("line " + cls).text(text));
+      box.scrollTop(box[0].scrollHeight);
+    }
+
+    function appendMarkdownLine(text) {
+      const box = $("#chatBox");
+      const raw = (text == null ? "" : String(text));
+      let parsed = raw
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\n/g, "<br>");
+      if (window.marked && typeof marked.parse === "function") {
+        parsed = marked.parse(raw);
+      }
+      const html = (window.DOMPurify && typeof DOMPurify.sanitize === "function")
+        ? DOMPurify.sanitize(parsed)
+        : parsed;
+      const row = $("<div>").addClass("line bot md").html(html);
+      if (window.hljs && typeof hljs.highlightElement === "function") {
+        row.find("pre code").each(function() {
+          hljs.highlightElement(this);
+        });
+      }
+      box.append(row);
+      box.scrollTop(box[0].scrollHeight);
+    }
+
+    function appendReqLog(kind, title, payload) {
+      const box = $("#requestLog");
+      const ts = new Date().toLocaleTimeString();
+      let txt = payload;
+      if (typeof payload !== "string") {
+        try {
+          txt = JSON.stringify(payload);
+        } catch (_) {
+          txt = String(payload);
+        }
+      }
+      const cls = kind === "out" ? "req-out" : (kind === "in" ? "req-in" : "req-err");
+      box.append($("<div>").addClass("req-item " + cls).text("[" + ts + "] " + title + " => " + txt));
+      box.scrollTop(box[0].scrollHeight);
+    }
+
+    async function connectSession() {
+      const proxyKey = $.trim($("#proxyKey").val());
+      if (!proxyKey) {
+        throw new Error("请先输入 proxy-key");
+      }
+      const sessionId = $.trim($("#uiSessionId").val());
+      const res = await $.ajax({
+        method: "POST",
+        url: "/api/session/connect",
+        contentType: "application/json",
+        data: JSON.stringify({ proxy_key: proxyKey, session_id: sessionId })
+      });
+      if (!res.ok) {
+        throw new Error(res.error || "连接失败");
+      }
+      boundSessionId = res.session_id;
+      localStorage.setItem("openbot-ui-session-id", boundSessionId);
+      $("#uiSessionId").val(boundSessionId);
+      $("#connectStatus").text("已连接\nSession: " + boundSessionId + "\nKey: " + (res.proxy_key || proxyKey));
+      return res;
+    }
+
+    async function proxyRequest(action, payload, timeoutSeconds) {
+      const sid = $.trim($("#uiSessionId").val());
+      if (!sid) {
+        throw new Error("session 未初始化");
+      }
+      const requestBody = {
+        session_id: sid,
+        action: action,
+        payload: payload || {},
+        timeout_seconds: timeoutSeconds || 25
+      };
+      appendReqLog("out", "REQUEST " + action, requestBody);
+      const res = await $.ajax({
+        method: "POST",
+        url: "/api/proxy/request",
+        contentType: "application/json",
+        data: JSON.stringify(requestBody)
+      });
+      if (!res.ok) {
+        appendReqLog("err", "RESPONSE " + action, res.error || "请求失败");
+        throw new Error(res.error || "请求失败");
+      }
+      appendReqLog("in", "RESPONSE " + action, res.payload || {});
+      return res.payload || {};
+    }
+
+    async function bootstrapCommands() {
+      try {
+        const m = await proxyRequest("chat", { ui_session_id: boundSessionId, message: "/models" }, 30);
+        appendMarkdownLine("[auto /models]\n\n" + (m.reply || m.message || JSON.stringify(m)));
+      } catch (e) {
+        appendLine("err", "[auto /models] " + e.message);
+      }
+      try {
+        const s = await proxyRequest("chat", { ui_session_id: boundSessionId, message: "/skills" }, 30);
+        appendMarkdownLine("[auto /skills]\n\n" + (s.reply || s.message || JSON.stringify(s)));
+      } catch (e) {
+        appendLine("err", "[auto /skills] " + e.message);
+      }
+    }
+
+    function renderSkills(list) {
+      const root = $("#skillsList");
+      root.empty();
+      if (!list.length) {
+        root.append($("<div>").addClass("skill-item").text("无技能"));
+        return;
+      }
+      list.forEach(function(item) {
+        const row = $("<div>").addClass("skill-item");
+        const left = $("<div>");
+        left.append($("<div>").addClass("skill-name").text(item.name || "unknown"));
+        left.append($("<div>").addClass("skill-desc").text(item.description || "(无描述)"));
+        const actions = $("<div>").addClass("skill-actions");
+        const installBtn = $("<button>").text("install");
+        const uninstallBtn = $("<button>").text("uninstall").addClass("alt");
+        installBtn.on("click", async function() {
+          try {
+            const r = await proxyRequest("skill_install", { skill: item.name }, 120);
+            appendLine("bot", r.message || ("已安装 " + item.name));
+          } catch (e) {
+            appendLine("err", e.message);
+          }
+        });
+        if (item.can_uninstall === true) {
+          uninstallBtn.on("click", async function() {
+            try {
+              const r = await proxyRequest("skill_uninstall", { skill: item.name }, 120);
+              appendLine("bot", r.message || ("已卸载 " + item.name));
+              await loadSkills();
+            } catch (e) {
+              appendLine("err", e.message);
+            }
+          });
+          actions.append(installBtn, uninstallBtn);
+        } else {
+          actions.append(installBtn);
+        }
+        row.append(left, actions);
+        root.append(row);
+      });
+    }
+
+    function renderModels(providers) {
+      const root = $("#modelsList");
+      root.empty();
+      if (!providers || !providers.length) {
+        root.text("未获取到模型列表");
+        return;
+      }
+      providers.forEach(function(p) {
+        root.append($("<div>").addClass("model-provider").text("[" + (p.id || p.ID || "unknown") + "]"));
+        const models = p.models || p.Models || [];
+        models.forEach(function(m, idx) {
+          if (idx >= 20) {
+            root.append($("<div>").text("  ..."));
+            return false;
+          }
+          root.append($("<div>").text("- " + (m.id || m.ID || "")));
+        });
+      });
+    }
+
+    function filterSkills() {
+      const q = $.trim($("#skillSearch").val()).toLowerCase();
+      if (!q) {
+        renderSkills(allSkills);
+        return;
+      }
+      renderSkills(allSkills.filter(function(s) {
+        return (s.name || "").toLowerCase().includes(q) || (s.description || "").toLowerCase().includes(q);
+      }));
+    }
+
+    async function loadSkills() {
+      const data = await proxyRequest("list_skills", {}, 30);
+      allSkills = data.skills || [];
+      filterSkills();
+    }
+
+    async function loadModels() {
+      const data = await proxyRequest("list_models", {}, 30);
+      renderModels(data.providers || []);
+    }
+
+    $(function() {
+      const sid = localStorage.getItem("openbot-ui-session-id") || genId();
+      $("#uiSessionId").val(sid);
+      boundSessionId = sid;
+
+      const keyInUrl = new URLSearchParams(location.search).get("proxy_key") || "";
+      if (keyInUrl) {
+        $("#proxyKey").val(keyInUrl);
+      }
+
+      $(".nav-btn").on("click", function() {
+        const target = $(this).data("target");
+        $(".nav-btn").removeClass("active");
+        $(this).addClass("active");
+        $(".panel").removeClass("active");
+        $("#" + target).addClass("active");
+      });
+
+      $("#connectBtn").on("click", async function() {
+        try {
+          await connectSession();
+          appendReqLog("in", "CONNECT", { session_id: boundSessionId, proxy_key: $.trim($("#proxyKey").val()) });
+          appendLine("bot", "连接成功，后续请求将自动走此 session 绑定的 openbot websocket。");
+          await bootstrapCommands();
+          try {
+            await loadSkills();
+            await loadModels();
+          } catch (_) {
+          }
+        } catch (e) {
+          appendReqLog("err", "CONNECT", e.message);
+          appendLine("err", "连接失败: " + e.message);
+          $("#connectStatus").text("连接失败: " + e.message);
+        }
+      });
+
+      $("#checkKeys").on("click", async function() {
+        try {
+          const data = await $.ajax({ method: "GET", url: "/api/proxy/keys" });
+          appendReqLog("in", "GET /api/proxy/keys", data);
+          appendLine("bot", "在线 keys: " + ((data.keys || []).join(", ") || "<none>"));
+        } catch (e) {
+          appendReqLog("err", "GET /api/proxy/keys", "检查失败");
+          appendLine("err", "检查失败");
+        }
+      });
+
+      $("#exampleSoul").on("click", function() {
+        $("#soul").val("你是资深 Go 架构师助手。回答遵循：1) 先给可执行方案；2) 再给最小改动代码；3) 最后给风险与回滚步骤。默认中文，术语保留英文。");
+      });
+
+      $("#saveSettings").on("click", async function() {
+        try {
+          await proxyRequest("set_model_config", {
+            ui_session_id: boundSessionId,
+            provider_base_url: $.trim($("#providerBaseUrl").val()),
+            api_key: $.trim($("#providerApiKey").val()),
+            model: $.trim($("#providerModel").val())
+          }, 20);
+          await proxyRequest("set_soul", { ui_session_id: boundSessionId, soul: $("#soul").val() }, 20);
+          appendLine("bot", "设置已保存");
+        } catch (e) {
+          appendLine("err", e.message);
+        }
+      });
+
+      $("#loadState").on("click", async function() {
+        try {
+          const state = await proxyRequest("get_state", { ui_session_id: boundSessionId }, 20);
+          $("#providerBaseUrl").val(state.provider_base_url || "");
+          $("#providerApiKey").val(state.api_key || "");
+          $("#providerModel").val(state.model || "");
+          $("#soul").val(state.soul || "");
+          appendLine("bot", "状态已加载，后端会话: " + (state.session_id || "<new>"));
+        } catch (e) {
+          appendLine("err", e.message);
+        }
+      });
+
+      $("#refreshSkills").on("click", async function() {
+        try {
+          await loadSkills();
+          appendLine("bot", "skills 已刷新");
+        } catch (e) {
+          appendLine("err", e.message);
+        }
+      });
+
+      $("#refreshModels").on("click", async function() {
+        try {
+          await loadModels();
+          appendLine("bot", "models 已刷新");
+        } catch (e) {
+          appendLine("err", e.message);
+        }
+      });
+
+      $("#skillSearch").on("input", filterSkills);
+
+      $("#installSkill").on("click", async function() {
+        const name = $.trim($("#skillName").val());
+        if (!name) {
+          appendLine("err", "skill 名称不能为空");
+          return;
+        }
+        try {
+          const r = await proxyRequest("skill_install", { skill: name }, 120);
+          appendMarkdownLine(r.message || ("已安装 " + name));
+          await loadSkills();
+        } catch (e) {
+          appendLine("err", e.message);
+        }
+      });
+
+      $("#uninstallSkill").on("click", async function() {
+        const name = $.trim($("#skillName").val());
+        if (!name) {
+          appendLine("err", "skill 名称不能为空");
+          return;
+        }
+        try {
+          const r = await proxyRequest("skill_uninstall", { skill: name }, 120);
+          appendMarkdownLine(r.message || ("已卸载 " + name));
+          await loadSkills();
+        } catch (e) {
+          appendLine("err", e.message);
+        }
+      });
+
+      $("#sendChat").on("click", async function() {
+        const message = $("#chatInput").val();
+        if (!message || !$.trim(message)) {
+          appendLine("err", "消息不能为空");
+          return;
+        }
+        appendLine("me", message);
+        $("#chatInput").val("");
+        try {
+          const payload = await proxyRequest("chat", { ui_session_id: boundSessionId, message: message }, 120);
+          appendMarkdownLine(payload.reply || payload.message || JSON.stringify(payload));
+        } catch (e) {
+          appendLine("err", e.message);
+        }
+      });
+
+      $("#chatInput").on("keydown", function(e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          $("#sendChat").trigger("click");
+        }
+      });
+    });
+  </script>
+</body>
+</html>
