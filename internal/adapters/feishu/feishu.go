@@ -9,6 +9,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -333,6 +336,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleModel(ctx, target, msg.UserID, content)
 	}
 
+	// Handle /memory command for persistent user memory
+	if strings.HasPrefix(content, "/memory") {
+		return h.handleMemory(ctx, target, msg.UserID, content)
+	}
+
 	// Handle /thinking command to toggle reasoning output
 	if strings.HasPrefix(content, "/thinking") {
 		return h.handleThinking(ctx, target, content)
@@ -578,22 +586,47 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		threadID = msg.MessageID
 	}
 
+	sendContent := msg.Content
+	metadata := map[string]string{
+		"message_id":      msg.MessageID,
+		"message_type":    msg.MessageType,
+		"chat_type":       msg.ChatType,
+		"chat_id":         msg.ChatID,
+		"receive_id":      target.receiveID,
+		"receive_id_type": target.receiveIDType,
+	}
+	if len(msg.MediaFiles) > 0 && (msg.MessageType == "file" || msg.MessageType == "video") {
+		taskSessionID := sessionID
+		if strings.TrimSpace(taskSessionID) == "" {
+			taskSessionID = "new"
+		}
+		mediaCtx := base.MediaTaskContext{
+			Platform:    "feishu",
+			MessageType: msg.MessageType,
+			UserID:      msg.UserID,
+			SessionID:   taskSessionID,
+			MessageID:   msg.MessageID,
+			Files:       msg.MediaFiles,
+		}
+		if mediaMD, mdErr := base.BuildMediaMetadata(mediaCtx); mdErr != nil {
+			log.Printf("feishu: ⚠️ failed to build media metadata: %v", mdErr)
+		} else {
+			for k, v := range mediaMD {
+				metadata[k] = v
+			}
+			sendContent = base.BuildMediaPromptPrefix(mediaCtx) + sendContent
+		}
+	}
+
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:     "feishu",
 		UserID:      msg.UserID,
 		ThreadID:    threadID,
 		SessionID:   sessionID,
-		Content:     msg.Content,
+		Content:     sendContent,
 		Streaming:   true,
 		Attachments: msg.Attachments,
-		Metadata: map[string]string{
-			"message_id":      msg.MessageID,
-			"message_type":    msg.MessageType,
-			"chat_type":       msg.ChatType,
-			"chat_id":         msg.ChatID,
-			"receive_id":      target.receiveID,
-			"receive_id_type": target.receiveIDType,
-		},
+		Metadata:    metadata,
 	}, callback)
 
 	log.Printf("feishu: 🔍 SendMessageStreaming returned - user=%s, err=%v, reply_len=%d, accumulated_len=%d",
@@ -709,7 +742,18 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 		messageType = *event.Event.Message.MessageType
 	}
 
-	content, attachments, err := h.parseFeishuMessageContent(ctx, messageType, *event.Event.Message.Content, messageID)
+	if event.Event.Sender == nil || event.Event.Sender.SenderId == nil || event.Event.Sender.SenderId.OpenId == nil {
+		log.Printf("❌ feishu: 缺少发送者信息")
+		return fmt.Errorf("feishu: missing sender info")
+	}
+	userID := *event.Event.Sender.SenderId.OpenId
+
+	mediaSessionID := "new"
+	if existingSessionID, ok := h.adapter.GetSessionForUser(userID); ok && strings.TrimSpace(existingSessionID) != "" {
+		mediaSessionID = strings.TrimSpace(existingSessionID)
+	}
+
+	content, attachments, mediaFiles, err := h.parseFeishuMessageContent(ctx, messageType, *event.Event.Message.Content, messageID, userID, mediaSessionID)
 	if err != nil {
 		log.Printf("❌ feishu: 解析消息内容失败: %v", err)
 		return fmt.Errorf("feishu: parse content: %w", err)
@@ -722,12 +766,6 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 	if h.debugMode {
 		log.Printf("📝 消息内容: %s", content)
 	}
-
-	if event.Event.Sender == nil || event.Event.Sender.SenderId == nil || event.Event.Sender.SenderId.OpenId == nil {
-		log.Printf("❌ feishu: 缺少发送者信息")
-		return fmt.Errorf("feishu: missing sender info")
-	}
-	userID := *event.Event.Sender.SenderId.OpenId
 
 	chatID := ""
 	if event.Event.Message.ChatId != nil {
@@ -752,6 +790,7 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 		Content:     content,
 		MessageType: messageType,
 		Attachments: attachments,
+		MediaFiles:  mediaFiles,
 	})
 
 	if err != nil {
@@ -1132,24 +1171,63 @@ func extractNLSRecognizedText(raw string) string {
 }
 
 // parseFeishuMessageContent \u6839\u636e\u6d88\u606f\u7c7b\u578b\u89e3\u6790\u98de\u4e66\u6d88\u606f\uff0c\u8fd4\u56de\u6587\u5b57\u5185\u5bb9\u548c\u9644\u4ef6\u5217\u8868\u3002
-func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawContent, messageID string) (string, []opencode.Attachment, error) {
+func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawContent, messageID, userID, sessionID string) (string, []opencode.Attachment, []base.MediaFileRecord, error) {
+	mediaSessionID := strings.TrimSpace(sessionID)
+	if mediaSessionID == "" {
+		mediaSessionID = "new"
+	}
+	saveMediaRecord := func(kind, filename, mime string, data []byte) (*base.MediaFileRecord, error) {
+		now := time.Now().UTC()
+		relDir := base.BuildMediaRelativeDir("feishu", userID, mediaSessionID, now)
+		saved, err := base.SaveTempMedia(
+			base.MediaRootDirFromEnv(),
+			relDir,
+			kind,
+			messageID,
+			filename,
+			mime,
+			data,
+			base.MediaTTLFromEnv(),
+			base.MediaMaxBytesFromEnv(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		record := &base.MediaFileRecord{
+			MessageID:    messageID,
+			UserID:       userID,
+			SessionID:    mediaSessionID,
+			Platform:     "feishu",
+			MsgType:      kind,
+			Filename:     saved.Filename,
+			Mime:         saved.Mime,
+			Size:         saved.Size,
+			SHA256:       saved.SHA256,
+			LocalPath:    saved.LocalPath,
+			RelativePath: saved.RelativePath,
+			CreatedAt:    saved.CreatedAt,
+			ExpireAt:     saved.ExpireAt,
+		}
+		return record, nil
+	}
+
 	switch msgType {
 	case "text":
 		text, err := parseFeishuText(rawContent)
-		return text, nil, err
+		return text, nil, nil, err
 
 	case "image":
 		var img feishuImageContent
 		if err := json.Unmarshal([]byte(rawContent), &img); err != nil || img.ImageKey == "" {
-			return "[图片消息]", nil, nil
+			return "[图片消息]", nil, nil, nil
 		}
 		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, img.ImageKey, "image")
 		if err != nil {
 			log.Printf("feishu: ⚠️ image download failed: %v", err)
-			return "[图片消息]", nil, nil
+			return "[图片消息]", nil, nil, nil
 		}
 		log.Printf("feishu: ✅ image downloaded (mime=%s, len=%d)", mime, len(dataURI))
-		return "[图片消息]", []opencode.Attachment{{Mime: mime, URL: dataURI}}, nil
+		return "[图片消息]", []opencode.Attachment{{Mime: mime, URL: dataURI}}, nil, nil
 
 	case "audio", "voice":
 		var aud feishuAudioContent
@@ -1161,7 +1239,7 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		if err := json.Unmarshal([]byte(rawContent), &aud); err != nil {
 			asrStatus = "parse_failed"
 			log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
-			return "[语音消息]", nil, nil
+			return "[语音消息]", nil, nil, nil
 		}
 		durMs, _ := strconv.Atoi(aud.Duration)
 		durSec := durMs / 1000
@@ -1189,7 +1267,7 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 					asrTextLen = len(text)
 					asrStatus = "ok"
 					log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
-					return fmt.Sprintf("[语音转文字] %s", text), nil, nil
+					return fmt.Sprintf("[语音转文字] %s", text), nil, nil, nil
 				} else {
 					log.Printf("feishu: ⚠️ NLS returned empty text")
 					asrStatus = "empty"
@@ -1201,13 +1279,13 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 
 		log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
 
-		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil
+		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil, nil
 
 	case "video":
 		var vid feishuVideoContent
 		if err := json.Unmarshal([]byte(rawContent), &vid); err != nil {
 			log.Printf("feishu: ⚠️ parse video content failed: %v", err)
-			return "[视频消息]", nil, nil
+			return "[视频消息]", nil, nil, nil
 		}
 
 		durMs, _ := strconv.Atoi(strings.TrimSpace(vid.Duration))
@@ -1218,9 +1296,9 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 
 		if vid.FileKey == "" {
 			if durSec > 0 {
-				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil
+				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil, nil
 			}
-			return "[视频消息]", nil, nil
+			return "[视频消息]", nil, nil, nil
 		}
 
 		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, vid.FileKey, "video")
@@ -1231,28 +1309,81 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		if err != nil {
 			log.Printf("feishu: ⚠️ video download failed: %v", err)
 			if durSec > 0 {
-				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil
+				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil, nil
 			}
-			return "[视频消息]", nil, nil
+			return "[视频消息]", nil, nil, nil
+		}
+
+		videoBytes, videoMime, bytesErr := h.downloadFeishuMediaBytes(ctx, messageID, vid.FileKey, "video")
+		if bytesErr != nil {
+			log.Printf("feishu: ⚠️ video bytes download with type=video failed: %v, retry with type=file", bytesErr)
+			videoBytes, videoMime, bytesErr = h.downloadFeishuMediaBytes(ctx, messageID, vid.FileKey, "file")
+		}
+		var mediaFiles []base.MediaFileRecord
+		if bytesErr != nil {
+			log.Printf("feishu: ⚠️ video temp save skipped, download bytes failed: %v", bytesErr)
+		} else {
+			record, saveErr := saveMediaRecord("video", "feishu_video.mp4", videoMime, videoBytes)
+			if saveErr != nil {
+				log.Printf("feishu: ⚠️ failed to save temp video file: %v", saveErr)
+			} else {
+				mediaFiles = append(mediaFiles, *record)
+				log.Printf("feishu: 🗂️ video temp saved: %s", record.LocalPath)
+			}
 		}
 
 		log.Printf("feishu: ✅ video downloaded (mime=%s, len=%d)", mime, len(dataURI))
 		if durSec > 0 {
-			return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, nil
+			return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, nil
 		}
-		return "[视频消息]", []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, nil
+		return "[视频消息]", []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, nil
+
+	case "file":
+		var fileContent feishuFileContent
+		if err := json.Unmarshal([]byte(rawContent), &fileContent); err != nil {
+			log.Printf("feishu: ⚠️ parse file content failed: %v", err)
+			return "[文件消息]", nil, nil, nil
+		}
+		if strings.TrimSpace(fileContent.FileKey) == "" {
+			return "[文件消息]", nil, nil, nil
+		}
+
+		fileBytes, fileMime, err := h.downloadFeishuMediaBytes(ctx, messageID, fileContent.FileKey, "file")
+		if err != nil {
+			log.Printf("feishu: ⚠️ file download failed: %v", err)
+			if strings.TrimSpace(fileContent.FileName) != "" {
+				return fmt.Sprintf("[文件消息: %s]", strings.TrimSpace(fileContent.FileName)), nil, nil, nil
+			}
+			return "[文件消息]", nil, nil, nil
+		}
+
+		fileName := strings.TrimSpace(fileContent.FileName)
+		if fileName == "" {
+			fileName = "feishu_file.bin"
+		}
+
+		record, saveErr := saveMediaRecord("file", fileName, fileMime, fileBytes)
+		if saveErr != nil {
+			log.Printf("feishu: ⚠️ failed to save temp file: %v", saveErr)
+			if fileName != "" {
+				return fmt.Sprintf("[文件消息: %s]", fileName), nil, nil, nil
+			}
+			return "[文件消息]", nil, nil, nil
+		}
+		log.Printf("feishu: 🗂️ file temp saved: %s", record.LocalPath)
+		return fmt.Sprintf("[文件消息: %s]", fileName), nil, []base.MediaFileRecord{*record}, nil
 
 	case "post":
 		var post feishuPostContent
 		if err := json.Unmarshal([]byte(rawContent), &post); err != nil {
-			return "[图文消息]", nil, nil
+			return "[图文消息]", nil, nil, nil
 		}
 		lang := post.ZhCN
 		if lang == nil {
 			lang = post.EnUS
 		}
 		if lang == nil {
-			return "[图文消息]", nil, nil
+			return "[图文消息]", nil, nil, nil
 		}
 		var textParts []string
 		var attachments []opencode.Attachment
@@ -1287,10 +1418,10 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		if text == "" {
 			text = "[图文消息]"
 		}
-		return text, attachments, nil
+		return text, attachments, nil, nil
 
 	default:
-		return fmt.Sprintf("[%s消息]", msgType), nil, nil
+		return fmt.Sprintf("[%s消息]", msgType), nil, nil, nil
 	}
 }
 
@@ -1411,13 +1542,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		msgType = *envelope.Event.Message.MessageType
 	}
 
-	content, attachments, parseErr := h.parseFeishuMessageContent(r.Context(), msgType, envelope.Event.Message.Content,
+	messageID := ""
+	if envelope.Event.Message.MessageID != nil {
+		messageID = *envelope.Event.Message.MessageID
+	}
+
+	userID := strings.TrimSpace(envelope.Event.Sender.SenderID.OpenID)
+	if userID == "" {
+		http.Error(w, "missing sender", http.StatusBadRequest)
+		return
+	}
+
+	mediaSessionID := "new"
+	if existingSessionID, ok := h.adapter.GetSessionForUser(userID); ok && strings.TrimSpace(existingSessionID) != "" {
+		mediaSessionID = strings.TrimSpace(existingSessionID)
+	}
+
+	content, attachments, mediaFiles, parseErr := h.parseFeishuMessageContent(r.Context(), msgType, envelope.Event.Message.Content,
 		func() string {
-			if envelope.Event.Message.MessageID != nil {
-				return *envelope.Event.Message.MessageID
-			}
-			return ""
-		}())
+			return messageID
+		}(), userID, mediaSessionID)
 	if parseErr != nil {
 		http.Error(w, "invalid content", http.StatusBadRequest)
 		return
@@ -1427,10 +1571,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	messageID := ""
-	if envelope.Event.Message.MessageID != nil {
-		messageID = *envelope.Event.Message.MessageID
-	}
 	if messageID != "" && !h.shouldProcessMessage(messageID) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -1442,13 +1582,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reply, err := h.handleIncomingMessage(r.Context(), incomingMessage{
-		UserID:      envelope.Event.Sender.SenderID.OpenID,
+		UserID:      userID,
 		ChatID:      envelope.Event.Message.ChatID,
 		ChatType:    chatType,
 		MessageID:   messageID,
 		Content:     content,
 		MessageType: msgType,
 		Attachments: attachments,
+		MediaFiles:  mediaFiles,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("forward failed: %v", err), http.StatusBadGateway)
@@ -1514,6 +1655,14 @@ type feishuVideoContent struct {
 	Duration string `json:"duration"` // 毫秒
 }
 
+// feishuFileContent 文件消息
+type feishuFileContent struct {
+	FileKey  string `json:"file_key"`
+	FileName string `json:"file_name"`
+	FileType string `json:"file_type"`
+	FileSize string `json:"file_size"`
+}
+
 // feishuPostContent 富文本消息（图文混排）
 type feishuPostContent struct {
 	ZhCN *feishuPostLang `json:"zh_cn"`
@@ -1545,6 +1694,7 @@ type incomingMessage struct {
 	Content     string
 	MessageType string
 	Attachments []opencode.Attachment // 图片/音频等附件
+	MediaFiles  []base.MediaFileRecord
 }
 
 func parseFeishuText(raw string) (string, error) {
@@ -1652,14 +1802,26 @@ func (h *Handler) handleListSkills(ctx context.Context, target chatTarget) (stri
 		return "", err
 	}
 
+	customSkills := listCustomSkillsForDisplay(h.client.Directory())
+
 	// Build response message
 	var reply strings.Builder
-	reply.WriteString("📋 可用的 Skills/Agents:\n\n")
+	reply.WriteString("📋 可用的 Skills:\n\n")
+
+	if len(customSkills) > 0 {
+		reply.WriteString("🧩 自定义 Skills（与 TUI /skills 一致）：\n")
+		for i, item := range customSkills {
+			reply.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, item.Name, item.Source))
+		}
+		reply.WriteString("\n")
+	}
 
 	if len(agents) == 0 {
-		reply.WriteString("暂无可用的 agent。\n")
-		reply.WriteString("请在 OpenCode 工作目录创建 AGENTS.md 文件定义 agents。")
+		if len(customSkills) == 0 {
+			reply.WriteString("暂无可用 skills。\n")
+		}
 	} else {
+		reply.WriteString("🤖 内置 Agents：\n")
 		for i, agent := range agents {
 			reply.WriteString(fmt.Sprintf("%d. **%s**", i+1, agent.Name))
 			if agent.Description != "" {
@@ -1671,13 +1833,75 @@ func (h *Handler) handleListSkills(ctx context.Context, target chatTarget) (stri
 			}
 			reply.WriteString("\n\n")
 		}
-		reply.WriteString("💡 使用方法: @agent_name 你的消息\n")
-		reply.WriteString("例如: @build 帮我编译项目")
+	}
+
+	reply.WriteString("💡 使用方法: @agent_name 你的消息\n")
+	reply.WriteString("例如: @build 帮我编译项目")
+	if len(customSkills) > 0 {
+		reply.WriteString("\n\n📁 自定义 skills 目录: ~/.config/opencode/skills")
 	}
 
 	// Reply to user
 	_ = h.sendTextChunks(ctx, target, reply.String())
 	return "handled", nil
+}
+
+type customSkillItem struct {
+	Name   string
+	Source string
+}
+
+func listCustomSkillsForDisplay(baseDir string) []customSkillItem {
+	seen := map[string]bool{}
+	out := []customSkillItem{}
+	dirs := []string{
+		filepath.Join(resolveOpenCodeDirectory(baseDir), ".opencode", "skills"),
+		filepath.Join(getHomeDirSafe(), ".config", "opencode", "skills"),
+	}
+	for i, dir := range dirs {
+		source := "project"
+		if i == 1 {
+			source = "global"
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, customSkillItem{Name: name, Source: source})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func resolveOpenCodeDirectory(baseDir string) string {
+	d := strings.TrimSpace(baseDir)
+	if d == "" {
+		d = "."
+	}
+	if abs, err := filepath.Abs(d); err == nil {
+		return abs
+	}
+	return d
+}
+
+func getHomeDirSafe() string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // handleHelp handles help command
@@ -1708,6 +1932,16 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 🤖 模型配置：
 /model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
+/memory - 查看已记录的长期记忆
+/memory pin <内容> - 固定一条高优先级记忆
+/memory pin <category> <内容> - 按分类固定记忆
+/memory unpin <关键词> - 按关键词删除记忆
+/memory unpin #<序号> - 按列表序号删除记忆
+/memory export - 导出当前用户记忆快照
+/memory import <base64> - 导入记忆快照（覆盖）
+/memory merge-import <base64> - 合并导入记忆快照（不覆盖）
+/memory clear - 清空当前用户记忆
+/memory compact - 压缩去重当前用户记忆
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -1772,6 +2006,159 @@ func (h *Handler) handleThinking(ctx context.Context, target chatTarget, content
 		_ = h.sendTextChunks(ctx, target, msg)
 		return "handled", nil
 	}
+}
+
+func (h *Handler) handleMemory(ctx context.Context, target chatTarget, userID, content string) (string, error) {
+	normalizeCategory := func(raw string) string {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "profile", "preference", "project", "environment", "model", "conversation":
+			return strings.ToLower(strings.TrimSpace(raw))
+		default:
+			return "preference"
+		}
+	}
+
+	parts := strings.Fields(strings.TrimSpace(content))
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
+		limit := 10
+		if len(parts) >= 3 {
+			if strings.EqualFold(parts[2], "all") {
+				limit = 0
+			} else if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		facts := h.client.ListUserMemory("feishu", userID, limit)
+		if len(facts) == 0 {
+			_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有已记录的长期记忆")
+			return "handled", nil
+		}
+		var b strings.Builder
+		b.WriteString("🧠 长期记忆（Top 10）\n")
+		for i, f := range facts {
+			b.WriteString(fmt.Sprintf("%d. [%s][P%d] %s\n", i+1, f.Category, f.Importance, f.Text))
+		}
+		_ = h.sendTextChunks(ctx, target, b.String())
+		return "handled", nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "clear") {
+		if err := h.client.ClearUserMemory("feishu", userID); err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 清空 memory 失败: "+err.Error())
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, "✅ 已清空当前用户长期记忆")
+		return "handled", nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "compact") {
+		removed, err := h.client.CompactUserMemory("feishu", userID)
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 压缩 memory 失败: "+err.Error())
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ memory 压缩完成，移除 %d 条冗余记录", removed))
+		return "handled", nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "pin") {
+		category := "preference"
+		text := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if len(parts) >= 4 {
+			candidate := normalizeCategory(parts[2])
+			if candidate == strings.ToLower(strings.TrimSpace(parts[2])) {
+				category = candidate
+				text = strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+			}
+		}
+		if text == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory pin <内容> 或 /memory pin <category> <内容>")
+			return "handled", nil
+		}
+		if err := h.client.PinUserMemory("feishu", userID, text, category); err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 固定 memory 失败: "+err.Error())
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, "✅ 已固定高优先级记忆（category="+category+"）")
+		return "handled", nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "unpin") {
+		keyword := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if keyword == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory unpin <关键词>")
+			return "handled", nil
+		}
+		if strings.HasPrefix(keyword, "#") {
+			rawRank := strings.TrimPrefix(keyword, "#")
+			rank, convErr := strconv.Atoi(rawRank)
+			if convErr != nil || rank <= 0 {
+				_ = h.sendTextChunks(ctx, target, "❌ 序号格式错误，用法: /memory unpin #<序号>")
+				return "handled", nil
+			}
+			ok, err := h.client.RemoveUserMemoryByRank("feishu", userID, rank)
+			if err != nil {
+				_ = h.sendTextChunks(ctx, target, "❌ 删除 memory 失败: "+err.Error())
+				return "handled", nil
+			}
+			if ok {
+				_ = h.sendTextChunks(ctx, target, "✅ 已按序号删除记忆")
+			} else {
+				_ = h.sendTextChunks(ctx, target, "ℹ️ 未找到对应序号记忆")
+			}
+			return "handled", nil
+		}
+		removed, err := h.client.UnpinUserMemory("feishu", userID, keyword)
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 删除 memory 失败: "+err.Error())
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ 已删除 %d 条匹配记忆", removed))
+		return "handled", nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "export") {
+		snapshot, err := h.client.ExportUserMemory("feishu", userID)
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 导出 memory 失败: "+err.Error())
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, "📦 memory 导出（base64）:\n"+snapshot)
+		return "handled", nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "import") {
+		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if payload == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory import <base64>")
+			return "handled", nil
+		}
+		count, err := h.client.ImportUserMemory("feishu", userID, payload)
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 导入 memory 失败: "+err.Error())
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ memory 导入完成，共 %d 条", count))
+		return "handled", nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "merge-import") {
+		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if payload == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory merge-import <base64>")
+			return "handled", nil
+		}
+		count, err := h.client.MergeImportUserMemory("feishu", userID, payload)
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 合并导入 memory 失败: "+err.Error())
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ memory 合并导入完成，共 %d 条", count))
+		return "handled", nil
+	}
+
+	_ = h.sendTextChunks(ctx, target, "❌ 命令格式错误\n\n用法:\n/memory\n/memory show [all|N]\n/memory pin <内容>\n/memory pin <category> <内容>\n/memory unpin <关键词>\n/memory unpin #<序号>\n/memory export\n/memory import <base64>\n/memory merge-import <base64>\n/memory clear\n/memory compact\n\ncategory: profile|preference|project|environment|model|conversation")
+	return "handled", nil
 }
 
 // handleFinal 处理最终输出模式开关命令（全局）

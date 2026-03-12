@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,6 +94,10 @@ type StreamCallback func(chunk string) error
 
 // EventHandler defines a callback for incoming OpenCode events.
 type EventHandler func(ctx context.Context, event *opencode.EventListResponse) error
+
+// ServerUnavailableHandler is invoked when OpenCode server is unreachable.
+// Typical use is to ensure `opencode serve` is running.
+type ServerUnavailableHandler func(ctx context.Context, reason string) (string, error)
 
 // ModelConfig 存储模型配置信息
 type ModelConfig struct {
@@ -233,13 +238,44 @@ type Client struct {
 	enableSkillHint   bool          // 是否在消息中添加skill提示
 	skillHintCache    []string      // 缓存的可用skill列表
 	skillCacheMu      sync.RWMutex
+	memoryEnabled     bool
+	memoryDir         string
+	memoryMaxChars    int
+	memoryMaxFacts    int
+	memoryInjectFacts int
+	memoryMu          sync.Mutex
 	lastHealthCheck   time.Time    // 最后一次健康检查时间
 	isHealthy         bool         // OpenCode server是否健康
 	healthCheckMu     sync.RWMutex // 保护健康状态
 	thinkingEnabled   atomic.Bool  // 是否输出 reasoning/thinking 内容
 	finalOnlyEnabled  atomic.Bool  // 是否仅在结束时发送最终回复
 	stepEnabled       atomic.Bool  // 是否显示 step-start/step-finish 中间步骤
+	serverUnavailable ServerUnavailableHandler
+	unavailableMu     sync.Mutex
+	lastUnavailableAt time.Time
+	unavailableDelay  time.Duration
+}
 
+type memoryFact struct {
+	Text       string    `json:"text"`
+	Category   string    `json:"category"`
+	Importance int       `json:"importance"`
+	LastSeen   time.Time `json:"last_seen"`
+	Count      int       `json:"count"`
+}
+
+type userMemoryStore struct {
+	Version int          `json:"version"`
+	Facts   []memoryFact `json:"facts"`
+}
+
+// MemoryFactView is a safe exported view used by adapters.
+type MemoryFactView struct {
+	Text       string
+	Category   string
+	Importance int
+	LastSeen   time.Time
+	Count      int
 }
 
 // Option mutates a client during construction.
@@ -250,6 +286,11 @@ func WithDirectory(dir string) Option {
 	return func(c *Client) {
 		c.directory = dir
 	}
+}
+
+// Directory returns the current working directory context used by OpenCode APIs.
+func (c *Client) Directory() string {
+	return strings.TrimSpace(c.directory)
 }
 
 // WithTimeout sets the default timeout for OpenCode operations.
@@ -284,6 +325,14 @@ func WithSkillHint(enable bool) Option {
 func WithDebugMediaRouting(enable bool) Option {
 	return func(c *Client) {
 		c.debugMediaRouting = enable
+	}
+}
+
+// WithServerUnavailableHandler installs a self-healing hook used when the
+// OpenCode server is unreachable (for example connection refused on /event).
+func WithServerUnavailableHandler(handler ServerUnavailableHandler) Option {
+	return func(c *Client) {
+		c.serverUnavailable = handler
 	}
 }
 
@@ -356,8 +405,32 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 		enableSkillHint:   false, // 默认禁用skill提示
 		debugMediaRouting: parseEnvBool("OPENBOT_DEBUG_MEDIA_ROUTING"),
 		modelCatalog:      make(map[string]*ModelCapability),
+		memoryEnabled:     parseEnvBool("OPENCODE_GATEWAY_MEMORY_ENABLED"),
+		memoryDir:         strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_DIR")),
+		memoryMaxChars:    4000,
+		memoryMaxFacts:    40,
+		memoryInjectFacts: 8,
 		isHealthy:         false,       // 初始状态未知
 		lastHealthCheck:   time.Time{}, // 未检查过
+		unavailableDelay:  20 * time.Second,
+	}
+	if client.memoryDir == "" {
+		client.memoryDir = filepath.Join(client.directory, ".opencode-gateway-memory")
+	}
+	if rawMax := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_MAX_CHARS")); rawMax != "" {
+		if parsed, err := strconv.Atoi(rawMax); err == nil && parsed > 0 {
+			client.memoryMaxChars = parsed
+		}
+	}
+	if rawMaxFacts := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_MAX_FACTS")); rawMaxFacts != "" {
+		if parsed, err := strconv.Atoi(rawMaxFacts); err == nil && parsed > 0 {
+			client.memoryMaxFacts = parsed
+		}
+	}
+	if rawInjectFacts := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_INJECT_FACTS")); rawInjectFacts != "" {
+		if parsed, err := strconv.Atoi(rawInjectFacts); err == nil && parsed > 0 {
+			client.memoryInjectFacts = parsed
+		}
 	}
 
 	for _, opt := range opts {
@@ -466,6 +539,7 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	if err != nil {
 		c.isHealthy = false
 		c.healthCheckMu.Unlock()
+		c.maybeHandleServerUnavailable(context.Background(), err, "health-check")
 		return c.formatHealthCheckError(err)
 	}
 	c.isHealthy = true
@@ -520,6 +594,14 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
+	}
+	originalContent := payload.Content
+
+	if c.memoryEnabled {
+		if memory := c.renderUserMemoryForPrompt(payload.Channel, payload.UserID); memory != "" {
+			payload.Content = fmt.Sprintf("[用户长期记忆]\n%s\n\n[用户当前消息]\n%s", memory, originalContent)
+			log.Printf("opencode: injected user memory for %s/%s (%d chars)", payload.Channel, payload.UserID, len(memory))
+		}
 	}
 
 	// ========== 健康检查：确保OpenCode server已启动 ==========
@@ -860,10 +942,604 @@ sendMessage:
 		Trace:     sessionID,
 	}
 
+	if c.memoryEnabled {
+		c.updateUserMemory(payload.Channel, payload.UserID, originalContent, reply)
+	}
+
 	// ========== 缓存成功响应用于去重 ==========
 	c.completeRequest(requestHash, response)
 
 	return response, nil
+}
+
+func (c *Client) memoryFilePath(channel, userID string) string {
+	channel = sanitizeMemoryKey(channel)
+	userID = sanitizeMemoryKey(userID)
+	if channel == "" {
+		channel = "unknown"
+	}
+	if userID == "" {
+		userID = "unknown"
+	}
+	return filepath.Join(c.memoryDir, channel+"__"+userID+".json")
+}
+
+func sanitizeMemoryKey(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range input {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+func (c *Client) loadUserMemoryStore(channel, userID string) userMemoryStore {
+	path := c.memoryFilePath(channel, userID)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return userMemoryStore{Version: 1, Facts: []memoryFact{}}
+	}
+	raw := strings.TrimSpace(string(b))
+	if raw == "" {
+		return userMemoryStore{Version: 1, Facts: []memoryFact{}}
+	}
+
+	var store userMemoryStore
+	if err := json.Unmarshal([]byte(raw), &store); err == nil {
+		if store.Version == 0 {
+			store.Version = 1
+		}
+		return store
+	}
+
+	// Backward compatibility: old plain text memory file.
+	return userMemoryStore{
+		Version: 1,
+		Facts: []memoryFact{{
+			Text:       raw,
+			Category:   "conversation",
+			Importance: 1,
+			LastSeen:   time.Now(),
+			Count:      1,
+		}},
+	}
+}
+
+func (c *Client) renderUserMemoryForPrompt(channel, userID string) string {
+	store := c.loadUserMemoryStore(channel, userID)
+	if len(store.Facts) == 0 {
+		return ""
+	}
+
+	facts := append([]memoryFact(nil), store.Facts...)
+	sort.Slice(facts, func(i, j int) bool {
+		if facts[i].Importance != facts[j].Importance {
+			return facts[i].Importance > facts[j].Importance
+		}
+		if !facts[i].LastSeen.Equal(facts[j].LastSeen) {
+			return facts[i].LastSeen.After(facts[j].LastSeen)
+		}
+		return facts[i].Count > facts[j].Count
+	})
+
+	limit := c.memoryInjectFacts
+	if limit <= 0 {
+		limit = 8
+	}
+	if limit > len(facts) {
+		limit = len(facts)
+	}
+
+	items := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		items = append(items, fmt.Sprintf("- [%s] %s", facts[i].Category, facts[i].Text))
+	}
+	prompt := strings.Join(items, "\n")
+	runes := []rune(prompt)
+	if len(runes) > c.memoryMaxChars {
+		prompt = string(runes[:c.memoryMaxChars])
+	}
+	return prompt
+}
+
+func (c *Client) updateUserMemory(channel, userID, userMessage, assistantReply string) {
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+
+	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
+		log.Printf("opencode: create memory dir failed: %v", err)
+		return
+	}
+
+	path := c.memoryFilePath(channel, userID)
+	store := c.loadUserMemoryStore(channel, userID)
+	candidates := extractMemoryCandidates(userMessage, assistantReply)
+	if len(candidates) == 0 {
+		return
+	}
+
+	for _, cand := range candidates {
+		merged := false
+		for i := range store.Facts {
+			if normalizeMemoryText(store.Facts[i].Text) == normalizeMemoryText(cand.Text) {
+				store.Facts[i].LastSeen = time.Now()
+				store.Facts[i].Count++
+				if cand.Importance > store.Facts[i].Importance {
+					store.Facts[i].Importance = cand.Importance
+				}
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			cand.LastSeen = time.Now()
+			cand.Count = 1
+			store.Facts = append(store.Facts, cand)
+		}
+	}
+
+	sort.Slice(store.Facts, func(i, j int) bool {
+		if store.Facts[i].Importance != store.Facts[j].Importance {
+			return store.Facts[i].Importance > store.Facts[j].Importance
+		}
+		if !store.Facts[i].LastSeen.Equal(store.Facts[j].LastSeen) {
+			return store.Facts[i].LastSeen.After(store.Facts[j].LastSeen)
+		}
+		return store.Facts[i].Count > store.Facts[j].Count
+	})
+
+	if c.memoryMaxFacts > 0 && len(store.Facts) > c.memoryMaxFacts {
+		store.Facts = store.Facts[:c.memoryMaxFacts]
+	}
+
+	encoded, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		log.Printf("opencode: marshal memory failed: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(path, encoded, 0o644); err != nil {
+		log.Printf("opencode: write memory failed: %v", err)
+	}
+}
+
+// ListUserMemory returns top memory facts sorted by priority.
+func (c *Client) ListUserMemory(channel, userID string, limit int) []MemoryFactView {
+	store := c.loadUserMemoryStore(channel, userID)
+	if len(store.Facts) == 0 {
+		return nil
+	}
+
+	facts := c.sortedMemoryFacts(store.Facts)
+
+	if limit <= 0 || limit > len(facts) {
+		limit = len(facts)
+	}
+	out := make([]MemoryFactView, 0, limit)
+	for i := 0; i < limit; i++ {
+		out = append(out, MemoryFactView{
+			Text:       facts[i].Text,
+			Category:   facts[i].Category,
+			Importance: facts[i].Importance,
+			LastSeen:   facts[i].LastSeen,
+			Count:      facts[i].Count,
+		})
+	}
+	return out
+}
+
+// ExportUserMemory returns base64-encoded JSON snapshot for backup/migration.
+func (c *Client) ExportUserMemory(channel, userID string) (string, error) {
+	store := c.loadUserMemoryStore(channel, userID)
+	encoded, err := json.Marshal(store)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(encoded), nil
+}
+
+// ImportUserMemory imports a base64 JSON snapshot and replaces existing memory.
+func (c *Client) ImportUserMemory(channel, userID, payload string) (int, error) {
+	store, err := parseImportMemoryStore(payload)
+	if err != nil {
+		return 0, err
+	}
+
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
+		return 0, err
+	}
+	if err := c.saveMemoryStore(channel, userID, store); err != nil {
+		return 0, err
+	}
+	return len(store.Facts), nil
+}
+
+// MergeImportUserMemory imports snapshot and merges with existing facts (dedupe + priority keep).
+func (c *Client) MergeImportUserMemory(channel, userID, payload string) (int, error) {
+	incoming, err := parseImportMemoryStore(payload)
+	if err != nil {
+		return 0, err
+	}
+
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
+		return 0, err
+	}
+
+	existing := c.loadUserMemoryStore(channel, userID)
+	merged := map[string]memoryFact{}
+	for _, f := range existing.Facts {
+		key := normalizeMemoryText(f.Text)
+		merged[key] = f
+	}
+	for _, f := range incoming.Facts {
+		key := normalizeMemoryText(f.Text)
+		if cur, ok := merged[key]; ok {
+			if f.Importance > cur.Importance {
+				cur.Importance = f.Importance
+				cur.Category = f.Category
+			}
+			if f.LastSeen.After(cur.LastSeen) {
+				cur.LastSeen = f.LastSeen
+			}
+			cur.Count += f.Count
+			merged[key] = cur
+			continue
+		}
+		merged[key] = f
+	}
+
+	facts := make([]memoryFact, 0, len(merged))
+	for _, f := range merged {
+		facts = append(facts, f)
+	}
+	existing.Facts = facts
+	if err := c.saveMemoryStore(channel, userID, existing); err != nil {
+		return 0, err
+	}
+	return len(existing.Facts), nil
+}
+
+// ClearUserMemory deletes persisted memory for the user.
+func (c *Client) ClearUserMemory(channel, userID string) error {
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+	path := c.memoryFilePath(channel, userID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// PinUserMemory stores a high-priority explicit memory fact.
+func (c *Client) PinUserMemory(channel, userID, text, category string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("memory text is empty")
+	}
+	category = normalizeMemoryCategory(category)
+
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
+		return err
+	}
+
+	store := c.loadUserMemoryStore(channel, userID)
+	norm := normalizeMemoryText(text)
+	for i := range store.Facts {
+		if normalizeMemoryText(store.Facts[i].Text) == norm {
+			store.Facts[i].Category = category
+			store.Facts[i].Importance = 5
+			store.Facts[i].LastSeen = time.Now()
+			store.Facts[i].Count++
+			return c.saveMemoryStore(channel, userID, store)
+		}
+	}
+
+	store.Facts = append(store.Facts, memoryFact{
+		Text:       text,
+		Category:   category,
+		Importance: 5,
+		LastSeen:   time.Now(),
+		Count:      1,
+	})
+	return c.saveMemoryStore(channel, userID, store)
+}
+
+// UnpinUserMemory removes memory facts containing the keyword.
+func (c *Client) UnpinUserMemory(channel, userID, keyword string) (int, error) {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return 0, fmt.Errorf("memory keyword is empty")
+	}
+
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+	store := c.loadUserMemoryStore(channel, userID)
+	if len(store.Facts) == 0 {
+		return 0, nil
+	}
+
+	norm := normalizeMemoryText(keyword)
+	filtered := make([]memoryFact, 0, len(store.Facts))
+	removed := 0
+	for _, f := range store.Facts {
+		if strings.Contains(normalizeMemoryText(f.Text), norm) {
+			removed++
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+
+	if removed == 0 {
+		return 0, nil
+	}
+	store.Facts = filtered
+	if err := c.saveMemoryStore(channel, userID, store); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+// RemoveUserMemoryByRank removes an entry by its display rank (1-based from /memory show order).
+func (c *Client) RemoveUserMemoryByRank(channel, userID string, rank int) (bool, error) {
+	if rank <= 0 {
+		return false, fmt.Errorf("rank must be >= 1")
+	}
+
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+	store := c.loadUserMemoryStore(channel, userID)
+	if len(store.Facts) == 0 {
+		return false, nil
+	}
+
+	sorted := c.sortedMemoryFacts(store.Facts)
+	if rank > len(sorted) {
+		return false, nil
+	}
+	target := normalizeMemoryText(sorted[rank-1].Text)
+
+	filtered := make([]memoryFact, 0, len(store.Facts))
+	removed := false
+	for _, f := range store.Facts {
+		if !removed && normalizeMemoryText(f.Text) == target {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	if !removed {
+		return false, nil
+	}
+	store.Facts = filtered
+	if err := c.saveMemoryStore(channel, userID, store); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CompactUserMemory deduplicates and trims lower-value memory entries.
+func (c *Client) CompactUserMemory(channel, userID string) (int, error) {
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+	store := c.loadUserMemoryStore(channel, userID)
+	if len(store.Facts) == 0 {
+		return 0, nil
+	}
+
+	merged := map[string]memoryFact{}
+	for _, f := range store.Facts {
+		key := normalizeMemoryText(f.Text)
+		existing, ok := merged[key]
+		if !ok {
+			merged[key] = f
+			continue
+		}
+		if f.Importance > existing.Importance {
+			existing.Importance = f.Importance
+			existing.Category = f.Category
+		}
+		if f.LastSeen.After(existing.LastSeen) {
+			existing.LastSeen = f.LastSeen
+		}
+		existing.Count += f.Count
+		merged[key] = existing
+	}
+
+	facts := make([]memoryFact, 0, len(merged))
+	for _, v := range merged {
+		facts = append(facts, v)
+	}
+
+	sort.Slice(facts, func(i, j int) bool {
+		if facts[i].Importance != facts[j].Importance {
+			return facts[i].Importance > facts[j].Importance
+		}
+		if !facts[i].LastSeen.Equal(facts[j].LastSeen) {
+			return facts[i].LastSeen.After(facts[j].LastSeen)
+		}
+		return facts[i].Count > facts[j].Count
+	})
+
+	if c.memoryMaxFacts > 0 && len(facts) > c.memoryMaxFacts {
+		facts = facts[:c.memoryMaxFacts]
+	}
+	removed := len(store.Facts) - len(facts)
+	store.Facts = facts
+	if err := c.saveMemoryStore(channel, userID, store); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+func (c *Client) saveMemoryStore(channel, userID string, store userMemoryStore) error {
+	path := c.memoryFilePath(channel, userID)
+	sort.Slice(store.Facts, func(i, j int) bool {
+		if store.Facts[i].Importance != store.Facts[j].Importance {
+			return store.Facts[i].Importance > store.Facts[j].Importance
+		}
+		if !store.Facts[i].LastSeen.Equal(store.Facts[j].LastSeen) {
+			return store.Facts[i].LastSeen.After(store.Facts[j].LastSeen)
+		}
+		return store.Facts[i].Count > store.Facts[j].Count
+	})
+	if c.memoryMaxFacts > 0 && len(store.Facts) > c.memoryMaxFacts {
+		store.Facts = store.Facts[:c.memoryMaxFacts]
+	}
+	encoded, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, encoded, 0o644)
+}
+
+func (c *Client) sortedMemoryFacts(facts []memoryFact) []memoryFact {
+	out := append([]memoryFact(nil), facts...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Importance != out[j].Importance {
+			return out[i].Importance > out[j].Importance
+		}
+		if !out[i].LastSeen.Equal(out[j].LastSeen) {
+			return out[i].LastSeen.After(out[j].LastSeen)
+		}
+		return out[i].Count > out[j].Count
+	})
+	return out
+}
+
+func normalizeMemoryText(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "")
+	return s
+}
+
+func parseImportMemoryStore(payload string) (userMemoryStore, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return userMemoryStore{}, fmt.Errorf("memory import payload is empty")
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		// Allow raw JSON payload as fallback.
+		raw = []byte(payload)
+	}
+
+	var store userMemoryStore
+	if err := json.Unmarshal(raw, &store); err != nil {
+		return userMemoryStore{}, fmt.Errorf("invalid memory payload: %w", err)
+	}
+	if store.Version == 0 {
+		store.Version = 1
+	}
+
+	now := time.Now()
+	for i := range store.Facts {
+		store.Facts[i].Category = normalizeMemoryCategory(store.Facts[i].Category)
+		if store.Facts[i].Importance <= 0 {
+			store.Facts[i].Importance = 1
+		}
+		if store.Facts[i].LastSeen.IsZero() {
+			store.Facts[i].LastSeen = now
+		}
+		if store.Facts[i].Count <= 0 {
+			store.Facts[i].Count = 1
+		}
+		store.Facts[i].Text = strings.TrimSpace(store.Facts[i].Text)
+	}
+	return store, nil
+}
+
+func normalizeMemoryCategory(category string) string {
+	v := strings.ToLower(strings.TrimSpace(category))
+	switch v {
+	case "profile", "preference", "project", "environment", "model", "conversation":
+		return v
+	default:
+		return "preference"
+	}
+}
+
+func extractMemoryCandidates(userMessage, assistantReply string) []memoryFact {
+	_ = assistantReply
+	msg := strings.TrimSpace(userMessage)
+	if msg == "" {
+		return nil
+	}
+
+	separators := []string{"\n", "。", ".", "；", ";", "!", "！", "?", "？"}
+	parts := []string{msg}
+	for _, sep := range separators {
+		next := make([]string, 0, len(parts))
+		for _, p := range parts {
+			next = append(next, strings.Split(p, sep)...)
+		}
+		parts = next
+	}
+
+	facts := make([]memoryFact, 0)
+	for _, p := range parts {
+		text := strings.TrimSpace(p)
+		if text == "" {
+			continue
+		}
+		runes := []rune(text)
+		if len(runes) < 4 || len(runes) > 140 {
+			continue
+		}
+
+		cat, importance := classifyMemoryFact(text)
+		if importance <= 0 {
+			continue
+		}
+		facts = append(facts, memoryFact{
+			Text:       text,
+			Category:   cat,
+			Importance: importance,
+		})
+	}
+
+	if len(facts) > 12 {
+		facts = facts[:12]
+	}
+	return facts
+}
+
+func classifyMemoryFact(text string) (string, int) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	if strings.HasPrefix(lower, "/model ") {
+		return "model", 5
+	}
+	if strings.HasPrefix(lower, "/provider ") {
+		return "environment", 5
+	}
+	if strings.Contains(lower, "记住") || strings.Contains(lower, "以后") || strings.Contains(lower, "请用") || strings.Contains(lower, "必须") || strings.Contains(lower, "不要") {
+		return "preference", 4
+	}
+	if strings.Contains(lower, "我叫") || strings.Contains(lower, "叫我") || strings.Contains(lower, "我的") || strings.Contains(lower, "我是") {
+		return "profile", 3
+	}
+	if strings.Contains(lower, "项目") || strings.Contains(lower, "仓库") || strings.Contains(lower, "服务") || strings.Contains(lower, "端口") || strings.Contains(lower, "环境") {
+		return "project", 3
+	}
+	if strings.Contains(lower, "喜欢") || strings.Contains(lower, "不喜欢") || strings.Contains(lower, "偏好") || strings.Contains(lower, "习惯") {
+		return "preference", 3
+	}
+
+	return "conversation", 1
 }
 
 // GetSession retrieves session details.
@@ -1230,12 +1906,6 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 		log.Printf("opencode: creating event stream...")
 		stream := c.sdk.Event.ListStreaming(ctx, opencode.EventListParams{})
 
-		// 清除旧的 session 缓存（server 重启后 session 可能失效）
-		if consecutiveFailures > 0 {
-			log.Printf("opencode: 🔄 server reconnected after %d failures, invalidating stale session cache", consecutiveFailures)
-			c.invalidateStaleSessions(ctx)
-		}
-
 		eventCount := 0
 		connected := false
 
@@ -1249,6 +1919,8 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 			if !connected {
 				connected = true
 				if consecutiveFailures > 0 {
+					log.Printf("opencode: 🔄 server reconnected after %d failures, invalidating stale session cache", consecutiveFailures)
+					c.invalidateStaleSessions(ctx)
 					log.Printf("opencode: ✅ event listener reconnected successfully after %d failures", consecutiveFailures)
 				}
 				consecutiveFailures = 0
@@ -1415,6 +2087,7 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 
 		if err := stream.Err(); err != nil {
 			log.Printf("opencode: event stream error: %v", err)
+			c.maybeHandleServerUnavailable(ctx, err, "event-stream")
 		}
 
 		// 检查是否是主动退出
@@ -1428,6 +2101,41 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 			log.Printf("opencode: ⚠️ event stream disconnected unexpectedly, will reconnect...")
 		}
 	}
+}
+
+func (c *Client) maybeHandleServerUnavailable(ctx context.Context, err error, source string) {
+	if c.serverUnavailable == nil || err == nil {
+		return
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "connection refused") &&
+		!strings.Contains(msg, "no such host") &&
+		!strings.Contains(msg, "dial tcp") &&
+		!strings.Contains(msg, "connect:") {
+		return
+	}
+
+	c.unavailableMu.Lock()
+	if !c.lastUnavailableAt.IsZero() && time.Since(c.lastUnavailableAt) < c.unavailableDelay {
+		c.unavailableMu.Unlock()
+		return
+	}
+	c.lastUnavailableAt = time.Now()
+	c.unavailableMu.Unlock()
+
+	reason := fmt.Sprintf("%s unavailable: %v", source, err)
+	go func() {
+		actionCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		msg, actionErr := c.serverUnavailable(actionCtx, reason)
+		if actionErr != nil {
+			log.Printf("opencode: self-heal action failed (%s): %v", source, actionErr)
+			return
+		}
+		if strings.TrimSpace(msg) != "" {
+			log.Printf("opencode: self-heal action: %s", msg)
+		}
+	}()
 }
 
 // invalidateStaleSessions 清除可能失效的 session 缓存

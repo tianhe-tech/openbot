@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SkillsHub</title>
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <style>
+    :root {
+      --bg: #f7f3e9;
+      --card: #fff;
+      --ink: #221d15;
+      --sub: #615645;
+      --line: #d9ccb7;
+      --accent: #0f766e;
+      --danger: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: linear-gradient(150deg, #f8f5ee, #f2e8d6 52%, #ebdcc4);
+    }
+    .wrap { max-width: 1100px; margin: 20px auto; padding: 0 14px 22px; }
+    .head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .head h1 { margin: 0; font-size: 26px; }
+    .bar { margin-top: 10px; display: flex; gap: 8px; }
+    .bar input, .bar button { border-radius: 8px; border: 1px solid var(--line); padding: 9px 10px; font: inherit; }
+    .bar input { flex: 1; }
+    .bar button { background: var(--accent); color: #fff; border: none; cursor: pointer; }
+    .list { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+    .item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: var(--card);
+      box-shadow: 0 6px 16px rgba(0,0,0,.05);
+    }
+    .name { font-size: 18px; font-weight: 700; }
+    .meta { color: var(--sub); font-size: 12px; margin-top: 4px; }
+    .desc { margin: 8px 0; font-size: 14px; min-height: 40px; }
+    .item button { width: 100%; border: none; border-radius: 8px; padding: 9px 10px; background: #1d4ed8; color: #fff; cursor: pointer; }
+    .log { margin-top: 12px; border: 1px dashed var(--line); border-radius: 10px; padding: 10px; white-space: pre-wrap; background: #fffcf6; min-height: 100px; }
+    a { color: #1d4ed8; text-decoration: none; }
+    .err { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <h1>SkillsHub</h1>
+      <a id="backLink" href="/ui/index.html">返回主控台</a>
+    </div>
+    <div class="bar">
+      <input id="proxyKey" placeholder="proxy-key">
+      <button id="refresh">刷新列表</button>
+    </div>
+    <div class="list" id="skillsList"></div>
+    <div class="log" id="logBox">等待操作...</div>
+  </div>
+
+  <script>
+    async function proxyRequest(action, payload, timeoutSeconds) {
+      const proxyKey = $.trim($("#proxyKey").val());
+      if (!proxyKey) {
+        throw new Error("请先输入 proxy-key");
+      }
+      const res = await $.ajax({
+        method: "POST",
+        url: "/api/proxy/request",
+        contentType: "application/json",
+        data: JSON.stringify({
+          proxy_key: proxyKey,
+          action: action,
+          payload: payload || {},
+          timeout_seconds: timeoutSeconds || 30
+        })
+      });
+      if (!res.ok) {
+        throw new Error(res.error || "请求失败");
+      }
+      return res.payload || {};
+    }
+
+    function log(msg, isErr) {
+      const box = $("#logBox");
+      const line = (isErr ? "[ERROR] " : "[INFO] ") + msg + "\n";
+      box.append(document.createTextNode(line));
+      box.scrollTop(box[0].scrollHeight);
+      if (isErr) box.addClass("err");
+    }
+
+    function renderSkills(items) {
+      const root = $("#skillsList");
+      root.empty();
+      if (!items || !items.length) {
+        root.append($("<div>").addClass("item").text("本地 skills 库为空"));
+        return;
+      }
+      items.forEach(function(item) {
+        const card = $("<div>").addClass("item");
+        card.append($("<div>").addClass("name").text(item.name || "unknown"));
+        card.append($("<div>").addClass("meta").text((item.source || "local") + " | " + (item.path || "")));
+        card.append($("<div>").addClass("desc").text(item.description || "(无描述)"));
+        const btn = $("<button>").text("安装到 OpenCode");
+        btn.on("click", async function() {
+          try {
+            log("开始安装 " + item.name);
+            const resp = await proxyRequest("skill_install", { skill: item.name }, 120);
+            log(resp.message || "安装完成");
+          } catch (e) {
+            log(e.message, true);
+          }
+        });
+        card.append(btn);
+        root.append(card);
+      });
+    }
+
+    $(function() {
+      const keyInUrl = new URLSearchParams(location.search).get("proxy_key") || "";
+      $("#proxyKey").val(keyInUrl);
+      $("#backLink").attr("href", "/ui/index.html?proxy_key=" + encodeURIComponent(keyInUrl));
+
+      async function refresh() {
+        try {
+          const data = await proxyRequest("skillshub_list", {}, 30);
+          renderSkills(data.skills || []);
+          log("已加载 skills: " + ((data.skills || []).length));
+        } catch (e) {
+          log(e.message, true);
+        }
+      }
+
+      $("#refresh").on("click", refresh);
+      if (keyInUrl) {
+        refresh();
+      }
+    });
+  </script>
+</body>
+</html>
