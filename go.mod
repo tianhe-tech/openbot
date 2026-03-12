@@ -11,6 +11,8 @@ require (
 	github.com/sst/opencode-sdk-go v0.19.2
 )
 
+replace github.com/open-dingtalk/dingtalk-stream-sdk-go => ./third_party/dingtalk-stream-sdk-go
+
 require (
 	github.com/aliyun/alibaba-cloud-sdk-go v1.61.1376 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect

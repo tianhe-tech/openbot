@@ -1,0 +1,84 @@
+{
+  "skill_name": "video-analyzer",
+  "description": "Test cases for video analysis skill",
+  "evals": [
+    {
+      "id": 1,
+      "name": "basic_video_analysis",
+      "prompt": "帮我分析这个视频 /path/to/test-video.mp4 里发生了什么？",
+      "expected_output": "JSON格式的视频分析结果，包含summary、timeline、answer等字段",
+      "files": ["test-video.mp4"],
+      "assertions": [
+        {
+          "name": "returns_valid_json",
+          "type": "output_format",
+          "description": "输出应该是有效的JSON格式"
+        },
+        {
+          "name": "contains_video_analysis",
+          "type": "output_content",
+          "description": "JSON应包含video_analysis字段"
+        },
+        {
+          "name": "has_timeline",
+          "type": "output_content",
+          "description": "结果应包含timeline数组，列出分析的关键帧"
+        },
+        {
+          "name": "provides_answer",
+          "type": "output_content",
+          "description": "应包含answer字段，回答用户的问题"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "specific_question_analysis",
+      "prompt": "在视频 /path/to/presentation.avi 中，演讲者展示了哪些幻灯片？",
+      "expected_output": "详细描述演讲内容和幻灯片信息",
+      "files": ["presentation.avi"],
+      "assertions": [
+        {
+          "name": "identifies_slides",
+          "type": "output_content",
+          "description": "应识别出演示文稿中的幻灯片"
+        },
+        {
+          "name": "describes_content",
+          "type": "output_content",
+          "description": "应描述幻灯片的具体内容"
+        },
+        {
+          "name": "confidence_level",
+          "type": "output_content",
+          "description": "应在answer中提供confidence级别"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "nonexistent_video",
+      "prompt": "分析视频 /path/to/nonexistent.mp4 的内容",
+      "expected_output": "明确的错误信息，指出视频文件不存在",
+      "files": [],
+      "assertions": [
+        {
+          "name": "handles_error",
+          "type": "error_handling",
+          "description": "应优雅地处理文件不存在的错误"
+        },
+        {
+          "name": "clear_error_message",
+          "type": "output_content",
+          "description": "应提供清晰的错误消息"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "测试前需要准备实际的视频文件",
+    "测试视频应覆盖不同场景：演示、监控、活动等",
+    "建议使用短视频（1-2分钟）以加快测试速度",
+    "可调整max-frames参数以平衡分析质量和速度"
+  ]
+}

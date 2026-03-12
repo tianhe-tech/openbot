@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,13 +19,33 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
 	"github.com/user/opencode-gateway/internal/config"
+	"github.com/user/opencode-gateway/internal/logging"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/opencodesvc"
 	"github.com/user/opencode-gateway/internal/proxy"
 	"github.com/user/opencode-gateway/internal/scheduler"
 	"github.com/user/opencode-gateway/internal/server"
+	"github.com/user/opencode-gateway/internal/uibrpc"
 )
 
 func main() {
+	configPath := flag.String("config", "", "path to JSON config file")
+	logLevelFlag := flag.String("log-level", "", "log level: debug|info|warn|error")
+	flag.Parse()
+
+	fileLogCfg, err := config.LoadLogConfigFile(*configPath)
+	if err != nil {
+		log.Fatalf("load config file error: %v", err)
+	}
+
+	resolvedLogLevel, levelSource := config.ResolveLogLevel(*logLevelFlag, fileLogCfg)
+	level, ok := logging.ParseLevel(resolvedLogLevel)
+	if !ok {
+		log.Fatalf("invalid log level %q, expected one of: debug|info|warn|error", resolvedLogLevel)
+	}
+	logging.Install(level)
+	log.Printf("log level set to %s (source=%s)", level.String(), levelSource)
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config error: %v", err)
@@ -32,10 +53,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	proxyKey := ""
 
 	fmt.Println("cfg.ProxyHubWSURL:", cfg.ProxyHubWSURL)
 	if cfg.ProxyHubWSURL != "" {
-		proxyKey, err := proxy.PrepareRuntimeKey(cfg.ProxyKeyFile, cfg.ProxyHubWSURL)
+		proxyKey, err = proxy.PrepareRuntimeKey(cfg.ProxyKeyFile, cfg.ProxyHubWSURL)
 		if err != nil {
 			log.Fatalf("proxy key init error: %v", err)
 		}
@@ -46,11 +68,51 @@ func main() {
 
 	// Create adapter registry for bidirectional communication
 	adapterRegistry := base.NewAdapterRegistry()
+	var serveManager *opencodesvc.Manager
+	if cfg.OpenCodeManageServe {
+		serveManager = opencodesvc.NewManager(cfg.OpenCodeDirectory, cfg.OpenCodeServeCommand, cfg.OpenCodeServeArgs)
+		msg, startErr := serveManager.Start(ctx)
+		if startErr != nil {
+			log.Fatalf("opencode serve manager start error: %v", startErr)
+		}
+		log.Printf("%s", msg)
+		// Keep the process alive: restart automatically whenever it exits.
+		go serveManager.RunWithAutoRestart(ctx, cfg.OpenCodeEndpoint)
+		defer func() {
+			if err := serveManager.Stop(); err != nil {
+				log.Printf("stop opencode serve error: %v", err)
+			}
+		}()
+	}
 
 	// Create OpenCode client with event handling support
-	ocClient := opencode.NewClient(cfg.OpenCodeEndpoint, cfg.OpenCodeAPIKey,
-		opencode.WithDirectory("."),
-	)
+	ocOptions := []opencode.Option{
+		opencode.WithDirectory(cfg.OpenCodeDirectory),
+	}
+	if serveManager != nil {
+		ocOptions = append(ocOptions, opencode.WithServerUnavailableHandler(func(restartCtx context.Context, reason string) (string, error) {
+			msg, err := serveManager.Start(restartCtx)
+			if err != nil {
+				return msg, err
+			}
+			log.Printf("opencode: waiting for server to become ready (%s)...", cfg.OpenCodeEndpoint)
+			if waitErr := serveManager.WaitReady(restartCtx, cfg.OpenCodeEndpoint); waitErr != nil {
+				log.Printf("opencode: server readiness wait ended: %v", waitErr)
+			}
+			return msg, nil
+		}))
+	}
+	ocClient := opencode.NewClient(cfg.OpenCodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
+	if cfg.ProxyHubWSURL != "" {
+		restartFn := func(restartCtx context.Context, reason string) (string, error) {
+			if serveManager == nil {
+				return "opencode serve manager disabled (OPENCODE_MANAGE_SERVE=false)", nil
+			}
+			return serveManager.Restart(restartCtx, reason)
+		}
+		rpcHandler := uibrpc.NewServer(proxyKey, ocClient, restartFn)
+		go proxy.StartGatewayRPCClient(ctx, cfg.ProxyHubWSURL, proxyKey, cfg.ProxyReconnect, rpcHandler.Handle)
+	}
 
 	// ========== Create Task Scheduler ==========
 	schedulerCfg := scheduler.DefaultTaskSchedulerConfig()

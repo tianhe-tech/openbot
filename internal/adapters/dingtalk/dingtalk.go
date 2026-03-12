@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,6 +59,14 @@ type videoContent struct {
 	DownloadCode string  `json:"downloadCode"`
 	Duration     flexInt `json:"duration"` // 毫秒，钉钉可能返回字符串或数字
 	VideoType    string  `json:"videoType"`
+}
+
+// fileContent 文件消息内容
+type fileContent struct {
+	DownloadCode string  `json:"downloadCode"`
+	FileName     string  `json:"fileName"`
+	FileType     string  `json:"fileType"`
+	FileSize     flexInt `json:"fileSize"`
 }
 
 // richTextItem 图文消息中的单个元素
@@ -275,6 +285,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	msgType := data.Msgtype
 	var mediaInfo map[string]interface{}
 	var extraAttachments []opencode.Attachment // 用于 richText 等多附件场景
+	var mediaFiles []base.MediaFileRecord
+	mediaSessionID := "new"
+	if existingSessionID, ok := h.adapter.GetSessionForUser(userID); ok && strings.TrimSpace(existingSessionID) != "" {
+		mediaSessionID = strings.TrimSpace(existingSessionID)
+	}
 
 	log.Printf("dingtalk stream: 🔍 [DEBUG] Message received:")
 	log.Printf("  - MsgID: %s", msgID)
@@ -456,6 +471,45 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 						"mime": mime,
 					}
 				}
+
+				videoBytes, videoMime, videoErr := h.downloadMediaBytes(ctx, vidContent.DownloadCode, "video/mp4")
+				if videoErr != nil {
+					log.Printf("  - ⚠️ Failed to save temp video (download bytes): %v", videoErr)
+				} else {
+					now := time.Now().UTC()
+					relDir := base.BuildMediaRelativeDir("dingtalk", userID, mediaSessionID, now)
+					saved, saveErr := base.SaveTempMedia(
+						base.MediaRootDirFromEnv(),
+						relDir,
+						"video",
+						msgID,
+						"dingtalk_video.mp4",
+						videoMime,
+						videoBytes,
+						base.MediaTTLFromEnv(),
+						base.MediaMaxBytesFromEnv(),
+					)
+					if saveErr != nil {
+						log.Printf("  - ⚠️ Failed to save temp video file: %v", saveErr)
+					} else {
+						mediaFiles = append(mediaFiles, base.MediaFileRecord{
+							MessageID:    msgID,
+							UserID:       userID,
+							SessionID:    mediaSessionID,
+							Platform:     "dingtalk",
+							MsgType:      "video",
+							Filename:     saved.Filename,
+							Mime:         saved.Mime,
+							Size:         saved.Size,
+							SHA256:       saved.SHA256,
+							LocalPath:    saved.LocalPath,
+							RelativePath: saved.RelativePath,
+							CreatedAt:    saved.CreatedAt,
+							ExpireAt:     saved.ExpireAt,
+						})
+						log.Printf("  - 🗂️ Video temp saved: %s", saved.LocalPath)
+					}
+				}
 			}
 		}
 		if content == "" {
@@ -465,6 +519,67 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				durSec = durRaw / 1000
 			}
 			content = fmt.Sprintf("[视频消息，时长: %d秒]", durSec)
+		}
+
+	case "file":
+		log.Printf("dingtalk stream: 📄 [FILE] received from %s", userID)
+		var fContent fileContent
+		if data.Content != nil {
+			contentBytes, _ := json.Marshal(data.Content)
+			log.Printf("  - File content JSON: %s", string(contentBytes))
+			if err := json.Unmarshal(contentBytes, &fContent); err != nil {
+				log.Printf("  - ⚠️ Failed to parse file content: %v", err)
+			} else if strings.TrimSpace(fContent.DownloadCode) != "" {
+				fileBytes, fileMime, dlErr := h.downloadMediaBytes(ctx, fContent.DownloadCode, "application/octet-stream")
+				if dlErr != nil {
+					log.Printf("  - ⚠️ Failed to download file: %v", dlErr)
+				} else {
+					fileName := strings.TrimSpace(fContent.FileName)
+					if fileName == "" {
+						fileName = "dingtalk_file.bin"
+					}
+					now := time.Now().UTC()
+					relDir := base.BuildMediaRelativeDir("dingtalk", userID, mediaSessionID, now)
+					saved, saveErr := base.SaveTempMedia(
+						base.MediaRootDirFromEnv(),
+						relDir,
+						"file",
+						msgID,
+						fileName,
+						fileMime,
+						fileBytes,
+						base.MediaTTLFromEnv(),
+						base.MediaMaxBytesFromEnv(),
+					)
+					if saveErr != nil {
+						log.Printf("  - ⚠️ Failed to save temp file: %v", saveErr)
+					} else {
+						mediaFiles = append(mediaFiles, base.MediaFileRecord{
+							MessageID:    msgID,
+							UserID:       userID,
+							SessionID:    mediaSessionID,
+							Platform:     "dingtalk",
+							MsgType:      "file",
+							Filename:     saved.Filename,
+							Mime:         saved.Mime,
+							Size:         saved.Size,
+							SHA256:       saved.SHA256,
+							LocalPath:    saved.LocalPath,
+							RelativePath: saved.RelativePath,
+							CreatedAt:    saved.CreatedAt,
+							ExpireAt:     saved.ExpireAt,
+						})
+						log.Printf("  - 🗂️ File temp saved: %s", saved.LocalPath)
+					}
+				}
+			}
+		}
+		if strings.TrimSpace(content) == "" {
+			fileName := strings.TrimSpace(fContent.FileName)
+			if fileName == "" {
+				fileName = "未命名文件"
+			}
+			content = fmt.Sprintf("[文件消息: %s]", fileName)
 		}
 
 	case "richText":
@@ -551,7 +666,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		log.Printf("dingtalk stream: ⚠️ [UNSUPPORTED] message type '%s' from %s", msgType, userID)
 		replier := chatbot.NewChatbotReplier()
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook,
-			[]byte(fmt.Sprintf("暂不支持 %s 类型的消息，请发送文本、图片、语音或视频消息。", msgType)))
+			[]byte(fmt.Sprintf("暂不支持 %s 类型的消息，请发送文本、图片、语音、视频或文件消息。", msgType)))
 		return nil, nil
 	}
 
@@ -627,6 +742,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Handle /model command to get/set model
 	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
 		return h.handleModel(ctx, data, userID, content)
+	}
+
+	// Handle /memory commands for persistent user memory
+	if strings.HasPrefix(content, "/memory") {
+		return h.handleMemory(ctx, data, userID, content)
 	}
 
 	// Handle /thinking command to toggle reasoning output
@@ -772,20 +892,45 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
 	}
 
+	sendContent := content
+	metadata := map[string]string{
+		"conversation_type": data.ConversationType,
+		"sender_nick":       data.SenderNick,
+		"message_type":      msgType,
+	}
+	if len(mediaFiles) > 0 && (msgType == "file" || msgType == "video") {
+		taskSessionID := sessionID
+		if strings.TrimSpace(taskSessionID) == "" {
+			taskSessionID = mediaSessionID
+		}
+		mediaCtx := base.MediaTaskContext{
+			Platform:    "dingtalk",
+			MessageType: msgType,
+			UserID:      userID,
+			SessionID:   taskSessionID,
+			MessageID:   msgID,
+			Files:       mediaFiles,
+		}
+		if mediaMD, mdErr := base.BuildMediaMetadata(mediaCtx); mdErr != nil {
+			log.Printf("dingtalk stream: ⚠️ failed to build media metadata: %v", mdErr)
+		} else {
+			for k, v := range mediaMD {
+				metadata[k] = v
+			}
+			sendContent = base.BuildMediaPromptPrefix(mediaCtx) + sendContent
+		}
+	}
+
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:     "dingtalk",
 		UserID:      userID,
 		ThreadID:    conversationID,
 		SessionID:   sessionID, // Pass existing session if available
-		Content:     content,
+		Content:     sendContent,
 		Agent:       agentName,
 		Streaming:   true,
 		Attachments: attachments,
-		Metadata: map[string]string{
-			"conversation_type": data.ConversationType,
-			"sender_nick":       data.SenderNick,
-			"message_type":      msgType,
-		},
+		Metadata:    metadata,
 	}, func(chunk string) error {
 		// 🔍 诊断：记录第一个 callback
 		if !callbackCalled {
@@ -1083,14 +1228,26 @@ func (h *Handler) handleListSkills(ctx context.Context, data *chatbot.BotCallbac
 		return nil, err
 	}
 
+	customSkills := listCustomSkillsForDisplay(h.client.Directory())
+
 	// Build response message
 	var reply strings.Builder
-	reply.WriteString("📋 可用的 Skills/Agents:\n\n")
+	reply.WriteString("📋 可用的 Skills:\n\n")
+
+	if len(customSkills) > 0 {
+		reply.WriteString("🧩 自定义 Skills（与 TUI /skills 一致）：\n")
+		for i, item := range customSkills {
+			reply.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, item.Name, item.Source))
+		}
+		reply.WriteString("\n")
+	}
 
 	if len(agents) == 0 {
-		reply.WriteString("暂无可用的 agent。\n")
-		reply.WriteString("请在 OpenCode 工作目录创建 AGENTS.md 文件定义 agents。")
+		if len(customSkills) == 0 {
+			reply.WriteString("暂无可用 skills。\n")
+		}
 	} else {
+		reply.WriteString("🤖 内置 Agents：\n")
 		for i, agent := range agents {
 			reply.WriteString(fmt.Sprintf("%d. **%s**", i+1, agent.Name))
 			if agent.Description != "" {
@@ -1102,8 +1259,12 @@ func (h *Handler) handleListSkills(ctx context.Context, data *chatbot.BotCallbac
 			}
 			reply.WriteString("\n\n")
 		}
-		reply.WriteString("💡 使用方法: @agent_name 你的消息\n")
-		reply.WriteString("例如: @build 帮我编译项目")
+	}
+
+	reply.WriteString("💡 使用方法: @agent_name 你的消息\n")
+	reply.WriteString("例如: @build 帮我编译项目")
+	if len(customSkills) > 0 {
+		reply.WriteString("\n\n📁 自定义 skills 目录: ~/.config/opencode/skills")
 	}
 
 	// Reply to user
@@ -1115,6 +1276,64 @@ func (h *Handler) handleListSkills(ctx context.Context, data *chatbot.BotCallbac
 	}
 
 	return nil, nil
+}
+
+type customSkillItem struct {
+	Name   string
+	Source string
+}
+
+func listCustomSkillsForDisplay(baseDir string) []customSkillItem {
+	seen := map[string]bool{}
+	out := []customSkillItem{}
+	dirs := []string{
+		filepath.Join(resolveOpenCodeDirectory(baseDir), ".opencode", "skills"),
+		filepath.Join(getHomeDirSafe(), ".config", "opencode", "skills"),
+	}
+	for i, dir := range dirs {
+		source := "project"
+		if i == 1 {
+			source = "global"
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, customSkillItem{Name: name, Source: source})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func resolveOpenCodeDirectory(baseDir string) string {
+	d := strings.TrimSpace(baseDir)
+	if d == "" {
+		d = "."
+	}
+	if abs, err := filepath.Abs(d); err == nil {
+		return abs
+	}
+	return d
+}
+
+func getHomeDirSafe() string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // handleWhitelist 处理白名单管理命令（运行时生效，不持久化）
@@ -1538,6 +1757,16 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 🤖 模型配置：
 /model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
+/memory - 查看已记录的长期记忆
+/memory pin <内容> - 固定一条高优先级记忆
+/memory pin <category> <内容> - 按分类固定记忆
+/memory unpin <关键词> - 按关键词删除记忆
+/memory unpin #<序号> - 按列表序号删除记忆
+/memory export - 导出当前用户记忆快照
+/memory import <base64> - 导入记忆快照（覆盖）
+/memory merge-import <base64> - 合并导入记忆快照（不覆盖）
+/memory clear - 清空当前用户记忆
+/memory compact - 压缩去重当前用户记忆
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -1584,6 +1813,184 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 		return nil, err
 	}
 
+	return nil, nil
+}
+
+func (h *Handler) handleMemory(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
+	normalizeCategory := func(raw string) string {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "profile", "preference", "project", "environment", "model", "conversation":
+			return strings.ToLower(strings.TrimSpace(raw))
+		default:
+			return "preference"
+		}
+	}
+
+	parts := strings.Fields(strings.TrimSpace(content))
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
+		limit := 10
+		if len(parts) >= 3 {
+			if strings.EqualFold(parts[2], "all") {
+				limit = 0
+			} else if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		facts := h.client.ListUserMemory("dingtalk", userID, limit)
+		if len(facts) == 0 {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 当前没有已记录的长期记忆"))
+			return nil, nil
+		}
+		var b strings.Builder
+		b.WriteString("🧠 长期记忆（Top 10）\n")
+		for i, f := range facts {
+			b.WriteString(fmt.Sprintf("%d. [%s][P%d] %s\n", i+1, f.Category, f.Importance, f.Text))
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(b.String()))
+		return nil, nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "clear") {
+		if err := h.client.ClearUserMemory("dingtalk", userID); err != nil {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 清空 memory 失败: "+err.Error()))
+			return nil, nil
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已清空当前用户长期记忆"))
+		return nil, nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "compact") {
+		removed, err := h.client.CompactUserMemory("dingtalk", userID)
+		if err != nil {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 压缩 memory 失败: "+err.Error()))
+			return nil, nil
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 压缩完成，移除 %d 条冗余记录", removed)))
+		return nil, nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "pin") {
+		category := "preference"
+		text := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if len(parts) >= 4 {
+			candidate := normalizeCategory(parts[2])
+			if candidate == strings.ToLower(strings.TrimSpace(parts[2])) {
+				category = candidate
+				text = strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+			}
+		}
+		if text == "" {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory pin <内容> 或 /memory pin <category> <内容>"))
+			return nil, nil
+		}
+		if err := h.client.PinUserMemory("dingtalk", userID, text, category); err != nil {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 固定 memory 失败: "+err.Error()))
+			return nil, nil
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已固定高优先级记忆（category="+category+"）"))
+		return nil, nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "unpin") {
+		keyword := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if keyword == "" {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory unpin <关键词>"))
+			return nil, nil
+		}
+		if strings.HasPrefix(keyword, "#") {
+			rawRank := strings.TrimPrefix(keyword, "#")
+			rank, convErr := strconv.Atoi(rawRank)
+			if convErr != nil || rank <= 0 {
+				reply := chatbot.NewChatbotReplier()
+				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 序号格式错误，用法: /memory unpin #<序号>"))
+				return nil, nil
+			}
+			ok, err := h.client.RemoveUserMemoryByRank("dingtalk", userID, rank)
+			if err != nil {
+				reply := chatbot.NewChatbotReplier()
+				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 删除 memory 失败: "+err.Error()))
+				return nil, nil
+			}
+			reply := chatbot.NewChatbotReplier()
+			if ok {
+				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已按序号删除记忆"))
+			} else {
+				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 未找到对应序号记忆"))
+			}
+			return nil, nil
+		}
+		removed, err := h.client.UnpinUserMemory("dingtalk", userID, keyword)
+		if err != nil {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 删除 memory 失败: "+err.Error()))
+			return nil, nil
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ 已删除 %d 条匹配记忆", removed)))
+		return nil, nil
+	}
+
+	if len(parts) >= 2 && strings.EqualFold(parts[1], "export") {
+		snapshot, err := h.client.ExportUserMemory("dingtalk", userID)
+		if err != nil {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 导出 memory 失败: "+err.Error()))
+			return nil, nil
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("📦 memory 导出（base64）:\n"+snapshot))
+		return nil, nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "import") {
+		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if payload == "" {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory import <base64>"))
+			return nil, nil
+		}
+		count, err := h.client.ImportUserMemory("dingtalk", userID, payload)
+		if err != nil {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 导入 memory 失败: "+err.Error()))
+			return nil, nil
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 导入完成，共 %d 条", count)))
+		return nil, nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "merge-import") {
+		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if payload == "" {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory merge-import <base64>"))
+			return nil, nil
+		}
+		count, err := h.client.MergeImportUserMemory("dingtalk", userID, payload)
+		if err != nil {
+			reply := chatbot.NewChatbotReplier()
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 合并导入 memory 失败: "+err.Error()))
+			return nil, nil
+		}
+		reply := chatbot.NewChatbotReplier()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 合并导入完成，共 %d 条", count)))
+		return nil, nil
+	}
+
+	usage := "❌ 命令格式错误\n\n用法:\n/memory\n/memory show [all|N]\n/memory pin <内容>\n/memory pin <category> <内容>\n/memory unpin <关键词>\n/memory unpin #<序号>\n/memory export\n/memory import <base64>\n/memory merge-import <base64>\n/memory clear\n/memory compact\n\ncategory: profile|preference|project|environment|model|conversation"
+	reply := chatbot.NewChatbotReplier()
+	_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(usage))
 	return nil, nil
 }
 

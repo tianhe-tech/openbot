@@ -2,7 +2,7 @@
 
 ## 概述
 
-OpenCode Gateway 是一个将消息平台（钉钉、飞书、企业微信）与 OpenCode AI 编程助手连接起来的网关服务。
+OpenCode Gateway(openbot) 是一个将消息平台（钉钉、飞书、企业微信）与 OpenCode AI 编程助手连接起来的网关服务。
 
 默认采用更安全的部署模式：
 - openbot 默认不开放 HTTP 监听端口（`HTTP_ENABLED=false`）
@@ -24,7 +24,7 @@ OpenCode Gateway 是一个将消息平台（钉钉、飞书、企业微信）与
 ### 1. 获取代码
 
 ```bash
-git clone https://github.com/user/opencode-gateway.git
+git clone https://github.com/tianhe-tech/openbot.git
 cd opencode-gateway
 ```
 
@@ -50,6 +50,7 @@ OPENCODE_SERVER_PASSWORD=your_server_password
 
 # 服务监听地址
 SERVER_ADDR=:8080
+LOG_LEVEL=info
 
 # 钉钉 Stream 模式配置（推荐）
 DINGTALK_USE_STREAM=true
@@ -75,13 +76,31 @@ WECOM_AES_KEY=your_aes_key
 ### 3. 构建
 
 ```bash
-go build -o bin/gateway cmd/gateway/main.go
+go build -o bin/openbot cmd/gateway/main.go
 ```
 
 ### 4. 运行
 
 ```bash
-./bin/gateway
+./bin/openbot
+```
+
+指定日志级别启动：
+
+```bash
+./bin/openbot --log-level warn
+```
+
+从配置文件读取日志级别（JSON）：
+
+```bash
+cat > openbot.json << 'EOF'
+{
+   "log_level": "error"
+}
+EOF
+
+./bin/openbot --config gateway.json
 ```
 
 或直接运行：
@@ -157,6 +176,7 @@ services:
 | `OPENCODE_API_KEY` | 是* | - | OpenCode API 密钥（Bearer / X-API-Key 模式） |
 | `OPENCODE_SERVER_PASSWORD` | 是* | - | OpenCode Server 密码（HTTP Basic Auth 模式） |
 | `OPENCODE_SERVER_USERNAME` | 否 | `opencode` | Basic Auth 用户名 |
+| `LOG_LEVEL` | 否 | `info` | 日志级别（`debug`/`info`/`warn`/`error`） |
 | `SERVER_ADDR` | 否 | `:8080` | 服务监听地址 |
 | `READ_TIMEOUT` | 否 | `30s` | 读取超时 |
 | `WRITE_TIMEOUT` | 否 | `30s` | 写入超时 |
@@ -312,21 +332,21 @@ Gateway 会：
 
 ### 1. 使用 systemd
 
-创建 `/etc/systemd/system/opencode-gateway.service`:
+创建 `/etc/systemd/system/openbot.service`:
 
 ```ini
 [Unit]
-Description=OpenCode Gateway
+Description=Openbot
 After=network.target
 
 [Service]
 User=opencode
 Group=opencode
-WorkingDirectory=/opt/opencode-gateway
-ExecStart=/opt/opencode-gateway/bin/gateway
+WorkingDirectory=/opt/openbot
+ExecStart=/opt/openbot/bin/openbot
 Restart=always
 RestartSec=10
-EnvironmentFile=/opt/opencode-gateway/.env
+EnvironmentFile=/opt/openbot/.env
 
 [Install]
 WantedBy=multi-user.target
@@ -335,9 +355,9 @@ WantedBy=multi-user.target
 启动服务：
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable opencode-gateway
-sudo systemctl start opencode-gateway
-sudo systemctl status opencode-gateway
+sudo systemctl enable openbot
+sudo systemctl start openbot
+sudo systemctl status openbot
 ```
 
 ### 2. 使用 Nginx 反向代理
@@ -366,7 +386,7 @@ server {
 
 使用 `journalctl` 查看日志：
 ```bash
-sudo journalctl -u opencode-gateway -f
+sudo journalctl -u openbot-f
 ```
 
 ---

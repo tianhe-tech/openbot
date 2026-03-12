@@ -87,6 +87,7 @@ cp .env.example .env
 | `OPENCODE_SERVER_PASSWORD` | ❌* | empty | OpenCode Server password (HTTP Basic Auth mode) |
 | `OPENCODE_SERVER_USERNAME` | ❌ | `opencode` | Username for HTTP Basic Auth when `OPENCODE_SERVER_PASSWORD` is set |
 | `HTTP_ENABLED` | ❌ | `false` | Enable built-in HTTP server |
+| `LOG_LEVEL` | ❌ | `info` | Log level (`debug`/`info`/`warn`/`error`) |
 | `SERVER_ADDR` | ❌ | `:8080` | Service listen address |
 | `DINGTALK_USE_STREAM` | ❌ | `false` | Enable DingTalk Stream mode |
 | `DINGTALK_CLIENT_ID` | ✅ Stream | DingTalk Client ID |
@@ -100,6 +101,24 @@ cp .env.example .env
 
 ```bash
 ./bin/openbot
+```
+
+With explicit log level:
+
+```bash
+./bin/openbot --log-level warn
+```
+
+With JSON config file:
+
+```bash
+cat > gateway.json << 'EOF'
+{
+  "log_level": "error"
+}
+EOF
+
+./bin/openbot --config gateway.json
 ```
 
 ### 5. Verify
