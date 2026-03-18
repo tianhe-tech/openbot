@@ -56,6 +56,7 @@ type Handler struct {
 	cronScheduler   *scheduler.CronScheduler
 	processedMsgIDs sync.Map
 	cleanupOnce     sync.Once
+	sessionPrompts  sync.Map
 	httpClient      *http.Client
 	userTargets     sync.Map
 	tokenMu         sync.Mutex
@@ -75,6 +76,91 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	}
 	h.adapter = base.NewBidirectionalAdapter("feishu", h)
 	return h
+}
+
+type sessionSwitchPrompt struct {
+	SessionID   string
+	ThreadID    string
+	RequestedAt time.Time
+}
+
+func buildSessionSwitchPromptMessage(sessionID string) string {
+	return fmt.Sprintf("当前有活跃会话 %s。\n\n请选择接下来怎么做：\n1. 继续原来的任务（先压缩当前会话，再派生新会话）\n2. 开始新的对话（不继承历史）\n\n请直接回复 1 或 2。", sessionID[:min(8, len(sessionID))])
+}
+
+func parseSessionSwitchChoice(input string) string {
+	normalized := strings.TrimSpace(strings.ToLower(input))
+	normalized = strings.Map(func(r rune) rune {
+		if strings.ContainsRune(" \t\r\n,.;:!?，。；：！？()（）[]【】", r) {
+			return -1
+		}
+		return r
+	}, normalized)
+
+	switch normalized {
+	case "1", "继续", "继续原任务", "继续原来的任务", "继续任务", "延续", "continue", "resume", "keep":
+		return "continue"
+	case "2", "新对话", "开始新对话", "开始新的对话", "新任务", "重新开始", "fresh", "new", "reset":
+		return "fresh"
+	default:
+		return ""
+	}
+}
+
+func (h *Handler) getSessionSwitchPrompt(userID string) (*sessionSwitchPrompt, bool) {
+	if v, ok := h.sessionPrompts.Load(userID); ok {
+		return v.(*sessionSwitchPrompt), true
+	}
+	return nil, false
+}
+
+func (h *Handler) clearSessionSwitchPrompt(userID string) {
+	h.sessionPrompts.Delete(userID)
+}
+
+func (h *Handler) handleSessionSwitchReply(ctx context.Context, target chatTarget, userID, content string) (string, error) {
+	prompt, ok := h.getSessionSwitchPrompt(userID)
+	if !ok {
+		return "", nil
+	}
+
+	choice := parseSessionSwitchChoice(content)
+	if choice == "" {
+		_ = h.sendTextChunks(ctx, target, "请直接回复 1 或 2。\n\n"+buildSessionSwitchPromptMessage(prompt.SessionID))
+		return "handled", nil
+	}
+
+	h.clearSessionSwitchPrompt(userID)
+
+	if choice == "fresh" {
+		h.adapter.ClearSessionForUser(userID)
+		if prompt.ThreadID != "" {
+			h.client.ResetSession(prompt.ThreadID)
+		}
+		_ = h.sendTextChunks(ctx, target, "✅ 已开始新的对话\n\n下次发送消息将创建全新的会话，不会继承之前的任务上下文。")
+		return "handled", nil
+	}
+
+	_ = h.sendTextChunks(ctx, target, "⏳ 正在压缩当前任务并派生新会话...")
+	newSessionID, err := h.client.CompactAndForkSession(ctx, prompt.SessionID)
+	if err != nil {
+		h.sessionPrompts.Store(userID, prompt)
+		msg := fmt.Sprintf("❌ 继续原任务失败: %v\n\n你可以回复 1 重试，或回复 2 改为开始新的对话。", err)
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+
+	h.adapter.MapUserToSession(userID, newSessionID)
+	if prompt.ThreadID != "" {
+		h.client.SetSessionForThread(prompt.ThreadID, newSessionID)
+	}
+	h.adapter.MapSessionData(newSessionID, "receive_id", target.receiveID)
+	h.adapter.MapSessionData(newSessionID, "receive_id_type", target.receiveIDType)
+
+	msg := fmt.Sprintf("✅ 已继续原任务\n\n旧会话: %s\n新会话: %s\n\n后续对话将使用新的派生会话继续处理。",
+		prompt.SessionID[:min(8, len(prompt.SessionID))], newSessionID[:min(8, len(newSessionID))])
+	_ = h.sendTextChunks(ctx, target, msg)
+	return "handled", nil
 }
 
 func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
@@ -219,6 +305,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// ========== 检查是否是快速回复（权限或问题回答）==========
 	content := strings.TrimSpace(msg.Content)
 	sessionID, hasSession := h.adapter.GetSessionForUser(msg.UserID)
+	if !strings.HasPrefix(content, "/") {
+		if result, err := h.handleSessionSwitchReply(ctx, target, msg.UserID, content); result != "" || err != nil {
+			return result, err
+		}
+	}
 
 	if hasSession {
 		log.Printf("feishu: checking quick reply '%s' for user %s (session: %s)", content, userLabel, sessionID[:min(8, len(sessionID))])
@@ -334,6 +425,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// Handle /model command to get/set model
 	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
 		return h.handleModel(ctx, target, msg.UserID, content)
+	}
+
+	// Handle /memory command for persistent user memory
+	if strings.HasPrefix(content, "/memorycfg") {
+		return h.handleMemoryConfig(ctx, target, content)
 	}
 
 	// Handle /memory command for persistent user memory
@@ -1919,10 +2015,10 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 
 📊 会话管理：
 /status 或 状态 - 查看当前会话状态
-/new 或 /reset - 创建新会话
+/new 或 /reset - 创建新会话，系统会提示回复 1 或 2 选择“延续当前任务”或“开始新对话”
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
-/compact 或 总结 - 压缩会话历史（减少上下文占用）
+/compact 或 总结 - 调用 OpenCode 官方 compaction 压缩当前会话
 /sessions 或 /list - 列出所有会话
 
 📋 任务追踪（对应 TUI 实时看板）：
@@ -1942,6 +2038,11 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 /memory merge-import <base64> - 合并导入记忆快照（不覆盖）
 /memory clear - 清空当前用户记忆
 /memory compact - 压缩去重当前用户记忆
+/memorycfg show - 查看记忆检索/压缩参数
+/memorycfg set <key> <value> - 修改记忆参数（运行时生效）
+/memorycfg on|off - 快速开关长期记忆
+/memorycfg quota set <category=n,...> - 设置分类配额
+/memorycfg reset default - 恢复启动时默认参数
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -2006,6 +2107,116 @@ func (h *Handler) handleThinking(ctx context.Context, target chatTarget, content
 		_ = h.sendTextChunks(ctx, target, msg)
 		return "handled", nil
 	}
+}
+
+func (h *Handler) handleMemoryConfig(ctx context.Context, target chatTarget, content string) (string, error) {
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	format := func(cfg opencode.MemoryRuntimeConfig) string {
+		quota := ""
+		if len(cfg.CategoryQuota) == 0 {
+			quota = "(empty)"
+		} else {
+			keys := make([]string, 0, len(cfg.CategoryQuota))
+			for k := range cfg.CategoryQuota {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			parts := make([]string, 0, len(keys))
+			for _, k := range keys {
+				parts = append(parts, fmt.Sprintf("%s=%d", k, cfg.CategoryQuota[k]))
+			}
+			quota = strings.Join(parts, ",")
+		}
+		return fmt.Sprintf("🧠 Memory Runtime Config\n\n"+
+			"enabled=%t\n"+
+			"max_chars=%d\n"+
+			"max_facts=%d\n"+
+			"inject_facts=%d\n"+
+			"short_term_facts=%d\n"+
+			"recent_window=%s\n"+
+			"decay_enabled=%t\n"+
+			"decay_half_life=%s\n"+
+			"category_quota_enabled=%t\n"+
+			"category_quota=%s\n"+
+			"auto_compact_interval=%s\n"+
+			"debug_recall=%t",
+			cfg.Enabled,
+			cfg.MaxChars,
+			cfg.MaxFacts,
+			cfg.InjectFacts,
+			cfg.ShortTermFacts,
+			cfg.RecentWindow,
+			cfg.DecayEnabled,
+			cfg.DecayHalfLife,
+			cfg.CategoryQuotaEnabled,
+			quota,
+			cfg.AutoCompactInterval,
+			cfg.DebugRecall,
+		)
+	}
+
+	usage := "❌ 用法:\n" +
+		"/memorycfg show\n" +
+		"/memorycfg on|off\n" +
+		"/memorycfg quota set <category=n,...>\n" +
+		"/memorycfg reset default\n" +
+		"/memorycfg set <key> <value>\n\n" +
+		"常用 key:\n" +
+		"enabled|max_chars|max_facts|inject_facts|short_term_facts\n" +
+		"recent_window|decay_enabled|decay_half_life\n" +
+		"category_quota_enabled|category_quota|auto_compact_interval|debug_recall\n\n" +
+		"示例:\n" +
+		"/memorycfg set inject_facts 12\n" +
+		"/memorycfg set decay_half_life 240h\n" +
+		"/memorycfg set category_quota preference=2,project=1"
+
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
+		_ = h.sendTextChunks(ctx, target, format(h.client.GetMemoryRuntimeConfig()))
+		return "handled", nil
+	}
+	if len(parts) >= 2 && (strings.EqualFold(parts[1], "on") || strings.EqualFold(parts[1], "off")) {
+		cfg, err := h.client.UpdateMemoryRuntimeConfig("enabled", parts[1])
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 更新失败: "+err.Error()+"\n\n"+usage)
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, "✅ 已更新 memory 开关\n\n"+format(cfg))
+		return "handled", nil
+	}
+
+	if len(parts) >= 4 && strings.EqualFold(parts[1], "quota") && strings.EqualFold(parts[2], "set") {
+		value := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+		cfg, err := h.client.UpdateMemoryRuntimeConfig("category_quota", value)
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 更新失败: "+err.Error()+"\n\n"+usage)
+			return "handled", nil
+		}
+		cfg, _ = h.client.UpdateMemoryRuntimeConfig("category_quota_enabled", "on")
+		_ = h.sendTextChunks(ctx, target, "✅ 已更新分类配额并自动启用\n\n"+format(cfg))
+		return "handled", nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "reset") && strings.EqualFold(parts[2], "default") {
+		cfg := h.client.ResetMemoryRuntimeConfigToDefault()
+		_ = h.sendTextChunks(ctx, target, "✅ 已恢复启动默认 memory 配置\n\n"+format(cfg))
+		return "handled", nil
+	}
+
+	if len(parts) >= 4 && strings.EqualFold(parts[1], "set") {
+		key := parts[2]
+		value := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+		cfg, err := h.client.UpdateMemoryRuntimeConfig(key, value)
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 更新失败: "+err.Error()+"\n\n"+usage)
+			return "handled", nil
+		}
+		_ = h.sendTextChunks(ctx, target, "✅ 已更新 memory 配置\n\n"+format(cfg))
+		return "handled", nil
+	}
+
+	_ = h.sendTextChunks(ctx, target, usage)
+	return "handled", nil
 }
 
 func (h *Handler) handleMemory(ctx context.Context, target chatTarget, userID, content string) (string, error) {
@@ -2258,16 +2469,22 @@ func (h *Handler) handleNewSession(ctx context.Context, target chatTarget, userI
 		oldSessionID = sid
 	}
 
-	if threadID != "" {
-		h.client.ResetSession(threadID)
+	if oldSessionID == "" {
+		if threadID != "" {
+			h.client.ResetSession(threadID)
+		}
+		h.adapter.ClearSessionForUser(userID)
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃会话\n\n下次发送消息将创建新会话")
+		return "handled", nil
 	}
-	h.adapter.ClearSessionForUser(userID)
 
-	msg := "✅ 已重置会话\n\n"
-	if oldSessionID != "" {
-		msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:min(8, len(oldSessionID))])
-	}
-	msg += "下次发送消息将创建新会话"
+	h.sessionPrompts.Store(userID, &sessionSwitchPrompt{
+		SessionID:   oldSessionID,
+		ThreadID:    threadID,
+		RequestedAt: time.Now(),
+	})
+
+	msg := buildSessionSwitchPromptMessage(oldSessionID)
 
 	_ = h.sendTextChunks(ctx, target, msg)
 	return "handled", nil
@@ -2570,11 +2787,12 @@ func (h *Handler) handleConfig(ctx context.Context, target chatTarget, userID st
 
 	msgBuilder.WriteString("\n🔧 可用命令:\n")
 	msgBuilder.WriteString("  /model - 查看/设置模型\n")
+	msgBuilder.WriteString("  /memorycfg - 查看/设置记忆检索参数\n")
 	msgBuilder.WriteString("  /thinking - 查看/设置 thinking 返回\n")
 	msgBuilder.WriteString("  /final - 查看/设置 final-only 输出\n")
 	msgBuilder.WriteString("  /steps - 查看/设置步骤显示\n")
 	msgBuilder.WriteString("  /status - 查看会话状态\n")
-	msgBuilder.WriteString("  /new - 创建新会话\n")
+	msgBuilder.WriteString("  /new - 创建新会话（可选择延续当前任务）\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
 	msgBuilder.WriteString("  /fork - 派生(fork)当前会话\n")
 	msgBuilder.WriteString("  /compact - 压缩/总结当前会话\n")
@@ -2639,6 +2857,10 @@ func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, c
 	// 2) /answer <questionID> <answer>
 	parts := strings.Fields(content)
 	if len(parts) < 2 {
+		if prompt, ok := h.getSessionSwitchPrompt(userID); ok {
+			_ = h.sendTextChunks(ctx, target, buildSessionSwitchPromptMessage(prompt.SessionID))
+			return "handled", nil
+		}
 		msg := h.buildPendingRequirementHint(userID)
 		if msg == "" {
 			msg = "❌ 当前没有待确认问题。请先等待 OpenCode 提问后直接回复选项内容（如：1、允许、yes）。"
@@ -2652,6 +2874,10 @@ func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, c
 		questionID = parts[1]
 		answer = strings.Join(parts[2:], " ")
 	} else {
+		if _, ok := h.getSessionSwitchPrompt(userID); ok {
+			return h.handleSessionSwitchReply(ctx, target, userID, strings.Join(parts[1:], " "))
+		}
+
 		sessionID, ok := h.adapter.GetSessionForUser(userID)
 		if !ok {
 			_ = h.sendTextChunks(ctx, target, "❌ 当前没有活跃会话，无法定位待确认问题")
@@ -3130,14 +3356,14 @@ func (h *Handler) handleCompact(ctx context.Context, target chatTarget, userID s
 		return "handled", nil
 	}
 
-	_ = h.sendTextChunks(ctx, target, "⏳ 正在压缩会话历史...")
+	_ = h.sendTextChunks(ctx, target, "⏳ 正在调用 OpenCode 官方 compaction 压缩当前会话...")
 
 	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
 		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 压缩会话失败: %v", err))
 		return "", err
 	}
 
-	msg := fmt.Sprintf("✅ 会话 %s 已压缩总结\n\n会话历史已被 AI 摘要，上下文占用将减少。", sessionID[:min(8, len(sessionID))])
+	msg := fmt.Sprintf("✅ 会话 %s 已完成官方压缩\n\nOpenCode 已在当前会话内完成 compaction。\n后续对话仍会继续使用这个会话。", sessionID[:min(8, len(sessionID))])
 	_ = h.sendTextChunks(ctx, target, msg)
 	return "handled", nil
 }

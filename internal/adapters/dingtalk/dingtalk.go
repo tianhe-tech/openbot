@@ -118,6 +118,7 @@ type Handler struct {
 	cronScheduler   *scheduler.CronScheduler // 定时任务调度器
 	processedMsgIDs sync.Map                 // map[string]time.Time - 已处理的消息ID及其时间戳
 	cleanupOnce     sync.Once                // 确保清理goroutine只启动一次
+	sessionPrompts  sync.Map                 // map[userID]*sessionSwitchPrompt - /new /reset 待确认状态
 	// access token 缓存（避免每次都获取）
 	accessToken       string
 	accessTokenExpiry time.Time
@@ -153,6 +154,91 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	h.adapter = base.NewBidirectionalAdapter("dingtalk", h)
 
 	return h
+}
+
+type sessionSwitchPrompt struct {
+	SessionID   string
+	ThreadID    string
+	RequestedAt time.Time
+}
+
+func buildSessionSwitchPromptMessage(sessionID string) string {
+	return fmt.Sprintf("当前有活跃会话 %s。\n\n请选择接下来怎么做：\n1. 继续原来的任务（先压缩当前会话，再派生新会话）\n2. 开始新的对话（不继承历史）\n\n请直接回复 1 或 2。", sessionID[:min(8, len(sessionID))])
+}
+
+func parseSessionSwitchChoice(input string) string {
+	normalized := strings.TrimSpace(strings.ToLower(input))
+	normalized = strings.Map(func(r rune) rune {
+		if strings.ContainsRune(" \t\r\n,.;:!?，。；：！？()（）[]【】", r) {
+			return -1
+		}
+		return r
+	}, normalized)
+
+	switch normalized {
+	case "1", "继续", "继续原任务", "继续原来的任务", "继续任务", "延续", "continue", "resume", "keep":
+		return "continue"
+	case "2", "新对话", "开始新对话", "开始新的对话", "新任务", "重新开始", "fresh", "new", "reset":
+		return "fresh"
+	default:
+		return ""
+	}
+}
+
+func (h *Handler) getSessionSwitchPrompt(userID string) (*sessionSwitchPrompt, bool) {
+	if v, ok := h.sessionPrompts.Load(userID); ok {
+		return v.(*sessionSwitchPrompt), true
+	}
+	return nil, false
+}
+
+func (h *Handler) clearSessionSwitchPrompt(userID string) {
+	h.sessionPrompts.Delete(userID)
+}
+
+func (h *Handler) handleSessionSwitchReply(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
+	prompt, ok := h.getSessionSwitchPrompt(userID)
+	if !ok {
+		return nil, nil
+	}
+
+	replier := chatbot.NewChatbotReplier()
+	choice := parseSessionSwitchChoice(content)
+	if choice == "" {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("请直接回复 1 或 2。\n\n"+buildSessionSwitchPromptMessage(prompt.SessionID)))
+		return []byte("handled"), nil
+	}
+
+	h.clearSessionSwitchPrompt(userID)
+
+	if choice == "fresh" {
+		h.adapter.ClearSessionForUser(userID)
+		if prompt.ThreadID != "" {
+			h.client.ResetSession(prompt.ThreadID)
+		}
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已开始新的对话\n\n下次发送消息将创建全新的会话，不会继承之前的任务上下文。"))
+		return []byte("handled"), nil
+	}
+
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 正在压缩当前任务并派生新会话..."))
+	newSessionID, err := h.client.CompactAndForkSession(ctx, prompt.SessionID)
+	if err != nil {
+		h.sessionPrompts.Store(userID, prompt)
+		msg := fmt.Sprintf("❌ 继续原任务失败: %v\n\n你可以回复 1 重试，或回复 2 改为开始新的对话。", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return []byte("handled"), nil
+	}
+
+	h.adapter.MapUserToSession(userID, newSessionID)
+	if prompt.ThreadID != "" {
+		h.client.SetSessionForThread(prompt.ThreadID, newSessionID)
+	}
+	h.adapter.MapSessionData(newSessionID, "channel", data.SessionWebhook)
+
+	msg := fmt.Sprintf("✅ 已继续原任务\n\n旧会话: %s\n新会话: %s\n\n后续对话将使用新的派生会话继续处理。",
+		prompt.SessionID[:min(8, len(prompt.SessionID))], newSessionID[:min(8, len(newSessionID))])
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	return []byte("handled"), nil
 }
 
 // SetCronScheduler 设置定时任务调度器
@@ -698,7 +784,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 	}
 
-	// 先尝试把非命令文本当作“待确认问题”的直接回复（无需 /answer）。
+	// 先尝试把非命令文本当作“新会话选择”的直接回复。
+	if !strings.HasPrefix(strings.TrimSpace(content), "/") {
+		if result, err := h.handleSessionSwitchReply(ctx, data, userID, content); result != nil || err != nil {
+			return result, err
+		}
+	}
+
+	// 再尝试把非命令文本当作“待确认问题”的直接回复（无需 /answer）。
 	if !strings.HasPrefix(strings.TrimSpace(content), "/") {
 		if result, err := h.handleQuickReply(ctx, data, userID, content); result != nil || err != nil {
 			return result, err
@@ -742,6 +835,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Handle /model command to get/set model
 	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
 		return h.handleModel(ctx, data, userID, content)
+	}
+
+	// Handle /memory commands for persistent user memory
+	if strings.HasPrefix(content, "/memorycfg") {
+		return h.handleMemoryConfig(ctx, data, content)
 	}
 
 	// Handle /memory commands for persistent user memory
@@ -1200,9 +1298,22 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 					len(accumulatedContent))
 			}
 		} else {
-			// 没有内容累积（可能是权限请求之类的交互式任务，或者全都是特殊消息）
-			log.Printf("dingtalk stream: ℹ️ async mode completed with no accumulated content "+
-				"(callbackCalled=%t, user=%s)", callbackCalled, userID)
+			// No text was accumulated.  This can happen for:
+			//   a) Pure tool-execution tasks where OpenCode does file edits but
+			//      produces no text summary (the final text part is empty).
+			//   b) Interactive tasks (permission requests, questions) where
+			//      all content was sent as immediate "special" messages.
+			//
+			// For case (a) we send a minimal completion notice so the user always
+			// gets SOME response when the task ends.
+			if callbackCalled {
+				// Something was processed (tool messages may have been sent earlier).
+				log.Printf("dingtalk stream: ℹ️ async completed with no text content for user %s "+
+					"(callbackCalled=true); sending task-done notice", userID)
+				_ = sendReply("✅ 任务已完成")
+			} else {
+				log.Printf("dingtalk stream: ℹ️ async completed, no callbacks at all for user %s", userID)
+			}
 		}
 	}
 
@@ -1744,10 +1855,10 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 
 📊 会话管理：
 /status 或 状态 - 查看当前会话状态
-/new 或 /reset - 创建新会话
+/new 或 /reset - 创建新会话，系统会提示回复 1 或 2 选择“延续当前任务”或“开始新对话”
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
-/compact 或 总结 - 压缩会话历史（减少上下文占用）
+/compact 或 总结 - 调用 OpenCode 官方 compaction 压缩当前会话
 /sessions 或 /list - 列出所有会话
 
 📋 任务追踪（对应 TUI 实时看板）：
@@ -1767,6 +1878,11 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /memory merge-import <base64> - 合并导入记忆快照（不覆盖）
 /memory clear - 清空当前用户记忆
 /memory compact - 压缩去重当前用户记忆
+/memorycfg show - 查看记忆检索/压缩参数
+/memorycfg set <key> <value> - 修改记忆参数（运行时生效）
+/memorycfg on|off - 快速开关长期记忆
+/memorycfg quota set <category=n,...> - 设置分类配额
+/memorycfg reset default - 恢复启动时默认参数
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -1813,6 +1929,117 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 		return nil, err
 	}
 
+	return nil, nil
+}
+
+func (h *Handler) handleMemoryConfig(ctx context.Context, data *chatbot.BotCallbackDataModel, content string) ([]byte, error) {
+	reply := chatbot.NewChatbotReplier()
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	format := func(cfg opencode.MemoryRuntimeConfig) string {
+		quota := ""
+		if len(cfg.CategoryQuota) == 0 {
+			quota = "(empty)"
+		} else {
+			keys := make([]string, 0, len(cfg.CategoryQuota))
+			for k := range cfg.CategoryQuota {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			parts := make([]string, 0, len(keys))
+			for _, k := range keys {
+				parts = append(parts, fmt.Sprintf("%s=%d", k, cfg.CategoryQuota[k]))
+			}
+			quota = strings.Join(parts, ",")
+		}
+		return fmt.Sprintf("🧠 Memory Runtime Config\n\n"+
+			"enabled=%t\n"+
+			"max_chars=%d\n"+
+			"max_facts=%d\n"+
+			"inject_facts=%d\n"+
+			"short_term_facts=%d\n"+
+			"recent_window=%s\n"+
+			"decay_enabled=%t\n"+
+			"decay_half_life=%s\n"+
+			"category_quota_enabled=%t\n"+
+			"category_quota=%s\n"+
+			"auto_compact_interval=%s\n"+
+			"debug_recall=%t",
+			cfg.Enabled,
+			cfg.MaxChars,
+			cfg.MaxFacts,
+			cfg.InjectFacts,
+			cfg.ShortTermFacts,
+			cfg.RecentWindow,
+			cfg.DecayEnabled,
+			cfg.DecayHalfLife,
+			cfg.CategoryQuotaEnabled,
+			quota,
+			cfg.AutoCompactInterval,
+			cfg.DebugRecall,
+		)
+	}
+
+	usage := "❌ 用法:\n" +
+		"/memorycfg show\n" +
+		"/memorycfg on|off\n" +
+		"/memorycfg quota set <category=n,...>\n" +
+		"/memorycfg reset default\n" +
+		"/memorycfg set <key> <value>\n\n" +
+		"常用 key:\n" +
+		"enabled|max_chars|max_facts|inject_facts|short_term_facts\n" +
+		"recent_window|decay_enabled|decay_half_life\n" +
+		"category_quota_enabled|category_quota|auto_compact_interval|debug_recall\n\n" +
+		"示例:\n" +
+		"/memorycfg set inject_facts 12\n" +
+		"/memorycfg set decay_half_life 240h\n" +
+		"/memorycfg set category_quota preference=2,project=1"
+
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(format(h.client.GetMemoryRuntimeConfig())))
+		return nil, nil
+	}
+	if len(parts) >= 2 && (strings.EqualFold(parts[1], "on") || strings.EqualFold(parts[1], "off")) {
+		cfg, err := h.client.UpdateMemoryRuntimeConfig("enabled", parts[1])
+		if err != nil {
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 更新失败: "+err.Error()+"\n\n"+usage))
+			return nil, nil
+		}
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已更新 memory 开关\n\n"+format(cfg)))
+		return nil, nil
+	}
+
+	if len(parts) >= 4 && strings.EqualFold(parts[1], "quota") && strings.EqualFold(parts[2], "set") {
+		value := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+		cfg, err := h.client.UpdateMemoryRuntimeConfig("category_quota", value)
+		if err != nil {
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 更新失败: "+err.Error()+"\n\n"+usage))
+			return nil, nil
+		}
+		cfg, _ = h.client.UpdateMemoryRuntimeConfig("category_quota_enabled", "on")
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已更新分类配额并自动启用\n\n"+format(cfg)))
+		return nil, nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "reset") && strings.EqualFold(parts[2], "default") {
+		cfg := h.client.ResetMemoryRuntimeConfigToDefault()
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已恢复启动默认 memory 配置\n\n"+format(cfg)))
+		return nil, nil
+	}
+
+	if len(parts) >= 4 && strings.EqualFold(parts[1], "set") {
+		key := parts[2]
+		value := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+		cfg, err := h.client.UpdateMemoryRuntimeConfig(key, value)
+		if err != nil {
+			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 更新失败: "+err.Error()+"\n\n"+usage))
+			return nil, nil
+		}
+		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已更新 memory 配置\n\n"+format(cfg)))
+		return nil, nil
+	}
+
+	_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(usage))
 	return nil, nil
 }
 
@@ -2099,6 +2326,10 @@ func (h *Handler) handleAnswer(ctx context.Context, data *chatbot.BotCallbackDat
 	// 2) /answer <questionID> <answer>
 	parts := strings.Fields(content)
 	if len(parts) < 2 {
+		if prompt, ok := h.getSessionSwitchPrompt(userID); ok {
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(buildSessionSwitchPromptMessage(prompt.SessionID)))
+			return nil, nil
+		}
 		msg := h.buildPendingRequirementHint(userID)
 		if msg == "" {
 			msg = "❌ 当前没有待确认问题。请先等待 OpenCode 提问后直接回复选项内容（如：1、允许、yes）。"
@@ -2112,6 +2343,10 @@ func (h *Handler) handleAnswer(ctx context.Context, data *chatbot.BotCallbackDat
 		questionID = parts[1]
 		answer = strings.Join(parts[2:], " ")
 	} else {
+		if _, ok := h.getSessionSwitchPrompt(userID); ok {
+			return h.handleSessionSwitchReply(ctx, data, userID, strings.Join(parts[1:], " "))
+		}
+
 		sessionID, ok := h.adapter.GetSessionForUser(userID)
 		if !ok {
 			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 当前没有活跃会话，无法定位待确认问题"))
@@ -3087,9 +3322,17 @@ func (h *Handler) sendReplyBySource(ctx context.Context, sessionWebhook, convers
 
 	if routeToGroup {
 		if strings.TrimSpace(sessionWebhook) == "" {
-			return fmt.Errorf("group conversation but sessionWebhook is empty")
+			// No webhook available — fall back to robot API using conversationID.
+			log.Printf("dingtalk stream: group but no webhook, using robot API (conversationID=%s)", conversationID)
+			return h.sendReplyRobot(ctx, conversationID, userID, content)
 		}
-		return h.sendViaWebhook(ctx, sessionWebhook, content)
+		if err := h.sendViaWebhook(ctx, sessionWebhook, content); err != nil {
+			// Webhook may have expired (DingTalk stream webhooks are short-lived).
+			// Fall back to robot API which uses permanent credentials.
+			log.Printf("dingtalk stream: webhook send failed (%v), falling back to robot API", err)
+			return h.sendReplyRobot(ctx, conversationID, userID, content)
+		}
+		return nil
 	}
 
 	return h.sendReplyRobot(ctx, conversationID, userID, content)
@@ -3124,18 +3367,27 @@ func (h *Handler) handleNewSession(ctx context.Context, data *chatbot.BotCallbac
 		oldSessionID = sid
 	}
 
-	// 重置session映射
-	threadID := data.ConversationId
-	if threadID != "" {
-		h.client.ResetSession(threadID)
+	if oldSessionID == "" {
+		threadID := data.ConversationId
+		if threadID != "" {
+			h.client.ResetSession(threadID)
+		}
+		h.adapter.ClearSessionForUser(userID)
+		msg := "ℹ️ 当前没有活跃会话\n\n下次发送消息将创建新会话"
+		if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+			log.Printf("dingtalk: failed to send new session response: %v", err)
+			return nil, err
+		}
+		return nil, nil
 	}
-	h.adapter.ClearSessionForUser(userID)
 
-	msg := "✅ 已重置会话\n\n"
-	if oldSessionID != "" {
-		msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:8])
-	}
-	msg += "下次发送消息将创建新会话"
+	h.sessionPrompts.Store(userID, &sessionSwitchPrompt{
+		SessionID:   oldSessionID,
+		ThreadID:    data.ConversationId,
+		RequestedAt: time.Now(),
+	})
+
+	msg := buildSessionSwitchPromptMessage(oldSessionID)
 
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
 		log.Printf("dingtalk: failed to send new session response: %v", err)
@@ -3496,11 +3748,12 @@ func (h *Handler) handleConfig(ctx context.Context, data *chatbot.BotCallbackDat
 
 	msgBuilder.WriteString("\n🔧 可用命令:\n")
 	msgBuilder.WriteString("  /model - 查看/设置模型\n")
+	msgBuilder.WriteString("  /memorycfg - 查看/设置记忆检索参数\n")
 	msgBuilder.WriteString("  /thinking - 查看/设置 thinking 返回\n")
 	msgBuilder.WriteString("  /final - 查看/设置 final-only 输出\n")
 	msgBuilder.WriteString("  /steps - 查看/设置步骤显示\n")
 	msgBuilder.WriteString("  /status - 查看会话状态\n")
-	msgBuilder.WriteString("  /new - 创建新会话\n")
+	msgBuilder.WriteString("  /new - 创建新会话（可选择延续当前任务）\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
 	msgBuilder.WriteString("  /fork - 派生(fork)当前会话\n")
 	msgBuilder.WriteString("  /compact - 压缩/总结当前会话\n")
@@ -3535,7 +3788,7 @@ func (h *Handler) handleFork(ctx context.Context, data *chatbot.BotCallbackDataM
 
 	// 更新用户的 session 映射到新派生的 session
 	h.adapter.MapUserToSession(userID, newSessionID)
-	h.client.ResetSession(data.ConversationId)
+	h.client.SetSessionForThread(data.ConversationId, newSessionID)
 	// 存储新 session 到 thread 映射
 	if data.ConversationId != "" {
 		h.adapter.MapSessionData(newSessionID, "channel", data.SessionWebhook)
@@ -3560,7 +3813,7 @@ func (h *Handler) handleCompact(ctx context.Context, data *chatbot.BotCallbackDa
 		return nil, nil
 	}
 
-	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 正在压缩会话历史..."))
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 正在调用 OpenCode 官方 compaction 压缩当前会话..."))
 
 	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
 		msg := fmt.Sprintf("❌ 压缩会话失败: %v", err)
@@ -3568,7 +3821,7 @@ func (h *Handler) handleCompact(ctx context.Context, data *chatbot.BotCallbackDa
 		return nil, err
 	}
 
-	msg := fmt.Sprintf("✅ 会话 %s 已压缩总结\n\n会话历史已被 AI 摘要，上下文占用将减少。\n后续对话将延续本次会话。", sessionID[:min(8, len(sessionID))])
+	msg := fmt.Sprintf("✅ 会话 %s 已完成官方压缩\n\nOpenCode 已在当前会话内完成 compaction。\n后续对话仍会继续使用这个会话。", sessionID[:min(8, len(sessionID))])
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 	return nil, nil
 }

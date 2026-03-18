@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/user/opencode-gateway/internal/bootstrap"
 	"github.com/user/opencode-gateway/internal/opencode"
 )
 
@@ -32,6 +33,8 @@ type uiSessionState struct {
 	Model           string `json:"model"`
 	Soul            string `json:"soul"`
 	UpdatedAt       string `json:"updated_at"`
+	PendingReset    bool   `json:"pending_reset,omitempty"`
+	ResetFrom       string `json:"reset_from,omitempty"`
 }
 
 type chatReq struct {
@@ -147,10 +150,11 @@ func (s *Server) handleChat(ctx context.Context, req chatReq) (interface{}, erro
 		return s.handleSlashCommand(ctx, state, msg)
 	}
 
-	content := msg
-	if strings.TrimSpace(state.Soul) != "" {
-		content = "[灵魂设定]\n" + state.Soul + "\n\n[用户消息]\n" + msg
+	if state.PendingReset {
+		return s.handlePendingResetChoice(ctx, state, msg)
 	}
+
+	content := msg
 
 	if state.SessionID != "" && strings.TrimSpace(state.Model) != "" {
 		_ = s.oc.UpdateSessionProvider(ctx, state.SessionID, "openai", state.Model)
@@ -179,6 +183,73 @@ func (s *Server) handleChat(ctx context.Context, req chatReq) (interface{}, erro
 	}, nil
 }
 
+func buildUIResetPromptMessage(sessionID string) string {
+	return fmt.Sprintf("当前有活跃会话 %s。\n\n请选择接下来怎么做：\n1. 继续原来的任务（先压缩当前会话，再派生新会话）\n2. 开始新的对话（不继承历史）\n\n请直接回复 1 或 2。", shortForID(sessionID))
+}
+
+func parseUIResetChoice(input string) string {
+	normalized := strings.TrimSpace(strings.ToLower(input))
+	normalized = strings.Map(func(r rune) rune {
+		if strings.ContainsRune(" \t\r\n,.;:!?，。；：！？()（）[]【】", r) {
+			return -1
+		}
+		return r
+	}, normalized)
+
+	switch normalized {
+	case "1", "/1", "继续", "继续原任务", "继续原来的任务", "继续任务", "continue", "/continue", "resume", "keep":
+		return "continue"
+	case "2", "/2", "新对话", "开始新对话", "开始新的对话", "新任务", "重新开始", "fresh", "new", "/new", "reset":
+		return "fresh"
+	default:
+		return ""
+	}
+}
+
+func (s *Server) handlePendingResetChoice(ctx context.Context, state *uiSessionState, input string) (interface{}, error) {
+	choice := parseUIResetChoice(input)
+	if choice == "" {
+		return map[string]string{"message": "请直接回复 1 或 2。\n\n" + buildUIResetPromptMessage(state.ResetFrom)}, nil
+	}
+
+	if choice == "fresh" {
+		s.mu.Lock()
+		state.SessionID = ""
+		state.ThreadID = "thread-" + state.UISessionID
+		state.PendingReset = false
+		state.ResetFrom = ""
+		state.UpdatedAt = time.Now().Format(time.RFC3339)
+		s.mu.Unlock()
+		return map[string]string{"message": "已开始新的对话。下条非命令消息将创建全新的会话，不会继承之前的任务上下文。"}, nil
+	}
+
+	oldSessionID := state.ResetFrom
+	newSessionID, err := s.oc.CompactAndForkSession(ctx, oldSessionID)
+	if err != nil {
+		return map[string]string{"message": "继续原任务失败: " + err.Error() + "\n\n请回复 1 重试，或回复 2 改为开始新的对话。"}, nil
+	}
+
+	s.mu.Lock()
+	state.SessionID = newSessionID
+	state.PendingReset = false
+	state.ResetFrom = ""
+	state.UpdatedAt = time.Now().Format(time.RFC3339)
+	threadID := state.ThreadID
+	model := state.Model
+	uiSessionID := state.UISessionID
+	s.mu.Unlock()
+
+	if strings.TrimSpace(threadID) == "" {
+		threadID = "thread-" + uiSessionID
+	}
+	s.oc.SetSessionForThread(threadID, newSessionID)
+	if strings.TrimSpace(model) != "" {
+		_ = s.oc.UpdateSessionProvider(ctx, newSessionID, "openai", model)
+	}
+
+	return map[string]string{"message": fmt.Sprintf("已继续原任务。\n\n旧会话: %s\n新会话: %s\n\n后续对话将使用新的派生会话继续处理。", shortForID(oldSessionID), shortForID(newSessionID))}, nil
+}
+
 func (s *Server) handleSlashCommand(ctx context.Context, state *uiSessionState, cmd string) (interface{}, error) {
 	fields := strings.Fields(cmd)
 	if len(fields) == 0 {
@@ -187,7 +258,7 @@ func (s *Server) handleSlashCommand(ctx context.Context, state *uiSessionState, 
 
 	switch fields[0] {
 	case "/help":
-		return map[string]string{"message": "可用命令: /help, /model, /model openai/<model>, /provider <base_url> <api_key>, /soul, /soul set <text>, /skills, /skills install <name>, /reset"}, nil
+		return map[string]string{"message": "可用命令: /help, /model, /model openai/<model>, /provider <base_url> <api_key>, /soul, /soul set <text>, /soul set <vibe|boundaries|core|continuity> <text>, /skills, /skills install <name>, /reset（可选择延续当前任务）"}, nil
 	case "/model":
 		if len(fields) == 1 {
 			return s.handleModelQuery(ctx, state)
@@ -219,6 +290,12 @@ func (s *Server) handleSlashCommand(ctx context.Context, state *uiSessionState, 
 		return map[string]string{"message": "provider 配置已保存 (openai format)"}, nil
 	case "/soul":
 		if len(fields) == 1 {
+			if fromFile, err := s.loadSoulFromFile(); err == nil && strings.TrimSpace(fromFile) != "" {
+				s.mu.Lock()
+				state.Soul = fromFile
+				state.UpdatedAt = time.Now().Format(time.RFC3339)
+				s.mu.Unlock()
+			}
 			text := strings.TrimSpace(state.Soul)
 			if text == "" {
 				text = "<未设置>"
@@ -226,17 +303,24 @@ func (s *Server) handleSlashCommand(ctx context.Context, state *uiSessionState, 
 			return map[string]string{"message": text}, nil
 		}
 		if len(fields) >= 3 && fields[1] == "set" {
-			text := strings.TrimSpace(strings.TrimPrefix(cmd, "/soul set"))
+			section, text := parseSoulSetInput(fields, cmd)
 			if text == "" {
 				return nil, fmt.Errorf("soul 不能为空")
 			}
+			if err := s.saveSoulToFile(section, text); err != nil {
+				return nil, fmt.Errorf("保存 soul.md 失败: %w", err)
+			}
+			latest := text
+			if fromFile, err := s.loadSoulFromFile(); err == nil && strings.TrimSpace(fromFile) != "" {
+				latest = fromFile
+			}
 			s.mu.Lock()
-			state.Soul = text
+			state.Soul = latest
 			state.UpdatedAt = time.Now().Format(time.RFC3339)
 			s.mu.Unlock()
-			return map[string]string{"message": "灵魂设定已更新"}, nil
+			return map[string]string{"message": fmt.Sprintf("灵魂设定已更新（写入 SOUL 的 %s 段），并已同步到 soul.md", soulSectionLabel(section))}, nil
 		}
-		return nil, fmt.Errorf("用法: /soul 或 /soul set <text>")
+		return nil, fmt.Errorf("用法: /soul 或 /soul set <text> 或 /soul set <vibe|boundaries|core|continuity> <text>")
 	case "/skills":
 		if len(fields) == 1 {
 			return s.handleSkillsQuery(ctx)
@@ -246,12 +330,24 @@ func (s *Server) handleSlashCommand(ctx context.Context, state *uiSessionState, 
 		}
 		return nil, fmt.Errorf("用法: /skills 或 /skills install <name>")
 	case "/reset":
+		if strings.TrimSpace(state.SessionID) == "" {
+			s.mu.Lock()
+			state.SessionID = ""
+			state.ThreadID = "thread-" + state.UISessionID
+			state.PendingReset = false
+			state.ResetFrom = ""
+			state.UpdatedAt = time.Now().Format(time.RFC3339)
+			s.mu.Unlock()
+			return map[string]string{"message": "当前没有活跃会话。下条消息将创建新会话。"}, nil
+		}
+
 		s.mu.Lock()
-		state.SessionID = ""
-		state.ThreadID = "thread-" + state.UISessionID
+		state.PendingReset = true
+		state.ResetFrom = state.SessionID
 		state.UpdatedAt = time.Now().Format(time.RFC3339)
+		currentSessionID := state.SessionID
 		s.mu.Unlock()
-		return map[string]string{"message": "会话已重置，下条消息将创建新会话"}, nil
+		return map[string]string{"message": buildUIResetPromptMessage(currentSessionID)}, nil
 	default:
 		return nil, fmt.Errorf("未知命令: %s", fields[0])
 	}
@@ -306,13 +402,20 @@ func (s *Server) handleSetSoul(req soulReq) (interface{}, error) {
 	if len(text) > 2000 {
 		return nil, fmt.Errorf("soul 太长，最多 2000 字")
 	}
+	if err := s.saveSoulToFile("vibe", text); err != nil {
+		return nil, fmt.Errorf("保存 soul.md 失败: %w", err)
+	}
+	latest := text
+	if fromFile, err := s.loadSoulFromFile(); err == nil && strings.TrimSpace(fromFile) != "" {
+		latest = fromFile
+	}
 
 	s.mu.Lock()
-	state.Soul = text
+	state.Soul = latest
 	state.UpdatedAt = time.Now().Format(time.RFC3339)
 	s.mu.Unlock()
 
-	return map[string]string{"message": "灵魂设定已保存"}, nil
+	return map[string]string{"message": "灵魂设定已保存（默认写入 SOUL 的 Vibe 段），并已同步到 soul.md"}, nil
 }
 
 func (s *Server) handleGetState(req stateReq) (interface{}, error) {
@@ -665,8 +768,180 @@ func (s *Server) getState(uiSessionID string) *uiSessionState {
 		ThreadID:    "thread-" + id,
 		UpdatedAt:   time.Now().Format(time.RFC3339),
 	}
+	if soulText, err := s.loadSoulFromFile(); err == nil {
+		st.Soul = soulText
+	}
 	s.sessions[id] = st
 	return st
+}
+
+func (s *Server) soulFilePaths() []string {
+	base := bootstrap.ResolveBootstrapDir(strings.TrimSpace(s.oc.Directory()))
+	return []string{
+		filepath.Join(base, "soul.md"),
+		filepath.Join(base, "SOUL.md"),
+	}
+}
+
+func (s *Server) loadSoulFromFile() (string, error) {
+	for _, p := range s.soulFilePaths() {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", err
+		}
+		text := strings.TrimSpace(string(b))
+		if text != "" {
+			return text, nil
+		}
+	}
+	return "", nil
+}
+
+func (s *Server) saveSoulToFile(section, text string) error {
+	base := bootstrap.ResolveBootstrapDir(strings.TrimSpace(s.oc.Directory()))
+	botName := strings.TrimSpace(os.Getenv("OPENBOT_NAME"))
+	if _, err := bootstrap.EnsurePersonaFiles(base, botName); err != nil {
+		return err
+	}
+
+	for _, p := range s.soulFilePaths() {
+		existing := ""
+		if b, err := os.ReadFile(p); err == nil {
+			existing = string(b)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+
+		merged := mergeSoulContent(existing, section, text)
+		if err := os.WriteFile(p, []byte(merged), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mergeSoulContent(existing, section, update string) string {
+	trimmedUpdate := strings.TrimSpace(update)
+	if trimmedUpdate == "" {
+		return strings.TrimSpace(existing) + "\n"
+	}
+
+	// If caller provides a full SOUL document, respect full replacement.
+	if strings.Contains(trimmedUpdate, "# SOUL.md") || strings.Contains(trimmedUpdate, "## Core Truths") {
+		return trimmedUpdate + "\n"
+	}
+
+	base := strings.TrimSpace(existing)
+	if base == "" {
+		base = "# SOUL.md - Who You Are"
+	}
+
+	heading := soulSectionHeading(section)
+	lines := strings.Split(base, "\n")
+	start := -1
+	end := -1
+	for i, line := range lines {
+		if strings.EqualFold(strings.TrimSpace(line), heading) {
+			start = i
+			continue
+		}
+		if start >= 0 && strings.HasPrefix(strings.TrimSpace(line), "## ") {
+			end = i
+			break
+		}
+	}
+	if start >= 0 && end < 0 {
+		end = len(lines)
+	}
+
+	sectionLines := make([]string, 0)
+	for _, line := range strings.Split(trimmedUpdate, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		if strings.HasPrefix(t, "-") {
+			sectionLines = append(sectionLines, t)
+		} else {
+			sectionLines = append(sectionLines, "- "+t)
+		}
+	}
+	if len(sectionLines) == 0 {
+		sectionLines = append(sectionLines, "- "+trimmedUpdate)
+	}
+
+	replacement := append([]string{heading, ""}, sectionLines...)
+
+	if start >= 0 {
+		merged := append([]string{}, lines[:start]...)
+		merged = append(merged, replacement...)
+		merged = append(merged, lines[end:]...)
+		return strings.TrimSpace(strings.Join(merged, "\n")) + "\n"
+	}
+
+	if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
+		lines = append(lines, "")
+	}
+	lines = append(lines, replacement...)
+	return strings.TrimSpace(strings.Join(lines, "\n")) + "\n"
+}
+
+func parseSoulSetInput(fields []string, cmd string) (string, string) {
+	section := "vibe"
+	remainder := strings.TrimSpace(strings.TrimPrefix(cmd, "/soul set"))
+	if len(fields) >= 4 {
+		if normalized, ok := normalizeSoulSection(fields[2]); ok {
+			section = normalized
+			prefix := "/soul set " + fields[2]
+			remainder = strings.TrimSpace(strings.TrimPrefix(cmd, prefix))
+		}
+	}
+	return section, remainder
+}
+
+func normalizeSoulSection(raw string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	switch s {
+	case "vibe", "style", "语气", "风格":
+		return "vibe", true
+	case "boundaries", "boundary", "guardrails", "边界":
+		return "boundaries", true
+	case "core", "truths", "coretruths", "核心":
+		return "core", true
+	case "continuity", "memory", "持续性", "连续性":
+		return "continuity", true
+	default:
+		return "", false
+	}
+}
+
+func soulSectionHeading(section string) string {
+	switch section {
+	case "boundaries":
+		return "## Boundaries"
+	case "core":
+		return "## Core Truths"
+	case "continuity":
+		return "## Continuity"
+	default:
+		return "## Vibe"
+	}
+}
+
+func soulSectionLabel(section string) string {
+	switch section {
+	case "boundaries":
+		return "Boundaries"
+	case "core":
+		return "Core Truths"
+	case "continuity":
+		return "Continuity"
+	default:
+		return "Vibe"
+	}
 }
 
 func shortForID(s string) string {

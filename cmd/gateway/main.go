@@ -6,9 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +21,7 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
+	"github.com/user/opencode-gateway/internal/bootstrap"
 	"github.com/user/opencode-gateway/internal/config"
 	"github.com/user/opencode-gateway/internal/logging"
 	"github.com/user/opencode-gateway/internal/opencode"
@@ -46,6 +50,28 @@ func main() {
 	logging.Install(level)
 	log.Printf("log level set to %s (source=%s)", level.String(), levelSource)
 
+	bootstrapDir := bootstrap.ResolveBootstrapDir(strings.TrimSpace(os.Getenv("OPENCODE_DIRECTORY")))
+	botName := strings.TrimSpace(os.Getenv("OPENBOT_NAME"))
+	personaSetupPrompt := ""
+	bootstrapFiles, err := bootstrap.EnsurePersonaFiles(bootstrapDir, botName)
+	if err != nil {
+		log.Printf("bootstrap persona files error: %v", err)
+	} else {
+		created := 0
+		for _, status := range bootstrapFiles {
+			if status.Created {
+				created++
+			}
+		}
+		log.Printf("bootstrap persona files ready: total=%d created=%d dir=%s", len(bootstrapFiles), created, bootstrapDir)
+	}
+	if setupStatus, setupErr := bootstrap.InspectPersonaSetup(bootstrapDir); setupErr != nil {
+		log.Printf("bootstrap persona inspect error: %v", setupErr)
+	} else if setupStatus.NeedsSetup {
+		personaSetupPrompt = setupStatus.Prompt
+		log.Printf("bootstrap persona setup pending: reasons=%v", setupStatus.Reasons)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config error: %v", err)
@@ -70,7 +96,32 @@ func main() {
 	adapterRegistry := base.NewAdapterRegistry()
 	var serveManager *opencodesvc.Manager
 	if cfg.OpenCodeManageServe {
-		serveManager = opencodesvc.NewManager(cfg.OpenCodeDirectory, cfg.OpenCodeServeCommand, cfg.OpenCodeServeArgs)
+		// Inject --port <n> into the serve args so opencode binds to a known port
+		// (opencode ≥1.2 defaults to --port 0 / random port).
+		// Strategy:
+		//   1. If the caller already supplied --port in OPENCODE_SERVE_ARGS, honour it.
+		//   2. Otherwise pick a free port dynamically: try the port from
+		//      OPENCODE_ENDPOINT first; if it is in use fall back to any free port.
+		//      Update cfg.OpenCodeEndpoint so the client connects to the right port.
+		serveArgs := cfg.OpenCodeServeArgs
+		hasPortFlag := false
+		for _, a := range serveArgs {
+			if a == "--port" || strings.HasPrefix(a, "--port=") {
+				hasPortFlag = true
+				break
+			}
+		}
+		if !hasPortFlag {
+			freePort := pickFreePort(cfg.OpenCodeEndpoint)
+			endpointURL, parseErr := url.Parse(cfg.OpenCodeEndpoint)
+			if parseErr == nil {
+				endpointURL.Host = endpointURL.Hostname() + ":" + strconv.Itoa(freePort)
+				cfg.OpenCodeEndpoint = endpointURL.String()
+			}
+			serveArgs = append(serveArgs, "--port", strconv.Itoa(freePort))
+			log.Printf("opencodesvc: injecting --port %d into serve args; endpoint=%s", freePort, cfg.OpenCodeEndpoint)
+		}
+		serveManager = opencodesvc.NewManager(cfg.OpenCodeDirectory, cfg.OpenCodeServeCommand, serveArgs)
 		msg, startErr := serveManager.Start(ctx)
 		if startErr != nil {
 			log.Fatalf("opencode serve manager start error: %v", startErr)
@@ -88,6 +139,9 @@ func main() {
 	// Create OpenCode client with event handling support
 	ocOptions := []opencode.Option{
 		opencode.WithDirectory(cfg.OpenCodeDirectory),
+	}
+	if strings.TrimSpace(personaSetupPrompt) != "" {
+		ocOptions = append(ocOptions, opencode.WithPersonaSetupPrompt(personaSetupPrompt))
 	}
 	if serveManager != nil {
 		ocOptions = append(ocOptions, opencode.WithServerUnavailableHandler(func(restartCtx context.Context, reason string) (string, error) {
@@ -392,6 +446,36 @@ func main() {
 			"status":   "ok",
 			"note":     "Session mappings are stored in memory. Check application logs for detailed session->user mappings.",
 			"adapters": sessionMappings,
+		})
+	})
+
+	mux.HandleFunc("/debug/memory/recall", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		channel := strings.TrimSpace(r.URL.Query().Get("channel"))
+		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+		query := strings.TrimSpace(r.URL.Query().Get("query"))
+		limit := 8
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+		if channel == "" || userID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "missing required query params: channel, user_id",
+			})
+			return
+		}
+
+		results := ocClient.PreviewMemoryRecall(channel, userID, query, limit)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"channel": channel,
+			"user_id": userID,
+			"query":   query,
+			"limit":   limit,
+			"count":   len(results),
+			"items":   results,
 		})
 	})
 
@@ -749,4 +833,34 @@ func handleCronPermission(ctx context.Context, ocClient *opencode.Client, event 
 
 	log.Printf("opencode cron: successfully auto-answered %s for cron session %s", eventType, sessionID[:min(8, len(sessionID))])
 	return nil
+}
+
+// pickFreePort returns a free TCP port, preferring the port encoded in
+// preferredEndpoint.  If that port is already in use (or cannot be parsed),
+// it falls back to asking the OS for any available port.
+func pickFreePort(preferredEndpoint string) int {
+	// Try the preferred port first.
+	if u, err := url.Parse(preferredEndpoint); err == nil {
+		if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+			if err == nil {
+				ln.Close()
+				return p
+			}
+			log.Printf("opencodesvc: preferred port %d is in use, picking a random free port", p)
+		}
+	}
+	// Fall back to OS-assigned free port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		// Extremely unlikely; return the preferred port anyway and let opencode fail loudly.
+		if u, _ := url.Parse(preferredEndpoint); u != nil {
+			if p, _ := strconv.Atoi(u.Port()); p > 0 {
+				return p
+			}
+		}
+		return 4096
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
 }

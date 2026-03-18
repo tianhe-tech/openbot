@@ -16,10 +16,10 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
   - Permission/Q&A auto-reply support
 
 - **Smart Session Management**
-  - Auto-summarization: Summarizes conversation after context threshold
-  - Auto-renewal: Creates new session when context is full
-  - Context preservation: Carries conversation summary to new sessions
-  - Token estimation to prevent context overflow
+  - Official session lifecycle: Reuses the same OpenCode session and relies on server-side compaction
+  - Explicit new-dialog flow: `/new` and `/reset` ask whether to continue the current task or start fresh, and users reply `1` or `2`
+  - Task continuation: The gateway uses official summarize/compaction plus fork to continue work in a new session
+  - Session status visibility: Token estimates remain available for diagnostics and status views
 
 - **Streaming Progress Updates** ⚡
   - Real-time progress notifications via SSE

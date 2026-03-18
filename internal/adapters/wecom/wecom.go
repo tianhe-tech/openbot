@@ -147,6 +147,9 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 	if content == "/status" || content == "状态" {
 		return h.handleStatus(userID)
 	}
+	if strings.HasPrefix(content, "/memorycfg") {
+		return h.handleMemoryConfig(content)
+	}
 	if strings.HasPrefix(content, "/memory") {
 		return h.handleMemory(userID, content)
 	}
@@ -173,7 +176,7 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 			"msg_type": env.MsgType,
 		},
 	}, func(chunk string) error {
-		// First callback with a session-ID-like value is a mapping signal.
+		// Session-mapping signal: first callback starting with "ses_".
 		if !sessionMapped && strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
 			h.adapter.MapUserToSession(userID, chunk)
 			log.Printf("wecom: mapped user %s to session %s", userID, chunk[:min(8, len(chunk))])
@@ -181,6 +184,24 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 			return nil
 		}
 		if chunk == "" {
+			return nil
+		}
+		// FlushSignal: notifyCompletion asks us to flush; for WeChat the final
+		// send happens after SendMessageStreaming returns, so we just skip it.
+		if chunk == opencode.FlushSignal {
+			return nil
+		}
+		// Queued notification: send immediately as a one-off message and
+		// do NOT include it in the accumulated final reply.
+		if strings.HasPrefix(chunk, "⏳") {
+			_ = h.SendMessage(sendCtx, "wecom", userID, chunk)
+			return nil
+		}
+		// Drop internal signal prefixes (tool/step/todo) from the final reply.
+		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.StepSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.TodoSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
 			return nil
 		}
 		mu.Lock()
@@ -231,9 +252,123 @@ func (h *Handler) handleHelp() (string, error) {
 /memory merge-import <base64> - 合并导入记忆快照（不覆盖）
 /memory clear      - 清空当前用户记忆
 /memory compact    - 压缩去重当前用户记忆
+/memorycfg show    - 查看记忆检索/压缩参数
+/memorycfg set <key> <value> - 修改记忆参数（运行时生效）
+/memorycfg on|off  - 快速开关长期记忆
+/memorycfg quota set <category=n,...> - 设置分类配额
+/memorycfg reset default - 恢复启动时默认参数
 
  直接发送消息即可与 AI 对话`
 	return helpText, nil
+}
+
+func (h *Handler) handleMemoryConfig(content string) (string, error) {
+	parts := strings.Fields(strings.TrimSpace(content))
+
+	format := func(cfg opencode.MemoryRuntimeConfig) string {
+		quota := ""
+		if len(cfg.CategoryQuota) == 0 {
+			quota = "(empty)"
+		} else {
+			ordered := []string{"profile", "preference", "project", "environment", "model", "conversation"}
+			segments := make([]string, 0, len(cfg.CategoryQuota))
+			used := map[string]bool{}
+			for _, k := range ordered {
+				if v, ok := cfg.CategoryQuota[k]; ok {
+					segments = append(segments, fmt.Sprintf("%s=%d", k, v))
+					used[k] = true
+				}
+			}
+			for k, v := range cfg.CategoryQuota {
+				if used[k] {
+					continue
+				}
+				segments = append(segments, fmt.Sprintf("%s=%d", k, v))
+			}
+			quota = strings.Join(segments, ",")
+		}
+
+		return fmt.Sprintf("🧠 Memory Runtime Config\n\n"+
+			"enabled=%t\n"+
+			"max_chars=%d\n"+
+			"max_facts=%d\n"+
+			"inject_facts=%d\n"+
+			"short_term_facts=%d\n"+
+			"recent_window=%s\n"+
+			"decay_enabled=%t\n"+
+			"decay_half_life=%s\n"+
+			"category_quota_enabled=%t\n"+
+			"category_quota=%s\n"+
+			"auto_compact_interval=%s\n"+
+			"debug_recall=%t",
+			cfg.Enabled,
+			cfg.MaxChars,
+			cfg.MaxFacts,
+			cfg.InjectFacts,
+			cfg.ShortTermFacts,
+			cfg.RecentWindow,
+			cfg.DecayEnabled,
+			cfg.DecayHalfLife,
+			cfg.CategoryQuotaEnabled,
+			quota,
+			cfg.AutoCompactInterval,
+			cfg.DebugRecall,
+		)
+	}
+
+	usage := "❌ 用法:\n" +
+		"/memorycfg show\n" +
+		"/memorycfg on|off\n" +
+		"/memorycfg quota set <category=n,...>\n" +
+		"/memorycfg reset default\n" +
+		"/memorycfg set <key> <value>\n\n" +
+		"常用 key:\n" +
+		"enabled|max_chars|max_facts|inject_facts|short_term_facts\n" +
+		"recent_window|decay_enabled|decay_half_life\n" +
+		"category_quota_enabled|category_quota|auto_compact_interval|debug_recall\n\n" +
+		"示例:\n" +
+		"/memorycfg set inject_facts 12\n" +
+		"/memorycfg set decay_half_life 240h\n" +
+		"/memorycfg set category_quota preference=2,project=1"
+
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
+		return format(h.client.GetMemoryRuntimeConfig()), nil
+	}
+
+	if len(parts) >= 2 && (strings.EqualFold(parts[1], "on") || strings.EqualFold(parts[1], "off")) {
+		cfg, err := h.client.UpdateMemoryRuntimeConfig("enabled", parts[1])
+		if err != nil {
+			return "❌ 更新失败: " + err.Error() + "\n\n" + usage, nil
+		}
+		return "✅ 已更新 memory 开关\n\n" + format(cfg), nil
+	}
+
+	if len(parts) >= 4 && strings.EqualFold(parts[1], "quota") && strings.EqualFold(parts[2], "set") {
+		value := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+		cfg, err := h.client.UpdateMemoryRuntimeConfig("category_quota", value)
+		if err != nil {
+			return "❌ 更新失败: " + err.Error() + "\n\n" + usage, nil
+		}
+		cfg, _ = h.client.UpdateMemoryRuntimeConfig("category_quota_enabled", "on")
+		return "✅ 已更新分类配额并自动启用\n\n" + format(cfg), nil
+	}
+
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "reset") && strings.EqualFold(parts[2], "default") {
+		cfg := h.client.ResetMemoryRuntimeConfigToDefault()
+		return "✅ 已恢复启动默认 memory 配置\n\n" + format(cfg), nil
+	}
+
+	if len(parts) >= 4 && strings.EqualFold(parts[1], "set") {
+		key := parts[2]
+		value := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
+		cfg, err := h.client.UpdateMemoryRuntimeConfig(key, value)
+		if err != nil {
+			return "❌ 更新失败: " + err.Error() + "\n\n" + usage, nil
+		}
+		return "✅ 已更新 memory 配置\n\n" + format(cfg), nil
+	}
+
+	return usage, nil
 }
 
 func (h *Handler) handleMemory(userID, content string) (string, error) {

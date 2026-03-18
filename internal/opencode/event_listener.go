@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sst/opencode-sdk-go"
 )
@@ -33,11 +35,13 @@ type StreamingSessionHandler struct {
 	lastEventType      string    // 最后一次收到的事件类型
 	mu                 sync.Mutex
 	completed          bool
-	contentSent        bool        // 标记是否已发送过内容
-	waitingHintSent    bool        // 标记是否已发送等待提示
-	receivedStepFinish bool        // 标记是否已收到 step-finish 事件
-	stepFinishTime     time.Time   // 收到 step-finish 的时间
-	waitingTimer       *time.Timer // 等待提示定时器
+	doneCh             chan struct{} // closed when session reaches a terminal state (idle/error/deleted)
+	doneOnce           sync.Once     // ensures doneCh is closed exactly once
+	contentSent        bool          // 标记是否已发送过内容
+	waitingHintSent    bool          // 标记是否已发送等待提示
+	receivedStepFinish bool          // 标记是否已收到 step-finish 事件
+	stepFinishTime     time.Time     // 收到 step-finish 的时间
+	waitingTimer       *time.Timer   // 等待提示定时器
 	onComplete         func()
 	client             *Client       // 用于存储问题
 	messageSender      MessageSender // 用于主动推送消息到用户
@@ -46,11 +50,13 @@ type StreamingSessionHandler struct {
 	lastTodoSummary    string        // 最近一次自动推送的 todo 文本（用于去重）
 	lastTodoPushTime   time.Time     // 最近一次自动推送 todo 的时间
 	// 增量内容追踪（对照 TUI sync.tsx 中 message.part.delta / message.part.updated 机制）
-	partTextCache   sync.Map   // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
-	toolSignalCache sync.Map   // partID -> string: 最近一次已发送的工具状态签名，避免重复推送
-	partRoles       sync.Map   // partID -> string: 每个 part 所属 message 的 role（"user"/"assistant"），用于过滤用户消息
-	sessionTodos    []TodoItem // 当前 todo 列表（来自 todo.updated 事件）
-	sessionDiff     []FileDiff // 本次会话的文件变更（来自 session.diff 事件）
+	partTextCache      sync.Map   // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
+	partDeltaSeen      sync.Map   // partID -> bool: 已收到过 message.part.delta，优先使用 delta，避免快照污染
+	toolSignalCache    sync.Map   // partID -> string: 最近一次已发送的工具状态签名，避免重复推送
+	partRoles          sync.Map   // partID -> string: 每个 part 所属 message 的 role（"user"/"assistant"），用于过滤用户消息
+	sessionTodos       []TodoItem // 当前 todo 列表（来自 todo.updated 事件）
+	sessionDiff        []FileDiff // 本次会话的文件变更（来自 session.diff 事件）
+	hasPendingQuestion bool       // true while question.asked/permission.asked awaits user reply
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -64,6 +70,7 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onCom
 		messageSender:  messageSender,
 		showThinking:   showThinking,
 		showSteps:      showSteps,
+		doneCh:         make(chan struct{}),
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
@@ -142,6 +149,14 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		}(),
 		s.sessionID[:8])
 
+	if candidateSessionID != "" && candidateSessionID != s.sessionID {
+		log.Printf("opencode: ignore cross-session event type=%s eventSession=%s handlerSession=%s",
+			eventType,
+			candidateSessionID[:min(8, len(candidateSessionID))],
+			s.sessionID[:8])
+		return nil
+	}
+
 	if s.completed {
 		log.Printf("opencode: ignoring event for completed session %s", s.sessionID[:8])
 		return nil
@@ -156,7 +171,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 	// 只处理 message.part.updated 事件获取增量内容
 	switch eventType {
 	case "message.part.updated":
-		// 先解析 partID 和 role，记录到 partRoles（供 message.part.delta 过滤用户消息）
+		// 解析 partID、messageID 和 partType，用于 step-finish 检测和 partRoles 查找。
+		// 注意：message.part.updated 的 properties.part 包含完整的 Part 对象
+		// (id, messageID, sessionID, type, text, ...)，没有独立的 message 字段。
+		// role 信息来自 message.updated 事件（存入 client.messageRoles）。
 		if jsonData := event.JSON.RawJSON(); jsonData != "" {
 			// 🔍 输出原始 JSON 用于诊断
 			log.Printf("opencode: 🔍 message.part.updated RAW JSON (first 800 chars): %.800s", jsonData)
@@ -164,22 +182,19 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			var partMeta struct {
 				Properties struct {
 					Part struct {
-						ID   string `json:"id"`
-						Type string `json:"type"`
+						ID        string `json:"id"`
+						MessageID string `json:"messageID"`
+						Type      string `json:"type"`
 					} `json:"part"`
-					Message struct {
-						Role string `json:"role"`
-					} `json:"message"`
 				} `json:"properties"`
 			}
 			if err := json.Unmarshal([]byte(jsonData), &partMeta); err == nil {
 				partID := partMeta.Properties.Part.ID
-				role := partMeta.Properties.Message.Role
-				log.Printf("opencode: 🔍 message.part.updated parsed - partID=%s, role=%s, partType=%s",
-					partID[:min(8, len(partID))], role, partMeta.Properties.Part.Type)
-				if partID != "" && role != "" {
-					s.partRoles.Store(partID, role)
-				}
+				msgID := partMeta.Properties.Part.MessageID
+				log.Printf("opencode: 🔍 message.part.updated parsed - partID=%s, msgID=%s, partType=%s",
+					partID[:min(8, len(partID))], msgID[:min(8, len(msgID))], partMeta.Properties.Part.Type)
+				// partRoles is populated from message.updated events (via client.messageRoles).
+				// Here we only track step-finish for timeout logic.
 				if partMeta.Properties.Part.Type == "step-finish" {
 					s.receivedStepFinish = true
 					s.stepFinishTime = time.Now()
@@ -216,18 +231,48 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		}
 
 	case "question.answered", "permission.answered":
-		// 用户已回答问题或权限请求
+		// 用户已回答问题或权限请求；恢复正常空闲超时
+		s.hasPendingQuestion = false
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
 	case "permission.replied":
-		// 权限已确认（兼容性事件）
+		// 权限已确认（兼容性事件）；恢复正常空闲超时
+		s.hasPendingQuestion = false
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
-	case "question.asked", "permission.asked":
-		// OpenCode 需要用户确认（build 模式或权限请求）
-		// ⚠️ 不再设置 waitingForResponse，以免阻止后续事件处理
-		// s.waitingForResponse = true // 注释掉，让事件继续流动
+	case "question.asked", "permission.asked", "permission.updated":
+		// OpenCode 需要用户确认（question.asked / permission.asked = 旧 SDK；permission.updated = 新 SDK ≥ v1.2）
 		log.Printf("opencode: user response needed (type: %s) for session %s", event.Type, s.sessionID[:8])
+
+		// permission.updated 可能多次触发（创建/回复后）。只在 permission 尚未回复时处理。
+		if eventType == "permission.updated" {
+			if raw := event.JSON.RawJSON(); raw != "" {
+				var probe struct {
+					Properties struct {
+						ID   string `json:"id"`
+						Time struct {
+							Responded float64 `json:"responded"`
+						} `json:"time"`
+					} `json:"properties"`
+				}
+				if err := json.Unmarshal([]byte(raw), &probe); err == nil {
+					if probe.Properties.Time.Responded > 0 {
+						// 权限已被回复，这是第二次 permission.updated，跳过
+						log.Printf("opencode: permission.updated (already responded, id=%s) — ignoring",
+							probe.Properties.ID)
+						break
+					}
+					// 检查是否已存储该 permission（防止重复显示）
+					if probe.Properties.ID != "" && s.client != nil {
+						if _, exists := s.client.GetPendingQuestion(probe.Properties.ID); exists {
+							log.Printf("opencode: permission.updated (already stored, id=%s) — ignoring",
+								probe.Properties.ID)
+							break
+						}
+					}
+				}
+			}
+		}
 
 		question, questionMsg := s.extractQuestionFromEvent(event)
 		if question != nil && s.client != nil {
@@ -253,6 +298,8 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			log.Printf("opencode: %s message sent via callback successfully", event.Type)
 			s.contentSent = true
 		}
+		// 标记正在等待用户回复，阻止 SendMessageStreaming 的短超时触发
+		s.hasPendingQuestion = true
 
 	case "session.idle":
 		s.completed = true
@@ -271,6 +318,11 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 	case "session.updated":
 		// Session 更新事件，静默处理
 		log.Printf("opencode: session updated for session %s", s.sessionID[:8])
+
+	case "session.compacted":
+		// Session 压缩事件（新 SDK ≥ v1.2）：将历史上下文压缩以减小 token 占用。
+		// 这是正常操作，不影响会话继续执行。
+		log.Printf("opencode: session compacted for session %s", s.sessionID[:8])
 
 	case "session.status":
 		// Session 状态事件，静默处理
@@ -371,6 +423,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				} else {
 					// callback 成功后才提交缓存，确保"缓存 == 已送达"
 					if partID != "" {
+						s.partDeltaSeen.Store(partID, true)
 						existing, _ := s.partTextCache.Load(partID)
 						existingStr, _ := existing.(string)
 						s.partTextCache.Store(partID, existingStr+delta)
@@ -428,6 +481,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			}
 			if err := json.Unmarshal([]byte(raw), &w); err == nil && w.Properties.PartID != "" {
 				s.partTextCache.Delete(w.Properties.PartID)
+				s.partDeltaSeen.Delete(w.Properties.PartID)
 				s.toolSignalCache.Delete(w.Properties.PartID)
 			}
 		}
@@ -498,6 +552,7 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 
 	type ToolState struct {
 		Status string    `json:"status"`
+		Title  string    `json:"title"` // human-readable title (new SDK ≥ v1.2)
 		Input  ToolInput `json:"input"`
 		Output string    `json:"output"`
 		Error  string    `json:"error"`
@@ -559,6 +614,10 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 	case "text":
 		// 优先使用 delta 字段（部分 server 版本在 message.part.updated 中直接送 delta）
 		if props.Delta != "" {
+			if looksLikeGarbledText(props.Delta) {
+				log.Printf("opencode: 🚫 drop suspicious part.updated delta (partID=%s, len=%d)", props.Part.ID[:min(8, len(props.Part.ID))], len(props.Delta))
+				return "", "", ""
+			}
 			if props.Part.ID != "" {
 				existing, _ := s.partTextCache.Load(props.Part.ID)
 				existingStr, _ := existing.(string)
@@ -571,13 +630,28 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 			return props.Delta, "", ""
 		}
 
+		// 当已收到过 message.part.delta 时，优先信任 delta，忽略 updated 快照文本。
+		if props.Part.ID != "" {
+			if _, ok := s.partDeltaSeen.Load(props.Part.ID); ok {
+				return "", "", ""
+			}
+		}
+
 		// 没有 delta 时，利用 partTextCache 计算增量
 		// 这对应 TUI 中 message.part.updated 携带完整 part.text 而非 delta 的情况
 		if props.Part.Text != "" && props.Part.ID != "" {
+			if looksLikeGarbledText(props.Part.Text) {
+				log.Printf("opencode: 🚫 drop suspicious part.updated snapshot (partID=%s, len=%d)", props.Part.ID[:min(8, len(props.Part.ID))], len(props.Part.Text))
+				return "", "", ""
+			}
 			existing, _ := s.partTextCache.Load(props.Part.ID)
 			existingStr, _ := existing.(string)
 			if len(props.Part.Text) > len(existingStr) {
 				delta := props.Part.Text[len(existingStr):]
+				if looksLikeGarbledText(delta) {
+					log.Printf("opencode: 🚫 drop suspicious computed delta from snapshot (partID=%s, len=%d)", props.Part.ID[:min(8, len(props.Part.ID))], len(delta))
+					return "", "", ""
+				}
 				s.partTextCache.Store(props.Part.ID, props.Part.Text)
 				log.Printf("opencode: 🔍 extractContent - computed delta from cached text (%d new chars, total=%d)",
 					len(delta), len(props.Part.Text))
@@ -589,6 +663,10 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 			// 没有 partID 时，用 lastContent 估算增量（兼容旧行为）
 			if len(props.Part.Text) > len(s.lastContent) {
 				delta := props.Part.Text[len(s.lastContent):]
+				if looksLikeGarbledText(delta) {
+					log.Printf("opencode: 🚫 drop suspicious inferred delta (no partID, len=%d)", len(delta))
+					return "", "", ""
+				}
 				log.Printf("opencode: 🔍 extractContent - inferred delta (no partID, %d chars)", len(delta))
 				return delta, "", ""
 			}
@@ -603,7 +681,11 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 
 		switch state.Status {
 		case "running":
-			desc := state.Input.Description
+			// 优先使用 SDK 提供的 title（新 ≥ v1.2），其次是把 input 内各字段
+			desc := state.Title
+			if desc == "" {
+				desc = state.Input.Description
+			}
 			if desc == "" {
 				desc = state.Input.Command
 			}
@@ -801,14 +883,46 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 	return message
 }
 
+func looksLikeGarbledText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	if !utf8.ValidString(trimmed) {
+		return true
+	}
+	if strings.ContainsRune(trimmed, '�') || strings.Contains(trimmed, "\\uFFFD") {
+		return true
+	}
+
+	markers := []string{"Ã", "Â", "ðŸ", "ä¸", "ï¿½", "鐢", "涓", "鍙"}
+	for _, m := range markers {
+		if strings.Contains(trimmed, m) {
+			return true
+		}
+	}
+
+	controlCount := 0
+	for _, r := range trimmed {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			controlCount++
+		}
+	}
+	return controlCount > 0
+}
+
 // extractQuestionFromEvent 从 question.asked 或 permission.asked 事件中提取问题内容和选项
 func (s *StreamingSessionHandler) extractQuestionFromEvent(event *opencode.EventListResponse) (*Question, string) {
 	if event == nil {
 		return nil, ""
 	}
 
-	// 支持 question.asked 和 permission.asked 两种事件类型
-	if event.Type != "question.asked" && event.Type != "permission.asked" {
+	eventType := string(event.Type)
+
+	// 支持 question.asked / permission.asked（旧 SDK）和 permission.updated（新 SDK ≥ v1.2）
+	switch eventType {
+	case "question.asked", "permission.asked", "permission.updated":
+	default:
 		return nil, ""
 	}
 
@@ -817,19 +931,22 @@ func (s *StreamingSessionHandler) extractQuestionFromEvent(event *opencode.Event
 		return nil, ""
 	}
 
-	// 添加调试日志查看实际内容
-	log.Printf("opencode: extracting from %s event, json: %s", event.Type, jsonData)
+	log.Printf("opencode: extracting from %s event, json: %.300s", eventType, jsonData)
 
-	// 处理 permission.asked 事件
-	if event.Type == "permission.asked" {
+	switch eventType {
+	case "permission.asked", "permission.updated":
 		return s.extractPermissionQuestion(jsonData)
 	}
 
-	// 处理 question.asked 事件
+	// question.asked
 	return s.extractNormalQuestion(jsonData)
 }
 
-// extractPermissionQuestion 从 permission.asked 事件中提取权限请求
+// extractPermissionQuestion 从 permission.asked / permission.updated 事件中提取权限请求。
+// 新 SDK (≥ v1.2) 使用 permission.updated，其 properties 直接是 Permission 对象
+// （含 id, sessionID, title, type, callID, messageID, pattern…）。
+// 旧 SDK 使用 permission.asked，properties 含 permission, patterns, metadata, tool 等字段。
+// 两种格式均在此函数中处理。
 func (s *StreamingSessionHandler) extractPermissionQuestion(jsonData string) (*Question, string) {
 	// permission.asked 事件结构：
 	// {"type":"permission.asked","properties":{"id":"per_xxx","sessionID":"ses_xxx",
@@ -837,8 +954,9 @@ func (s *StreamingSessionHandler) extractPermissionQuestion(jsonData string) (*Q
 	//   "metadata":{"filepath":"...","parentDir":"..."},"always":["path/*"],
 	//   "tool":{"messageID":"msg_xxx","callID":"xxx"}}}
 	type PermissionProps struct {
-		ID         string   `json:"id"`
-		SessionID  string   `json:"sessionID"`
+		ID        string `json:"id"`
+		SessionID string `json:"sessionID"`
+		// 旧格式字段
 		Permission string   `json:"permission"`
 		Patterns   []string `json:"patterns"`
 		Metadata   struct {
@@ -850,38 +968,66 @@ func (s *StreamingSessionHandler) extractPermissionQuestion(jsonData string) (*Q
 			MessageID string `json:"messageID"`
 			CallID    string `json:"callID"`
 		} `json:"tool"`
+		// 新格式字段（permission.updated，SDK ≥ v1.2）
+		// properties 直接就是 Permission 对象：{id, sessionID, title, type, callID, messageID, ...}
+		Title     string `json:"title"`
+		Type      string `json:"type"`
+		CallID    string `json:"callID"`
+		MessageID string `json:"messageID"`
 	}
 
 	var wrapper struct {
 		Properties PermissionProps `json:"properties"`
 	}
 	if err := json.Unmarshal([]byte(jsonData), &wrapper); err != nil {
-		log.Printf("opencode: failed to parse permission.asked event: %v", err)
+		log.Printf("opencode: failed to parse permission event: %v", err)
 		return nil, ""
 	}
 
 	props := wrapper.Properties
 	if props.ID == "" {
-		log.Printf("opencode: permission.asked event missing id")
+		log.Printf("opencode: permission event missing id")
 		return nil, ""
 	}
 
-	// 构造用户友好的权限描述
-	var permDesc string
-	switch props.Permission {
-	case "external_directory":
-		permDesc = "访问外部目录"
-	case "write_file":
-		permDesc = "写入文件"
-	case "execute_command":
-		permDesc = "执行命令"
-	case "network_access":
-		permDesc = "网络访问"
-	default:
-		permDesc = props.Permission
+	// 构造 session / message ID（兼容新旧格式）
+	sessionID := props.SessionID
+	if sessionID == "" {
+		sessionID = s.sessionID
+	}
+	messageID := props.Tool.MessageID
+	if messageID == "" {
+		messageID = props.MessageID
 	}
 
-	// 构造描述文本
+	// 构造用户友好的权限描述
+	// 新格式：直接使用 title 字段（比旧格式的 permission 字段更友好）
+	// 旧格式：根据 permission 类型翻译
+	var permDesc string
+	if props.Title != "" {
+		permDesc = props.Title
+	} else {
+		switch props.Permission {
+		case "external_directory":
+			permDesc = "访问外部目录"
+		case "write_file", "write":
+			permDesc = "写入文件"
+		case "execute_command", "bash":
+			permDesc = "执行命令"
+		case "network_access", "webfetch":
+			permDesc = "网络访问"
+		case "doom_loop":
+			permDesc = "可能的循环操作（doom_loop）"
+		case "plan_enter":
+			permDesc = "进入计划模式"
+		case "plan_exit":
+			permDesc = "退出计划模式"
+		default:
+			permDesc = props.Permission
+		}
+	}
+
+	// 构造描述文本（路径/文件信息）
 	var details string
 	if len(props.Patterns) > 0 {
 		details = fmt.Sprintf("路径: %s", strings.Join(props.Patterns, ", "))
@@ -894,33 +1040,35 @@ func (s *StreamingSessionHandler) extractPermissionQuestion(jsonData string) (*Q
 	}
 
 	questionText := fmt.Sprintf("%s\n%s", permDesc, details)
-
-	log.Printf("opencode: extracted permission - id: '%s', permission: '%s', patterns: %v, parentDir: '%s'",
-		props.ID, props.Permission, props.Patterns, props.Metadata.ParentDir)
+	log.Printf("opencode: extracted permission - id: '%s', permDesc: '%s', patterns: %v, sessionID: %s",
+		props.ID, permDesc, props.Patterns, sessionID[:min(8, len(sessionID))])
 
 	// 使用权限事件的原始 ID
 	question := &Question{
-		ID:           props.ID, // 使用原始权限 ID
-		SessionID:    props.SessionID,
-		MessageID:    props.Tool.MessageID,
+		ID:           props.ID,
+		SessionID:    sessionID,
+		MessageID:    messageID,
 		Text:         questionText,
 		Options:      []string{"允许", "拒绝", "始终允许"},
-		IsPermission: true,                     // 标记为权限请求
-		Directory:    props.Metadata.ParentDir, // 保存工作目录
+		IsPermission: true,
+		Directory:    props.Metadata.ParentDir,
 		CreatedAt:    time.Now(),
 	}
 
-	// 构造消息 - 简化用户回复方式（去掉Markdown格式避免钉钉显示问题）
+	// 构造消息
+	detailsSection := ""
+	if details != "" {
+		detailsSection = "\n\n" + details
+	}
 	msg := fmt.Sprintf("🔐 OpenCode 请求权限：\n\n"+
-		"【%s】\n\n"+
-		"%s\n\n"+
+		"【%s】%s\n\n"+
 		"请回复：\n"+
 		"• 允许 - 本次允许\n"+
 		"• 拒绝 - 拒绝此请求\n"+
 		"• 始终允许 - 以后都允许",
-		permDesc, details)
+		permDesc, detailsSection)
 
-	log.Printf("opencode: permission message to send: %s", msg)
+	log.Printf("opencode: permission message to send: %.200s", msg)
 	return question, msg
 }
 
@@ -1039,7 +1187,7 @@ func (s *StreamingSessionHandler) extractNormalQuestion(jsonData string) (*Quest
 		} else if len(props.Questions) > 1 {
 			msgBuilder.WriteString("多个问题用分号分隔回复，如 `1;2,3;1`（第一个问题选1，第二个问题选2和3，第三个问题选1）")
 		} else {
-			msgBuilder.WriteString(fmt.Sprintf("回复 `/answer %s <选择>` 来确认", questionID))
+			msgBuilder.WriteString("直接回复选项内容即可（无需输入 /answer）")
 		}
 
 		question := &Question{
@@ -1112,6 +1260,12 @@ func (s *StreamingSessionHandler) IsCompleted() bool {
 	return s.completed
 }
 
+// Done returns a channel that is closed when the session reaches a terminal state.
+// Callers can select on this channel to avoid polling IsCompleted.
+func (s *StreamingSessionHandler) Done() <-chan struct{} {
+	return s.doneCh
+}
+
 // GetLastContent 获取最后的内容
 func (s *StreamingSessionHandler) GetLastContent() string {
 	s.mu.Lock()
@@ -1145,6 +1299,16 @@ func (s *StreamingSessionHandler) GetLastEventInfo() (time.Time, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastEventTime, s.lastEventType
+}
+
+// HasPendingQuestion returns true while the session is waiting for user input
+// (question.asked / permission.asked received but not yet answered).
+// SendMessageStreaming uses this to suppress idle-timeout fallbacks so the
+// handler stays registered until OpenCode resumes after the answer.
+func (s *StreamingSessionHandler) HasPendingQuestion() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasPendingQuestion
 }
 
 // IsActivelyProcessing 检查session是否正在活跃处理中
@@ -1194,22 +1358,33 @@ const TodoAutoPushInterval = 5 * time.Second
 func (s *StreamingSessionHandler) notifyCompletion() {
 	s.stopWaitingTimer()
 
-	// 如果有文件变更，在完成时追加摘要
+	// ── 1. 追加文件变更摘要 ─────────────────────────────────────────────────
 	if len(s.sessionDiff) > 0 {
 		diffMsg := s.FormatDiffSummary()
 		if diffMsg != "" {
-			_ = s.callback(diffMsg)
+			if s.client != nil {
+				if prev, ok := s.client.lastDiffSummary.Load(s.sessionID); ok && prev.(string) == diffMsg {
+					log.Printf("opencode: skip duplicate session.diff summary for session %s", s.sessionID[:8])
+				} else {
+					s.client.lastDiffSummary.Store(s.sessionID, diffMsg)
+					_ = s.callback(diffMsg)
+				}
+			} else {
+				_ = s.callback(diffMsg)
+			}
 		}
 	}
 
-	// 发送 flush 信号：让 adapter 立即把 fullReply 中尚未发送的内容全部发出去。
-	// 这发生在 SSE goroutine 持有 s.mu 期间，确保在 SendMessageStreaming 返回之前
-	// 最终内容已经发送完毕，避免任何竞态条件。
-	_ = s.callback(FlushSignal)
-
-	if s.onComplete != nil {
-		go s.onComplete()
-	}
+	// ── 2. 关闭 doneCh ────────────────────────────────────────────────────────
+	// NOTE: FlushSignal is intentionally NOT sent here.
+	// Sending FlushSignal from inside notifyCompletion (while s.mu is held)
+	// would perform an HTTP send inside the SSE reader goroutine, blocking all
+	// event processing for the duration of the network call.
+	//
+	// Instead, FlushSignal is sent by SendMessageStreaming right after it
+	// observes doneCh closing — that runs in the adapter's message-handler
+	// goroutine, completely outside any lock, and can safely do network I/O.
+	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
 // stopWaitingTimer 取消等待提示定时器
@@ -1305,7 +1480,23 @@ func extractDiffFromEvent(event *opencode.EventListResponse) []FileDiff {
 		log.Printf("opencode: failed to parse session.diff: %v", err)
 		return nil
 	}
-	return wrapper.Properties.Diff
+
+	cleaned := make([]FileDiff, 0, len(wrapper.Properties.Diff))
+	for _, f := range wrapper.Properties.Diff {
+		path := strings.TrimSpace(f.Path)
+		if path == "" {
+			continue
+		}
+		cleaned = append(cleaned, FileDiff{
+			Path:    path,
+			Added:   f.Added,
+			Removed: f.Removed,
+		})
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	return cleaned
 }
 
 // GetTodos 返回本次会话当前的 todo 列表（线程安全）
@@ -1331,10 +1522,21 @@ func (s *StreamingSessionHandler) FormatDiffSummary() string {
 	if len(s.sessionDiff) == 0 {
 		return ""
 	}
+	valid := make([]FileDiff, 0, len(s.sessionDiff))
+	for _, f := range s.sessionDiff {
+		if strings.TrimSpace(f.Path) == "" {
+			continue
+		}
+		valid = append(valid, f)
+	}
+	if len(valid) == 0 {
+		return ""
+	}
+
 	var sb strings.Builder
 	sb.WriteString("\n\n📁 **文件变更摘要**\n")
 	totalAdded, totalRemoved := 0, 0
-	for _, f := range s.sessionDiff {
+	for _, f := range valid {
 		icon := "📝"
 		if f.Added > 0 && f.Removed == 0 {
 			icon = "🆕"
@@ -1349,8 +1551,8 @@ func (s *StreamingSessionHandler) FormatDiffSummary() string {
 		totalAdded += f.Added
 		totalRemoved += f.Removed
 	}
-	if len(s.sessionDiff) > 1 {
-		sb.WriteString(fmt.Sprintf("共 %d 个文件，+%d/-%d 行\n", len(s.sessionDiff), totalAdded, totalRemoved))
+	if len(valid) > 1 {
+		sb.WriteString(fmt.Sprintf("共 %d 个文件，+%d/-%d 行\n", len(valid), totalAdded, totalRemoved))
 	}
 	return sb.String()
 }

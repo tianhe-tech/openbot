@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
+	"github.com/user/opencode-gateway/internal/bootstrap"
 )
 
 // ErrEmptyPayload indicates the caller attempted to send an empty message.
@@ -38,10 +40,6 @@ var ErrDuplicateRequest = errors.New("opencode: duplicate request detected")
 var ErrMaxRetriesExceeded = errors.New("opencode: max retries exceeded")
 
 const (
-	// ContextUsageThreshold 上下文使用率达到此阈值时创建新session (默认80%)
-	ContextUsageThreshold = 0.8
-	// SummaryThreshold 上下文使用率达到此阈值时开始总结 (默认60%)
-	SummaryThreshold = 0.6
 	// DefaultMaxTokens 默认最大token数（当无法获取模型配置时使用）
 	DefaultMaxTokens = 4096
 	// EstimatedTokensPerMessage 估算每条消息的平均token数
@@ -87,6 +85,11 @@ type MessagePayload struct {
 	Streaming   bool              `json:"streaming,omitempty"` // 是否使用流式返回
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	Attachments []Attachment      `json:"attachments,omitempty"` // 附件（图片/语音/视频）
+
+	// slotPreAcquired is an internal flag set by SendMessageStreaming.
+	// When true, SendMessage skips per-session slot acquisition because
+	// SendMessageStreaming already holds the slot and its doneFn releases it.
+	slotPreAcquired bool
 }
 
 // StreamCallback defines a callback for streaming responses.
@@ -203,57 +206,77 @@ type Question struct {
 
 // Client knows how to talk to the remote OpenCode service using the official SDK.
 type Client struct {
-	sdk               *opencode.Client
-	endpoint          string
-	apiKey            string
-	basicAuthHeader   string
-	httpClient        *http.Client
-	eventHandlers     []EventHandler
-	eventListenerMu   sync.RWMutex
-	sessionHandlers   sync.Map     // map[sessionID]EventHandler for fast lookup
-	activeHandlers    sync.Map     // map[sessionID]*StreamingSessionHandler for todo/diff access
-	messageToSession  sync.Map     // map[messageID]sessionID for events with only messageID
-	messageRoles      sync.Map     // map[messageID]role ("user"/"assistant") for filtering user message delta events
-	sessionMu         sync.RWMutex // 用于保护 session 相关操作
-	sessions          sync.Map     // map[threadID]sessionID
-	sessionLocks      sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
-	sessionsMu        sync.RWMutex // 保护 sessions 的读写
-	messageCount      sync.Map     // map[sessionID]int tracks messages per session
-	tokenCount        sync.Map     // map[sessionID]int tracks estimated tokens per session
-	sessionSummary    sync.Map     // map[sessionID]string stores session summaries
-	modelConfig       sync.Map     // map[sessionID]*ModelConfig caches model config per session
-	sessionModel      sync.Map     // map[sessionID]*ModelConfig tracks latest provider/model seen in assistant replies
-	sessionOverride   sync.Map     // map[sessionID]*ModelConfig stores user-selected model via /model
-	requestCache      sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
-	runningSessions   sync.Map     // map[sessionID]bool 跟踪正在运行的session
-	pendingQuestions  sync.Map     // map[questionID]*Question 待回答的问题
-	modelCatalogMu    sync.RWMutex
-	modelCatalog      map[string]*ModelCapability // key: providerID/modelID
-	defaultModelMu    sync.RWMutex
-	defaultModel      *ModelConfig
-	directory         string
-	timeout           time.Duration // 默认超时时间
-	retryConfig       RetryConfig   // 重试配置
-	debugMediaRouting bool          // 是否启用多模态路由调试日志
-	enableSkillHint   bool          // 是否在消息中添加skill提示
-	skillHintCache    []string      // 缓存的可用skill列表
-	skillCacheMu      sync.RWMutex
-	memoryEnabled     bool
-	memoryDir         string
-	memoryMaxChars    int
-	memoryMaxFacts    int
-	memoryInjectFacts int
-	memoryMu          sync.Mutex
-	lastHealthCheck   time.Time    // 最后一次健康检查时间
-	isHealthy         bool         // OpenCode server是否健康
-	healthCheckMu     sync.RWMutex // 保护健康状态
-	thinkingEnabled   atomic.Bool  // 是否输出 reasoning/thinking 内容
-	finalOnlyEnabled  atomic.Bool  // 是否仅在结束时发送最终回复
-	stepEnabled       atomic.Bool  // 是否显示 step-start/step-finish 中间步骤
-	serverUnavailable ServerUnavailableHandler
-	unavailableMu     sync.Mutex
-	lastUnavailableAt time.Time
-	unavailableDelay  time.Duration
+	sdk                        *opencode.Client
+	endpoint                   string
+	apiKey                     string
+	basicAuthHeader            string
+	httpClient                 *http.Client
+	eventHandlers              []EventHandler
+	eventListenerMu            sync.RWMutex
+	sessionHandlers            sync.Map     // map[sessionID]EventHandler for fast lookup
+	activeHandlers             sync.Map     // map[sessionID]*StreamingSessionHandler for todo/diff access
+	messageToSession           sync.Map     // map[messageID]sessionID for events with only messageID
+	partToSession              sync.Map     // map[partID]sessionID for message.part.delta fallback routing
+	messageRoles               sync.Map     // map[messageID]role ("user"/"assistant") for filtering user message delta events
+	lastDiffSummary            sync.Map     // map[sessionID]string dedupe auto-pushed session.diff summaries across turns
+	sessionMu                  sync.RWMutex // 用于保护 session 相关操作
+	sessions                   sync.Map     // map[sessionMapKey]sessionID, sessionMapKey=channel:threadID (legacy fallback: threadID)
+	sessionLocks               sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
+	sessionsMu                 sync.RWMutex // 保护 sessions 的读写
+	messageCount               sync.Map     // map[sessionID]int tracks messages per session
+	tokenCount                 sync.Map     // map[sessionID]int tracks estimated tokens per session
+	sessionSummary             sync.Map     // map[sessionID]string stores session summaries
+	modelConfig                sync.Map     // map[sessionID]*ModelConfig caches model config per session
+	sessionModel               sync.Map     // map[sessionID]*ModelConfig tracks latest provider/model seen in assistant replies
+	sessionOverride            sync.Map     // map[sessionID]*ModelConfig stores user-selected model via /model
+	requestCache               sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
+	sessionQueues              sync.Map     // map[sessionID]chan struct{} (cap=1) per-session semaphore; held ⟺ running
+	pendingQuestions           sync.Map     // map[questionID]*Question 待回答的问题
+	modelCatalogMu             sync.RWMutex
+	modelCatalog               map[string]*ModelCapability // key: providerID/modelID
+	defaultModelMu             sync.RWMutex
+	defaultModel               *ModelConfig
+	directory                  string
+	timeout                    time.Duration // 默认超时时间
+	retryConfig                RetryConfig   // 重试配置
+	debugMediaRouting          bool          // 是否启用多模态路由调试日志
+	enableSkillHint            bool          // 是否在消息中添加skill提示
+	skillHintCache             []string      // 缓存的可用skill列表
+	skillCacheMu               sync.RWMutex
+	personaSetupPrompt         string
+	personaPromptSent          sync.Map // map[channel:userID]struct{}
+	personaSetupPending        sync.Map // map[channel:userID]struct{} answers to startup persona questions are expected
+	memoryEnabled              bool
+	memoryDir                  string
+	memoryMaxChars             int
+	memoryMaxFacts             int
+	memoryInjectFacts          int
+	memoryShortTermFacts       int
+	memoryRecentWindow         time.Duration
+	memoryDecayEnabled         bool
+	memoryDecayHalfLife        time.Duration
+	memoryDebugRecall          bool
+	memoryCategoryQuotaEnabled bool
+	memoryCategoryQuota        map[string]int
+	memoryAutoCompactInterval  time.Duration
+	memoryDefaults             MemoryRuntimeConfig
+	memoryMu                   sync.Mutex
+	lastHealthCheck            time.Time    // 最后一次健康检查时间
+	isHealthy                  bool         // OpenCode server是否健康
+	healthCheckMu              sync.RWMutex // 保护健康状态
+	thinkingEnabled            atomic.Bool  // 是否输出 reasoning/thinking 内容
+	finalOnlyEnabled           atomic.Bool  // 是否仅在结束时发送最终回复
+	stepEnabled                atomic.Bool  // 是否显示 step-start/step-finish 中间步骤
+	serverUnavailable          ServerUnavailableHandler
+	unavailableMu              sync.Mutex
+	lastUnavailableAt          time.Time
+	unavailableDelay           time.Duration
+
+	// dispatcher is the SSE event routing hub.  It replaces the old
+	// eventHandlers/eventListenerMu/sessionHandlers trio with a single
+	// component that guarantees per-session ordered delivery and exposes
+	// a clean API for registering global and session-specific handlers.
+	dispatcher *SSEDispatcher
 }
 
 type memoryFact struct {
@@ -276,6 +299,34 @@ type MemoryFactView struct {
 	Importance int
 	LastSeen   time.Time
 	Count      int
+}
+
+// MemoryRecallResult exposes scored recall candidates for debugging/tuning.
+type MemoryRecallResult struct {
+	Text       string    `json:"text"`
+	Category   string    `json:"category"`
+	Importance int       `json:"importance"`
+	Count      int       `json:"count"`
+	LastSeen   time.Time `json:"last_seen"`
+	Score      float64   `json:"score"`
+	Layer      string    `json:"layer"`
+	Reasons    []string  `json:"reasons"`
+}
+
+// MemoryRuntimeConfig is a snapshot of memory tuning knobs that can be changed at runtime.
+type MemoryRuntimeConfig struct {
+	Enabled              bool           `json:"enabled"`
+	MaxChars             int            `json:"max_chars"`
+	MaxFacts             int            `json:"max_facts"`
+	InjectFacts          int            `json:"inject_facts"`
+	ShortTermFacts       int            `json:"short_term_facts"`
+	RecentWindow         string         `json:"recent_window"`
+	DecayEnabled         bool           `json:"decay_enabled"`
+	DecayHalfLife        string         `json:"decay_half_life"`
+	CategoryQuotaEnabled bool           `json:"category_quota_enabled"`
+	CategoryQuota        map[string]int `json:"category_quota"`
+	AutoCompactInterval  string         `json:"auto_compact_interval"`
+	DebugRecall          bool           `json:"debug_recall"`
 }
 
 // Option mutates a client during construction.
@@ -353,6 +404,25 @@ func parseEnvBool(key string) bool {
 	}
 }
 
+func parseEnvBoolDefault(key string, fallback bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err == nil {
+		return b
+	}
+	switch strings.ToLower(v) {
+	case "1", "y", "yes", "on", "enable", "enabled":
+		return true
+	case "0", "n", "no", "off", "disable", "disabled":
+		return false
+	default:
+		return fallback
+	}
+}
+
 // NewClient builds a Client instance using the official OpenCode SDK.
 func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 	sdkOptions := []option.RequestOption{
@@ -402,21 +472,28 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 				"500",
 			},
 		},
-		enableSkillHint:   false, // 默认禁用skill提示
-		debugMediaRouting: parseEnvBool("OPENBOT_DEBUG_MEDIA_ROUTING"),
-		modelCatalog:      make(map[string]*ModelCapability),
-		memoryEnabled:     parseEnvBool("OPENCODE_GATEWAY_MEMORY_ENABLED"),
-		memoryDir:         strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_DIR")),
-		memoryMaxChars:    4000,
-		memoryMaxFacts:    40,
-		memoryInjectFacts: 8,
-		isHealthy:         false,       // 初始状态未知
-		lastHealthCheck:   time.Time{}, // 未检查过
-		unavailableDelay:  20 * time.Second,
+		enableSkillHint:            false, // 默认禁用skill提示
+		debugMediaRouting:          parseEnvBool("OPENBOT_DEBUG_MEDIA_ROUTING"),
+		modelCatalog:               make(map[string]*ModelCapability),
+		memoryEnabled:              parseEnvBoolDefault("OPENCODE_GATEWAY_MEMORY_ENABLED", true),
+		memoryDir:                  strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_DIR")),
+		memoryMaxChars:             4000,
+		memoryMaxFacts:             40,
+		memoryInjectFacts:          8,
+		memoryShortTermFacts:       3,
+		memoryRecentWindow:         48 * time.Hour,
+		memoryDecayEnabled:         true,
+		memoryDecayHalfLife:        7 * 24 * time.Hour,
+		memoryDebugRecall:          parseEnvBool("OPENCODE_GATEWAY_MEMORY_DEBUG_RECALL"),
+		memoryCategoryQuotaEnabled: parseEnvBoolDefault("OPENCODE_GATEWAY_MEMORY_CATEGORY_QUOTA_ENABLED", true),
+		memoryCategoryQuota:        map[string]int{},
+		memoryAutoCompactInterval:  6 * time.Hour,
+		isHealthy:                  false,       // 初始状态未知
+		lastHealthCheck:            time.Time{}, // 未检查过
+		unavailableDelay:           20 * time.Second,
+		dispatcher:                 NewSSEDispatcher(),
 	}
-	if client.memoryDir == "" {
-		client.memoryDir = filepath.Join(client.directory, ".opencode-gateway-memory")
-	}
+	log.Printf("opencode: initializing client endpoint=%s memory_enabled=%t memory_dir_env=%s", endpoint, client.memoryEnabled, client.memoryDir)
 	if rawMax := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_MAX_CHARS")); rawMax != "" {
 		if parsed, err := strconv.Atoi(rawMax); err == nil && parsed > 0 {
 			client.memoryMaxChars = parsed
@@ -432,10 +509,51 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 			client.memoryInjectFacts = parsed
 		}
 	}
+	if rawShort := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_SHORT_TERM_FACTS")); rawShort != "" {
+		if parsed, err := strconv.Atoi(rawShort); err == nil && parsed >= 0 {
+			client.memoryShortTermFacts = parsed
+		}
+	}
+	if rawRecent := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_RECENT_WINDOW")); rawRecent != "" {
+		if parsed, err := time.ParseDuration(rawRecent); err == nil && parsed > 0 {
+			client.memoryRecentWindow = parsed
+		}
+	}
+	client.memoryDecayEnabled = parseEnvBoolDefault("OPENCODE_GATEWAY_MEMORY_DECAY_ENABLED", true)
+	if rawHalf := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_DECAY_HALFLIFE")); rawHalf != "" {
+		if parsed, err := time.ParseDuration(rawHalf); err == nil && parsed > 0 {
+			client.memoryDecayHalfLife = parsed
+		}
+	}
+	if rawCompact := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_AUTO_COMPACT_INTERVAL")); rawCompact != "" {
+		if strings.EqualFold(rawCompact, "off") || rawCompact == "0" {
+			client.memoryAutoCompactInterval = 0
+		} else if parsed, err := time.ParseDuration(rawCompact); err == nil && parsed > 0 {
+			client.memoryAutoCompactInterval = parsed
+		}
+	}
+	client.memoryCategoryQuotaEnabled = parseEnvBoolDefault("OPENCODE_GATEWAY_MEMORY_CATEGORY_QUOTA_ENABLED", true)
+	if rawQuota := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_CATEGORY_QUOTA")); rawQuota != "" {
+		client.memoryCategoryQuota = parseMemoryCategoryQuota(rawQuota)
+	}
 
 	for _, opt := range opts {
 		opt(client)
 	}
+
+	if client.memoryDir == "" {
+		base := bootstrap.ResolveBootstrapDir(strings.TrimSpace(client.directory))
+		client.memoryDir = filepath.Join(base, ".opencode-gateway-memory")
+	}
+	log.Printf("opencode: memory configured enabled=%t dir=%s maxChars=%d maxFacts=%d injectFacts=%d",
+		client.memoryEnabled, client.memoryDir, client.memoryMaxChars, client.memoryMaxFacts, client.memoryInjectFacts)
+	log.Printf("opencode: memory retrieval shortTerm=%d recentWindow=%s decayEnabled=%t halfLife=%s autoCompact=%s debugRecall=%t",
+		client.memoryShortTermFacts, client.memoryRecentWindow, client.memoryDecayEnabled, client.memoryDecayHalfLife, client.memoryAutoCompactInterval, client.memoryDebugRecall)
+	log.Printf("opencode: memory category quota enabled=%t", client.memoryCategoryQuotaEnabled)
+	if len(client.memoryCategoryQuota) > 0 {
+		log.Printf("opencode: memory category quota config=%v", client.memoryCategoryQuota)
+	}
+	client.memoryDefaults = client.GetMemoryRuntimeConfig()
 
 	client.thinkingEnabled.Store(parseEnvBool("OPENBOT_SHOW_THINKING"))
 	log.Printf("opencode: thinking output enabled=%t (env OPENBOT_SHOW_THINKING)", client.thinkingEnabled.Load())
@@ -446,6 +564,7 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 
 	// 启动后台清理协程
 	go client.cleanupRequestCache()
+	go client.autoCompactMemoryLoop()
 
 	// 启动后进行首次健康检查
 	go func() {
@@ -464,6 +583,14 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 	}()
 
 	return client
+}
+
+// WithPersonaSetupPrompt pushes a one-time startup prompt to each user/channel
+// when persona files are still in default template state.
+func WithPersonaSetupPrompt(prompt string) Option {
+	return func(c *Client) {
+		c.personaSetupPrompt = strings.TrimSpace(prompt)
+	}
 }
 
 func (c *Client) applyAuthHeaders(header http.Header) {
@@ -595,11 +722,46 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
 	}
+
+	startupNotice := ""
+	if !payload.Streaming {
+		startupNotice = c.consumePersonaSetupPrompt(payload.Channel, payload.UserID)
+	}
+
+	if response, handled, err := c.handlePersonaSetupCommand(payload.Content); handled {
+		if err != nil {
+			return Response{}, err
+		}
+		c.clearPersonaSetupPending(payload.Channel, payload.UserID)
+		response.Reply = prependNotice(response.Reply, startupNotice)
+		response.SessionID = payload.SessionID
+		response.Trace = payload.SessionID
+		return response, nil
+	}
+	if response, handled, err := c.handlePersonaSetupPromptReply(payload.Channel, payload.UserID, payload.Content); handled {
+		if err != nil {
+			return Response{}, err
+		}
+		response.Reply = prependNotice(response.Reply, startupNotice)
+		response.SessionID = payload.SessionID
+		response.Trace = payload.SessionID
+		return response, nil
+	}
+	if response, handled, err := c.handleBotNamingCommand(payload.Content); handled {
+		if err != nil {
+			return Response{}, err
+		}
+		response.Reply = prependNotice(response.Reply, startupNotice)
+		response.SessionID = payload.SessionID
+		response.Trace = payload.SessionID
+		return response, nil
+	}
 	originalContent := payload.Content
+	payload.Content = c.injectSoulIntoPrompt(payload.Content)
 
 	if c.memoryEnabled {
-		if memory := c.renderUserMemoryForPrompt(payload.Channel, payload.UserID); memory != "" {
-			payload.Content = fmt.Sprintf("[用户长期记忆]\n%s\n\n[用户当前消息]\n%s", memory, originalContent)
+		if memory := c.renderUserMemoryForPrompt(payload.Channel, payload.UserID, originalContent); memory != "" {
+			payload.Content = fmt.Sprintf("[用户长期记忆]\n%s\n\n[用户当前消息]\n%s", memory, payload.Content)
 			log.Printf("opencode: injected user memory for %s/%s (%d chars)", payload.Channel, payload.UserID, len(memory))
 		}
 	}
@@ -636,7 +798,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 	defer sessionCancel()
 
 	// Get or create session with lock to prevent concurrent session creation
-	threadLock := c.getThreadLock(payload.ThreadID)
+	threadLock := c.getThreadLock(sessionMapKey(payload.Channel, payload.ThreadID))
 	threadLock.Lock()
 	sessionID := payload.SessionID
 
@@ -645,8 +807,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		payload.Channel, payload.UserID, payload.ThreadID, sessionID)
 
 	if sessionID == "" && payload.ThreadID != "" {
-		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
-			foundSessionID := sid.(string)
+		if foundSessionID, ok := c.loadSessionForThread(payload.Channel, payload.ThreadID); ok {
 
 			// 🔍 诊断日志：检查 session 是否属于当前用户
 			// 通过查询 adapter 的映射来验证（如果可用）
@@ -682,7 +843,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		}
 		sessionID = session.ID
 		if payload.ThreadID != "" {
-			c.sessions.Store(payload.ThreadID, sessionID)
+			c.storeSessionForThread(payload.Channel, payload.ThreadID, sessionID)
 			// 🔍 诊断日志：记录 session 映射
 			log.Printf("opencode: mapped threadID %s -> sessionID %s (for %s user %s)",
 				payload.ThreadID, sessionID[:8], payload.Channel, payload.UserID)
@@ -709,7 +870,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 			// 清除旧映射
 			if payload.ThreadID != "" {
-				c.sessions.Delete(payload.ThreadID)
+				c.deleteSessionForThread(payload.Channel, payload.ThreadID)
 			}
 			c.messageCount.Delete(sessionID)
 			c.tokenCount.Delete(sessionID)
@@ -727,7 +888,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			}
 			sessionID = newSession.ID
 			if payload.ThreadID != "" {
-				c.sessions.Store(payload.ThreadID, sessionID)
+				c.storeSessionForThread(payload.Channel, payload.ThreadID, sessionID)
 				log.Printf("opencode: 🔄 remapped threadID %s -> new sessionID %s (replaced stale session)",
 					payload.ThreadID, sessionID[:8])
 			}
@@ -739,7 +900,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			goto sendMessage
 		}
 
-		// 检查是否需要总结或创建新session
+		// 记录当前会话的大致上下文占用，仅用于状态展示与日志。
 		msgCount := c.loadCounter(&c.messageCount, sessionID)
 		currentTokens := c.loadCounter(&c.tokenCount, sessionID)
 
@@ -753,67 +914,6 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 		log.Printf("opencode: session %s - messages: %d, tokens: %d/%d (%.1f%%), estimated msg tokens: %d",
 			sessionID[:8], msgCount, currentTokens, maxContextTokens, contextUsage*100, estimatedMsgTokens)
-
-		// 如果上下文使用率超过阈值，创建新session
-		if contextUsage >= ContextUsageThreshold {
-			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, creating new session",
-				sessionID[:8], contextUsage*100, ContextUsageThreshold*100)
-
-			// 总结旧session
-			if err := c.SummarizeSession(ctx, sessionID); err != nil {
-				log.Printf("opencode: failed to summarize session %s: %v", sessionID, err)
-			}
-
-			// 获取总结内容
-			summary := ""
-			if sum, ok := c.sessionSummary.Load(sessionID); ok {
-				summary = sum.(string)
-			}
-
-			// 创建新session，标题包含历史信息
-			title := fmt.Sprintf("%s-%s-续", payload.Channel, payload.UserID)
-			if summary != "" {
-				title = fmt.Sprintf("%s-%s (之前讨论: %s)", payload.Channel, payload.UserID, truncateString(summary, 50))
-			}
-
-			newSession, err := c.sdk.Session.New(ctx, opencode.SessionNewParams{
-				Title: opencode.F(title),
-			})
-			if err != nil {
-				log.Printf("opencode: failed to create new session: %v, continuing with current", err)
-			} else {
-				sessionID = newSession.ID
-				if payload.ThreadID != "" {
-					c.sessions.Store(payload.ThreadID, sessionID)
-				}
-				c.messageCount.Store(sessionID, 0)
-				c.tokenCount.Store(sessionID, 0)
-
-				// 获取新session的模型配置
-				go c.fetchAndCacheModelConfig(context.Background(), sessionID)
-
-				// 如果有总结，将总结作为系统消息添加到新session的上下文
-				if summary != "" {
-					contextMsg := fmt.Sprintf("[上一轮对话总结]: %s\n\n[用户新消息]: %s", summary, payload.Content)
-					payload.Content = contextMsg
-					estimatedMsgTokens = estimateTokens(contextMsg) // 重新估算
-					log.Printf("opencode: created new session %s with context from previous session", sessionID)
-				} else {
-					log.Printf("opencode: created new session %s for thread %s", sessionID, payload.ThreadID)
-				}
-			}
-		} else if contextUsage >= SummaryThreshold && msgCount%5 == 0 {
-			// 在达到总结阈值后，每5条消息尝试总结一次（后台异步）
-			log.Printf("opencode: session %s context usage %.1f%% >= summary threshold %.1f%%, scheduling background summary",
-				sessionID[:8], contextUsage*100, SummaryThreshold*100)
-			go func(sid string) {
-				sumCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if err := c.SummarizeSession(sumCtx, sid); err != nil {
-					log.Printf("opencode: background summarization failed for session %s: %v", sid, err)
-				}
-			}(sessionID)
-		}
 	}
 	threadLock.Unlock()
 
@@ -884,9 +984,10 @@ sendMessage:
 
 	// 流式模式下改用异步 prompt_async，避免长任务导致 context deadline
 	if payload.Streaming {
-		c.runningSessions.Store(sessionID, true)
+		// Slot is pre-acquired by SendMessageStreaming before handler registration.
+		// On error, release it so the next queued message can proceed.
 		if err := c.sendPromptAsync(ctx, sessionID, parts, mainModelOverride); err != nil {
-			c.runningSessions.Delete(sessionID)
+			c.releaseSessionSlot(sessionID)
 			c.failRequest(requestHash)
 			return Response{}, fmt.Errorf("opencode: prompt_async: %w", err)
 		}
@@ -903,18 +1004,28 @@ sendMessage:
 			Trace:     sessionID,
 		}
 
+		// Streaming channels (dingtalk/feishu/wecom) also need memory persistence.
+		// We at least persist user-side candidates here; assistant reply is delivered by SSE.
+		if c.memoryEnabled {
+			c.updateUserMemory(payload.Channel, payload.UserID, originalContent, "")
+		}
+
 		c.completeRequest(requestHash, response)
 		return response, nil
 	}
 
 	// ========== 使用重试机制发送消息 ==========
-	// 标记session为运行状态
-	c.runningSessions.Store(sessionID, true)
+	// 仅对 webui 启用 per-session 排队，其他 adapter 保持原行为。
+	if shouldQueueByChannel(payload.Channel) {
+		slotRelease, slotErr := c.acquireSessionSlot(ctx, sessionID)
+		if slotErr != nil {
+			c.failRequest(requestHash)
+			return Response{}, fmt.Errorf("opencode: wait for session slot: %w", slotErr)
+		}
+		defer slotRelease()
+	}
 
 	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, mainModelOverride)
-
-	// 清除运行状态
-	c.runningSessions.Delete(sessionID)
 
 	if err != nil {
 		c.failRequest(requestHash)
@@ -941,6 +1052,7 @@ sendMessage:
 		MessageID: result.Info.ID,
 		Trace:     sessionID,
 	}
+	response.Reply = prependNotice(response.Reply, startupNotice)
 
 	if c.memoryEnabled {
 		c.updateUserMemory(payload.Channel, payload.UserID, originalContent, reply)
@@ -950,6 +1062,506 @@ sendMessage:
 	c.completeRequest(requestHash, response)
 
 	return response, nil
+}
+
+func prependNotice(reply, notice string) string {
+	notice = strings.TrimSpace(notice)
+	if notice == "" {
+		return reply
+	}
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		return notice
+	}
+	return notice + "\n\n" + reply
+}
+
+func (c *Client) consumePersonaSetupPrompt(channel, userID string) string {
+	prompt := strings.TrimSpace(c.personaSetupPrompt)
+	if prompt == "" {
+		return ""
+	}
+	key := strings.ToLower(strings.TrimSpace(channel)) + ":" + strings.TrimSpace(userID)
+	if strings.TrimSpace(userID) == "" {
+		return ""
+	}
+	if _, exists := c.personaPromptSent.Load(key); exists {
+		return ""
+	}
+	c.personaPromptSent.Store(key, struct{}{})
+	c.personaSetupPending.Store(key, struct{}{})
+	return prompt
+}
+
+func personaSetupKey(channel, userID string) string {
+	return strings.ToLower(strings.TrimSpace(channel)) + ":" + strings.TrimSpace(userID)
+}
+
+func (c *Client) clearPersonaSetupPending(channel, userID string) {
+	key := personaSetupKey(channel, userID)
+	if strings.TrimSpace(userID) == "" {
+		return
+	}
+	c.personaSetupPending.Delete(key)
+}
+
+func (c *Client) handlePersonaSetupPromptReply(channel, userID, content string) (Response, bool, error) {
+	if strings.TrimSpace(userID) == "" {
+		return Response{}, false, nil
+	}
+	key := personaSetupKey(channel, userID)
+	if _, ok := c.personaSetupPending.Load(key); !ok {
+		return Response{}, false, nil
+	}
+
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" || strings.HasPrefix(trimmed, "/") {
+		return Response{}, false, nil
+	}
+
+	botName, preferredName, style, goals, ok := parsePersonaSetupBatch(trimmed)
+	if !ok {
+		return Response{}, false, nil
+	}
+
+	if err := writeBotNameToSoul(c.soulFilePaths(), botName); err != nil {
+		return Response{}, true, err
+	}
+	if err := upsertUserProfileInUserFiles(c.userFilePaths(), preferredName, style, goals); err != nil {
+		return Response{}, true, err
+	}
+	c.clearPersonaSetupPending(channel, userID)
+
+	reply := "✅ 已根据你的回复完成设定并写入文件：\n- SOUL: 机器人名称\n- USER: 称呼、回答风格、长期目标\n\n后续不会再重复询问；你也可随时用 /setup 或 /name 更新。"
+	return Response{Reply: reply}, true, nil
+}
+
+func parsePersonaSetupBatch(content string) (string, string, string, string, bool) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return "", "", "", "", false
+	}
+
+	// Format A: name|preferredName|style|goals
+	if strings.Contains(trimmed, "|") {
+		parts := strings.Split(trimmed, "|")
+		if len(parts) == 4 {
+			v0 := strings.TrimSpace(parts[0])
+			v1 := strings.TrimSpace(parts[1])
+			v2 := strings.TrimSpace(parts[2])
+			v3 := strings.TrimSpace(parts[3])
+			if v0 != "" && v1 != "" && v2 != "" && v3 != "" {
+				return v0, v1, v2, v3, true
+			}
+		}
+	}
+
+	// Format B: numbered lines, e.g. 1.xxx 2.xxx 3.xxx 4.xxx
+	values := map[string]string{}
+	for _, line := range strings.Split(trimmed, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		line = strings.TrimLeft(line, "-•")
+		line = strings.TrimSpace(line)
+
+		if idx := firstColonIndex(line); idx > 0 {
+			left := strings.TrimSpace(line[:idx])
+			right := strings.TrimSpace(line[idx+1:])
+			switch normalizeSetupKey(left) {
+			case "1", "name":
+				values["1"] = right
+			case "2", "preferred":
+				values["2"] = right
+			case "3", "style":
+				values["3"] = right
+			case "4", "goals":
+				values["4"] = right
+			}
+			continue
+		}
+
+		for _, k := range []string{"1.", "1 ", "2.", "2 ", "3.", "3 ", "4.", "4 ", "1、", "2、", "3、", "4、"} {
+			if strings.HasPrefix(line, k) {
+				key := string(k[0])
+				values[key] = strings.TrimSpace(line[len(k):])
+				break
+			}
+		}
+	}
+
+	v0 := strings.TrimSpace(values["1"])
+	v1 := strings.TrimSpace(values["2"])
+	v2 := strings.TrimSpace(values["3"])
+	v3 := strings.TrimSpace(values["4"])
+	if v0 != "" && v1 != "" && v2 != "" && v3 != "" {
+		return v0, v1, v2, v3, true
+	}
+
+	return "", "", "", "", false
+}
+
+func firstColonIndex(s string) int {
+	for i, r := range s {
+		if r == ':' || r == '：' {
+			return i
+		}
+	}
+	return -1
+}
+
+func normalizeSetupKey(s string) string {
+	v := strings.ToLower(strings.TrimSpace(s))
+	v = strings.TrimRight(v, ".、")
+	switch v {
+	case "1", "机器人名字", "机器人名称", "名字", "name", "bot", "botname":
+		return "name"
+	case "2", "如何称呼", "称呼", "叫我", "preferred", "preferredname":
+		return "preferred"
+	case "3", "回答风格", "风格", "style":
+		return "style"
+	case "4", "长期目标", "目标", "项目背景", "goals", "goal":
+		return "goals"
+	default:
+		return v
+	}
+}
+
+func (c *Client) handlePersonaSetupCommand(content string) (Response, bool, error) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "/") {
+		return Response{}, false, nil
+	}
+
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return Response{}, false, nil
+	}
+	if strings.ToLower(fields[0]) != "/setup" {
+		return Response{}, false, nil
+	}
+
+	if len(fields) == 1 {
+		return Response{Reply: "用法：/setup 机器人名称|如何称呼你|回答风格|长期目标\n\n示例：/setup 小码|老王|中文+简洁|维护 opencode-gateway 并提升稳定性"}, true, nil
+	}
+
+	raw := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+	parts := strings.Split(raw, "|")
+	if len(parts) != 4 {
+		return Response{}, true, fmt.Errorf("opencode: /setup 格式错误，应为 /setup 机器人名称|如何称呼你|回答风格|长期目标")
+	}
+
+	botName := strings.TrimSpace(parts[0])
+	preferredName := strings.TrimSpace(parts[1])
+	style := strings.TrimSpace(parts[2])
+	goals := strings.TrimSpace(parts[3])
+	if botName == "" || preferredName == "" || style == "" || goals == "" {
+		return Response{}, true, fmt.Errorf("opencode: /setup 每个字段都不能为空")
+	}
+
+	if err := writeBotNameToSoul(c.soulFilePaths(), botName); err != nil {
+		return Response{}, true, err
+	}
+	if err := upsertUserProfileInUserFiles(c.userFilePaths(), preferredName, style, goals); err != nil {
+		return Response{}, true, err
+	}
+
+	return Response{Reply: "✅ 人格设定已写入：SOUL 名称 + USER 档案。你也可以继续手动补充 IDENTITY/BOOTSTRAP。"}, true, nil
+}
+
+func (c *Client) handleBotNamingCommand(content string) (Response, bool, error) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "/") {
+		return Response{}, false, nil
+	}
+
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return Response{}, false, nil
+	}
+	cmd := strings.ToLower(fields[0])
+	if cmd != "/name" && cmd != "/botname" {
+		return Response{}, false, nil
+	}
+
+	paths := c.soulFilePaths()
+	if len(fields) == 1 {
+		name, err := readBotNameFromSoul(paths)
+		if err != nil {
+			return Response{}, true, err
+		}
+		if strings.TrimSpace(name) == "" {
+			name = "OpenBot"
+		}
+		return Response{Reply: fmt.Sprintf("🤖 当前名字：%s\n\n使用 /name <新名字> 进行修改。", name)}, true, nil
+	}
+
+	newName := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+	if newName == "" {
+		return Response{}, true, fmt.Errorf("opencode: name cannot be empty")
+	}
+	if len([]rune(newName)) > 40 {
+		return Response{}, true, fmt.Errorf("opencode: name too long (max 40 chars)")
+	}
+
+	if err := writeBotNameToSoul(paths, newName); err != nil {
+		return Response{}, true, err
+	}
+	return Response{Reply: fmt.Sprintf("✅ 好的，以后我就叫「%s」。", newName)}, true, nil
+}
+
+func (c *Client) injectSoulIntoPrompt(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return content
+	}
+
+	// Already injected by upstream caller.
+	if strings.Contains(trimmed, "[灵魂设定]") || strings.Contains(trimmed, "[人格设定]") {
+		return content
+	}
+
+	persona, err := c.readPersonaPromptContent()
+	if err != nil {
+		log.Printf("opencode: read persona files failed: %v", err)
+		return content
+	}
+	if persona == "" {
+		return content
+	}
+
+	return "[人格设定]\n" + persona + "\n\n[用户当前消息]\n" + content
+}
+
+func (c *Client) readSoulPromptContent() (string, error) {
+	return c.readFirstPersonaFile(c.soulFilePaths(), 4000)
+}
+
+func (c *Client) readPersonaPromptContent() (string, error) {
+	sections := []struct {
+		title    string
+		paths    []string
+		maxRunes int
+	}{
+		{title: "SOUL", paths: c.soulFilePaths(), maxRunes: 3200},
+		{title: "IDENTITY", paths: c.identityFilePaths(), maxRunes: 1800},
+		{title: "USER", paths: c.userFilePaths(), maxRunes: 1600},
+		{title: "BOOTSTRAP", paths: c.bootstrapFilePaths(), maxRunes: 1400},
+	}
+
+	blocks := make([]string, 0, len(sections))
+	for _, sec := range sections {
+		text, err := c.readFirstPersonaFile(sec.paths, sec.maxRunes)
+		if err != nil {
+			return "", err
+		}
+		if text == "" {
+			continue
+		}
+		blocks = append(blocks, "### "+sec.title+"\n"+text)
+	}
+
+	if len(blocks) == 0 {
+		return "", nil
+	}
+
+	joined := strings.Join(blocks, "\n\n")
+	if len([]rune(joined)) > 7000 {
+		joined = string([]rune(joined)[:7000])
+	}
+	return joined, nil
+}
+
+func (c *Client) readFirstPersonaFile(paths []string, maxRunes int) (string, error) {
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("read %s: %w", p, err)
+		}
+		s := strings.TrimSpace(string(b))
+		if s == "" {
+			continue
+		}
+		if maxRunes > 0 && len([]rune(s)) > maxRunes {
+			s = string([]rune(s)[:maxRunes])
+		}
+		return s, nil
+	}
+	return "", nil
+}
+
+func (c *Client) soulFilePaths() []string {
+	base := c.personaBaseDir()
+	return []string{
+		filepath.Join(base, "soul.md"),
+		filepath.Join(base, "SOUL.md"),
+	}
+}
+
+func (c *Client) identityFilePaths() []string {
+	base := c.personaBaseDir()
+	return []string{
+		filepath.Join(base, "identity.md"),
+		filepath.Join(base, "IDENTITY.md"),
+	}
+}
+
+func (c *Client) userFilePaths() []string {
+	base := c.personaBaseDir()
+	return []string{
+		filepath.Join(base, "user.md"),
+		filepath.Join(base, "USER.md"),
+	}
+}
+
+func (c *Client) bootstrapFilePaths() []string {
+	base := c.personaBaseDir()
+	return []string{
+		filepath.Join(base, "bootstrap.md"),
+		filepath.Join(base, "BOOTSTRAP.md"),
+	}
+}
+
+func (c *Client) personaBaseDir() string {
+	return bootstrap.ResolveBootstrapDir(strings.TrimSpace(c.directory))
+}
+
+func readBotNameFromSoul(paths []string) (string, error) {
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("read %s: %w", p, err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			t := strings.TrimSpace(line)
+			if strings.HasPrefix(strings.ToLower(t), "- **name:**") {
+				return strings.TrimSpace(strings.TrimPrefix(t, "- **Name:**")), nil
+			}
+			if strings.HasPrefix(t, "- **名称：**") {
+				return strings.TrimSpace(strings.TrimPrefix(t, "- **名称：**")), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func writeBotNameToSoul(paths []string, name string) error {
+	for _, p := range paths {
+		if err := upsertBotNameInSoulFile(p, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func upsertBotNameInSoulFile(path, name string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		content := "# SOUL.md - Who You Are\n\n- **Name:** " + name + "\n"
+		if writeErr := os.WriteFile(path, []byte(content), 0o644); writeErr != nil {
+			return fmt.Errorf("write %s: %w", path, writeErr)
+		}
+		return nil
+	}
+
+	lines := strings.Split(string(b), "\n")
+	replaced := false
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(t), "- **name:**") || strings.HasPrefix(t, "- **名称：**") {
+			lines[i] = "- **Name:** " + name
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		lines = append(lines, "", "- **Name:** "+name)
+	}
+	out := strings.Join(lines, "\n")
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+func upsertUserProfileInUserFiles(paths []string, preferredName, style, goals string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("no USER.md path configured")
+	}
+
+	target := strings.TrimSpace(paths[0])
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			target = p
+			break
+		}
+	}
+
+	content := "# USER.md\n\n## User Profile\n\n- Preferred name: " + preferredName + "\n- Communication style: " + style + "\n- Primary goals: " + goals + "\n\n## Working Preferences\n\n- Default response length: concise\n- Ask before destructive actions: yes\n- Show intermediate progress on long tasks: yes\n\n## Notes\n\nUpdate this file whenever the user gives stable preferences.\n"
+
+	if b, err := os.ReadFile(target); err == nil {
+		content = mergeUserProfileContent(string(b), preferredName, style, goals)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", target, err)
+	}
+
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+func mergeUserProfileContent(existing, preferredName, style, goals string) string {
+	lines := strings.Split(existing, "\n")
+	replacedPreferred := false
+	replacedStyle := false
+	replacedGoals := false
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(strings.ToLower(trimmed), "- preferred name:"):
+			lines[i] = "- Preferred name: " + preferredName
+			replacedPreferred = true
+		case strings.HasPrefix(strings.ToLower(trimmed), "- communication style:"):
+			lines[i] = "- Communication style: " + style
+			replacedStyle = true
+		case strings.HasPrefix(strings.ToLower(trimmed), "- primary goals:"):
+			lines[i] = "- Primary goals: " + goals
+			replacedGoals = true
+		}
+	}
+
+	if !replacedPreferred || !replacedStyle || !replacedGoals {
+		lines = append(lines,
+			"",
+			"## User Profile",
+			"",
+			"- Preferred name: "+preferredName,
+			"- Communication style: "+style,
+			"- Primary goals: "+goals,
+		)
+	}
+
+	return strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
 }
 
 func (c *Client) memoryFilePath(channel, userID string) string {
@@ -1012,34 +1624,48 @@ func (c *Client) loadUserMemoryStore(channel, userID string) userMemoryStore {
 	}
 }
 
-func (c *Client) renderUserMemoryForPrompt(channel, userID string) string {
+type memoryRecallCandidate struct {
+	Fact    memoryFact
+	Score   float64
+	Layer   string
+	Reasons []string
+}
+
+func (c *Client) renderUserMemoryForPrompt(channel, userID, query string) string {
 	store := c.loadUserMemoryStore(channel, userID)
 	if len(store.Facts) == 0 {
 		return ""
 	}
-
-	facts := append([]memoryFact(nil), store.Facts...)
-	sort.Slice(facts, func(i, j int) bool {
-		if facts[i].Importance != facts[j].Importance {
-			return facts[i].Importance > facts[j].Importance
-		}
-		if !facts[i].LastSeen.Equal(facts[j].LastSeen) {
-			return facts[i].LastSeen.After(facts[j].LastSeen)
-		}
-		return facts[i].Count > facts[j].Count
-	})
-
+	selected := c.selectMemoryForQuery(store.Facts, query)
+	if len(selected) == 0 {
+		return ""
+	}
 	limit := c.memoryInjectFacts
 	if limit <= 0 {
 		limit = 8
 	}
-	if limit > len(facts) {
-		limit = len(facts)
+	if limit > len(selected) {
+		limit = len(selected)
 	}
 
 	items := make([]string, 0, limit)
 	for i := 0; i < limit; i++ {
-		items = append(items, fmt.Sprintf("- [%s] %s", facts[i].Category, facts[i].Text))
+		items = append(items, fmt.Sprintf("- [%s] %s", selected[i].Fact.Category, selected[i].Fact.Text))
+	}
+	if c.memoryDebugRecall {
+		for i := 0; i < limit; i++ {
+			cand := selected[i]
+			log.Printf("opencode: memory recall[%d] layer=%s score=%.3f category=%s count=%d lastSeen=%s reasons=%s text=%.80s",
+				i+1,
+				cand.Layer,
+				cand.Score,
+				cand.Fact.Category,
+				cand.Fact.Count,
+				cand.Fact.LastSeen.Format(time.RFC3339),
+				strings.Join(cand.Reasons, ","),
+				cand.Fact.Text,
+			)
+		}
 	}
 	prompt := strings.Join(items, "\n")
 	runes := []rune(prompt)
@@ -1047,6 +1673,529 @@ func (c *Client) renderUserMemoryForPrompt(channel, userID string) string {
 		prompt = string(runes[:c.memoryMaxChars])
 	}
 	return prompt
+}
+
+func (c *Client) selectMemoryForQuery(facts []memoryFact, query string) []memoryRecallCandidate {
+	now := time.Now()
+	query = strings.TrimSpace(query)
+	short := make([]memoryRecallCandidate, 0)
+	long := make([]memoryRecallCandidate, 0)
+
+	for _, f := range facts {
+		score, reasons := c.memoryRecallScore(f, query, now)
+		cand := memoryRecallCandidate{Fact: f, Score: score, Reasons: reasons, Layer: "long"}
+
+		age := now.Sub(f.LastSeen)
+		if c.memoryRecentWindow > 0 && age <= c.memoryRecentWindow {
+			cand.Layer = "short"
+			short = append(short, cand)
+		} else {
+			long = append(long, cand)
+		}
+	}
+
+	sort.Slice(short, func(i, j int) bool {
+		if short[i].Score != short[j].Score {
+			return short[i].Score > short[j].Score
+		}
+		return short[i].Fact.LastSeen.After(short[j].Fact.LastSeen)
+	})
+	sort.Slice(long, func(i, j int) bool {
+		if long[i].Score != long[j].Score {
+			return long[i].Score > long[j].Score
+		}
+		return long[i].Fact.LastSeen.After(long[j].Fact.LastSeen)
+	})
+
+	shortLimit := c.memoryShortTermFacts
+	if shortLimit < 0 {
+		shortLimit = 0
+	}
+	if shortLimit > c.memoryInjectFacts {
+		shortLimit = c.memoryInjectFacts
+	}
+	out := make([]memoryRecallCandidate, 0, c.memoryInjectFacts)
+	seen := make(map[string]struct{}, c.memoryInjectFacts)
+	appendCandidate := func(cand memoryRecallCandidate) bool {
+		if len(out) >= c.memoryInjectFacts {
+			return false
+		}
+		key := normalizeMemoryText(cand.Fact.Text)
+		if _, ok := seen[key]; ok {
+			return false
+		}
+		seen[key] = struct{}{}
+		out = append(out, cand)
+		return true
+	}
+
+	for i := 0; i < len(short) && i < shortLimit; i++ {
+		appendCandidate(short[i])
+	}
+
+	if c.memoryCategoryQuotaEnabled {
+		quota := c.recallCategoryQuota(c.memoryInjectFacts)
+		for cat, minNeed := range quota {
+			if minNeed <= 0 {
+				continue
+			}
+			have := 0
+			for _, item := range out {
+				if strings.EqualFold(item.Fact.Category, cat) {
+					have++
+				}
+			}
+			if have >= minNeed {
+				continue
+			}
+			need := minNeed - have
+			for _, group := range [][]memoryRecallCandidate{short, long} {
+				for _, cand := range group {
+					if need <= 0 {
+						break
+					}
+					if !strings.EqualFold(cand.Fact.Category, cat) {
+						continue
+					}
+					if appendCandidate(cand) {
+						need--
+					}
+				}
+				if need <= 0 || len(out) >= c.memoryInjectFacts {
+					break
+				}
+			}
+			if len(out) >= c.memoryInjectFacts {
+				break
+			}
+		}
+	}
+
+	for _, group := range [][]memoryRecallCandidate{long, short} {
+		for _, cand := range group {
+			if !appendCandidate(cand) && len(out) >= c.memoryInjectFacts {
+				break
+			}
+		}
+		if len(out) >= c.memoryInjectFacts {
+			break
+		}
+	}
+
+	return out
+}
+
+func (c *Client) recallCategoryQuota(injectLimit int) map[string]int {
+	if injectLimit <= 0 {
+		return map[string]int{}
+	}
+
+	if len(c.memoryCategoryQuota) > 0 {
+		custom := make(map[string]int, len(c.memoryCategoryQuota))
+		sum := 0
+		for k, v := range c.memoryCategoryQuota {
+			if v <= 0 {
+				continue
+			}
+			custom[k] = v
+			sum += v
+		}
+		if sum <= injectLimit {
+			return custom
+		}
+
+		scaled := make(map[string]int, len(custom))
+		remaining := injectLimit
+		for k, v := range custom {
+			sv := int(math.Floor(float64(v) * float64(injectLimit) / float64(sum)))
+			if sv < 1 {
+				sv = 1
+			}
+			scaled[k] = sv
+			remaining -= sv
+		}
+
+		if remaining < 0 {
+			type pair struct {
+				k string
+				v int
+			}
+			pairs := make([]pair, 0, len(scaled))
+			for k, v := range scaled {
+				pairs = append(pairs, pair{k: k, v: v})
+			}
+			sort.Slice(pairs, func(i, j int) bool {
+				return pairs[i].v > pairs[j].v
+			})
+			for remaining < 0 {
+				adjusted := false
+				for _, p := range pairs {
+					if remaining == 0 {
+						break
+					}
+					if scaled[p.k] > 1 {
+						scaled[p.k]--
+						remaining++
+						adjusted = true
+					}
+				}
+				if !adjusted {
+					break
+				}
+			}
+		} else if remaining > 0 {
+			for remaining > 0 {
+				for k := range scaled {
+					if remaining == 0 {
+						break
+					}
+					scaled[k]++
+					remaining--
+				}
+			}
+		}
+
+		log.Printf("opencode: memory quota scaled raw=%v scaled=%v injectLimit=%d", custom, scaled, injectLimit)
+		return scaled
+	}
+
+	if injectLimit < 4 {
+		return map[string]int{}
+	}
+	quota := map[string]int{"preference": 1, "project": 1}
+	if injectLimit >= 6 {
+		quota["profile"] = 1
+	}
+	if injectLimit >= 8 {
+		quota["environment"] = 1
+	}
+	return quota
+}
+
+func parseMemoryCategoryQuota(raw string) map[string]int {
+	out := map[string]int{}
+	allowed := map[string]struct{}{
+		"profile":      {},
+		"preference":   {},
+		"project":      {},
+		"environment":  {},
+		"model":        {},
+		"conversation": {},
+	}
+	for _, item := range strings.Split(raw, ",") {
+		part := strings.TrimSpace(item)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			log.Printf("opencode: ignore invalid memory category quota segment %q (expected category=value)", part)
+			continue
+		}
+		rawKey := strings.TrimSpace(kv[0])
+		key := normalizeMemoryCategory(rawKey)
+		if _, ok := allowed[key]; !ok {
+			log.Printf("opencode: ignore unsupported memory category quota %q (supported: profile, preference, project, environment, model, conversation)", rawKey)
+			continue
+		}
+		val, err := strconv.Atoi(strings.TrimSpace(kv[1]))
+		if err != nil || val <= 0 {
+			log.Printf("opencode: ignore invalid memory category quota value %q for %s", strings.TrimSpace(kv[1]), key)
+			continue
+		}
+		out[key] = val
+	}
+	return out
+}
+
+// GetMemoryRuntimeConfig returns a snapshot of current memory runtime settings.
+func (c *Client) GetMemoryRuntimeConfig() MemoryRuntimeConfig {
+	quota := map[string]int{}
+	for k, v := range c.memoryCategoryQuota {
+		quota[k] = v
+	}
+	return MemoryRuntimeConfig{
+		Enabled:              c.memoryEnabled,
+		MaxChars:             c.memoryMaxChars,
+		MaxFacts:             c.memoryMaxFacts,
+		InjectFacts:          c.memoryInjectFacts,
+		ShortTermFacts:       c.memoryShortTermFacts,
+		RecentWindow:         c.memoryRecentWindow.String(),
+		DecayEnabled:         c.memoryDecayEnabled,
+		DecayHalfLife:        c.memoryDecayHalfLife.String(),
+		CategoryQuotaEnabled: c.memoryCategoryQuotaEnabled,
+		CategoryQuota:        quota,
+		AutoCompactInterval:  c.memoryAutoCompactInterval.String(),
+		DebugRecall:          c.memoryDebugRecall,
+	}
+}
+
+// ResetMemoryRuntimeConfigToDefault resets memory runtime knobs to startup values.
+func (c *Client) ResetMemoryRuntimeConfigToDefault() MemoryRuntimeConfig {
+	defaults := c.memoryDefaults
+	quota := map[string]int{}
+	for k, v := range defaults.CategoryQuota {
+		quota[k] = v
+	}
+	c.memoryEnabled = defaults.Enabled
+	c.memoryMaxChars = defaults.MaxChars
+	c.memoryMaxFacts = defaults.MaxFacts
+	c.memoryInjectFacts = defaults.InjectFacts
+	c.memoryShortTermFacts = defaults.ShortTermFacts
+	if d, err := time.ParseDuration(defaults.RecentWindow); err == nil {
+		c.memoryRecentWindow = d
+	}
+	c.memoryDecayEnabled = defaults.DecayEnabled
+	if d, err := time.ParseDuration(defaults.DecayHalfLife); err == nil {
+		c.memoryDecayHalfLife = d
+	}
+	c.memoryCategoryQuotaEnabled = defaults.CategoryQuotaEnabled
+	c.memoryCategoryQuota = quota
+	if d, err := time.ParseDuration(defaults.AutoCompactInterval); err == nil {
+		c.memoryAutoCompactInterval = d
+	}
+	c.memoryDebugRecall = defaults.DebugRecall
+	return c.GetMemoryRuntimeConfig()
+}
+
+// UpdateMemoryRuntimeConfig updates one memory runtime key and returns the latest snapshot.
+func (c *Client) UpdateMemoryRuntimeConfig(key, value string) (MemoryRuntimeConfig, error) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	value = strings.TrimSpace(value)
+	if key == "" {
+		return c.GetMemoryRuntimeConfig(), fmt.Errorf("memory config key is empty")
+	}
+
+	parseOnOff := func(v string) (bool, error) {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "on", "true", "1", "yes", "y", "enable", "enabled":
+			return true, nil
+		case "off", "false", "0", "no", "n", "disable", "disabled":
+			return false, nil
+		default:
+			return false, fmt.Errorf("invalid bool value %q", v)
+		}
+	}
+
+	switch key {
+	case "enabled":
+		b, err := parseOnOff(value)
+		if err != nil {
+			return c.GetMemoryRuntimeConfig(), err
+		}
+		c.memoryEnabled = b
+	case "max_chars":
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("max_chars must be positive int")
+		}
+		c.memoryMaxChars = n
+	case "max_facts":
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("max_facts must be positive int")
+		}
+		c.memoryMaxFacts = n
+	case "inject_facts":
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("inject_facts must be positive int")
+		}
+		c.memoryInjectFacts = n
+	case "short_term_facts":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("short_term_facts must be >= 0")
+		}
+		c.memoryShortTermFacts = n
+	case "recent_window":
+		d, err := time.ParseDuration(value)
+		if err != nil || d <= 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("recent_window must be duration, e.g. 24h")
+		}
+		c.memoryRecentWindow = d
+	case "decay_enabled":
+		b, err := parseOnOff(value)
+		if err != nil {
+			return c.GetMemoryRuntimeConfig(), err
+		}
+		c.memoryDecayEnabled = b
+	case "decay_half_life":
+		d, err := time.ParseDuration(value)
+		if err != nil || d <= 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("decay_half_life must be duration, e.g. 168h")
+		}
+		c.memoryDecayHalfLife = d
+	case "category_quota_enabled":
+		b, err := parseOnOff(value)
+		if err != nil {
+			return c.GetMemoryRuntimeConfig(), err
+		}
+		c.memoryCategoryQuotaEnabled = b
+	case "category_quota":
+		if value == "" {
+			c.memoryCategoryQuota = map[string]int{}
+			break
+		}
+		parsed := parseMemoryCategoryQuota(value)
+		if len(parsed) == 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("category_quota parsed empty, expected format preference=2,project=1")
+		}
+		c.memoryCategoryQuota = parsed
+	case "auto_compact_interval":
+		if strings.EqualFold(value, "off") || value == "0" {
+			c.memoryAutoCompactInterval = 0
+			break
+		}
+		d, err := time.ParseDuration(value)
+		if err != nil || d <= 0 {
+			return c.GetMemoryRuntimeConfig(), fmt.Errorf("auto_compact_interval must be duration or off")
+		}
+		c.memoryAutoCompactInterval = d
+	case "debug_recall":
+		b, err := parseOnOff(value)
+		if err != nil {
+			return c.GetMemoryRuntimeConfig(), err
+		}
+		c.memoryDebugRecall = b
+	default:
+		return c.GetMemoryRuntimeConfig(), fmt.Errorf("unsupported memory config key: %s", key)
+	}
+
+	return c.GetMemoryRuntimeConfig(), nil
+}
+
+// PreviewMemoryRecall returns top recall results with score breakdown for diagnostics.
+func (c *Client) PreviewMemoryRecall(channel, userID, query string, limit int) []MemoryRecallResult {
+	store := c.loadUserMemoryStore(channel, userID)
+	if len(store.Facts) == 0 {
+		return nil
+	}
+	selected := c.selectMemoryForQuery(store.Facts, query)
+	if len(selected) == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > len(selected) {
+		limit = len(selected)
+	}
+	out := make([]MemoryRecallResult, 0, limit)
+	for i := 0; i < limit; i++ {
+		cand := selected[i]
+		out = append(out, MemoryRecallResult{
+			Text:       cand.Fact.Text,
+			Category:   cand.Fact.Category,
+			Importance: cand.Fact.Importance,
+			Count:      cand.Fact.Count,
+			LastSeen:   cand.Fact.LastSeen,
+			Score:      cand.Score,
+			Layer:      cand.Layer,
+			Reasons:    append([]string(nil), cand.Reasons...),
+		})
+	}
+	return out
+}
+
+func (c *Client) memoryRecallScore(f memoryFact, query string, now time.Time) (float64, []string) {
+	reasons := make([]string, 0, 6)
+	base := float64(f.Importance) * 2.0
+	reasons = append(reasons, fmt.Sprintf("importance=%.2f", base))
+
+	countBoost := math.Log1p(float64(max(1, f.Count)))
+	reasons = append(reasons, fmt.Sprintf("count=%.2f", countBoost))
+
+	decay := 1.0
+	if c.memoryDecayEnabled && c.memoryDecayHalfLife > 0 && !f.LastSeen.IsZero() {
+		ageHours := now.Sub(f.LastSeen).Hours()
+		if ageHours < 0 {
+			ageHours = 0
+		}
+		halfHours := c.memoryDecayHalfLife.Hours()
+		decay = math.Exp(-math.Ln2 * ageHours / halfHours)
+		reasons = append(reasons, fmt.Sprintf("decay=%.3f", decay))
+	}
+
+	queryScore := memoryQueryRelevanceScore(f.Text, query)
+	if queryScore > 0 {
+		reasons = append(reasons, fmt.Sprintf("query=%.2f", queryScore))
+	}
+
+	// Apply forgetting curve on base knowledge while keeping query hit additive.
+	total := (base+countBoost)*decay + queryScore*3.0
+	if f.Importance >= 5 {
+		total += 1.5
+		reasons = append(reasons, "pinned=1.50")
+	}
+	return total, reasons
+}
+
+func memoryQueryRelevanceScore(text, query string) float64 {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return 0
+	}
+	textNorm := normalizeMemoryText(text)
+	queryNorm := normalizeMemoryText(query)
+	if textNorm == "" || queryNorm == "" {
+		return 0
+	}
+
+	if strings.Contains(queryNorm, textNorm) || strings.Contains(textNorm, queryNorm) {
+		return 2.0
+	}
+
+	textTokens := tokenizeMemoryText(text)
+	queryTokens := tokenizeMemoryText(query)
+	if len(textTokens) == 0 || len(queryTokens) == 0 {
+		return 0
+	}
+
+	querySet := make(map[string]struct{}, len(queryTokens))
+	for _, t := range queryTokens {
+		querySet[t] = struct{}{}
+	}
+	overlap := 0
+	for _, t := range textTokens {
+		if _, ok := querySet[t]; ok {
+			overlap++
+		}
+	}
+	if overlap == 0 {
+		return 0
+	}
+	return float64(overlap) / float64(len(querySet))
+}
+
+func tokenizeMemoryText(s string) []string {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	if lower == "" {
+		return nil
+	}
+	tokens := strings.FieldsFunc(lower, func(r rune) bool {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			return false
+		}
+		if r >= 0x4e00 && r <= 0x9fff {
+			return false
+		}
+		return true
+	})
+	if len(tokens) == 0 {
+		return nil
+	}
+	uniq := make(map[string]struct{}, len(tokens))
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if _, ok := uniq[t]; ok {
+			continue
+		}
+		uniq[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }
 
 func (c *Client) updateUserMemory(channel, userID, userMessage, assistantReply string) {
@@ -1612,7 +2761,7 @@ func (c *Client) AbortSession(ctx context.Context, sessionID string) error {
 	if err != nil {
 		return fmt.Errorf("opencode: abort session: %w", err)
 	}
-	c.runningSessions.Delete(sessionID)
+	c.releaseSessionSlot(sessionID)
 	return nil
 }
 
@@ -1626,7 +2775,7 @@ func (c *Client) ForkSession(ctx context.Context, sessionID string) (string, err
 	log.Printf("opencode: forking session %s", sessionID[:min(8, len(sessionID))])
 
 	forkURL := fmt.Sprintf("%s/session/%s/fork", strings.TrimRight(c.endpoint, "/"), sessionID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, forkURL, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, forkURL, bytes.NewBufferString("{}"))
 	if err != nil {
 		return "", fmt.Errorf("opencode: fork session request: %w", err)
 	}
@@ -1658,6 +2807,39 @@ func (c *Client) ForkSession(ctx context.Context, sessionID string) (string, err
 	return result.ID, nil
 }
 
+// CompactAndForkSession compacts the current session via the official summarize API
+// and then forks it into a new session for continued work.
+func (c *Client) CompactAndForkSession(ctx context.Context, sessionID string) (string, error) {
+	if err := c.SummarizeSession(ctx, sessionID); err != nil {
+		return "", err
+	}
+
+	newSessionID, err := c.ForkSession(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+
+	if cfg, ok := c.getCurrentSessionModel(ctx, sessionID); ok {
+		copied := &ModelConfig{
+			ProviderID:  cfg.ProviderID,
+			ModelID:     cfg.ModelID,
+			LastUpdated: time.Now(),
+		}
+		c.sessionModel.Store(newSessionID, copied)
+	}
+	if override, ok := c.sessionOverride.Load(sessionID); ok {
+		cfg := override.(*ModelConfig)
+		c.sessionOverride.Store(newSessionID, &ModelConfig{
+			ProviderID:  cfg.ProviderID,
+			ModelID:     cfg.ModelID,
+			LastUpdated: time.Now(),
+		})
+	}
+	go c.fetchAndCacheModelConfig(context.Background(), newSessionID)
+
+	return newSessionID, nil
+}
+
 // DeleteSession deletes a session.
 func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	log.Printf("opencode: deleting session %s", sessionID[:8])
@@ -1670,7 +2852,9 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	c.tokenCount.Delete(sessionID)
 	c.sessionSummary.Delete(sessionID)
 	c.modelConfig.Delete(sessionID)
-	c.runningSessions.Delete(sessionID)
+	c.lastDiffSummary.Delete(sessionID)
+	c.releaseSessionSlot(sessionID)
+	c.sessionQueues.Delete(sessionID)
 	return nil
 }
 
@@ -1855,13 +3039,105 @@ func (c *Client) getSessionModelOverride(sessionID string) *opencode.SessionProm
 	return nil
 }
 
-// IsSessionRunning checks if a session is currently running
+// IsSessionRunning checks if a session is currently running.
+// A session is considered running when its semaphore slot is held.
 func (c *Client) IsSessionRunning(sessionID string) bool {
-	val, ok := c.runningSessions.Load(sessionID)
+	raw, ok := c.sessionQueues.Load(sessionID)
 	if !ok {
 		return false
 	}
-	return val.(bool)
+	return len(raw.(chan struct{})) > 0
+}
+
+func shouldQueueByChannel(_ string) bool {
+	// All channels queue messages: only one message per session is sent to
+	// OpenCode at a time.  Subsequent messages from the same user are held in
+	// the per-session semaphore and the user sees an "⏳ 已入队" notification.
+	// This matches TUI behaviour and prevents interleaved responses under
+	// concurrent sends from DingTalk, Feishu, WeChat, and WebUI.
+	return true
+}
+
+func sessionMapKey(channel, threadID string) string {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return ""
+	}
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	if channel == "" {
+		return threadID
+	}
+	return channel + ":" + threadID
+}
+
+func (c *Client) loadSessionForThread(channel, threadID string) (string, bool) {
+	key := sessionMapKey(channel, threadID)
+	if key != "" {
+		if sid, ok := c.sessions.Load(key); ok {
+			return sid.(string), true
+		}
+	}
+	legacyKey := strings.TrimSpace(threadID)
+	if legacyKey != "" && legacyKey != key {
+		if sid, ok := c.sessions.Load(legacyKey); ok {
+			return sid.(string), true
+		}
+	}
+	return "", false
+}
+
+func (c *Client) storeSessionForThread(channel, threadID, sessionID string) {
+	key := sessionMapKey(channel, threadID)
+	if key == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	c.sessions.Store(key, sessionID)
+}
+
+func (c *Client) deleteSessionForThread(channel, threadID string) {
+	key := sessionMapKey(channel, threadID)
+	if key != "" {
+		c.sessions.Delete(key)
+	}
+	legacyKey := strings.TrimSpace(threadID)
+	if legacyKey != "" && legacyKey != key {
+		c.sessions.Delete(legacyKey)
+	}
+}
+
+// acquireSessionSlot blocks until a slot is free for the given session,
+// serialising concurrent messages to the same opencode session.
+// Returns a release function that MUST be called when the send completes.
+func (c *Client) acquireSessionSlot(ctx context.Context, sessionID string) (func(), error) {
+	raw, _ := c.sessionQueues.LoadOrStore(sessionID, make(chan struct{}, 1))
+	sem := raw.(chan struct{})
+	// Fast path: slot is free
+	select {
+	case sem <- struct{}{}:
+		return func() { c.releaseSessionSlot(sessionID) }, nil
+	default:
+	}
+	// Slow path: session busy, queue up
+	log.Printf("opencode: session %s busy, queuing new message", sessionID[:8])
+	select {
+	case sem <- struct{}{}:
+		log.Printf("opencode: session %s slot acquired after queuing", sessionID[:8])
+		return func() { c.releaseSessionSlot(sessionID) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// releaseSessionSlot releases the current slot for a session. Idempotent and safe to call multiple times.
+func (c *Client) releaseSessionSlot(sessionID string) {
+	raw, ok := c.sessionQueues.Load(sessionID)
+	if !ok {
+		return
+	}
+	select {
+	case <-raw.(chan struct{}):
+	default:
+	}
 }
 
 // StartEventListener begins listening for OpenCode events via SSE.
@@ -1942,17 +3218,15 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 					if eventCount <= 15 {
 						log.Printf("opencode: 🔍🔍 [message.part.updated #%d RAW] %.1000s", eventCount, raw)
 					}
-					var msgInfo struct {
-						Properties struct {
-							Message struct {
-								ID   string `json:"id"`
-								Role string `json:"role"`
-							} `json:"message"`
-						} `json:"properties"`
-					}
-					if json.Unmarshal([]byte(raw), &msgInfo) == nil {
-						if msgID := msgInfo.Properties.Message.ID; msgID != "" && msgInfo.Properties.Message.Role != "" {
-							c.messageRoles.Store(msgID, msgInfo.Properties.Message.Role)
+					if meta, ok := parseMessagePartUpdatedMeta(raw); ok {
+						if meta.MessageID != "" && meta.Role != "" {
+							c.messageRoles.Store(meta.MessageID, meta.Role)
+						}
+						if meta.MessageID != "" && meta.SessionID != "" {
+							c.messageToSession.Store(meta.MessageID, meta.SessionID)
+						}
+						if meta.PartID != "" && meta.SessionID != "" {
+							c.partToSession.Store(meta.PartID, meta.SessionID)
 						}
 					}
 				}
@@ -1989,6 +3263,7 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 					var probe struct {
 						Properties struct {
 							MessageID string `json:"messageID"` // present in message.part.delta
+							PartID    string `json:"partID"`    // present in message.part.delta
 							Message   struct {
 								ID        string `json:"id"`
 								SessionID string `json:"sessionID"`
@@ -2006,14 +3281,14 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 									c.messageRoles.Store(msgID, role)
 								}
 							}
-						} else if probe.Properties.MessageID != "" {
-							// message.part.delta — look up sessionID via reverse map
-							if sid, ok := c.messageToSession.Load(probe.Properties.MessageID); ok {
-								sessionID = sid.(string)
+							if partID := probe.Properties.PartID; partID != "" {
+								c.partToSession.Store(partID, sessionID)
 							}
-							// If still no sessionID, broadcast — but only for assistant messages
-							// with a KNOWN role. Unknown-role deltas are likely from old/other
-							// sessions being replayed; broadcasting them would echo stale content.
+						} else if probe.Properties.MessageID != "" {
+							// message.part.delta — resolve via messageID, fallback to partID.
+							sessionID = resolveSessionIDForPartDelta(probe.Properties.MessageID, probe.Properties.PartID, &c.messageToSession, &c.partToSession)
+							// If still no sessionID, drop delta instead of broadcasting to all sessions.
+							// Broadcasting causes cross-session content mixing under high concurrency.
 							if sessionID == "" {
 								role, roleKnown := c.messageRoles.Load(probe.Properties.MessageID)
 								if !roleKnown {
@@ -2021,18 +3296,7 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 								} else if role.(string) == "user" {
 									log.Printf("opencode: skipping user message.part.delta broadcast (msgID=%s)", probe.Properties.MessageID[:min(8, len(probe.Properties.MessageID))])
 								} else {
-									// Known assistant message — broadcast to all session handlers
-									dispatched := 0
-									c.sessionHandlers.Range(func(k, v interface{}) bool {
-										if err := v.(EventHandler)(ctx, &event); err != nil {
-											log.Printf("opencode: message.part.delta broadcast error (session %v): %v", k, err)
-										}
-										dispatched++
-										return true
-									})
-									if dispatched == 0 {
-										log.Printf("opencode: message.part.delta broadcast - no session handlers registered")
-									}
+									log.Printf("opencode: dropping assistant message.part.delta without resolvable session (msgID=%s, partID=%s)", probe.Properties.MessageID[:min(8, len(probe.Properties.MessageID))], probe.Properties.PartID[:min(8, len(probe.Properties.PartID))])
 								}
 							}
 						}
@@ -2050,35 +3314,9 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 				log.Printf("opencode: processing event type=%s (no sessionID)", eventType)
 			}
 
-			// Dispatch to the specific session handler (when sessionID is known)
-			if sessionID != "" {
-				if handler, ok := c.sessionHandlers.Load(sessionID); ok {
-					if err := handler.(EventHandler)(ctx, &event); err != nil {
-						log.Printf("opencode: session handler error for %s: %v", sessionID[:8], err)
-					}
-				} else {
-					log.Printf("opencode: no session handler found for %s", sessionID[:8])
-					c.sessionHandlers.Range(func(k, v interface{}) bool {
-						log.Printf("opencode:   registered handler: %v", k)
-						return true
-					})
-				}
-			}
-
-			// Always dispatch to global handlers
-			c.eventListenerMu.RLock()
-			handlers := c.eventHandlers
-			c.eventListenerMu.RUnlock()
-
-			if len(handlers) > 0 {
-				log.Printf("opencode: dispatching to %d global handlers", len(handlers))
-			}
-
-			for _, handler := range handlers {
-				if err := handler(ctx, &event); err != nil {
-					log.Printf("opencode: global event handler error: %v", err)
-				}
-			}
+			// Dispatch: per-session streaming handler first, then global handlers.
+			// SSEDispatcher guarantees in-order delivery per session.
+			c.dispatcher.Dispatch(ctx, sessionID, &event)
 		}
 
 		stream.Close()
@@ -2175,23 +3413,25 @@ func (c *Client) invalidateStaleSessions(ctx context.Context) {
 	}
 }
 
-// RegisterEventHandler adds a new event handler dynamically.
+// RegisterEventHandler adds a global event handler that receives every SSE
+// event regardless of sessionID.  Delegates to the SSEDispatcher.
 func (c *Client) RegisterEventHandler(handler EventHandler) {
-	c.eventListenerMu.Lock()
-	defer c.eventListenerMu.Unlock()
-	c.eventHandlers = append(c.eventHandlers, handler)
+	c.dispatcher.AddGlobalHandler(handler)
 }
 
-// RegisterSessionHandler registers an event handler tied to a specific session.
-// This allows fast lookup and prevents unnecessary processing of unrelated events.
+// RegisterSessionHandler registers a per-session event handler.
+// The handler is stored both in the SSEDispatcher (for routing) and in
+// activeHandlers (for TODO/diff introspection by other callers).
 func (c *Client) RegisterSessionHandler(sessionID string, handler EventHandler) {
-	c.sessionHandlers.Store(sessionID, handler)
+	c.sessionHandlers.Store(sessionID, handler) // legacy: kept for direct Load calls in tests
+	c.dispatcher.SetSessionHandler(sessionID, handler)
 }
 
-// UnregisterSessionHandler removes an event handler for a specific session.
+// UnregisterSessionHandler removes per-session routing for sessionID.
 func (c *Client) UnregisterSessionHandler(sessionID string) {
 	c.sessionHandlers.Delete(sessionID)
 	c.activeHandlers.Delete(sessionID)
+	c.dispatcher.RemoveSessionHandler(sessionID)
 }
 
 // GetTodosForSession returns the current todo list for a running session.
@@ -2257,6 +3497,68 @@ func extractReplyFromMessage(msg *opencode.SessionPromptResponse) string {
 	return fullReply
 }
 
+type messagePartUpdatedMeta struct {
+	SessionID string
+	MessageID string
+	PartID    string
+	Role      string
+}
+
+func parseMessagePartUpdatedMeta(raw string) (messagePartUpdatedMeta, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return messagePartUpdatedMeta{}, false
+	}
+
+	// message.part.updated structure (from SDK EventListResponseEventMessagePartUpdatedProperties):
+	//   properties.part  → the full Part object (id, messageID, sessionID, type, text, ...)
+	//   properties.delta → optional incremental delta string
+	//
+	// The session ID and message ID are in properties.part.*, NOT in properties.message.*
+	// (there is no "message" field in message.part.updated properties).
+	var payload struct {
+		Properties struct {
+			Part struct {
+				ID        string `json:"id"`
+				MessageID string `json:"messageID"`
+				SessionID string `json:"sessionID"`
+			} `json:"part"`
+		} `json:"properties"`
+	}
+
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return messagePartUpdatedMeta{}, false
+	}
+
+	meta := messagePartUpdatedMeta{
+		SessionID: payload.Properties.Part.SessionID,
+		MessageID: payload.Properties.Part.MessageID,
+		PartID:    payload.Properties.Part.ID,
+		// Role is not available in message.part.updated; it comes from message.updated events.
+	}
+	if meta.SessionID == "" && meta.MessageID == "" && meta.PartID == "" {
+		return messagePartUpdatedMeta{}, false
+	}
+	return meta, true
+}
+
+func resolveSessionIDForPartDelta(messageID, partID string, messageToSession, partToSession *sync.Map) string {
+	if messageToSession != nil && strings.TrimSpace(messageID) != "" {
+		if sid, ok := messageToSession.Load(messageID); ok {
+			if resolved, ok := sid.(string); ok && strings.TrimSpace(resolved) != "" {
+				return resolved
+			}
+		}
+	}
+	if partToSession != nil && strings.TrimSpace(partID) != "" {
+		if sid, ok := partToSession.Load(partID); ok {
+			if resolved, ok := sid.(string); ok && strings.TrimSpace(resolved) != "" {
+				return resolved
+			}
+		}
+	}
+	return ""
+}
+
 // getThreadLock gets or creates a lock for a specific thread to prevent concurrent operations.
 func (c *Client) getThreadLock(threadID string) *sync.Mutex {
 	if threadID == "" {
@@ -2267,37 +3569,26 @@ func (c *Client) getThreadLock(threadID string) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
-// SummarizeSession 总结一个session的对话内容
+// SummarizeSession 使用官方 summarize API 压缩当前 session。
 func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
 	if !c.Ready() {
 		return fmt.Errorf("opencode: client not configured")
 	}
 
-	// 检查是否已有总结
-	if _, exists := c.sessionSummary.Load(sessionID); exists {
-		return nil // 已经总结过了
+	log.Printf("opencode: summarizing session %s", sessionID)
+	modelCfg, ok := c.getCurrentSessionModel(ctx, sessionID)
+	if !ok || strings.TrimSpace(modelCfg.ProviderID) == "" || strings.TrimSpace(modelCfg.ModelID) == "" {
+		return fmt.Errorf("opencode: summarize session: unable to determine model for session %s", sessionID)
 	}
 
-	log.Printf("opencode: summarizing session %s", sessionID)
-
-	// 调用OpenCode的summarize API
-	_, err := c.sdk.Session.Summarize(ctx, sessionID, opencode.SessionSummarizeParams{})
+	_, err := c.sdk.Session.Summarize(ctx, sessionID, opencode.SessionSummarizeParams{
+		ProviderID: opencode.F(modelCfg.ProviderID),
+		ModelID:    opencode.F(modelCfg.ModelID),
+	})
 	if err != nil {
 		return fmt.Errorf("opencode: summarize session: %w", err)
 	}
-
-	// 获取session详情以获取总结
-	session, err := c.GetSession(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("opencode: get session after summarize: %w", err)
-	}
-
-	// 提取总结内容（从session的messages中查找summary类型的消息）
-	summary := extractSummaryFromSession(session)
-	if summary != "" {
-		c.sessionSummary.Store(sessionID, summary)
-		log.Printf("opencode: session %s summarized successfully", sessionID)
-	}
+	log.Printf("opencode: session %s summarized successfully with %s/%s", sessionID, modelCfg.ProviderID, modelCfg.ModelID)
 
 	return nil
 }
@@ -2336,6 +3627,19 @@ func (c *Client) ResetSession(threadID string) {
 		c.sessions.Delete(threadID)
 		log.Printf("opencode: reset session mapping for thread %s", threadID)
 	}
+}
+
+// SetSessionForThread binds a thread to a specific session.
+func (c *Client) SetSessionForThread(threadID, sessionID string) {
+	if strings.TrimSpace(threadID) == "" {
+		return
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		c.sessions.Delete(threadID)
+		return
+	}
+	c.sessions.Store(threadID, sessionID)
+	log.Printf("opencode: set session mapping for thread %s -> %s", threadID, sessionID[:min(8, len(sessionID))])
 }
 
 // GetSessionForThread retrieves the session ID associated with a thread.
@@ -2395,13 +3699,19 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		return c.SendMessage(ctx, payload)
 	}
 
+	if notice := c.consumePersonaSetupPrompt(payload.Channel, payload.UserID); notice != "" {
+		if err := callback(notice + "\n\n"); err != nil {
+			log.Printf("opencode: persona setup notice callback failed: %v", err)
+		}
+	}
+
 	// 1. 先确定sessionID（可能需要创建新session）
-	threadLock := c.getThreadLock(payload.ThreadID)
+	threadLock := c.getThreadLock(sessionMapKey(payload.Channel, payload.ThreadID))
 	threadLock.Lock()
 	sessionID := payload.SessionID
 	if sessionID == "" && payload.ThreadID != "" {
-		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
-			sessionID = sid.(string)
+		if sid, ok := c.loadSessionForThread(payload.Channel, payload.ThreadID); ok {
+			sessionID = sid
 
 			// 验证 session 是否仍然有效
 			checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2410,7 +3720,7 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 			if checkErr != nil {
 				log.Printf("opencode: ⚠️ streaming session %s is stale (err: %v), will create new",
 					sessionID[:min(8, len(sessionID))], checkErr)
-				c.sessions.Delete(payload.ThreadID)
+				c.deleteSessionForThread(payload.Channel, payload.ThreadID)
 				c.messageCount.Delete(sessionID)
 				c.tokenCount.Delete(sessionID)
 				sessionID = "" // 强制创建新 session
@@ -2433,7 +3743,7 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		}
 		sessionID = session.ID
 		if payload.ThreadID != "" {
-			c.sessions.Store(payload.ThreadID, sessionID)
+			c.storeSessionForThread(payload.Channel, payload.ThreadID, sessionID)
 		}
 		c.messageCount.Store(sessionID, 0)
 		c.tokenCount.Store(sessionID, 0)
@@ -2449,35 +3759,67 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 		log.Printf("opencode: sessionID notification sent successfully")
 	}
 
-	// 3. 创建StreamingSessionHandler并注册
-	handler := NewStreamingSessionHandler(sessionID, callback, func() {
-		c.runningSessions.Delete(sessionID)
-		c.UnregisterSessionHandler(sessionID)
-	}, c, c, c.IsThinkingEnabled(), c.IsStepEnabled())
+	var handler *StreamingSessionHandler
+	unregisterIfCurrent := func() {
+		if current, ok := c.activeHandlers.Load(sessionID); ok {
+			if current == handler {
+				c.UnregisterSessionHandler(sessionID)
+			}
+		}
+	}
+
+	// 3. 仅对 webui 开启排队：钉钉/飞书/企微不在 gateway 侧排队。
+	queueEnabled := shouldQueueByChannel(payload.Channel)
+	if queueEnabled {
+		if c.IsSessionRunning(sessionID) {
+			log.Printf("opencode: session %s busy, notifying user of queued message", sessionID[:8])
+			_ = callback("⏳ 上条消息处理中，已排队等待...\n")
+		}
+		slotRelease, slotErr := c.acquireSessionSlot(ctx, sessionID)
+		if slotErr != nil {
+			return Response{}, fmt.Errorf("opencode: wait for session slot: %w", slotErr)
+		}
+		// defer 保证无论 SendMessageStreaming 经哪条路径退出（doneCh / 超时 / error / ctx），
+		// slot 一定被释放；handler 仅在仍是当前 active handler 时才会被注销。
+		defer func() {
+			unregisterIfCurrent()
+			slotRelease()
+		}()
+	} else {
+		defer unregisterIfCurrent()
+	}
+
+	// 4. 创建StreamingSessionHandler并注册（slot 已持有，handler 正式接管本次请求）
+	// onComplete=nil：清理统一由上方 defer 完成，handler 内部只需关闭 doneCh。
+	handler = NewStreamingSessionHandler(sessionID, callback, nil, c, c, c.IsThinkingEnabled(), c.IsStepEnabled())
 	c.RegisterSessionHandler(sessionID, handler.HandleEvent)
 	c.activeHandlers.Store(sessionID, handler)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
 
-	// 4. 使用goroutine异步发送消息
+	// 5. 使用goroutine异步发送消息（slot 已预占，SendMessage 中跳过再次获取）
 	responseChan := make(chan Response, 1)
 	errorChan := make(chan error, 1)
 
-	go func() {
-		response, err := c.SendMessage(ctx, payload)
+	payloadWithSlot := payload
+	payloadWithSlot.slotPreAcquired = true
+	go func(p MessagePayload) {
+		response, err := c.SendMessage(ctx, p)
 		if err != nil {
 			errorChan <- err
 			return
 		}
 		responseChan <- response
-	}()
+	}(payloadWithSlot)
 
-	// 4. 定时检查完成状态（不再发送进度消息）
+	// ticker 仅作超时兜底，正常完成路径由 handler.Done() channel 驱动，避免 5s 轮询延迟。
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	isAsyncMode := false
 	var asyncResponse Response
-	idleCheckCount := 0 // 空闲检测计数器
+	// sessionIdleFired: doneCh 已关闭，但 isAsyncMode 还未设置时的标记
+	sessionIdleFired := false
+	idleCheckCount := 0
 
 	for {
 		select {
@@ -2488,19 +3830,22 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 			return Response{}, err
 
 		case response := <-responseChan:
-			// 如果是Async模式（reply为空），标记并继续等待SSE事件
 			if response.Reply == "" {
+				// Async 模式：prompt_async 立即返回空 reply，等待 SSE 事件
 				log.Printf("opencode: streaming async mode for session %s, waiting for SSE events", sessionID[:8])
 				isAsyncMode = true
 				asyncResponse = response
+				// doneCh 可能已经关闭（session.idle 早于 prompt_async 响应极少数情况）
+				if sessionIdleFired {
+					log.Printf("opencode: ✅ session already idle before responseChan, returning immediately for %s", sessionID[:8])
+					return asyncResponse, nil
+				}
 				continue
 			}
-
-			// 同步模式：检查是否通过streaming handler已经发送了内容
+			// 同步模式
 			sentContent := handler.GetLastContent()
 			log.Printf("opencode: streaming completed, handler sent: %d chars, final response: %d chars",
 				len(sentContent), len(response.Reply))
-
 			if sentContent == "" || sentContent != response.Reply {
 				if response.Reply != "" {
 					log.Printf("opencode: sending final response via callback")
@@ -2511,53 +3856,68 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 			}
 			return response, nil
 
-		case <-ticker.C:
-			// 如果在async模式且handler已完成，返回结果
-			if isAsyncMode && handler.IsCompleted() {
-				log.Printf("opencode: ✅ async streaming completed via SSE for session %s (contentSent=%t, lastContentLen=%d)",
-					sessionID[:8], handler.HasSentContent(), len(handler.GetLastContent()))
-				// 注意：不填充 asyncResponse.Reply，让调用者从 fullReply 获取内容
+		case <-handler.Done():
+			// session.idle / error / deleted 事件关闭 doneCh，立即响应，无需等下一个 tick。
+			//
+			// FlushSignal is sent HERE, in the adapter's message-handler goroutine
+			// (NOT in the SSE reader goroutine while s.mu is held), so the SSE reader
+			// is never blocked by a potentially long network I/O call.
+			log.Printf("opencode: 📤 doneCh fired for session %s — sending FlushSignal", sessionID[:8])
+			_ = callback(FlushSignal)
+
+			if isAsyncMode {
+				log.Printf("opencode: ✅ async streaming completed via doneCh for session %s (contentSent=%t)",
+					sessionID[:8], handler.HasSentContent())
 				return asyncResponse, nil
 			}
+			// responseChan 尚未投递（极少数情况），先记录，等 responseChan case 处理
+			sessionIdleFired = true
 
-			// 检查最后一次事件时间
+		case <-ticker.C:
+			// 兜底超时逻辑（doneCh 未能触发时的安全网）
 			lastEventTime, lastEventType := handler.GetLastEventInfo()
 			timeSinceLastEvent := time.Since(lastEventTime)
 			hasSentContent := handler.HasSentContent()
 			hasStepFinish := handler.HasReceivedStepFinish()
 			stepFinishTime := handler.GetStepFinishTime()
-			isCompleted := handler.IsCompleted()
+			hasPendingQ := handler.HasPendingQuestion()
 
-			log.Printf("opencode: 🔍 ticker check - session=%s, isAsync=%t, isCompleted=%t, hasSent=%t, hasStepFinish=%t, lastEvent=%v ago (type=%s), idleCount=%d",
-				sessionID[:8], isAsyncMode, isCompleted, hasSentContent, hasStepFinish, timeSinceLastEvent, lastEventType, idleCheckCount)
+			log.Printf("opencode: 🔍 ticker check - session=%s, isAsync=%t, hasSent=%t, hasStepFinish=%t, lastEvent=%v ago (type=%s), pendingQ=%t, idleCount=%d",
+				sessionID[:8], isAsyncMode, hasSentContent, hasStepFinish, timeSinceLastEvent, lastEventType, hasPendingQ, idleCheckCount)
 
-			// 如果收到了 step-finish 事件且已发送内容，5秒后没有新事件就认为完成
-			// (step-finish 通常标志着模型输出完成，后续应该很快有 session.idle)
+			// 会话正在等待用户回答问题/权限确认时，跳过短超时，使用更长的超时（5分钟）。
+			// 这防止了用户在思考答案时 SendMessageStreaming 提前返回并注销 handler，
+			// 导致 OpenCode 继续执行后发出的事件找不到 handler 的问题。
+			if hasPendingQ {
+				if timeSinceLastEvent > 5*time.Minute {
+					log.Printf("opencode: ⏱️ question-answer timeout (5m) for session %s, giving up", sessionID[:8])
+					_ = callback(FlushSignal)
+					return asyncResponse, nil
+				}
+				idleCheckCount++
+				continue
+			}
+
+			// step-finish 后 5s 无新事件 → 认为完成
 			if isAsyncMode && hasStepFinish && hasSentContent && !stepFinishTime.IsZero() {
-				timeSinceStepFinish := time.Since(stepFinishTime)
-				if timeSinceStepFinish > 5*time.Second {
-					log.Printf("opencode: 🏁 received step-finish %v ago (has sent content), treating as completed for session %s",
-						timeSinceStepFinish, sessionID[:8])
+				if time.Since(stepFinishTime) > 5*time.Second {
+					log.Printf("opencode: 🏁 step-finish timeout fallback for session %s", sessionID[:8])
+					_ = callback(FlushSignal)
 					return asyncResponse, nil
 				}
 			}
-
-			// 如果已发送内容且超过30秒无新事件，认为可能完成
-			// （从2分钟缩短到30秒，更快响应）
-			if isAsyncMode && hasSentContent && timeSinceLastEvent > 30*time.Second {
-				log.Printf("opencode: ⏱️ streaming idle for %v (has sent content), treating as completed for session %s",
-					timeSinceLastEvent, sessionID[:8])
+			// 有内容且 10s 无事件
+			if isAsyncMode && hasSentContent && timeSinceLastEvent > 10*time.Second {
+				log.Printf("opencode: ⏱️ idle fallback (10s, has content) for session %s", sessionID[:8])
+				_ = callback(FlushSignal)
 				return asyncResponse, nil
 			}
-
-			// 如果超过1分钟无任何事件（即使没发送内容），也认为完成
-			// 这处理 OpenCode 不发送完成事件的情况
-			if isAsyncMode && timeSinceLastEvent > 1*time.Minute {
-				log.Printf("opencode: ⏱️ streaming timeout (no events for %v, hasSent=%t), treating as completed for session %s",
-					timeSinceLastEvent, hasSentContent, sessionID[:8])
+			// 20s 无任何事件
+			if isAsyncMode && timeSinceLastEvent > 20*time.Second {
+				log.Printf("opencode: ⏱️ idle fallback (20s, no content) for session %s", sessionID[:8])
+				_ = callback(FlushSignal)
 				return asyncResponse, nil
 			}
-
 			idleCheckCount++
 		}
 	}
@@ -3673,6 +5033,140 @@ func (c *Client) cleanupRequestCache() {
 			return true
 		})
 	}
+}
+
+func (c *Client) autoCompactMemoryLoop() {
+	if !c.memoryEnabled || c.memoryAutoCompactInterval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(c.memoryAutoCompactInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		removed, files, err := c.compactAllMemoryFiles()
+		if err != nil {
+			log.Printf("opencode: auto compact memory failed: %v", err)
+			continue
+		}
+		if removed > 0 || c.memoryDebugRecall {
+			log.Printf("opencode: auto compact memory done files=%d removed=%d", files, removed)
+		}
+	}
+}
+
+func (c *Client) compactAllMemoryFiles() (int, int, error) {
+	c.memoryMu.Lock()
+	defer c.memoryMu.Unlock()
+
+	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
+		return 0, 0, err
+	}
+
+	entries, err := os.ReadDir(c.memoryDir)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	removedTotal := 0
+	fileCount := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		path := filepath.Join(c.memoryDir, entry.Name())
+		store, removed, changed, compactErr := c.compactMemoryStoreByPath(path)
+		if compactErr != nil {
+			log.Printf("opencode: auto compact skip %s: %v", entry.Name(), compactErr)
+			continue
+		}
+		fileCount++
+		if !changed {
+			continue
+		}
+		encoded, marshalErr := json.MarshalIndent(store, "", "  ")
+		if marshalErr != nil {
+			log.Printf("opencode: auto compact marshal failed %s: %v", entry.Name(), marshalErr)
+			continue
+		}
+		if writeErr := os.WriteFile(path, encoded, 0o644); writeErr != nil {
+			log.Printf("opencode: auto compact write failed %s: %v", entry.Name(), writeErr)
+			continue
+		}
+		removedTotal += removed
+	}
+
+	return removedTotal, fileCount, nil
+}
+
+func (c *Client) compactMemoryStoreByPath(path string) (userMemoryStore, int, bool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return userMemoryStore{}, 0, false, err
+	}
+	if strings.TrimSpace(string(b)) == "" {
+		return userMemoryStore{Version: 1, Facts: []memoryFact{}}, 0, false, nil
+	}
+
+	var store userMemoryStore
+	if err := json.Unmarshal(b, &store); err != nil {
+		return userMemoryStore{}, 0, false, err
+	}
+	if store.Version == 0 {
+		store.Version = 1
+	}
+
+	original := len(store.Facts)
+	merged := map[string]memoryFact{}
+	for _, f := range store.Facts {
+		if strings.TrimSpace(f.Text) == "" {
+			continue
+		}
+		if f.Importance <= 0 {
+			f.Importance = 1
+		}
+		if f.Count <= 0 {
+			f.Count = 1
+		}
+		if f.LastSeen.IsZero() {
+			f.LastSeen = time.Now()
+		}
+		key := normalizeMemoryText(f.Text)
+		if cur, ok := merged[key]; ok {
+			if f.Importance > cur.Importance {
+				cur.Importance = f.Importance
+				cur.Category = f.Category
+			}
+			if f.LastSeen.After(cur.LastSeen) {
+				cur.LastSeen = f.LastSeen
+			}
+			cur.Count += f.Count
+			merged[key] = cur
+			continue
+		}
+		merged[key] = f
+	}
+
+	facts := make([]memoryFact, 0, len(merged))
+	for _, v := range merged {
+		facts = append(facts, v)
+	}
+	sort.Slice(facts, func(i, j int) bool {
+		if facts[i].Importance != facts[j].Importance {
+			return facts[i].Importance > facts[j].Importance
+		}
+		if !facts[i].LastSeen.Equal(facts[j].LastSeen) {
+			return facts[i].LastSeen.After(facts[j].LastSeen)
+		}
+		return facts[i].Count > facts[j].Count
+	})
+	if c.memoryMaxFacts > 0 && len(facts) > c.memoryMaxFacts {
+		facts = facts[:c.memoryMaxFacts]
+	}
+
+	store.Facts = facts
+	removed := original - len(facts)
+	changed := removed > 0 || original != len(merged)
+	return store, max(0, removed), changed, nil
 }
 
 // ========== Skill提示 ==========
