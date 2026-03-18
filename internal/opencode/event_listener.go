@@ -1358,6 +1358,25 @@ const TodoAutoPushInterval = 5 * time.Second
 func (s *StreamingSessionHandler) notifyCompletion() {
 	s.stopWaitingTimer()
 
+	// ── 0. 任务收尾：补发最终 todo 摘要与完成提示 ─────────────────────────────
+	if len(s.sessionTodos) > 0 {
+		summary := formatTodoSummaryFromTodos(s.sessionTodos)
+		if summary != "" && summary != s.lastTodoSummary {
+			if err := s.callback(TodoSignalPrefix + summary); err != nil {
+				log.Printf("opencode: final todo summary callback error: %v", err)
+			} else {
+				s.lastTodoSummary = summary
+				s.lastTodoPushTime = time.Now()
+			}
+		}
+
+		if allTodosTerminal(s.sessionTodos) {
+			if err := s.callback(TodoSignalPrefix + "✅ 任务已完成"); err != nil {
+				log.Printf("opencode: final todo completion callback error: %v", err)
+			}
+		}
+	}
+
 	// ── 1. 追加文件变更摘要 ─────────────────────────────────────────────────
 	if len(s.sessionDiff) > 0 {
 		diffMsg := s.FormatDiffSummary()
@@ -1589,6 +1608,22 @@ func formatTodoSummaryFromTodos(todos []TodoItem) string {
 		sb.WriteString(fmt.Sprintf("%s [%s][优先级:%s] %s\n", icon, statusText, todo.PriorityLabel(), todo.Text()))
 	}
 	return sb.String()
+}
+
+func allTodosTerminal(todos []TodoItem) bool {
+	if len(todos) == 0 {
+		return false
+	}
+	for _, todo := range todos {
+		status := strings.ToLower(strings.TrimSpace(todo.Status))
+		switch status {
+		case "completed", "cancelled":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // extractSessionIDFromEvent 从事件中提取 sessionID

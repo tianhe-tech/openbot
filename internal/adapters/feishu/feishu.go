@@ -792,7 +792,8 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			log.Printf("feishu: ✅ sent final message to user %s (%d bytes total, %d new)",
 				userLabel, len(accumulatedContent), len(unsentContent))
 		} else if len(accumulatedContent) == 0 {
-			// No accumulated content (might be interactive task like permission request)
+			// No accumulated content (might be pure tool/todo run or interactive task).
+			_ = h.sendTextChunks(sendCtx, target, "✅ 任务已完成")
 			log.Printf("feishu: async mode completed for user %s with no accumulated content", userLabel)
 		} else {
 			log.Printf("feishu: async mode completed for user %s, all content already sent (%d bytes)",
