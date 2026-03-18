@@ -1,3 +1,5 @@
+//go:build opencode_check
+
 package main
 
 import (

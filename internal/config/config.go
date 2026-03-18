@@ -92,10 +92,9 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("missing OPENCODE_ENDPOINT")
 	}
 
-	if cfg.DingTalk.OwnerUserID == "" {
-		return cfg, fmt.Errorf("missing DINGTALK_OWNER_USERID")
+	if cfg.DingTalk.OwnerUserID != "" {
+		cfg.DingTalk.UserWhitelist = []string{cfg.DingTalk.OwnerUserID}
 	}
-	cfg.DingTalk.UserWhitelist = []string{cfg.DingTalk.OwnerUserID}
 
 	return cfg, nil
 }

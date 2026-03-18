@@ -1,3 +1,5 @@
+//go:build event_stream_check
+
 package main
 
 import (

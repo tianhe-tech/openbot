@@ -1,3 +1,5 @@
+//go:build dingtalk_user_check
+
 package main
 
 import (

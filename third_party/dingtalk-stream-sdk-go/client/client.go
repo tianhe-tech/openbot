@@ -72,135 +72,170 @@ func NewStreamClient(options ...ClientOption) *StreamClient {
 }
 
 func (cli *StreamClient) Start(ctx context.Context) error {
-	if cli.conn != nil {
-		return nil
-	}
+if cli.conn != nil {
+return nil
+}
 
-	cli.mutex.Lock()
-	defer cli.mutex.Unlock()
+cli.mutex.Lock()
+defer cli.mutex.Unlock()
 
-	if cli.conn != nil {
-		return nil
-	}
+if cli.conn != nil {
+return nil
+}
 
-	endpoint, err := cli.GetConnectionEndpoint(ctx)
-	if err != nil {
-		return err
-	}
+endpoint, err := cli.GetConnectionEndpoint(ctx)
+if err != nil {
+return err
+}
 
-	wssUrl := fmt.Sprintf("%s?ticket=%s", endpoint.Endpoint, endpoint.Ticket)
+wssUrl := fmt.Sprintf("%s?ticket=%s", endpoint.Endpoint, endpoint.Ticket)
 
-	header := make(http.Header)
+header := make(http.Header)
 
-	var dialer *websocket.Dialer
+var dialer *websocket.Dialer
 
-	if len(cli.proxy) == 0 {
-		dialer = websocket.DefaultDialer
-	} else {
-		proxyURL, err := url.Parse(cli.proxy)
-		if err != nil {
-			return err
-		}
-		dialer = &websocket.Dialer{
-			Proxy: http.ProxyURL(proxyURL),
-		}
-	}
+if len(cli.proxy) == 0 {
+dialer = websocket.DefaultDialer
+} else {
+proxyURL, err := url.Parse(cli.proxy)
+if err != nil {
+return err
+}
+dialer = &websocket.Dialer{
+Proxy: http.ProxyURL(proxyURL),
+}
+}
 
-	conn, resp, err := dialer.Dial(wssUrl, header)
-	if err != nil {
-		return err
-	}
+conn, resp, err := dialer.Dial(wssUrl, header)
+if err != nil {
+return err
+}
 
-	// 建连失败
-	if resp.StatusCode >= http.StatusBadRequest {
-		return utils.ErrorFromHttpResponseBody(resp)
-	}
+// 建连失败
+if resp.StatusCode >= http.StatusBadRequest {
+return utils.ErrorFromHttpResponseBody(resp)
+}
 
-	cli.conn = conn
-	cli.sessionId = endpoint.Ticket
+cli.conn = conn
+cli.sessionId = endpoint.Ticket
 
-	logger.GetLogger().Infof("connect success, sessionId=[%s]", cli.sessionId)
+logger.GetLogger().Infof("connect success, sessionId=[%s]", cli.sessionId)
 
-	go cli.processLoop()
+go cli.processLoop()
 
-	return nil
+return nil
 }
 
 func (cli *StreamClient) processLoop() {
-	defer func() {
-		if err := recover(); err != nil {
-			logger.GetLogger().Errorf("connection process panic due to unknown reason, error=[%s]", err)
-		}
-		if cli.AutoReconnect {
-			go cli.reconnect()
-		}
-	}()
+defer func() {
+if err := recover(); err != nil {
+logger.GetLogger().Errorf("connection process panic due to unknown reason, error=[%s]", err)
+}
+if cli.AutoReconnect {
+go cli.reconnect()
+}
+}()
 
-	if cli.conn == nil {
-		logger.GetLogger().Errorf("connection process connect nil, maybe disconnected.")
-		return
-	}
-
-	readChan := make(chan []byte)
-	pongChan := make(chan struct{})
-	closeChan := make(chan struct{})
-	defer func() { close(closeChan) }()
-	defer func() { close(pongChan) }()
-	defer func() { close(readChan) }()
-
-	cli.conn.SetPongHandler(func(appData string) error {
-		pongChan <- struct{}{}
-		return nil
-	})
-	//开始启动协程读数据
-	go func() {
-		for {
-			messageType, message, err := cli.conn.ReadMessage()
-			if err != nil {
-				logger.GetLogger().Errorf("connection process read message error: messageType=[%d] message=[%s] error=[%s]", messageType, string(message), err)
-				closeChan <- struct{}{}
-				return
-			}
-			if messageType == websocket.TextMessage {
-				readChan <- message
-			}
-		}
-	}()
-
-	//循环处理事件
-	for {
-		timer := time.NewTimer(cli.keepAliveIdle)
-		select {
-		case msg, ok := <-readChan:
-			timer.Stop()
-			if ok {
-				go cli.processDataFrame(msg)
-			} else {
-				logger.GetLogger().Errorf("connection process is closed")
-				return
-			}
-		case <-timer.C:
-			e := cli.conn.WriteMessage(websocket.PingMessage, nil)
-			if e != nil {
-				logger.GetLogger().Errorf("connection write ping message error: error=[%s]", e)
-				return
-			}
-			go func() {
-				select {
-				case <-pongChan:
-					return
-				case <-time.After(5 * time.Second):
-					logger.GetLogger().Errorf("ping time out, connection is closing")
-					closeChan <- struct{}{}
-					return
-				}
-			}()
-		case <-closeChan:
-			return
-		}
-	}
+if cli.conn == nil {
+logger.GetLogger().Errorf("connection process connect nil, maybe disconnected.")
+return
 }
 
+readChan := make(chan []byte)
+pongChan := make(chan struct{}, 1)
+closeChan := make(chan struct{}, 1)
+done := make(chan struct{})
+defer close(done)
+
+notifyClose := func(reason string) {
+logger.GetLogger().Errorf("connection process close requested, reason=[%s]", reason)
+select {
+case closeChan <- struct{}{}:
+default:
+}
+}
+
+cli.conn.SetPongHandler(func(appData string) error {
+defer func() {
+if r := recover(); r != nil {
+logger.GetLogger().Errorf("connection pong handler panic, error=[%s]", r)
+}
+}()
+select {
+case <-done:
+return nil
+case pongChan <- struct{}{}:
+default:
+}
+return nil
+})
+
+// 开始启动协程读数据
+go func() {
+defer func() {
+if r := recover(); r != nil {
+logger.GetLogger().Errorf("connection readChan goroutine panic, error=[%s]", r)
+}
+}()
+for {
+messageType, message, err := cli.conn.ReadMessage()
+if err != nil {
+logger.GetLogger().Errorf("connection process read message error: messageType=[%d] message=[%s] error=[%s]", messageType, string(message), err)
+notifyClose("read_error")
+return
+}
+if messageType == websocket.TextMessage {
+select {
+case readChan <- message:
+case <-done:
+return
+}
+}
+}
+}()
+
+// 循环处理事件
+for {
+timer := time.NewTimer(cli.keepAliveIdle)
+select {
+case msg, ok := <-readChan:
+timer.Stop()
+if ok {
+go cli.processDataFrame(msg)
+} else {
+logger.GetLogger().Errorf("connection process is closed")
+return
+}
+case <-timer.C:
+e := cli.conn.WriteMessage(websocket.PingMessage, nil)
+if e != nil {
+logger.GetLogger().Errorf("connection write ping message error: error=[%s]", e)
+notifyClose("ping_write_error")
+return
+}
+go func() {
+defer func() {
+if r := recover(); r != nil {
+logger.GetLogger().Errorf("connection pong-check goroutine panic, error=[%s]", r)
+}
+}()
+select {
+case <-pongChan:
+return
+case <-time.After(5 * time.Second):
+logger.GetLogger().Errorf("ping time out, connection is closing")
+notifyClose("pong_timeout")
+return
+case <-done:
+return
+}
+}()
+case <-closeChan:
+logger.GetLogger().Errorf("connection process loop exiting after close signal")
+return
+}
+}
+}
 func (cli *StreamClient) processDataFrame(rawData []byte) {
 	defer func() {
 		if err := recover(); err != nil {

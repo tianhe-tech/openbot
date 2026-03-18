@@ -6,9 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -68,16 +71,44 @@ func main() {
 
 	// Create adapter registry for bidirectional communication
 	adapterRegistry := base.NewAdapterRegistry()
+	opencodeEndpoint := cfg.OpenCodeEndpoint
+	serveArgs := append([]string(nil), cfg.OpenCodeServeArgs...)
+	endpointSource := "config"
+	autoSelectedEndpoint := false
+
+	// Keep managed opencode serve port and client endpoint consistent.
+	if cfg.OpenCodeManageServe {
+		endpointFromEnv := strings.TrimSpace(os.Getenv("OPENCODE_ENDPOINT"))
+		if endpointFromEnv == "" {
+			// Endpoint not explicitly configured: avoid hard-binding to 4096 when occupied.
+			if p, err := pickFreeTCPPort(); err == nil {
+				opencodeEndpoint = fmt.Sprintf("http://127.0.0.1:%d", p)
+				endpointSource = "auto"
+				autoSelectedEndpoint = true
+				log.Printf("opencode: OPENCODE_ENDPOINT not set, auto-selected managed endpoint %s", opencodeEndpoint)
+			}
+		} else {
+			endpointSource = "env"
+		}
+
+		if isLocalEndpoint(opencodeEndpoint) && !serveArgsContainPort(serveArgs) {
+			if p, ok := endpointPort(opencodeEndpoint); ok {
+				serveArgs = append(serveArgs, "--port", strconv.Itoa(p))
+				log.Printf("opencode: forcing managed serve port to %d to match endpoint %s", p, opencodeEndpoint)
+			}
+		}
+	}
+
 	var serveManager *opencodesvc.Manager
 	if cfg.OpenCodeManageServe {
-		serveManager = opencodesvc.NewManager(cfg.OpenCodeDirectory, cfg.OpenCodeServeCommand, cfg.OpenCodeServeArgs)
+		serveManager = opencodesvc.NewManager(cfg.OpenCodeDirectory, cfg.OpenCodeServeCommand, serveArgs)
 		msg, startErr := serveManager.Start(ctx)
 		if startErr != nil {
 			log.Fatalf("opencode serve manager start error: %v", startErr)
 		}
 		log.Printf("%s", msg)
 		// Keep the process alive: restart automatically whenever it exits.
-		go serveManager.RunWithAutoRestart(ctx, cfg.OpenCodeEndpoint)
+		go serveManager.RunWithAutoRestart(ctx, opencodeEndpoint)
 		defer func() {
 			if err := serveManager.Stop(); err != nil {
 				log.Printf("stop opencode serve error: %v", err)
@@ -95,14 +126,14 @@ func main() {
 			if err != nil {
 				return msg, err
 			}
-			log.Printf("opencode: waiting for server to become ready (%s)...", cfg.OpenCodeEndpoint)
-			if waitErr := serveManager.WaitReady(restartCtx, cfg.OpenCodeEndpoint); waitErr != nil {
+			log.Printf("opencode: waiting for server to become ready (%s)...", opencodeEndpoint)
+			if waitErr := serveManager.WaitReady(restartCtx, opencodeEndpoint); waitErr != nil {
 				log.Printf("opencode: server readiness wait ended: %v", waitErr)
 			}
 			return msg, nil
 		}))
 	}
-	ocClient := opencode.NewClient(cfg.OpenCodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
+	ocClient := opencode.NewClient(opencodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
 	if cfg.ProxyHubWSURL != "" {
 		restartFn := func(restartCtx context.Context, reason string) (string, error) {
 			if serveManager == nil {
@@ -392,6 +423,30 @@ func main() {
 			"status":   "ok",
 			"note":     "Session mappings are stored in memory. Check application logs for detailed session->user mappings.",
 			"adapters": sessionMappings,
+			"opencode": map[string]interface{}{
+				"endpoint":               opencodeEndpoint,
+				"endpoint_source":        endpointSource,
+				"endpoint_auto_selected": autoSelectedEndpoint,
+				"manage_serve":           cfg.OpenCodeManageServe,
+				"serve_command":          cfg.OpenCodeServeCommand,
+				"serve_args":             serveArgs,
+			},
+		})
+	})
+
+	mux.HandleFunc("/debug/opencode", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		port, hasPort := endpointPort(opencodeEndpoint)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":                 "ok",
+			"endpoint":               opencodeEndpoint,
+			"endpoint_source":        endpointSource,
+			"endpoint_auto_selected": autoSelectedEndpoint,
+			"endpoint_port":          port,
+			"endpoint_port_known":    hasPort,
+			"manage_serve":           cfg.OpenCodeManageServe,
+			"serve_command":          cfg.OpenCodeServeCommand,
+			"serve_args":             serveArgs,
 		})
 	})
 
@@ -433,6 +488,64 @@ func main() {
 	}
 
 	log.Println("gateway stopped")
+}
+
+func serveArgsContainPort(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		a := strings.TrimSpace(args[i])
+		if a == "--port" || a == "-p" {
+			return true
+		}
+		if strings.HasPrefix(a, "--port=") {
+			return true
+		}
+	}
+	return false
+}
+
+func endpointPort(endpoint string) (int, bool) {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || u == nil {
+		return 0, false
+	}
+	p := u.Port()
+	if p == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			return 80, true
+		case "https":
+			return 443, true
+		default:
+			return 0, false
+		}
+	}
+	n, convErr := strconv.Atoi(p)
+	if convErr != nil || n <= 0 || n > 65535 {
+		return 0, false
+	}
+	return n, true
+}
+
+func isLocalEndpoint(endpoint string) bool {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || u == nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	return host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func pickFreeTCPPort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer ln.Close()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok || addr.Port <= 0 {
+		return 0, fmt.Errorf("failed to allocate free tcp port")
+	}
+	return addr.Port, nil
 }
 
 // extractSessionIDFromEvent 从OpenCode事件中提取sessionID

@@ -1,4 +1,4 @@
-﻿package dingtalk
+package dingtalk
 
 import (
 	"bytes"
@@ -878,7 +878,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	callbackCalled := false
 	var thinkingBuffer strings.Builder
 	thinkingSent := false
-	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled()
+	preferAICardForAllReplies := h.shouldPreferAICardForOpenCodeReply()
+	if preferAICardForAllReplies {
+		log.Printf("dingtalk stream: AI Card is enabled for all OpenCode replies for user %s", userID)
+	}
+	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled() || preferAICardForAllReplies
 
 	formatThinkingBlock := func(content string) string {
 		trimmed := strings.TrimSpace(content)
@@ -889,7 +893,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	sendReply := func(msg string) error {
-		return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+		if !preferAICardForAllReplies {
+			return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+		}
+		return h.sendReplyWithAICardFallback(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+	}
+	sendFinalReply := func(msg string) error {
+		return sendReply(msg)
 	}
 
 	sendContent := content
@@ -921,7 +931,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 	}
 
-	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
+	response, err := h.client.SendMessageStreamingWithEvents(sendCtx, opencode.MessagePayload{
 		Channel:     "dingtalk",
 		UserID:      userID,
 		ThreadID:    conversationID,
@@ -1016,12 +1026,16 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 			toSend := fullReply.String()[lastSentLength:]
 			if len(toSend) > 0 {
-				log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
-				if err := sendReply(toSend); err != nil {
-					log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
+				if preferAICardForAllReplies {
+					log.Printf("dingtalk stream: flush signal received with %d bytes; deferring final delivery to AI Card path", len(toSend))
 				} else {
-					lastSentLength = len(fullReply.String())
-					log.Printf("dingtalk stream: ✅ flush send done")
+					log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
+					if err := sendReply(toSend); err != nil {
+						log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
+					} else {
+						lastSentLength = len(fullReply.String())
+						log.Printf("dingtalk stream: ✅ flush send done")
+					}
 				}
 			}
 			return nil
@@ -1030,7 +1044,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		// 🔍 诊断：记录内容 callback
 		if len(chunk) > 0 && !strings.HasPrefix(chunk, "ses_") {
 			log.Printf("dingtalk stream: 🔍 CONTENT CALLBACK - len=%d, prefix='%s'",
-				len(chunk), chunk[:min(50, len(chunk))])
+				len(chunk), truncateForLog(chunk, 50))
 		}
 
 		// 处理特殊消息：权限请求、问题确认、等待提示等需要立即发送的消息
@@ -1039,7 +1053,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			strings.HasPrefix(chunk, "🔐") || strings.HasPrefix(chunk, "❓") ||
 			strings.HasPrefix(chunk, "🤔💭") {
 			// 这些是需要立即发送的提示消息
-			log.Printf("dingtalk stream: 📤 sending immediate message: %s", chunk[:min(50, len(chunk))])
+			log.Printf("dingtalk stream: 📤 sending immediate message: %s", truncateForLog(chunk, 50))
 			if err := sendReply(chunk); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send immediate message: %v", err)
 				// 发送失败时的处理：
@@ -1083,6 +1097,26 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			}
 		}
 
+		return nil
+	}, func(event opencode.StreamEvent) error {
+		switch event.Kind {
+		case opencode.StreamEventSessionReady:
+			if strings.TrimSpace(event.SessionID) == "" {
+				return nil
+			}
+			sessionMappingMu.Lock()
+			if !sessionMapped {
+				h.adapter.MapUserToSession(userID, event.SessionID)
+				h.adapter.MapSessionData(event.SessionID, "channel", data.SessionWebhook)
+				sessionMapped = true
+				log.Printf("dingtalk stream: structured session ready mapped user %s -> %s", userID, event.SessionID)
+			}
+			sessionMappingMu.Unlock()
+		case opencode.StreamEventTodoSnapshot:
+			log.Printf("dingtalk stream: structured todo snapshot received (%d items, session=%s)", len(event.Todos), event.SessionID)
+		case opencode.StreamEventDiffSnapshot:
+			log.Printf("dingtalk stream: structured diff snapshot received (%d files, session=%s)", len(event.Diff), event.SessionID)
+		}
 		return nil
 	})
 
@@ -1149,7 +1183,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			return "(none)"
 		}(),
 		len(accumulatedContent), lastSentLength, response.Reply != "",
-		accumulatedContent[:min(50, len(accumulatedContent))])
+		truncateForLog(accumulatedContent, 50))
 
 	// Send final complete reply (only if we have synchronous content)
 	// For async mode, the SSE callbacks already sent the content
@@ -1163,7 +1197,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			}
 		}
 
-		if err := sendReply(response.Reply); err != nil {
+		if err := sendFinalReply(response.Reply); err != nil {
 			log.Printf("dingtalk stream: failed to reply: %v", err)
 			return nil, err
 		}
@@ -1188,7 +1222,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 				// 🔧 修复：只发送未发送的部分，避免重复，使用 Robot API
 				unsentContent := accumulatedContent[lastSentLength:]
-				if err := sendReply(unsentContent); err != nil {
+				if err := sendFinalReply(unsentContent); err != nil {
 					log.Printf("dingtalk stream: ❌ failed to send final message: %v", err)
 					// 不返回错误，避免影响session映射
 				} else {
@@ -1218,6 +1252,17 @@ func (h *Handler) isUserAllowed(userID string) bool {
 	}
 	_, ok := h.allowedUserSet[strings.TrimSpace(userID)]
 	return ok
+}
+
+func truncateForLog(s string, maxRunes int) string {
+	if maxRunes <= 0 || s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
 }
 
 // handleListSkills handles the /skills command to list available agents.
@@ -2224,20 +2269,11 @@ func (h *Handler) buildPendingRequirementHint(userID string) string {
 
 // isQuickReply 检查是否是快捷回复（权限回复或问题选项）
 func (h *Handler) isQuickReply(content string) bool {
-	lower := strings.TrimSpace(strings.ToLower(content))
+	if replyToPermissionResponse(content) != "" {
+		return true
+	}
 
-	// 权限相关回复
-	permissionReplies := []string{
-		"允许", "拒绝", "始终允许", "始终",
-		"allow", "deny", "always", "reject",
-		"yes", "no", "y", "n", "ok", "cancel",
-		"确认", "取消",
-	}
-	for _, r := range permissionReplies {
-		if lower == r {
-			return true
-		}
-	}
+	lower := normalizePermissionReplyText(content)
 
 	// 数字选项（1-9）
 	if len(lower) == 1 && lower[0] >= '1' && lower[0] <= '9' {
@@ -2297,6 +2333,48 @@ func (h *Handler) isQuickReply(content string) bool {
 	return false
 }
 
+// replyToPermissionResponse maps any form of user permission reply to the canonical English
+// API value: "once" (allow once), "reject" (deny), "always" (always allow), or "" (unrecognized).
+func replyToPermissionResponse(content string) string {
+	normalized := normalizePermissionReplyText(content)
+
+	alwaysTokens := []string{"3", "always", "始终允许", "始终", "一直允许", "总是允许", "濮嬬粓鍏佽", "濮嬬粓", "涓€鐩村厑璁", "鎬绘槸鍏佽"}
+	rejectTokens := []string{"2", "deny", "reject", "no", "n", "拒绝", "不同意", "不允许", "取消", "鎷掔粷", "涓嶅悓鎰", "鍙栨秷", "涓嶅厑璁"}
+	allowTokens := []string{"1", "allow", "yes", "y", "ok", "okay", "允许", "同意", "确认", "可以", "行", "鍏佽", "鍚屾剰", "纭", "鍙互"}
+
+	if containsAnyPermissionToken(normalized, alwaysTokens) {
+		return "always"
+	}
+	if containsAnyPermissionToken(normalized, rejectTokens) {
+		return "reject"
+	}
+	if containsAnyPermissionToken(normalized, allowTokens) {
+		return "once"
+	}
+	return ""
+}
+func normalizePermissionReplyText(content string) string {
+	raw := strings.TrimSpace(strings.ToLower(content))
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '，', ',', '。', '.', '！', '!', '？', '?', '：', ':', ';', '；', '（', '）', '(', ')', '“', '”', '"', '\'', '、', '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		default:
+			return r
+		}
+	}, raw)
+}
+
+func containsAnyPermissionToken(text string, tokens []string) bool {
+	for _, token := range tokens {
+		t := normalizePermissionReplyText(token)
+		if t != "" && strings.Contains(text, t) {
+			return true
+		}
+	}
+	return false
+}
+
 // handleQuickReply 处理快捷回复（权限或问题选项）
 func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
@@ -2313,31 +2391,35 @@ func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbac
 	// 先尝试查找待处理的权限请求
 	permission, ok := h.client.GetLatestPendingPermission(sessionID)
 	if ok {
-		log.Printf("dingtalk: user %s replied '%s' to permission %s (session: %s)",
-			userID, content, permission.ID, sessionID[:min(8, len(sessionID))])
+		log.Printf("dingtalk: user %s replied '%s' (bytes=% X) to permission %s (session: %s)",
+			userID, content, []byte(content), permission.ID, sessionID[:min(8, len(sessionID))])
 
-		if h.isNonOwnerReadOnly(userID) {
-			log.Printf("dingtalk: read-only user %s quick-replied permission %s, force reject", userID, permission.ID)
-			if err := h.client.AnswerQuestion(ctx, permission.ID, "拒绝"); err != nil {
-				msg := fmt.Sprintf("❌ 只读策略拒绝权限时失败: %v", err)
-				_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-				return nil, err
-			}
-			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("🔒 当前为只读模式（非 owner），已自动拒绝本次写权限请求"))
+		// 直接映射为英文 API 值，绕过所有中文解析链
+		englishResponse := replyToPermissionResponse(content)
+		if englishResponse == "" {
+			log.Printf("dingtalk: unrecognized permission reply from %s: raw=%q bytes=% X", userID, content, []byte(content))
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook,
+				[]byte("❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许"))
 			return []byte("handled"), nil
 		}
 
-		if err := h.client.AnswerQuestion(ctx, permission.ID, content); err != nil {
-			msg := fmt.Sprintf("❌ 权限回复失败: %v", err)
-			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		if h.isNonOwnerReadOnly(userID) {
+			log.Printf("dingtalk: read-only user %s, forcing permission to reject", userID)
+			englishResponse = "reject"
+		}
+
+		log.Printf("dingtalk: resolved permission reply '%s' -> %s for %s", content, englishResponse, permission.ID)
+
+		if err := h.client.RespondToPermission(ctx, permission.ID, englishResponse); err != nil {
+			log.Printf("dingtalk: RespondToPermission failed for %s: %v", permission.ID, err)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 权限回复失败，请重试"))
 			return nil, err
 		}
 
-		msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", content)
+		displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+		msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-		log.Printf("dingtalk: successfully answered permission %s, continuing with original SSE listener", permission.ID)
-		// ⚠️ 重要：返回 handled 阻止将"允许"作为新消息发送给 OpenCode
-		// 原来的 SSE 监听器会继续接收权限回复后的事件
+		log.Printf("dingtalk: successfully responded to permission %s (%s)", permission.ID, englishResponse)
 		return []byte("handled"), nil
 	}
 
@@ -3093,6 +3175,41 @@ func (h *Handler) sendReplyBySource(ctx context.Context, sessionWebhook, convers
 	}
 
 	return h.sendReplyRobot(ctx, conversationID, userID, content)
+}
+
+func (h *Handler) shouldPreferAICardForOpenCodeReply() bool {
+	cardCfg := getCardSendConfig()
+	if !cardCfg.Enabled {
+		return false
+	}
+	return strings.TrimSpace(h.cfg.ClientID) != "" && strings.TrimSpace(h.cfg.ClientSecret) != ""
+}
+
+func (h *Handler) sendReplyWithAICardFallback(ctx context.Context, sessionWebhook, conversationType, conversationID, userID, content string) error {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+
+	cardCfg := getCardSendConfig()
+	if !cardCfg.Enabled {
+		log.Printf("dingtalk stream: send_mode=fallback reason=aicard_disabled content_len=%d", len(content))
+		return h.sendReplyBySource(ctx, sessionWebhook, conversationType, conversationID, userID, content)
+	}
+
+	cardCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if err := SendStreamingAICard(cardCtx, h.cfg.ClientID, h.cfg.ClientSecret, userID, content); err == nil {
+		log.Printf("dingtalk stream: send_mode=aicard content_len=%d", len(content))
+		return nil
+	} else {
+		log.Printf("dingtalk stream: send_mode=fallback reason=aicard_error content_len=%d err=%v", len(content), err)
+		if !cardCfg.AutoDowngrade {
+			return fmt.Errorf("aicard send failed and auto downgrade disabled: %w", err)
+		}
+	}
+
+	return h.sendReplyBySource(ctx, sessionWebhook, conversationType, conversationID, userID, content)
 }
 
 func isGroupConversation(conversationType string) bool {

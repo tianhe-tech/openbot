@@ -157,6 +157,8 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 	// Collect streamed chunks and return the combined reply.
 	var mu sync.Mutex
 	var chunks []string
+	var thinking strings.Builder
+	var meta []string
 	sessionMapped := false
 
 	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
@@ -180,6 +182,46 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 			sessionMapped = true
 			return nil
 		}
+		if chunk == opencode.FlushSignal {
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+			delta := strings.TrimPrefix(chunk, opencode.ThinkingSignalPrefix)
+			if strings.TrimSpace(delta) == "" {
+				return nil
+			}
+			mu.Lock()
+			thinking.WriteString(delta)
+			mu.Unlock()
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.ToolSignalPrefix))
+			if msg != "" {
+				mu.Lock()
+				meta = append(meta, msg)
+				mu.Unlock()
+			}
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.StepSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.StepSignalPrefix))
+			if msg != "" {
+				mu.Lock()
+				meta = append(meta, msg)
+				mu.Unlock()
+			}
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.TodoSignalPrefix))
+			if msg != "" {
+				mu.Lock()
+				meta = append(meta, msg)
+				mu.Unlock()
+			}
+			return nil
+		}
 		if chunk == "" {
 			return nil
 		}
@@ -195,11 +237,28 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 
 	mu.Lock()
 	reply := strings.Join(chunks, "")
+	thinkingText := strings.TrimSpace(thinking.String())
+	metaText := strings.TrimSpace(strings.Join(meta, "\n"))
 	mu.Unlock()
+
+	if reply != "" {
+		if thinkingText != "" {
+			reply = "思考过程:\n" + thinkingText + "\n\n" + reply
+		}
+		if metaText != "" {
+			reply = reply + "\n\n中间过程:\n" + metaText
+		}
+	}
 
 	// Fall back to the synchronous reply field if no chunks were streamed.
 	if reply == "" {
 		reply = response.Reply
+	}
+	if reply == "" && thinkingText != "" {
+		reply = "思考过程:\n" + thinkingText
+	}
+	if reply == "" && metaText != "" {
+		reply = "中间过程:\n" + metaText
 	}
 	if reply == "" {
 		reply = " 处理完成"

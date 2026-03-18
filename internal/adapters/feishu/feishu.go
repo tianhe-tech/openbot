@@ -226,19 +226,28 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		// 先尝试查找待处理的权限请求
 		permission, ok := h.client.GetLatestPendingPermission(sessionID)
 		if ok {
-			log.Printf("feishu: user %s replied '%s' to permission %s (session: %s)",
-				userLabel, content, permission.ID, sessionID[:min(8, len(sessionID))])
+			log.Printf("feishu: user %s replied '%s' (bytes=% X) to permission %s (session: %s)",
+				userLabel, content, []byte(content), permission.ID, sessionID[:min(8, len(sessionID))])
 
-			if err := h.client.AnswerQuestion(ctx, permission.ID, content); err != nil {
-				msg := fmt.Sprintf("❌ 权限回复失败: %v", err)
-				_ = h.sendTextChunks(ctx, target, msg)
+			englishResponse := parsePermissionReply(content)
+			if englishResponse == "" {
+				log.Printf("feishu: unrecognized permission reply from %s: raw=%q bytes=% X", userLabel, content, []byte(content))
+				_ = h.sendTextChunks(ctx, target, "❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许")
+				return "handled", nil
+			}
+
+			log.Printf("feishu: resolved permission reply '%s' -> %s for %s", content, englishResponse, permission.ID)
+
+			if err := h.client.RespondToPermission(ctx, permission.ID, englishResponse); err != nil {
+				log.Printf("feishu: RespondToPermission failed for %s: %v", permission.ID, err)
+				_ = h.sendTextChunks(ctx, target, "❌ 权限回复失败，请重试")
 				return "", err
 			}
 
-			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", content)
+			displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
 			_ = h.sendTextChunks(ctx, target, msg)
-			log.Printf("feishu: successfully answered permission %s, continuing with original SSE listener", permission.ID)
-			// 返回空字符串表示已处理，不需要作为新消息发送给 OpenCode
+			log.Printf("feishu: successfully answered permission %s (%s)", permission.ID, englishResponse)
 			return "handled", nil
 		}
 
@@ -2692,7 +2701,25 @@ func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, c
 	}
 
 	// 提交答案
-	log.Printf("feishu: submitting answer '%s' for question %s", answer, questionID)
+	log.Printf("feishu: submitting answer '%s' for question %s (isPermission=%v)", answer, questionID, question.IsPermission)
+
+	if question.IsPermission {
+		englishResponse := parsePermissionReply(answer)
+		if englishResponse == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许")
+			return "handled", nil
+		}
+		if err := h.client.RespondToPermission(ctx, questionID, englishResponse); err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 权限回复失败，请重试")
+			log.Printf("feishu: RespondToPermission failed for %s: %v", questionID, err)
+			return "", err
+		}
+		displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+		msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
+		_ = h.sendTextChunks(ctx, target, msg)
+		log.Printf("feishu: answered permission %s (%s) successfully", questionID, englishResponse)
+		return "handled", nil
+	}
 
 	if err := h.client.AnswerQuestion(ctx, questionID, answer); err != nil {
 		msg := fmt.Sprintf("❌ 提交答案失败: %v", err)
@@ -2706,6 +2733,41 @@ func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, c
 	log.Printf("feishu: answered question %s successfully", questionID)
 
 	return "handled", nil
+}
+
+// parsePermissionReply maps user input (any locale/encoding) to a canonical English
+// API value: "once" (allow once), "reject" (deny), "always" (always allow), or "" (unrecognized).
+func parsePermissionReply(content string) string {
+	norm := strings.ToLower(strings.TrimSpace(content))
+	// Strip common punctuation and zero-width chars
+	norm = strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', ',', '，', '.', '。', '!', '！', '?', '？', '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		}
+		return r
+	}, norm)
+
+	alwaysTokens := []string{"3", "always", "始终允许", "始终", "一直允许", "总是允许", "濮嬬粓鍏佽", "濮嬬粓", "涓€鐩村厑璁", "鎬绘槸鍏佽"}
+	rejectTokens := []string{"2", "deny", "reject", "no", "n", "拒绝", "不同意", "不允许", "取消", "鎷掔粷", "涓嶅悓鎰", "鍙栨秷", "涓嶅厑璁"}
+	allowTokens := []string{"1", "allow", "yes", "y", "ok", "okay", "允许", "同意", "确认", "可以", "行", "鍏佽", "鍚屾剰", "纭", "鍙互"}
+
+	for _, t := range alwaysTokens {
+		if strings.Contains(norm, strings.ToLower(t)) {
+			return "always"
+		}
+	}
+	for _, t := range rejectTokens {
+		if strings.Contains(norm, strings.ToLower(t)) {
+			return "reject"
+		}
+	}
+	for _, t := range allowTokens {
+		if strings.Contains(norm, strings.ToLower(t)) {
+			return "once"
+		}
+	}
+	return ""
 }
 
 func (h *Handler) buildPendingRequirementHint(userID string) string {
