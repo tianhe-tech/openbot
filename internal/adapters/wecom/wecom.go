@@ -166,6 +166,9 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 	if msg.MsgType == "text" && (content == "/status" || content == "状态") {
 		return h.handleStatus(userID)
 	}
+	if msg.MsgType == "text" && (content == "/summary" || content == "压缩" || content == "总结") {
+		return h.handleSummary(userID)
+	}
 
 	// normal message  streaming session
 	sessionID, _ := h.adapter.GetSessionForUser(userID)
@@ -755,17 +758,18 @@ func detectMimeByFilename(name string) string {
 //  command handlers
 
 func (h *Handler) handleHelp() (string, error) {
-	helpText := ` OpenCode Gateway (企业微信)
+	helpText := `📖 OpenCode Gateway (企业微信)
 
- 可用命令：
+📋 可用命令：
 /help 或 帮助      - 显示此帮助
 /fork 或 派生      - 派生当前会话（保留历史，开启新分支）
 /todo 或 任务      - 查看当前任务进度列表
 /diff 或 变更      - 查看本次会话的文件变更摘要
 /abort 或 停止     - 中止正在运行的任务
 /status 或 状态    - 查看当前会话状态
+/summary 或 压缩   - 压缩会话上下文（释放token空间）
 
- 直接发送消息即可与 AI 对话`
+💬 直接发送消息即可与 AI 对话`
 	return helpText, nil
 }
 
@@ -859,6 +863,20 @@ func (h *Handler) handleStatus(userID string) (string, error) {
 		return "ℹ 无活跃会话", nil
 	}
 	return fmt.Sprintf(" 当前会话: %s", sessionID[:min(8, len(sessionID))]), nil
+}
+
+func (h *Handler) handleSummary(userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		return "ℹ️ 当前没有活跃的会话", nil
+	}
+
+	ctx := context.Background()
+	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
+		return fmt.Sprintf("❌ 上下文压缩失败: %v", err), err
+	}
+
+	return fmt.Sprintf("✅ 上下文压缩完成\n\n会话 %s 的历史消息已被总结压缩。", sessionID[:min(8, len(sessionID))]), nil
 }
 
 //  envelope types

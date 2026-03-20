@@ -968,6 +968,33 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// SummarizeSession triggers context compression for a session.
+func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
+	log.Printf("opencode: summarizing session %s", sessionID[:8])
+
+	// Get the model for this session
+	modelParams := c.getSessionDefaultModel(sessionID)
+	if modelParams == nil {
+		return fmt.Errorf("no model available for session %s", sessionID[:8])
+	}
+
+	params := opencode.SessionSummarizeParams{
+		ProviderID: modelParams.ProviderID,
+		ModelID:    modelParams.ModelID,
+	}
+	if c.directory != "" {
+		params.Directory = opencode.F(c.directory)
+	}
+
+	_, err := c.sdk.Session.Summarize(ctx, sessionID, params)
+	if err != nil {
+		return fmt.Errorf("opencode: summarize session: %w", err)
+	}
+
+	log.Printf("opencode: session %s summarized successfully", sessionID[:8])
+	return nil
+}
+
 // GetProviders retrieves the list of available providers.
 // Uses SDK App.Providers endpoint (/config/providers).
 func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
@@ -2370,8 +2397,9 @@ func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) 
 	}
 
 	// Pass 2: metadata-missing fallback (common in some OpenAI-compatible providers).
-	// For image/video recognition, prefer known vision-capable model IDs (e.g., Kimi, Qwen).
-	if (needImage || needVideo) && !needAudio {
+	// For image recognition, prefer known vision-capable model IDs (e.g., Kimi, Qwen).
+	// NOTE: For video, we don't use heuristic because video support is rare and may cause errors.
+	if needImage && !needVideo && !needAudio {
 		for _, k := range keys {
 			cap := c.modelCatalog[k]
 			if cap == nil {
@@ -2387,6 +2415,22 @@ func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) 
 
 	log.Printf("opencode: WARNING - no multimodal model found for image=%t video=%t audio=%t (catalog has %d models)", needImage, needVideo, needAudio, len(keys))
 	return nil, false
+}
+
+// HasVideoCapableModel checks if any model in the catalog supports video input.
+func (c *Client) HasVideoCapableModel() bool {
+	c.modelCatalogMu.RLock()
+	defer c.modelCatalogMu.RUnlock()
+
+	for _, cap := range c.modelCatalog {
+		if cap == nil {
+			continue
+		}
+		if capabilitySupportsModality(cap, "video") {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) recognizeMediaWithModel(ctx context.Context, attachments []Attachment, visionModel *ModelConfig) (string, error) {
@@ -3084,7 +3128,35 @@ func (c *Client) RefreshSkills(ctx context.Context) error {
 	return nil
 }
 
-// SetSkillHintEnabled 璁剧疆鏄惁鍚敤skill鎻愮ず
+// SetSkillHintEnabled 设置是否启用skill提示
 func (c *Client) SetSkillHintEnabled(enabled bool) {
 	c.enableSkillHint = enabled
+}
+
+// FindVideoSkill 查找视频处理的 skill
+// 返回 skill 名称，如果没有找到返回空字符串
+func (c *Client) FindVideoSkill(ctx context.Context) string {
+	agents, err := c.ListAgents(ctx)
+	if err != nil {
+		log.Printf("opencode: failed to list agents for video skill: %v", err)
+		return ""
+	}
+
+	// 查找视频相关的 skill
+	videoKeywords := []string{"video", "视频", "analyze", "分析"}
+	for _, agent := range agents {
+		name := strings.ToLower(agent.Name)
+		desc := strings.ToLower(agent.Description)
+
+		// 检查名称或描述中是否包含视频相关关键词
+		for _, kw := range videoKeywords {
+			if strings.Contains(name, kw) || strings.Contains(desc, kw) {
+				log.Printf("opencode: found video skill: %s (%s)", agent.Name, agent.Description)
+				return agent.Name
+			}
+		}
+	}
+
+	log.Printf("opencode: no video skill found, will use model directly")
+	return ""
 }

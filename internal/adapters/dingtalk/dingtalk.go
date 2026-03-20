@@ -291,6 +291,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	var mediaInfo map[string]interface{}
 	var extraAttachments []opencode.Attachment // 用于 richText 等多附件场景
 	var mediaFiles []base.MediaFileRecord
+	var videoSkillName string // 视频处理 skill 名称
 	mediaSessionID := "new"
 	if existingSessionID, ok := h.adapter.GetSessionForUser(userID); ok && strings.TrimSpace(existingSessionID) != "" {
 		mediaSessionID = strings.TrimSpace(existingSessionID)
@@ -462,7 +463,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 
 	case "video":
-		// 视频消息：下载为 data URI 并作为附件转发给 OpenCode
+		// 视频消息：下载到本地缓存，然后检查是否有视频处理 skill
 		log.Printf("dingtalk stream: 🎬 [VIDEO] received from %s", userID)
 		var vidContent videoContent
 		if data.Content != nil {
@@ -471,21 +472,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			if err := json.Unmarshal(contentBytes, &vidContent); err != nil {
 				log.Printf("  - ⚠️ Failed to parse video content: %v", err)
 			} else if vidContent.DownloadCode != "" {
-				dataURI, mime, err := h.downloadMediaAsDataURI(ctx, vidContent.DownloadCode, "video/mp4")
-				if err != nil {
-					log.Printf("  - ⚠️ Failed to download video: %v", err)
-				} else {
-					log.Printf("  - ✅ Video downloaded as data URI (mime=%s, len=%d)", mime, len(dataURI))
-					mediaInfo = map[string]interface{}{
-						"type": "video",
-						"url":  dataURI,
-						"mime": mime,
-					}
-				}
-
 				videoBytes, videoMime, videoErr := h.downloadMediaBytes(ctx, vidContent.DownloadCode, "video/mp4")
 				if videoErr != nil {
-					log.Printf("  - ⚠️ Failed to save temp video (download bytes): %v", videoErr)
+					log.Printf("  - ⚠️ Failed to download video: %v", videoErr)
 				} else {
 					now := time.Now().UTC()
 					relDir := base.BuildMediaRelativeDir("dingtalk", userID, mediaSessionID, now)
@@ -503,38 +492,68 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 					if saveErr != nil {
 						log.Printf("  - ⚠️ Failed to save temp video file: %v", saveErr)
 					} else {
-						mediaFiles = append(mediaFiles, base.MediaFileRecord{
-							MessageID:    msgID,
-							UserID:       userID,
-							SessionID:    mediaSessionID,
-							Platform:     "dingtalk",
-							MsgType:      "video",
-							Filename:     saved.Filename,
-							Mime:         saved.Mime,
-							Size:         saved.Size,
-							SHA256:       saved.SHA256,
-							LocalPath:    saved.LocalPath,
-							RelativePath: saved.RelativePath,
-							CreatedAt:    saved.CreatedAt,
-							ExpireAt:     saved.ExpireAt,
-						})
-						log.Printf("  - 🗂️ Video temp saved: %s", saved.LocalPath)
+						log.Printf("  - 🗂️ Video temp saved: %s (size: %d bytes)", saved.LocalPath, saved.Size)
+
+						// 计算视频时长
+						durRaw := int(vidContent.Duration)
+						durSec := durRaw
+						if durRaw >= 1000 {
+							durSec = durRaw / 1000
+						}
+
+						// 检查是否有视频处理 skill
+						videoSkillName = h.client.FindVideoSkill(ctx)
+						if videoSkillName != "" {
+							log.Printf("  - 🎯 Found video skill: %s, will use skill to process", videoSkillName)
+							// 使用 skill 处理，在消息中包含视频文件路径
+							// 注意：不添加到 mediaFiles，让 AI 通过 skill 自己读取文件
+							content = fmt.Sprintf("请处理这个视频文件：\n文件路径: %s\n文件大小: %d bytes\n时长: %d秒", saved.LocalPath, saved.Size, durSec)
+						} else if h.client.HasVideoCapableModel() {
+							// 没有找到 skill，但有支持视频的模型，添加到 mediaFiles 让多模态模型处理
+							mediaFiles = append(mediaFiles, base.MediaFileRecord{
+								MessageID:    msgID,
+								UserID:       userID,
+								SessionID:    mediaSessionID,
+								Platform:     "dingtalk",
+								MsgType:      "video",
+								Filename:     saved.Filename,
+								Mime:         saved.Mime,
+								Size:         saved.Size,
+								SHA256:       saved.SHA256,
+								LocalPath:    saved.LocalPath,
+								RelativePath: saved.RelativePath,
+								CreatedAt:    saved.CreatedAt,
+								ExpireAt:     saved.ExpireAt,
+							})
+							log.Printf("  - 📝 No video skill found, but found video-capable model, added to mediaFiles")
+							dataURI, mime, err := h.downloadMediaAsDataURI(ctx, vidContent.DownloadCode, "video/mp4")
+							if err != nil {
+								log.Printf("  - ⚠️ Failed to create data URI for video: %v", err)
+								content = fmt.Sprintf("视频文件已保存到: %s\n文件大小: %d bytes\n请分析这个视频。", saved.LocalPath, saved.Size)
+							} else {
+								mediaInfo = map[string]interface{}{
+									"type": "video",
+									"url":  dataURI,
+									"mime": mime,
+								}
+								if durSec > 0 {
+									content = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
+								} else {
+									content = "请分析这个视频的内容。"
+								}
+							}
+						} else {
+							// 没有 video skill，也没有支持视频的模型
+							log.Printf("  - ⚠️ No video skill and no video-capable model found")
+							content = fmt.Sprintf("⚠️ 视频处理暂不可用。\n\n视频已保存到: %s\n大小: %d bytes\n时长: %d秒\n\n请配置 video-analyzer skill 或使用支持视频的模型来处理视频文件。", saved.LocalPath, saved.Size, durSec)
+						}
 					}
 				}
 			}
 		}
-		// 视频消息：构建合理的提示文本
+		// 如果内容为空，设置默认提示
 		if content == "" {
-			durRaw := int(vidContent.Duration)
-			durSec := durRaw
-			if durRaw >= 1000 {
-				durSec = durRaw / 1000
-			}
-			if durSec > 0 {
-				content = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
-			} else {
-				content = "请分析这个视频的内容。"
-			}
+			content = "请分析这个视频的内容。"
 		}
 
 	case "file":
@@ -766,6 +785,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleStatus(ctx, data, userID)
 	}
 
+	// Handle /summary command to trigger context compression
+	if content == "/summary" || content == "压缩" || content == "总结" {
+		return h.handleSummary(ctx, data, userID)
+	}
+
 	// Handle /clear command to clear/delete current session
 	if content == "/clear" || content == "清除" {
 		return h.handleClear(ctx, data, userID)
@@ -859,6 +883,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			content = parts[1]
 			log.Printf("dingtalk stream: using agent '%s' for message", agentName)
 		}
+	}
+
+	// 如果有视频 skill 且用户没有指定 agent，使用视频 skill
+	if videoSkillName != "" && agentName == "" {
+		agentName = videoSkillName
+		log.Printf("dingtalk stream: auto-using video skill '%s' for video message", agentName)
 	}
 
 	if h.isNonOwnerReadOnly(userID) {
@@ -1836,6 +1866,7 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
 /sessions 或 /list - 列出所有会话
+/summary 或 压缩 - 压缩会话上下文（释放token空间）
 
 📋 任务追踪（对应 TUI 实时看板）：
 /todo 或 任务 - 查看 AI 当前的任务进度
@@ -3198,6 +3229,38 @@ func (h *Handler) handleStatus(ctx context.Context, data *chatbot.BotCallbackDat
 
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String())); err != nil {
 		log.Printf("dingtalk: failed to send status: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleSummary 处理上下文压缩命令
+func (h *Handler) handleSummary(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	// 发送提示消息
+	msg := "⏳ 正在进行上下文压缩..."
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+
+	// 调用 summary API
+	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
+		errMsg := fmt.Sprintf("❌ 上下文压缩失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	successMsg := fmt.Sprintf("✅ 上下文压缩完成\n\n会话 %s 的历史消息已被总结压缩，上下文空间已释放。", sessionID[:8])
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(successMsg)); err != nil {
+		log.Printf("dingtalk: failed to send summary response: %v", err)
 		return nil, err
 	}
 

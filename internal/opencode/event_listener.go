@@ -345,7 +345,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: session status changed for session %s", s.sessionID[:8])
 
 	case "session.error":
+		rawJSON := event.JSON.RawJSON()
+		log.Printf("opencode: 🔴 session.error RAW JSON: %s", rawJSON)
 		errorMsg := s.extractSessionError(event)
+		log.Printf("opencode: 🔴 session.error extracted message: %q", errorMsg)
 		if errorMsg == "" {
 			errorMsg = "⚠️ OpenCode 会话发生错误，请稍后重试。"
 		} else {
@@ -819,9 +822,13 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 		MessageID string `json:"messageID"`
 		Error     struct {
 			Type    string `json:"type"`
+			Name    string `json:"name"`
 			Message string `json:"message"`
 			Code    string `json:"code"`
 			Detail  string `json:"detail"`
+			Data    struct {
+				Message string `json:"message"`
+			} `json:"data"`
 		} `json:"error"`
 		Message string `json:"message"`
 		Detail  string `json:"detail"`
@@ -834,18 +841,23 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 	}
 
 	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
-		log.Printf("opencode: failed to parse session.error event: %v", err)
+		log.Printf("opencode: failed to parse session.error event: %v, raw: %s", err, raw)
 		return ""
 	}
 
 	props := wrapper.Properties
+	log.Printf("opencode: session.error parsed props: Error.Name=%q, Error.Message=%q, Error.Data.Message=%q, Message=%q, Detail=%q, Reason=%q, Code=%q",
+		props.Error.Name, props.Error.Message, props.Error.Data.Message, props.Message, props.Detail, props.Reason, props.Code)
 
 	var parts []string
 
-	if props.Error.Message != "" {
+	if props.Error.Data.Message != "" {
+		parts = append(parts, props.Error.Data.Message)
+	}
+	if props.Error.Message != "" && props.Error.Message != props.Error.Data.Message {
 		parts = append(parts, props.Error.Message)
 	}
-	if props.Message != "" && props.Message != props.Error.Message {
+	if props.Message != "" && props.Message != props.Error.Message && props.Message != props.Error.Data.Message {
 		parts = append(parts, props.Message)
 	}
 	if props.Detail != "" {
@@ -868,6 +880,9 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 	}
 	if code == "" {
 		code = props.Error.Type
+	}
+	if code == "" {
+		code = props.Error.Name
 	}
 
 	message := strings.Join(parts, "; ")
