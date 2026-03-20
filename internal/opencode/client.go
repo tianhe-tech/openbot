@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,10 +37,6 @@ var ErrDuplicateRequest = errors.New("opencode: duplicate request detected")
 var ErrMaxRetriesExceeded = errors.New("opencode: max retries exceeded")
 
 const (
-	// ContextUsageThreshold 涓婁笅鏂囦娇鐢ㄧ巼杈惧埌姝ら槇鍊兼椂鍒涘缓鏂皊ession (榛樿80%)
-	ContextUsageThreshold = 0.8
-	// SummaryThreshold 涓婁笅鏂囦娇鐢ㄧ巼杈惧埌姝ら槇鍊兼椂寮€濮嬫€荤粨 (榛樿60%)
-	SummaryThreshold = 0.6
 	// DefaultMaxTokens 榛樿鏈€澶oken鏁帮紙褰撴棤娉曡幏鍙栨ā鍨嬮厤缃椂浣跨敤锛?
 	DefaultMaxTokens = 4096
 	// EstimatedTokensPerMessage 浼扮畻姣忔潯娑堟伅鐨勫钩鍧噒oken鏁?
@@ -220,7 +215,6 @@ type Client struct {
 	sessionsMu        sync.RWMutex // 淇濇姢 sessions 鐨勮鍐?
 	messageCount      sync.Map     // map[sessionID]int tracks messages per session
 	tokenCount        sync.Map     // map[sessionID]int tracks estimated tokens per session
-	sessionSummary    sync.Map     // map[sessionID]string stores session summaries
 	modelConfig       sync.Map     // map[sessionID]*ModelConfig caches model config per session
 	sessionModel      sync.Map     // map[sessionID]*ModelConfig tracks latest provider/model seen in assistant replies
 	sessionOverride   sync.Map     // map[sessionID]*ModelConfig stores user-selected model via /model
@@ -238,12 +232,6 @@ type Client struct {
 	enableSkillHint   bool          // 鏄惁鍦ㄦ秷鎭腑娣诲姞skill鎻愮ず
 	skillHintCache    []string      // 缂撳瓨鐨勫彲鐢╯kill鍒楄〃
 	skillCacheMu      sync.RWMutex
-	memoryEnabled     bool
-	memoryDir         string
-	memoryMaxChars    int
-	memoryMaxFacts    int
-	memoryInjectFacts int
-	memoryMu          sync.Mutex
 	lastHealthCheck   time.Time    // 鏈€鍚庝竴娆″仴搴锋鏌ユ椂闂?
 	isHealthy         bool         // OpenCode server鏄惁鍋ュ悍
 	healthCheckMu     sync.RWMutex // 淇濇姢鍋ュ悍鐘舵€?
@@ -254,28 +242,7 @@ type Client struct {
 	unavailableMu     sync.Mutex
 	lastUnavailableAt time.Time
 	unavailableDelay  time.Duration
-}
-
-type memoryFact struct {
-	Text       string    `json:"text"`
-	Category   string    `json:"category"`
-	Importance int       `json:"importance"`
-	LastSeen   time.Time `json:"last_seen"`
-	Count      int       `json:"count"`
-}
-
-type userMemoryStore struct {
-	Version int          `json:"version"`
-	Facts   []memoryFact `json:"facts"`
-}
-
-// MemoryFactView is a safe exported view used by adapters.
-type MemoryFactView struct {
-	Text       string
-	Category   string
-	Importance int
-	LastSeen   time.Time
-	Count      int
+	messageQueue      *MessageQueue
 }
 
 // Option mutates a client during construction.
@@ -405,32 +372,9 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 		enableSkillHint:   false, // 榛樿绂佺敤skill鎻愮ず
 		debugMediaRouting: parseEnvBool("OPENBOT_DEBUG_MEDIA_ROUTING"),
 		modelCatalog:      make(map[string]*ModelCapability),
-		memoryEnabled:     parseEnvBool("OPENCODE_GATEWAY_MEMORY_ENABLED"),
-		memoryDir:         strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_DIR")),
-		memoryMaxChars:    4000,
-		memoryMaxFacts:    40,
-		memoryInjectFacts: 8,
-		isHealthy:         false,       // 鍒濆鐘舵€佹湭鐭?
-		lastHealthCheck:   time.Time{}, // 鏈鏌ヨ繃
+		isHealthy:         false,
+		lastHealthCheck:   time.Time{},
 		unavailableDelay:  20 * time.Second,
-	}
-	if client.memoryDir == "" {
-		client.memoryDir = filepath.Join(client.directory, ".opencode-gateway-memory")
-	}
-	if rawMax := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_MAX_CHARS")); rawMax != "" {
-		if parsed, err := strconv.Atoi(rawMax); err == nil && parsed > 0 {
-			client.memoryMaxChars = parsed
-		}
-	}
-	if rawMaxFacts := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_MAX_FACTS")); rawMaxFacts != "" {
-		if parsed, err := strconv.Atoi(rawMaxFacts); err == nil && parsed > 0 {
-			client.memoryMaxFacts = parsed
-		}
-	}
-	if rawInjectFacts := strings.TrimSpace(os.Getenv("OPENCODE_GATEWAY_MEMORY_INJECT_FACTS")); rawInjectFacts != "" {
-		if parsed, err := strconv.Atoi(rawInjectFacts); err == nil && parsed > 0 {
-			client.memoryInjectFacts = parsed
-		}
 	}
 
 	for _, opt := range opts {
@@ -462,6 +406,13 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 			}
 		}
 	}()
+
+	client.messageQueue = NewMessageQueue(func(ctx context.Context, payload MessagePayload, cb StreamCallback, eventCb StreamEventCallback) (Response, error) {
+		if cb == nil && eventCb == nil {
+			return client.SendMessage(ctx, payload)
+		}
+		return client.SendMessageStreamingWithEvents(ctx, payload, cb, eventCb)
+	}, 4)
 
 	return client
 }
@@ -549,30 +500,30 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 }
 
 func (c *Client) formatHealthCheckError(err error) error {
-var apiErr *opencode.Error
-if errors.As(err, &apiErr) {
-switch apiErr.StatusCode {
-case http.StatusUnauthorized:
-return fmt.Errorf("opencode server unauthorized (401): %w; endpoint=%s", err, c.endpoint)
-case http.StatusForbidden:
-return fmt.Errorf("opencode server forbidden (403): %w", err)
-case http.StatusNotFound:
-return fmt.Errorf("opencode server endpoint not found (404): %w; endpoint=%s", err, c.endpoint)
-default:
-return fmt.Errorf("opencode server status %d: %w; endpoint=%s", apiErr.StatusCode, err, c.endpoint)
-}
-}
+	var apiErr *opencode.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusUnauthorized:
+			return fmt.Errorf("opencode server unauthorized (401): %w; endpoint=%s", err, c.endpoint)
+		case http.StatusForbidden:
+			return fmt.Errorf("opencode server forbidden (403): %w", err)
+		case http.StatusNotFound:
+			return fmt.Errorf("opencode server endpoint not found (404): %w; endpoint=%s", err, c.endpoint)
+		default:
+			return fmt.Errorf("opencode server status %d: %w; endpoint=%s", apiErr.StatusCode, err, c.endpoint)
+		}
+	}
 
-var urlErr *url.Error
-if errors.As(err, &urlErr) {
-return fmt.Errorf("opencode server unreachable: %w; endpoint=%s", err, c.endpoint)
-}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("opencode server unreachable: %w; endpoint=%s", err, c.endpoint)
+	}
 
-if errors.Is(err, context.DeadlineExceeded) {
-return fmt.Errorf("opencode server health check timeout: %w; endpoint=%s", err, c.endpoint)
-}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("opencode server health check timeout: %w; endpoint=%s", err, c.endpoint)
+	}
 
-return fmt.Errorf("opencode server unavailable: %w; endpoint=%s", err, c.endpoint)
+	return fmt.Errorf("opencode server unavailable: %w; endpoint=%s", err, c.endpoint)
 }
 
 // IsHealthy returns the cached health status.
@@ -594,14 +545,6 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
-	}
-	originalContent := payload.Content
-
-	if c.memoryEnabled {
-		if memory := c.renderUserMemoryForPrompt(payload.Channel, payload.UserID); memory != "" {
-			payload.Content = fmt.Sprintf("[鐢ㄦ埛闀挎湡璁板繂]\n%s\n\n[鐢ㄦ埛褰撳墠娑堟伅]\n%s", memory, originalContent)
-			log.Printf("opencode: injected user memory for %s/%s (%d chars)", payload.Channel, payload.UserID, len(memory))
-		}
 	}
 
 	// ========== 鍋ュ悍妫€鏌ワ細纭繚OpenCode server宸插惎鍔?==========
@@ -739,7 +682,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			goto sendMessage
 		}
 
-		// 妫€鏌ユ槸鍚﹂渶瑕佹€荤粨鎴栧垱寤烘柊session
+		// 妫€鏌ヤ笂涓嬫枃浣跨敤鎯呭喌锛堜粎璁板綍鏃ュ織锛孫penCode鑷姩绠＄悊涓婁笅鏂囧帇缂╋級
 		msgCount := c.loadCounter(&c.messageCount, sessionID)
 		currentTokens := c.loadCounter(&c.tokenCount, sessionID)
 
@@ -753,93 +696,43 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 		log.Printf("opencode: session %s - messages: %d, tokens: %d/%d (%.1f%%), estimated msg tokens: %d",
 			sessionID[:8], msgCount, currentTokens, maxContextTokens, contextUsage*100, estimatedMsgTokens)
-
-		// 濡傛灉涓婁笅鏂囦娇鐢ㄧ巼瓒呰繃闃堝€硷紝鍒涘缓鏂皊ession
-		if contextUsage >= ContextUsageThreshold {
-			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, creating new session",
-				sessionID[:8], contextUsage*100, ContextUsageThreshold*100)
-
-			// 鎬荤粨鏃ession
-			if err := c.SummarizeSession(ctx, sessionID); err != nil {
-				log.Printf("opencode: failed to summarize session %s: %v", sessionID, err)
-			}
-
-			// 鑾峰彇鎬荤粨鍐呭
-			summary := ""
-			if sum, ok := c.sessionSummary.Load(sessionID); ok {
-				summary = sum.(string)
-			}
-
-			// 鍒涘缓鏂皊ession锛屾爣棰樺寘鍚巻鍙蹭俊鎭?
-			title := fmt.Sprintf("%s-%s-next", payload.Channel, payload.UserID)
-			if summary != "" {
-				title = fmt.Sprintf("%s-%s (涔嬪墠璁ㄨ: %s)", payload.Channel, payload.UserID, truncateString(summary, 50))
-			}
-
-			newSession, err := c.sdk.Session.New(ctx, opencode.SessionNewParams{
-				Title: opencode.F(title),
-			})
-			if err != nil {
-				log.Printf("opencode: failed to create new session: %v, continuing with current", err)
-			} else {
-				sessionID = newSession.ID
-				if payload.ThreadID != "" {
-					c.sessions.Store(payload.ThreadID, sessionID)
-				}
-				c.messageCount.Store(sessionID, 0)
-				c.tokenCount.Store(sessionID, 0)
-
-				// 鑾峰彇鏂皊ession鐨勬ā鍨嬮厤缃?
-				go c.fetchAndCacheModelConfig(context.Background(), sessionID)
-
-				// 濡傛灉鏈夋€荤粨锛屽皢鎬荤粨浣滀负绯荤粺娑堟伅娣诲姞鍒版柊session鐨勪笂涓嬫枃
-				if summary != "" {
-					contextMsg := fmt.Sprintf("[涓婁竴杞璇濇€荤粨]: %s\n\n[鐢ㄦ埛鏂版秷鎭痌: %s", summary, payload.Content)
-					payload.Content = contextMsg
-					estimatedMsgTokens = estimateTokens(contextMsg) // 閲嶆柊浼扮畻
-					log.Printf("opencode: created new session %s with context from previous session", sessionID)
-				} else {
-					log.Printf("opencode: created new session %s for thread %s", sessionID, payload.ThreadID)
-				}
-			}
-		} else if contextUsage >= SummaryThreshold && msgCount%5 == 0 {
-			// 鍦ㄨ揪鍒版€荤粨闃堝€煎悗锛屾瘡5鏉℃秷鎭皾璇曟€荤粨涓€娆★紙鍚庡彴寮傛锛?
-			log.Printf("opencode: session %s context usage %.1f%% >= summary threshold %.1f%%, scheduling background summary",
-				sessionID[:8], contextUsage*100, SummaryThreshold*100)
-			go func(sid string) {
-				sumCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if err := c.SummarizeSession(sumCtx, sid); err != nil {
-					log.Printf("opencode: background summarization failed for session %s: %v", sid, err)
-				}
-			}(sessionID)
-		}
 	}
 	threadLock.Unlock()
 
 sendMessage:
-	// ========== 澧炲己娑堟伅鍐呭 ==========
+	// ========== 澧炲己娑堟伅鍐呭==========
 	// 娣诲姞skill鎻愮ず锛堜粎鍦╯ession寮€濮嬫椂锛?
 	enhancedContent := c.enhanceContentWithSkillHint(payload.Content, sessionID)
 	effectiveContent := enhancedContent
 
-	// ========== 澶氭ā鎬佸吋瀹瑰鐞?==========
-	// 鑻ュ綋鍓嶄細璇濇ā鍨嬩笉鏀寔鍥剧墖/瑙嗛锛屽垯浣跨敤鏀寔妯″瀷鍏堣瘑鍒獟浣擄紝鍐嶅皢璇嗗埆缁撴灉杞负鏂囨湰鍙戠粰褰撳墠浼氳瘽妯″瀷銆?
-	if processed, err := c.preprocessAttachmentsForSession(ctx, sessionID, &payload, &effectiveContent); err != nil {
-		log.Printf("opencode: media preprocessing failed for session %s: %v", sessionID[:8], err)
+	// ========== 澶氭ā鎬佸吋瀹瑰鐞?==========
+	// 妫€鏌ユ秷鎭被鍨嬶紝閫夋嫨鍚堥€傜殑妯″瀷
+	mediaModel, preprocessErr := c.preprocessAttachmentsForSession(ctx, sessionID, &payload, &effectiveContent)
+	if preprocessErr != nil {
+		log.Printf("opencode: media preprocessing failed for session %s: %v", sessionID[:8], preprocessErr)
 		c.failRequest(requestHash)
-		return Response{}, fmt.Errorf("opencode: media preprocessing: %w", err)
-	} else if processed {
-		log.Printf("opencode: media preprocessing applied for session %s", sessionID[:8])
+		return Response{}, fmt.Errorf("opencode: media preprocessing: %w", preprocessErr)
 	}
 
-	mainModelOverride := c.getSessionModelOverride(sessionID)
-	if mainModelOverride != nil {
-		log.Printf("opencode: request route - session=%s mainModel=%s/%s attachments=%d",
-			sessionID[:8], mainModelOverride.ProviderID.Value, mainModelOverride.ModelID.Value, len(payload.Attachments))
+	var mainModelOverride *opencode.SessionPromptParamsModel
+	if mediaModel != nil {
+		// 鏈夊浘鐗?瑙嗛/闊抽绂佷欢锛屽己鍒朵娇鐢ㄥ鎬佹ā鍨嬶紙浠呮湰娆堬級
+		mainModelOverride = &opencode.SessionPromptParamsModel{
+			ProviderID: opencode.F(mediaModel.ProviderID),
+			ModelID:    opencode.F(mediaModel.ModelID),
+		}
+		log.Printf("opencode: 🖼️ multimodal message - session=%s forcing model=%s/%s attachments=%d",
+			sessionID[:8], mediaModel.ProviderID, mediaModel.ModelID, len(payload.Attachments))
 	} else {
-		log.Printf("opencode: request route - session=%s mainModel=<default/session> attachments=%d",
-			sessionID[:8], len(payload.Attachments))
+		// 鏃堕檮浠剁函鏂囨湰锛屾樉寮忔寚瀹氫細璇濈殑榛樿妯″瀷锛堥槻姝 OpenCode 绠＄悊鐨勬ā鍨嬭瀺鍚堬級
+		mainModelOverride = c.getSessionDefaultModel(sessionID)
+		if mainModelOverride != nil {
+			log.Printf("opencode: 📝 text message - session=%s using default model=%s/%s",
+				sessionID[:8], mainModelOverride.ProviderID.Value, mainModelOverride.ModelID.Value)
+		} else {
+			log.Printf("opencode: 📝 text message - session=%s no default model, using OpenCode server default",
+				sessionID[:8])
+		}
 	}
 
 	// Build message parts
@@ -942,607 +835,9 @@ sendMessage:
 		Trace:     sessionID,
 	}
 
-	if c.memoryEnabled {
-		c.updateUserMemory(payload.Channel, payload.UserID, originalContent, reply)
-	}
-
-	// ========== 缂撳瓨鎴愬姛鍝嶅簲鐢ㄤ簬鍘婚噸 ==========
-	c.completeRequest(requestHash, response)
-
 	return response, nil
 }
 
-func (c *Client) memoryFilePath(channel, userID string) string {
-	channel = sanitizeMemoryKey(channel)
-	userID = sanitizeMemoryKey(userID)
-	if channel == "" {
-		channel = "unknown"
-	}
-	if userID == "" {
-		userID = "unknown"
-	}
-	return filepath.Join(c.memoryDir, channel+"__"+userID+".json")
-}
-
-func sanitizeMemoryKey(input string) string {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return ""
-	}
-	var b strings.Builder
-	for _, r := range input {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('_')
-		}
-	}
-	return b.String()
-}
-
-func (c *Client) loadUserMemoryStore(channel, userID string) userMemoryStore {
-	path := c.memoryFilePath(channel, userID)
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return userMemoryStore{Version: 1, Facts: []memoryFact{}}
-	}
-	raw := strings.TrimSpace(string(b))
-	if raw == "" {
-		return userMemoryStore{Version: 1, Facts: []memoryFact{}}
-	}
-
-	var store userMemoryStore
-	if err := json.Unmarshal([]byte(raw), &store); err == nil {
-		if store.Version == 0 {
-			store.Version = 1
-		}
-		return store
-	}
-
-	// Backward compatibility: old plain text memory file.
-	return userMemoryStore{
-		Version: 1,
-		Facts: []memoryFact{{
-			Text:       raw,
-			Category:   "conversation",
-			Importance: 1,
-			LastSeen:   time.Now(),
-			Count:      1,
-		}},
-	}
-}
-
-func (c *Client) renderUserMemoryForPrompt(channel, userID string) string {
-	store := c.loadUserMemoryStore(channel, userID)
-	if len(store.Facts) == 0 {
-		return ""
-	}
-
-	facts := append([]memoryFact(nil), store.Facts...)
-	sort.Slice(facts, func(i, j int) bool {
-		if facts[i].Importance != facts[j].Importance {
-			return facts[i].Importance > facts[j].Importance
-		}
-		if !facts[i].LastSeen.Equal(facts[j].LastSeen) {
-			return facts[i].LastSeen.After(facts[j].LastSeen)
-		}
-		return facts[i].Count > facts[j].Count
-	})
-
-	limit := c.memoryInjectFacts
-	if limit <= 0 {
-		limit = 8
-	}
-	if limit > len(facts) {
-		limit = len(facts)
-	}
-
-	items := make([]string, 0, limit)
-	for i := 0; i < limit; i++ {
-		items = append(items, fmt.Sprintf("- [%s] %s", facts[i].Category, facts[i].Text))
-	}
-	prompt := strings.Join(items, "\n")
-	runes := []rune(prompt)
-	if len(runes) > c.memoryMaxChars {
-		prompt = string(runes[:c.memoryMaxChars])
-	}
-	return prompt
-}
-
-func (c *Client) updateUserMemory(channel, userID, userMessage, assistantReply string) {
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-
-	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
-		log.Printf("opencode: create memory dir failed: %v", err)
-		return
-	}
-
-	path := c.memoryFilePath(channel, userID)
-	store := c.loadUserMemoryStore(channel, userID)
-	candidates := extractMemoryCandidates(userMessage, assistantReply)
-	if len(candidates) == 0 {
-		return
-	}
-
-	for _, cand := range candidates {
-		merged := false
-		for i := range store.Facts {
-			if normalizeMemoryText(store.Facts[i].Text) == normalizeMemoryText(cand.Text) {
-				store.Facts[i].LastSeen = time.Now()
-				store.Facts[i].Count++
-				if cand.Importance > store.Facts[i].Importance {
-					store.Facts[i].Importance = cand.Importance
-				}
-				merged = true
-				break
-			}
-		}
-		if !merged {
-			cand.LastSeen = time.Now()
-			cand.Count = 1
-			store.Facts = append(store.Facts, cand)
-		}
-	}
-
-	sort.Slice(store.Facts, func(i, j int) bool {
-		if store.Facts[i].Importance != store.Facts[j].Importance {
-			return store.Facts[i].Importance > store.Facts[j].Importance
-		}
-		if !store.Facts[i].LastSeen.Equal(store.Facts[j].LastSeen) {
-			return store.Facts[i].LastSeen.After(store.Facts[j].LastSeen)
-		}
-		return store.Facts[i].Count > store.Facts[j].Count
-	})
-
-	if c.memoryMaxFacts > 0 && len(store.Facts) > c.memoryMaxFacts {
-		store.Facts = store.Facts[:c.memoryMaxFacts]
-	}
-
-	encoded, err := json.MarshalIndent(store, "", "  ")
-	if err != nil {
-		log.Printf("opencode: marshal memory failed: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(path, encoded, 0o644); err != nil {
-		log.Printf("opencode: write memory failed: %v", err)
-	}
-}
-
-// ListUserMemory returns top memory facts sorted by priority.
-func (c *Client) ListUserMemory(channel, userID string, limit int) []MemoryFactView {
-	store := c.loadUserMemoryStore(channel, userID)
-	if len(store.Facts) == 0 {
-		return nil
-	}
-
-	facts := c.sortedMemoryFacts(store.Facts)
-
-	if limit <= 0 || limit > len(facts) {
-		limit = len(facts)
-	}
-	out := make([]MemoryFactView, 0, limit)
-	for i := 0; i < limit; i++ {
-		out = append(out, MemoryFactView{
-			Text:       facts[i].Text,
-			Category:   facts[i].Category,
-			Importance: facts[i].Importance,
-			LastSeen:   facts[i].LastSeen,
-			Count:      facts[i].Count,
-		})
-	}
-	return out
-}
-
-// ExportUserMemory returns base64-encoded JSON snapshot for backup/migration.
-func (c *Client) ExportUserMemory(channel, userID string) (string, error) {
-	store := c.loadUserMemoryStore(channel, userID)
-	encoded, err := json.Marshal(store)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(encoded), nil
-}
-
-// ImportUserMemory imports a base64 JSON snapshot and replaces existing memory.
-func (c *Client) ImportUserMemory(channel, userID, payload string) (int, error) {
-	store, err := parseImportMemoryStore(payload)
-	if err != nil {
-		return 0, err
-	}
-
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
-		return 0, err
-	}
-	if err := c.saveMemoryStore(channel, userID, store); err != nil {
-		return 0, err
-	}
-	return len(store.Facts), nil
-}
-
-// MergeImportUserMemory imports snapshot and merges with existing facts (dedupe + priority keep).
-func (c *Client) MergeImportUserMemory(channel, userID, payload string) (int, error) {
-	incoming, err := parseImportMemoryStore(payload)
-	if err != nil {
-		return 0, err
-	}
-
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
-		return 0, err
-	}
-
-	existing := c.loadUserMemoryStore(channel, userID)
-	merged := map[string]memoryFact{}
-	for _, f := range existing.Facts {
-		key := normalizeMemoryText(f.Text)
-		merged[key] = f
-	}
-	for _, f := range incoming.Facts {
-		key := normalizeMemoryText(f.Text)
-		if cur, ok := merged[key]; ok {
-			if f.Importance > cur.Importance {
-				cur.Importance = f.Importance
-				cur.Category = f.Category
-			}
-			if f.LastSeen.After(cur.LastSeen) {
-				cur.LastSeen = f.LastSeen
-			}
-			cur.Count += f.Count
-			merged[key] = cur
-			continue
-		}
-		merged[key] = f
-	}
-
-	facts := make([]memoryFact, 0, len(merged))
-	for _, f := range merged {
-		facts = append(facts, f)
-	}
-	existing.Facts = facts
-	if err := c.saveMemoryStore(channel, userID, existing); err != nil {
-		return 0, err
-	}
-	return len(existing.Facts), nil
-}
-
-// ClearUserMemory deletes persisted memory for the user.
-func (c *Client) ClearUserMemory(channel, userID string) error {
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-	path := c.memoryFilePath(channel, userID)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-// PinUserMemory stores a high-priority explicit memory fact.
-func (c *Client) PinUserMemory(channel, userID, text, category string) error {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return fmt.Errorf("memory text is empty")
-	}
-	category = normalizeMemoryCategory(category)
-
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-	if err := os.MkdirAll(c.memoryDir, 0o755); err != nil {
-		return err
-	}
-
-	store := c.loadUserMemoryStore(channel, userID)
-	norm := normalizeMemoryText(text)
-	for i := range store.Facts {
-		if normalizeMemoryText(store.Facts[i].Text) == norm {
-			store.Facts[i].Category = category
-			store.Facts[i].Importance = 5
-			store.Facts[i].LastSeen = time.Now()
-			store.Facts[i].Count++
-			return c.saveMemoryStore(channel, userID, store)
-		}
-	}
-
-	store.Facts = append(store.Facts, memoryFact{
-		Text:       text,
-		Category:   category,
-		Importance: 5,
-		LastSeen:   time.Now(),
-		Count:      1,
-	})
-	return c.saveMemoryStore(channel, userID, store)
-}
-
-// UnpinUserMemory removes memory facts containing the keyword.
-func (c *Client) UnpinUserMemory(channel, userID, keyword string) (int, error) {
-	keyword = strings.TrimSpace(keyword)
-	if keyword == "" {
-		return 0, fmt.Errorf("memory keyword is empty")
-	}
-
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-	store := c.loadUserMemoryStore(channel, userID)
-	if len(store.Facts) == 0 {
-		return 0, nil
-	}
-
-	norm := normalizeMemoryText(keyword)
-	filtered := make([]memoryFact, 0, len(store.Facts))
-	removed := 0
-	for _, f := range store.Facts {
-		if strings.Contains(normalizeMemoryText(f.Text), norm) {
-			removed++
-			continue
-		}
-		filtered = append(filtered, f)
-	}
-
-	if removed == 0 {
-		return 0, nil
-	}
-	store.Facts = filtered
-	if err := c.saveMemoryStore(channel, userID, store); err != nil {
-		return 0, err
-	}
-	return removed, nil
-}
-
-// RemoveUserMemoryByRank removes an entry by its display rank (1-based from /memory show order).
-func (c *Client) RemoveUserMemoryByRank(channel, userID string, rank int) (bool, error) {
-	if rank <= 0 {
-		return false, fmt.Errorf("rank must be >= 1")
-	}
-
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-	store := c.loadUserMemoryStore(channel, userID)
-	if len(store.Facts) == 0 {
-		return false, nil
-	}
-
-	sorted := c.sortedMemoryFacts(store.Facts)
-	if rank > len(sorted) {
-		return false, nil
-	}
-	target := normalizeMemoryText(sorted[rank-1].Text)
-
-	filtered := make([]memoryFact, 0, len(store.Facts))
-	removed := false
-	for _, f := range store.Facts {
-		if !removed && normalizeMemoryText(f.Text) == target {
-			removed = true
-			continue
-		}
-		filtered = append(filtered, f)
-	}
-	if !removed {
-		return false, nil
-	}
-	store.Facts = filtered
-	if err := c.saveMemoryStore(channel, userID, store); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// CompactUserMemory deduplicates and trims lower-value memory entries.
-func (c *Client) CompactUserMemory(channel, userID string) (int, error) {
-	c.memoryMu.Lock()
-	defer c.memoryMu.Unlock()
-	store := c.loadUserMemoryStore(channel, userID)
-	if len(store.Facts) == 0 {
-		return 0, nil
-	}
-
-	merged := map[string]memoryFact{}
-	for _, f := range store.Facts {
-		key := normalizeMemoryText(f.Text)
-		existing, ok := merged[key]
-		if !ok {
-			merged[key] = f
-			continue
-		}
-		if f.Importance > existing.Importance {
-			existing.Importance = f.Importance
-			existing.Category = f.Category
-		}
-		if f.LastSeen.After(existing.LastSeen) {
-			existing.LastSeen = f.LastSeen
-		}
-		existing.Count += f.Count
-		merged[key] = existing
-	}
-
-	facts := make([]memoryFact, 0, len(merged))
-	for _, v := range merged {
-		facts = append(facts, v)
-	}
-
-	sort.Slice(facts, func(i, j int) bool {
-		if facts[i].Importance != facts[j].Importance {
-			return facts[i].Importance > facts[j].Importance
-		}
-		if !facts[i].LastSeen.Equal(facts[j].LastSeen) {
-			return facts[i].LastSeen.After(facts[j].LastSeen)
-		}
-		return facts[i].Count > facts[j].Count
-	})
-
-	if c.memoryMaxFacts > 0 && len(facts) > c.memoryMaxFacts {
-		facts = facts[:c.memoryMaxFacts]
-	}
-	removed := len(store.Facts) - len(facts)
-	store.Facts = facts
-	if err := c.saveMemoryStore(channel, userID, store); err != nil {
-		return 0, err
-	}
-	return removed, nil
-}
-
-func (c *Client) saveMemoryStore(channel, userID string, store userMemoryStore) error {
-	path := c.memoryFilePath(channel, userID)
-	sort.Slice(store.Facts, func(i, j int) bool {
-		if store.Facts[i].Importance != store.Facts[j].Importance {
-			return store.Facts[i].Importance > store.Facts[j].Importance
-		}
-		if !store.Facts[i].LastSeen.Equal(store.Facts[j].LastSeen) {
-			return store.Facts[i].LastSeen.After(store.Facts[j].LastSeen)
-		}
-		return store.Facts[i].Count > store.Facts[j].Count
-	})
-	if c.memoryMaxFacts > 0 && len(store.Facts) > c.memoryMaxFacts {
-		store.Facts = store.Facts[:c.memoryMaxFacts]
-	}
-	encoded, err := json.MarshalIndent(store, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, encoded, 0o644)
-}
-
-func (c *Client) sortedMemoryFacts(facts []memoryFact) []memoryFact {
-	out := append([]memoryFact(nil), facts...)
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Importance != out[j].Importance {
-			return out[i].Importance > out[j].Importance
-		}
-		if !out[i].LastSeen.Equal(out[j].LastSeen) {
-			return out[i].LastSeen.After(out[j].LastSeen)
-		}
-		return out[i].Count > out[j].Count
-	})
-	return out
-}
-
-func normalizeMemoryText(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.ReplaceAll(s, " ", "")
-	return s
-}
-
-func parseImportMemoryStore(payload string) (userMemoryStore, error) {
-	payload = strings.TrimSpace(payload)
-	if payload == "" {
-		return userMemoryStore{}, fmt.Errorf("memory import payload is empty")
-	}
-
-	raw, err := base64.StdEncoding.DecodeString(payload)
-	if err != nil {
-		// Allow raw JSON payload as fallback.
-		raw = []byte(payload)
-	}
-
-	var store userMemoryStore
-	if err := json.Unmarshal(raw, &store); err != nil {
-		return userMemoryStore{}, fmt.Errorf("invalid memory payload: %w", err)
-	}
-	if store.Version == 0 {
-		store.Version = 1
-	}
-
-	now := time.Now()
-	for i := range store.Facts {
-		store.Facts[i].Category = normalizeMemoryCategory(store.Facts[i].Category)
-		if store.Facts[i].Importance <= 0 {
-			store.Facts[i].Importance = 1
-		}
-		if store.Facts[i].LastSeen.IsZero() {
-			store.Facts[i].LastSeen = now
-		}
-		if store.Facts[i].Count <= 0 {
-			store.Facts[i].Count = 1
-		}
-		store.Facts[i].Text = strings.TrimSpace(store.Facts[i].Text)
-	}
-	return store, nil
-}
-
-func normalizeMemoryCategory(category string) string {
-	v := strings.ToLower(strings.TrimSpace(category))
-	switch v {
-	case "profile", "preference", "project", "environment", "model", "conversation":
-		return v
-	default:
-		return "preference"
-	}
-}
-
-func extractMemoryCandidates(userMessage, assistantReply string) []memoryFact {
-	_ = assistantReply
-	msg := strings.TrimSpace(userMessage)
-	if msg == "" {
-		return nil
-	}
-
-	separators := []string{"\\n", "。", ".", "；", ";", "!", "！", "?", "？"}
-	parts := []string{msg}
-	for _, sep := range separators {
-		next := make([]string, 0, len(parts))
-		for _, p := range parts {
-			next = append(next, strings.Split(p, sep)...)
-		}
-		parts = next
-	}
-
-	facts := make([]memoryFact, 0)
-	for _, p := range parts {
-		text := strings.TrimSpace(p)
-		if text == "" {
-			continue
-		}
-		runes := []rune(text)
-		if len(runes) < 4 || len(runes) > 140 {
-			continue
-		}
-
-		cat, importance := classifyMemoryFact(text)
-		if importance <= 0 {
-			continue
-		}
-		facts = append(facts, memoryFact{
-			Text:       text,
-			Category:   cat,
-			Importance: importance,
-		})
-	}
-
-	if len(facts) > 12 {
-		facts = facts[:12]
-	}
-	return facts
-}
-
-func classifyMemoryFact(text string) (string, int) {
-	lower := strings.ToLower(strings.TrimSpace(text))
-
-	if strings.HasPrefix(lower, "/model ") {
-		return "model", 5
-	}
-	if strings.HasPrefix(lower, "/provider ") {
-		return "environment", 5
-	}
-	if strings.Contains(lower, "璁颁綇") || strings.Contains(lower, "浠ュ悗") || strings.Contains(lower, "璇风敤") || strings.Contains(lower, "蹇呴』") || strings.Contains(lower, "涓嶈") {
-		return "preference", 4
-	}
-	if strings.Contains(lower, "鎴戝彨") || strings.Contains(lower, "鍙垜") || strings.Contains(lower, "鎴戠殑") || strings.Contains(lower, "鎴戞槸") {
-		return "profile", 3
-	}
-	if strings.Contains(lower, "椤圭洰") || strings.Contains(lower, "浠撳簱") || strings.Contains(lower, "鏈嶅姟") || strings.Contains(lower, "绔彛") || strings.Contains(lower, "鐜") {
-		return "project", 3
-	}
-	if strings.Contains(lower, "鍠滄") || strings.Contains(lower, "涓嶅枩娆") || strings.Contains(lower, "鍋忓ソ") || strings.Contains(lower, "涔犳儻") {
-		return "preference", 3
-	}
-
-	return "conversation", 1
-}
-
-// GetSession retrieves session details.
 func (c *Client) GetSession(ctx context.Context, sessionID string) (*opencode.Session, error) {
 	return c.sdk.Session.Get(ctx, sessionID, opencode.SessionGetParams{})
 }
@@ -1668,7 +963,6 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	// Clean up local caches
 	c.messageCount.Delete(sessionID)
 	c.tokenCount.Delete(sessionID)
-	c.sessionSummary.Delete(sessionID)
 	c.modelConfig.Delete(sessionID)
 	c.runningSessions.Delete(sessionID)
 	return nil
@@ -1697,14 +991,18 @@ func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
 		return []Provider{}, nil
 	}
 
-	for _, v := range result.Default {
-		parts := strings.SplitN(strings.TrimSpace(v), "/", 2)
+	// 优先从 Config API 获取默认模型（配置文件中的 model 字段）
+	configResult, configErr := c.sdk.Config.Get(ctx, opencode.ConfigGetParams{})
+	if configErr == nil && configResult != nil && configResult.Model != "" {
+		parts := strings.SplitN(strings.TrimSpace(configResult.Model), "/", 2)
 		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 			c.defaultModelMu.Lock()
 			c.defaultModel = &ModelConfig{ProviderID: parts[0], ModelID: parts[1], LastUpdated: time.Now()}
 			c.defaultModelMu.Unlock()
-			break
+			log.Printf("opencode: default model from config: %s/%s", parts[0], parts[1])
 		}
+	} else if configErr != nil {
+		log.Printf("opencode: failed to get config: %v", configErr)
 	}
 
 	providers := make([]Provider, 0, len(result.Providers))
@@ -1739,6 +1037,11 @@ func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
 				outputMap[s] = true
 			}
 
+			// Log multimodal models
+			if inputMap["image"] || inputMap["video"] || inputMap["vision"] || inputMap["input_image"] || inputMap["input_video"] {
+				log.Printf("opencode: multimodal model found: %s/%s, input_modalities=%v", p.ID, modelID, inputModalities)
+			}
+
 			models = append(models, Model{
 				ID:               modelID,
 				Name:             m.Name,
@@ -1768,6 +1071,22 @@ func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
 	c.modelCatalogMu.Lock()
 	c.modelCatalog = newCatalog
 	c.modelCatalogMu.Unlock()
+
+	// 如果 OpenCode 没有返回默认模型（配置文件未设置 model），从模型目录中选择第一个可用模型
+	c.defaultModelMu.RLock()
+	hasDefault := c.defaultModel != nil
+	c.defaultModelMu.RUnlock()
+	if !hasDefault && len(newCatalog) > 0 {
+		for _, cap := range newCatalog {
+			if cap != nil && cap.ProviderID != "" && cap.ModelID != "" {
+				c.defaultModelMu.Lock()
+				c.defaultModel = &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID, LastUpdated: time.Now()}
+				c.defaultModelMu.Unlock()
+				log.Printf("opencode: no default model configured, auto-selected first model: %s/%s", cap.ProviderID, cap.ModelID)
+				break
+			}
+		}
+	}
 
 	return providers, nil
 }
@@ -1852,6 +1171,29 @@ func (c *Client) getSessionModelOverride(sessionID string) *opencode.SessionProm
 			}
 		}
 	}
+	return nil
+}
+
+// getSessionDefaultModel 获取会话默认模型（用于纯文本消息时显式指定）
+// 优先级：用户 /model 设置 > OpenCode 默认模型
+func (c *Client) getSessionDefaultModel(sessionID string) *opencode.SessionPromptParamsModel {
+	// 优先使用用户设置的模型
+	if override := c.getSessionModelOverride(sessionID); override != nil {
+		log.Printf("opencode: getSessionDefaultModel - using user override: %s/%s", override.ProviderID.Value, override.ModelID.Value)
+		return override
+	}
+
+	// 使用 OpenCode 默认模型
+	c.defaultModelMu.RLock()
+	defer c.defaultModelMu.RUnlock()
+	if c.defaultModel != nil {
+		log.Printf("opencode: getSessionDefaultModel - using OpenCode default: %s/%s", c.defaultModel.ProviderID, c.defaultModel.ModelID)
+		return &opencode.SessionPromptParamsModel{
+			ProviderID: opencode.F(c.defaultModel.ProviderID),
+			ModelID:    opencode.F(c.defaultModel.ModelID),
+		}
+	}
+	log.Printf("opencode: getSessionDefaultModel - no default model found (user override=nil, OpenCode default=nil)")
 	return nil
 }
 
@@ -2232,7 +1574,7 @@ func extractReplyFromMessage(msg *opencode.SessionPromptResponse) string {
 	if msg == nil || len(msg.Parts) == 0 {
 		log.Printf("opencode: WARNING - no response parts to extract")
 		return "(processing, please check OpenCode UI for result)"
-  }
+	}
 
 	var textParts []string
 
@@ -2265,64 +1607,6 @@ func (c *Client) getThreadLock(threadID string) *sync.Mutex {
 
 	lock, _ := c.sessionLocks.LoadOrStore(threadID, &sync.Mutex{})
 	return lock.(*sync.Mutex)
-}
-
-// SummarizeSession 鎬荤粨涓€涓猻ession鐨勫璇濆唴瀹?
-func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
-	if !c.Ready() {
-		return fmt.Errorf("opencode: client not configured")
-	}
-
-	// 妫€鏌ユ槸鍚﹀凡鏈夋€荤粨
-	if _, exists := c.sessionSummary.Load(sessionID); exists {
-		return nil // 宸茬粡鎬荤粨杩囦簡
-	}
-
-	log.Printf("opencode: summarizing session %s", sessionID)
-
-	// 璋冪敤OpenCode鐨剆ummarize API
-	_, err := c.sdk.Session.Summarize(ctx, sessionID, opencode.SessionSummarizeParams{})
-	if err != nil {
-		return fmt.Errorf("opencode: summarize session: %w", err)
-	}
-
-	// 鑾峰彇session璇︽儏浠ヨ幏鍙栨€荤粨
-	session, err := c.GetSession(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("opencode: get session after summarize: %w", err)
-	}
-
-	// 鎻愬彇鎬荤粨鍐呭锛堜粠session鐨刴essages涓煡鎵緎ummary绫诲瀷鐨勬秷鎭級
-	summary := extractSummaryFromSession(session)
-	if summary != "" {
-		c.sessionSummary.Store(sessionID, summary)
-		log.Printf("opencode: session %s summarized successfully", sessionID)
-	}
-
-	return nil
-}
-
-// extractSummaryFromSession 浠巗ession涓彁鍙栨€荤粨淇℃伅
-func extractSummaryFromSession(session *opencode.Session) string {
-	if session == nil {
-		return ""
-	}
-	// TODO: 鏍规嵁瀹為檯鐨剆ession缁撴瀯鎻愬彇鎬荤粨
-	// 鍙兘闇€瑕佽幏鍙杕essages骞舵煡鎵緎ummary绫诲瀷鐨勬秷鎭?
-	return "" // 鏆傛椂杩斿洖绌猴紝闇€瑕佹牴鎹甋DK瀹為檯缁撴瀯瀹炵幇
-}
-
-// truncateString 鎴柇瀛楃涓插埌鎸囧畾闀垮害
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	// 澶勭悊UTF-8瀛楃
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	return string(runes[:maxLen]) + "..."
 }
 
 // GetMessageCount 鑾峰彇鎸囧畾session鐨勬秷鎭暟閲?
@@ -2389,7 +1673,7 @@ func (c *Client) GetSessionInfo(ctx context.Context, sessionID string) (*Session
 // SendMessageStreaming sends a message and calls the callback for each chunk of the response.
 // 鐪熸鐨勬祦寮忓疄鐜帮細娉ㄥ唽StreamingSessionHandler鐩戝惉瀹炴椂浜嬩欢
 func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayload, callback StreamCallback) (Response, error) {
-  return c.SendMessageStreamingWithEvents(ctx, payload, callback, nil)
+	return c.SendMessageStreamingWithEvents(ctx, payload, callback, nil)
 }
 
 // SendMessageStreamingWithEvents sends a streaming message with both legacy chunk callback
@@ -2464,9 +1748,12 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	c.activeHandlers.Store(sessionID, handler)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
 
-	// 4. 浣跨敤goroutine寮傛鍙戦€佹秷鎭?
+	// 4. 浣跨敤goroutine寮傛鍙戦€佹秷鎭?
 	responseChan := make(chan Response, 1)
 	errorChan := make(chan error, 1)
+
+	// 将确定的 sessionID 设置到 payload 中，避免 SendMessage 再次创建 session
+	payload.SessionID = sessionID
 
 	go func() {
 		response, err := c.SendMessage(ctx, payload)
@@ -2940,13 +2227,13 @@ func capabilitySupportsModality(cap *ModelCapability, modality string) bool {
 		return cap.InputModalities["input_text"] || cap.InputModalities["prompt"]
 	}
 	if modality == "image" {
-		return cap.InputModalities["vision"] || cap.InputModalities["input_image"]
+		return cap.InputModalities["image"] || cap.InputModalities["vision"] || cap.InputModalities["input_image"]
 	}
 	if modality == "video" {
-		return cap.InputModalities["input_video"]
+		return cap.InputModalities["video"] || cap.InputModalities["input_video"]
 	}
 	if modality == "audio" {
-		return cap.InputModalities["voice"] || cap.InputModalities["speech"] || cap.InputModalities["input_audio"]
+		return cap.InputModalities["audio"] || cap.InputModalities["voice"] || cap.InputModalities["speech"] || cap.InputModalities["input_audio"]
 	}
 	return false
 }
@@ -2956,7 +2243,7 @@ func maybeVisionCapableByModelID(modelID string) bool {
 	if id == "" {
 		return false
 	}
-	for _, hint := range []string{"kimi", "gpt-4o", "gemini", "qwen-vl", "qvq", "claude-3-5-sonnet", "claude-3-7-sonnet", "vision", "vl"} {
+	for _, hint := range []string{"kimi", "gpt-4o", "gemini", "qwen", "qvq", "claude-3-5-sonnet", "claude-3-7-sonnet", "vision", "vl"} {
 		if strings.Contains(id, hint) {
 			return true
 		}
@@ -2964,9 +2251,9 @@ func maybeVisionCapableByModelID(modelID string) bool {
 	return false
 }
 
-func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID string, payload *MessagePayload, effectiveContent *string) (bool, error) {
+func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID string, payload *MessagePayload, effectiveContent *string) (*ModelConfig, error) {
 	if payload == nil || len(payload.Attachments) == 0 {
-		return false, nil
+		return nil, nil
 	}
 	c.mediaDebugf("preprocess start: session=%s attachments=%d", sessionID[:min(8, len(sessionID))], len(payload.Attachments))
 
@@ -2993,50 +2280,65 @@ func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID 
 
 	if !needImage && !needVideo && !needAudio {
 		c.mediaDebugf("no image/video/audio attachments, skip preprocess")
-		return false, nil
+		return nil, nil
 	}
 	c.mediaDebugf("media detected: needImage=%t needVideo=%t needAudio=%t mediaCount=%d", needImage, needVideo, needAudio, len(mediaAttachments))
 
 	c.ensureModelCatalog(ctx)
-	recognizerModel, ok := c.selectFallbackMediaModel(needImage, needVideo, needAudio)
-	if !ok {
-		c.mediaDebugf("no matched recognizer model for media, skip preprocessing")
-		return false, nil
-	}
-	c.mediaDebugf("matched recognizer model: %s/%s", recognizerModel.ProviderID, recognizerModel.ModelID)
 
-	recognized, err := c.recognizeMediaWithModel(ctx, mediaAttachments, recognizerModel)
-	if err != nil {
-		c.mediaDebugf("media recognizer failed: %v", err)
-		return false, err
-	}
-	if strings.TrimSpace(recognized) == "" {
-		c.mediaDebugf("media recognizer returned empty text, keep original flow")
-		return false, nil
-	}
+	sessionModel, hasSessionModel := c.getCurrentSessionModel(ctx, sessionID)
+	c.mediaDebugf("session model lookup: hasSessionModel=%t, model=%+v", hasSessionModel, sessionModel)
 
-	*effectiveContent = fmt.Sprintf("[澶氭ā鎬侀澶勭悊缁撴灉]\n%s\n\n[鐢ㄦ埛璇锋眰]\n%s", recognized, *effectiveContent)
+	if hasSessionModel && sessionModel != nil {
+		catalogKey := modelCatalogKey(sessionModel.ProviderID, sessionModel.ModelID)
+		c.modelCatalogMu.RLock()
+		sessionCap, hasCap := c.modelCatalog[catalogKey]
+		c.modelCatalogMu.RUnlock()
 
-	filtered := make([]Attachment, 0, len(payload.Attachments))
-	for _, att := range payload.Attachments {
-		if hasAttachmentType(att, "image/") || hasAttachmentType(att, "video/") || hasAttachmentType(att, "audio/") {
-			continue
+		c.mediaDebugf("session model %s/%s capability: hasCap=%t, modalities=%v", sessionModel.ProviderID, sessionModel.ModelID, hasCap, sessionCap.InputModalities)
+
+		if hasCap && sessionCap != nil {
+			supported := true
+			if needImage && !capabilitySupportsModality(sessionCap, "image") {
+				supported = false
+			}
+			if needVideo && !capabilitySupportsModality(sessionCap, "video") {
+				supported = false
+			}
+			if needAudio && !capabilitySupportsModality(sessionCap, "audio") {
+				supported = false
+			}
+
+			if supported {
+				c.mediaDebugf("session model %s/%s supports required modalities, keep attachments and use this model",
+					sessionModel.ProviderID, sessionModel.ModelID)
+				return sessionModel, nil
+			}
+			c.mediaDebugf("session model %s/%s does NOT support required modalities, will find fallback", sessionModel.ProviderID, sessionModel.ModelID)
 		}
-		filtered = append(filtered, att)
 	}
-	payload.Attachments = filtered
-	c.mediaDebugf("preprocess done: converted media to text, remaining attachments=%d", len(filtered))
 
-	return true, nil
+	fallbackModel, ok := c.selectFallbackMediaModel(needImage, needVideo, needAudio)
+	if !ok {
+		c.mediaDebugf("no matched fallback model for media, attachments will be sent without model override (may fail)")
+		return nil, nil
+	}
+	c.mediaDebugf("matched fallback model: %s/%s, will use this model to send attachments directly", fallbackModel.ProviderID, fallbackModel.ModelID)
+
+	return fallbackModel, nil
 }
 
 func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) (*ModelConfig, bool) {
 	c.modelCatalogMu.RLock()
+	defer c.modelCatalogMu.RUnlock()
+
 	keys := make([]string, 0, len(c.modelCatalog))
 	for k := range c.modelCatalog {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+
+	c.mediaDebugf("selectFallbackMediaModel: catalog has %d models, checking for image=%t video=%t audio=%t", len(keys), needImage, needVideo, needAudio)
 
 	// Pass 1: strict capability matching based on provider metadata.
 	for _, k := range keys {
@@ -3044,26 +2346,31 @@ func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) 
 		if cap == nil {
 			continue
 		}
+		c.mediaDebugf("  checking %s/%s: modalities=%v", cap.ProviderID, cap.ModelID, cap.InputModalities)
+
 		if !capabilitySupportsModality(cap, "text") {
+			c.mediaDebugf("    -> skipped (no text support)")
 			continue
 		}
 		if needImage && !capabilitySupportsModality(cap, "image") {
+			c.mediaDebugf("    -> skipped (no image support)")
 			continue
 		}
 		if needVideo && !capabilitySupportsModality(cap, "video") {
+			c.mediaDebugf("    -> skipped (no video support)")
 			continue
 		}
 		if needAudio && !capabilitySupportsModality(cap, "audio") {
+			c.mediaDebugf("    -> skipped (no audio support)")
 			continue
 		}
 		cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
-		c.mediaDebugf("selected media recognizer model: %s/%s", cfg.ProviderID, cfg.ModelID)
-		c.modelCatalogMu.RUnlock()
+		log.Printf("opencode: selected multimodal model %s/%s for image=%t video=%t audio=%t", cfg.ProviderID, cfg.ModelID, needImage, needVideo, needAudio)
 		return cfg, true
 	}
 
 	// Pass 2: metadata-missing fallback (common in some OpenAI-compatible providers).
-	// For image/video recognition, prefer known vision-capable model IDs (e.g., Kimi).
+	// For image/video recognition, prefer known vision-capable model IDs (e.g., Kimi, Qwen).
 	if (needImage || needVideo) && !needAudio {
 		for _, k := range keys {
 			cap := c.modelCatalog[k]
@@ -3072,15 +2379,13 @@ func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) 
 			}
 			if maybeVisionCapableByModelID(cap.ModelID) {
 				cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
-				c.mediaDebugf("selected media recognizer model by heuristic: %s/%s", cfg.ProviderID, cfg.ModelID)
-				c.modelCatalogMu.RUnlock()
+				log.Printf("opencode: selected model %s/%s by heuristic (vision-capable model ID)", cfg.ProviderID, cfg.ModelID)
 				return cfg, true
 			}
 		}
 	}
 
-	c.modelCatalogMu.RUnlock()
-	c.mediaDebugf("no media recognizer model found for needImage=%t needVideo=%t needAudio=%t", needImage, needVideo, needAudio)
+	log.Printf("opencode: WARNING - no multimodal model found for image=%t video=%t audio=%t (catalog has %d models)", needImage, needVideo, needAudio, len(keys))
 	return nil, false
 }
 
@@ -3338,12 +2643,12 @@ func (c *Client) AnswerQuestion(ctx context.Context, questionID string, answer s
 
 // answerPermission answers a permission request (internal, via AnswerQuestion path).
 func (c *Client) answerPermission(ctx context.Context, q *Question, answer string) error {
-_, responseStr, ok := parsePermissionAnswer(answer)
-if !ok {
-return fmt.Errorf("invalid permission answer (raw=%q bytes=% X)", answer, []byte(answer))
-}
-log.Printf("opencode: answerPermission via parsePermissionAnswer - ID=%s, responseStr=%s", q.ID, responseStr)
-return c.RespondToPermission(ctx, q.ID, responseStr)
+	_, responseStr, ok := parsePermissionAnswer(answer)
+	if !ok {
+		return fmt.Errorf("invalid permission answer (raw=%q bytes=% X)", answer, []byte(answer))
+	}
+	log.Printf("opencode: answerPermission via parsePermissionAnswer - ID=%s, responseStr=%s", q.ID, responseStr)
+	return c.RespondToPermission(ctx, q.ID, responseStr)
 }
 
 func parsePermissionAnswer(answer string) (opencode.SessionPermissionRespondParamsResponse, string, bool) {
@@ -3404,53 +2709,54 @@ func containsAnyToken(text string, tokens []string) bool {
 // response must be "once" (allow this time), "reject" (deny), or "always" (always allow).
 // Adapters should resolve locale-specific text to one of these values before calling.
 func (c *Client) RespondToPermission(ctx context.Context, permissionID, response string) error {
-switch response {
-case "once", "reject", "always":
-default:
-return fmt.Errorf("invalid permission response %q: must be once/reject/always", response)
+	switch response {
+	case "once", "reject", "always":
+	default:
+		return fmt.Errorf("invalid permission response %q: must be once/reject/always", response)
+	}
+
+	q, ok := c.GetPendingQuestion(permissionID)
+	if !ok {
+		return fmt.Errorf("permission not found: %s", permissionID)
+	}
+
+	directory := q.Directory
+	if directory == "" {
+		directory = c.directory
+	}
+
+	log.Printf("opencode: RespondToPermission - ID=%s, sessionID=%s, response=%s", permissionID, q.SessionID, response)
+
+	if err := c.answerPermissionViaHTTP(ctx, q, response); err != nil {
+		log.Printf("opencode: HTTP permission API failed: %v, falling back to SDK", err)
+
+		var responseParam opencode.SessionPermissionRespondParamsResponse
+		switch response {
+		case "always":
+			responseParam = opencode.SessionPermissionRespondParamsResponseAlways
+		case "reject":
+			responseParam = opencode.SessionPermissionRespondParamsResponseReject
+		default:
+			responseParam = opencode.SessionPermissionRespondParamsResponseOnce
+		}
+		result, sdkErr := c.sdk.Session.Permissions.Respond(ctx, q.SessionID, permissionID,
+			opencode.SessionPermissionRespondParams{
+				Response:  opencode.F(responseParam),
+				Directory: opencode.F(directory),
+			})
+		if sdkErr != nil {
+			return fmt.Errorf("permission respond failed (HTTP: %v, SDK: %w)", err, sdkErr)
+		}
+		if result != nil {
+			log.Printf("opencode: SDK permission respond succeeded")
+		}
+	}
+
+	c.DeletePendingQuestion(permissionID)
+	log.Printf("opencode: permission %s answered (%s) for session %s", permissionID, response, q.SessionID[:8])
+	return nil
 }
 
-q, ok := c.GetPendingQuestion(permissionID)
-if !ok {
-return fmt.Errorf("permission not found: %s", permissionID)
-}
-
-directory := q.Directory
-if directory == "" {
-directory = c.directory
-}
-
-log.Printf("opencode: RespondToPermission - ID=%s, sessionID=%s, response=%s", permissionID, q.SessionID, response)
-
-if err := c.answerPermissionViaHTTP(ctx, q, response); err != nil {
-log.Printf("opencode: HTTP permission API failed: %v, falling back to SDK", err)
-
-var responseParam opencode.SessionPermissionRespondParamsResponse
-switch response {
-case "always":
-responseParam = opencode.SessionPermissionRespondParamsResponseAlways
-case "reject":
-responseParam = opencode.SessionPermissionRespondParamsResponseReject
-default:
-responseParam = opencode.SessionPermissionRespondParamsResponseOnce
-}
-result, sdkErr := c.sdk.Session.Permissions.Respond(ctx, q.SessionID, permissionID,
-opencode.SessionPermissionRespondParams{
-Response:  opencode.F(responseParam),
-Directory: opencode.F(directory),
-})
-if sdkErr != nil {
-return fmt.Errorf("permission respond failed (HTTP: %v, SDK: %w)", err, sdkErr)
-}
-if result != nil {
-log.Printf("opencode: SDK permission respond succeeded")
-}
-}
-
-c.DeletePendingQuestion(permissionID)
-log.Printf("opencode: permission %s answered (%s) for session %s", permissionID, response, q.SessionID[:8])
-return nil
-}
 // answerPermissionViaHTTP 鐩存帴璋冪敤 HTTP API锛堜笌 Python 鐗堟湰涓€鑷达級
 func (c *Client) answerPermissionViaHTTP(ctx context.Context, q *Question, response string) error {
 	if c.endpoint == "" {
@@ -3782,12 +3088,3 @@ func (c *Client) RefreshSkills(ctx context.Context) error {
 func (c *Client) SetSkillHintEnabled(enabled bool) {
 	c.enableSkillHint = enabled
 }
-
-
-
-
-
-
-
-
-

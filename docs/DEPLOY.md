@@ -386,7 +386,7 @@ server {
 
 使用 `journalctl` 查看日志：
 ```bash
-sudo journalctl -u openbot-f
+sudo journalctl -u openbot -f
 ```
 
 ---

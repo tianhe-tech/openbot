@@ -19,7 +19,7 @@ import (
 
 	nls "github.com/aliyun/alibabacloud-nls-go-sdk"
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
-	"github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
+	dtclient "github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
 	"github.com/user/opencode-gateway/internal/scheduler"
@@ -114,7 +114,7 @@ type Handler struct {
 	client          *opencode.Client
 	cfg             Config
 	adapter         *base.BidirectionalAdapter
-	streamClient    *client.StreamClient
+	streamClient    *dtclient.StreamClient
 	cronScheduler   *scheduler.CronScheduler // 定时任务调度器
 	processedMsgIDs sync.Map                 // map[string]time.Time - 已处理的消息ID及其时间戳
 	cleanupOnce     sync.Once                // 确保清理goroutine只启动一次
@@ -127,9 +127,9 @@ type Handler struct {
 }
 
 // NewHandler wires the adapter with an OpenCode client.
-func NewHandler(client *opencode.Client, cfg Config) *Handler {
+func NewHandler(ocClient *opencode.Client, cfg Config) *Handler {
 	h := &Handler{
-		client:         client,
+		client:         ocClient,
 		cfg:            cfg,
 		allowedUserSet: make(map[string]struct{}),
 	}
@@ -187,29 +187,22 @@ func (h *Handler) Start(ctx context.Context) error {
 	}
 
 	log.Println("dingtalk: starting Stream mode connection...")
-	log.Printf("dingtalk: using ClientID: %s...", h.cfg.ClientID[:20])
+	log.Printf("dingtalk: using ClientID: %s...", h.cfg.ClientID[:min(20, len(h.cfg.ClientID))])
 
-	// Create Stream client
-	h.streamClient = client.NewStreamClient(
-		client.WithAppCredential(
-			client.NewAppCredentialConfig(h.cfg.ClientID, h.cfg.ClientSecret),
+	// Create Stream client. Use SDK router registration like the working check script.
+	h.streamClient = dtclient.NewStreamClient(
+		dtclient.WithAppCredential(
+			dtclient.NewAppCredentialConfig(h.cfg.ClientID, h.cfg.ClientSecret),
 		),
 	)
-
-	// Register callback for chat bot messages
 	h.streamClient.RegisterChatBotCallbackRouter(h.onChatBotMessageReceived)
 
-	// Start in background
-	go func() {
-		log.Println("dingtalk: starting Stream client connection...")
-		if err := h.streamClient.Start(ctx); err != nil {
-			log.Printf("dingtalk stream error: %v", err)
-		} else {
-			log.Println("dingtalk: Stream client connected successfully")
-		}
-	}()
+	log.Println("dingtalk: starting Stream client connection...")
+	if err := h.streamClient.Start(ctx); err != nil {
+		return fmt.Errorf("dingtalk: failed to start Stream client: %w", err)
+	}
 
-	log.Println("dingtalk: Stream mode client started (connecting in background)")
+	log.Println("dingtalk: Stream client connected successfully")
 	return nil
 }
 
@@ -266,18 +259,30 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	content := strings.TrimSpace(data.Text.Content)
-	userID := data.SenderStaffId
+	senderStaffID := strings.TrimSpace(data.SenderStaffId)
+	senderID := strings.TrimSpace(data.SenderId)
+	userID := senderStaffID
+	if userID == "" {
+		userID = senderID
+	}
 	conversationID := data.ConversationId
 
-	if !h.isUserAllowed(userID) {
-		log.Printf("dingtalk stream: blocked user %s by whitelist", userID)
+	if !h.isUserAllowedAny(senderStaffID, senderID) {
+		log.Printf("dingtalk stream: blocked user by whitelist (senderStaffId=%s, senderId=%s, resolved=%s)", senderStaffID, senderID, userID)
 		replier := chatbot.NewChatbotReplier()
 		//ownerUserID := h.currentOwnerUserID()
-		msg := fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人开通权限。", userID)
+		msg := fmt.Sprintf("❌ 当前机器人未对您开放（staffId=%s, senderId=%s），请联系机器人主人开通权限。", senderStaffID, senderID)
 		// if ownerUserID != "" {
 		// 	msg = fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人（%s）开通权限。", userID, data.SenderNick)
 		// }
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	if userID == "" {
+		log.Printf("dingtalk stream: cannot resolve sender user id (senderStaffId=%s, senderId=%s)", senderStaffID, senderID)
+		replier := chatbot.NewChatbotReplier()
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 无法识别您的用户标识（staffId/senderId 都为空），请联系管理员检查机器人权限配置。"))
 		return nil, nil
 	}
 
@@ -339,9 +344,15 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				}
 			}
 		}
-		content = "[图片消息]"
+		// 图片消息：构建合理的提示文本
+		// 如果有用户输入的文字就用文字，否则给模型一个识别图片的提示
+		content = ""
 		if data.Text.Content != "" {
 			content = data.Text.Content
+		}
+		// 如果用户没有提供文字说明，给模型一个默认提示
+		if content == "" {
+			content = "请分析这张图片的内容。"
 		}
 
 	case "audio", "voice":
@@ -512,13 +523,18 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				}
 			}
 		}
+		// 视频消息：构建合理的提示文本
 		if content == "" {
 			durRaw := int(vidContent.Duration)
 			durSec := durRaw
 			if durRaw >= 1000 {
 				durSec = durRaw / 1000
 			}
-			content = fmt.Sprintf("[视频消息，时长: %d秒]", durSec)
+			if durSec > 0 {
+				content = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
+			} else {
+				content = "请分析这个视频的内容。"
+			}
 		}
 
 	case "file":
@@ -596,7 +612,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				imgIndex := 0
 				failedImages := 0
 				for _, item := range rtContent.RichText {
-					switch item.Type {
+					// 钉钉 richText 中文字元素可能没有 type 字段，只有 text 字段
+					itemType := item.Type
+					if itemType == "" && item.Text != "" {
+						itemType = "text"
+					}
+
+					switch itemType {
 					case "text":
 						if t := strings.TrimSpace(item.Text); t != "" {
 							textParts = append(textParts, t)
@@ -646,7 +668,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 							})
 						}
 					default:
-						log.Printf("  - ⚠️ Unknown richText item type: %s", item.Type)
+						// 如果有 text 字段但没有 type，也当作文本处理
+						if t := strings.TrimSpace(item.Text); t != "" {
+							textParts = append(textParts, t)
+						} else {
+							log.Printf("  - ⚠️ Unknown richText item type: %s (text=%s)", item.Type, item.Text)
+						}
 					}
 				}
 				if failedImages > 0 {
@@ -655,8 +682,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				content = strings.Join(textParts, " ")
 			}
 		}
+		// richText 消息：如果用户没有提供文字，且只有图片，给默认提示
 		if content == "" && len(extraAttachments) > 0 {
-			content = fmt.Sprintf("[图文消息，含 %d 张图片]", len(extraAttachments))
+			content = "请分析这张图片的内容。"
 		} else if content == "" {
 			content = "[图文消息]"
 		}
@@ -699,10 +727,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	// 先尝试把非命令文本当作“待确认问题”的直接回复（无需 /answer）。
-	if !strings.HasPrefix(strings.TrimSpace(content), "/") {
+	// 仅对纯文本消息启用，避免图片/语音/文件等非文本消息被误当成权限或问题回复而提前消费。
+	isPlainTextMessage := msgType == "" || msgType == "text"
+	if isPlainTextMessage && !strings.HasPrefix(strings.TrimSpace(content), "/") {
 		if result, err := h.handleQuickReply(ctx, data, userID, content); result != nil || err != nil {
 			return result, err
 		}
+	} else if !isPlainTextMessage {
+		log.Printf("dingtalk stream: skip quick reply for non-text message (msgType=%s, user=%s)", msgType, userID)
 	}
 
 	// Handle special commands
@@ -742,11 +774,6 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Handle /model command to get/set model
 	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
 		return h.handleModel(ctx, data, userID, content)
-	}
-
-	// Handle /memory commands for persistent user memory
-	if strings.HasPrefix(content, "/memory") {
-		return h.handleMemory(ctx, data, userID, content)
 	}
 
 	// Handle /thinking command to toggle reasoning output
@@ -794,11 +821,6 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Handle /fork command to fork the current session
 	if content == "/fork" {
 		return h.handleFork(ctx, data, userID)
-	}
-
-	// Handle /compact command to compact/summarize the current session
-	if content == "/compact" || content == "/summarize" || content == "总结" {
-		return h.handleCompact(ctx, data, userID)
 	}
 
 	// Handle /todo command to show current todo list
@@ -1252,6 +1274,27 @@ func (h *Handler) isUserAllowed(userID string) bool {
 	}
 	_, ok := h.allowedUserSet[strings.TrimSpace(userID)]
 	return ok
+}
+
+func (h *Handler) isUserAllowedAny(userIDs ...string) bool {
+	h.whitelistMu.RLock()
+	defer h.whitelistMu.RUnlock()
+
+	if len(h.allowedUserSet) == 0 {
+		return true
+	}
+
+	for _, id := range userIDs {
+		normalized := strings.TrimSpace(id)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := h.allowedUserSet[normalized]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func truncateForLog(s string, maxRunes int) string {
@@ -1792,7 +1835,6 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /new 或 /reset - 创建新会话
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
-/compact 或 总结 - 压缩会话历史（减少上下文占用）
 /sessions 或 /list - 列出所有会话
 
 📋 任务追踪（对应 TUI 实时看板）：
@@ -1802,16 +1844,6 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 🤖 模型配置：
 /model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
-/memory - 查看已记录的长期记忆
-/memory pin <内容> - 固定一条高优先级记忆
-/memory pin <category> <内容> - 按分类固定记忆
-/memory unpin <关键词> - 按关键词删除记忆
-/memory unpin #<序号> - 按列表序号删除记忆
-/memory export - 导出当前用户记忆快照
-/memory import <base64> - 导入记忆快照（覆盖）
-/memory merge-import <base64> - 合并导入记忆快照（不覆盖）
-/memory clear - 清空当前用户记忆
-/memory compact - 压缩去重当前用户记忆
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -1858,184 +1890,6 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 		return nil, err
 	}
 
-	return nil, nil
-}
-
-func (h *Handler) handleMemory(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
-	normalizeCategory := func(raw string) string {
-		switch strings.ToLower(strings.TrimSpace(raw)) {
-		case "profile", "preference", "project", "environment", "model", "conversation":
-			return strings.ToLower(strings.TrimSpace(raw))
-		default:
-			return "preference"
-		}
-	}
-
-	parts := strings.Fields(strings.TrimSpace(content))
-	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
-		limit := 10
-		if len(parts) >= 3 {
-			if strings.EqualFold(parts[2], "all") {
-				limit = 0
-			} else if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
-				limit = n
-			}
-		}
-		facts := h.client.ListUserMemory("dingtalk", userID, limit)
-		if len(facts) == 0 {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 当前没有已记录的长期记忆"))
-			return nil, nil
-		}
-		var b strings.Builder
-		b.WriteString("🧠 长期记忆（Top 10）\n")
-		for i, f := range facts {
-			b.WriteString(fmt.Sprintf("%d. [%s][P%d] %s\n", i+1, f.Category, f.Importance, f.Text))
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(b.String()))
-		return nil, nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "clear") {
-		if err := h.client.ClearUserMemory("dingtalk", userID); err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 清空 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已清空当前用户长期记忆"))
-		return nil, nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "compact") {
-		removed, err := h.client.CompactUserMemory("dingtalk", userID)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 压缩 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 压缩完成，移除 %d 条冗余记录", removed)))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "pin") {
-		category := "preference"
-		text := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if len(parts) >= 4 {
-			candidate := normalizeCategory(parts[2])
-			if candidate == strings.ToLower(strings.TrimSpace(parts[2])) {
-				category = candidate
-				text = strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
-			}
-		}
-		if text == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory pin <内容> 或 /memory pin <category> <内容>"))
-			return nil, nil
-		}
-		if err := h.client.PinUserMemory("dingtalk", userID, text, category); err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 固定 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已固定高优先级记忆（category="+category+"）"))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "unpin") {
-		keyword := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if keyword == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory unpin <关键词>"))
-			return nil, nil
-		}
-		if strings.HasPrefix(keyword, "#") {
-			rawRank := strings.TrimPrefix(keyword, "#")
-			rank, convErr := strconv.Atoi(rawRank)
-			if convErr != nil || rank <= 0 {
-				reply := chatbot.NewChatbotReplier()
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 序号格式错误，用法: /memory unpin #<序号>"))
-				return nil, nil
-			}
-			ok, err := h.client.RemoveUserMemoryByRank("dingtalk", userID, rank)
-			if err != nil {
-				reply := chatbot.NewChatbotReplier()
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 删除 memory 失败: "+err.Error()))
-				return nil, nil
-			}
-			reply := chatbot.NewChatbotReplier()
-			if ok {
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已按序号删除记忆"))
-			} else {
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 未找到对应序号记忆"))
-			}
-			return nil, nil
-		}
-		removed, err := h.client.UnpinUserMemory("dingtalk", userID, keyword)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 删除 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ 已删除 %d 条匹配记忆", removed)))
-		return nil, nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "export") {
-		snapshot, err := h.client.ExportUserMemory("dingtalk", userID)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 导出 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("📦 memory 导出（base64）:\n"+snapshot))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory import <base64>"))
-			return nil, nil
-		}
-		count, err := h.client.ImportUserMemory("dingtalk", userID, payload)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 导入 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 导入完成，共 %d 条", count)))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "merge-import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory merge-import <base64>"))
-			return nil, nil
-		}
-		count, err := h.client.MergeImportUserMemory("dingtalk", userID, payload)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 合并导入 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 合并导入完成，共 %d 条", count)))
-		return nil, nil
-	}
-
-	usage := "❌ 命令格式错误\n\n用法:\n/memory\n/memory show [all|N]\n/memory pin <内容>\n/memory pin <category> <内容>\n/memory unpin <关键词>\n/memory unpin #<序号>\n/memory export\n/memory import <base64>\n/memory merge-import <base64>\n/memory clear\n/memory compact\n\ncategory: profile|preference|project|environment|model|conversation"
-	reply := chatbot.NewChatbotReplier()
-	_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(usage))
 	return nil, nil
 }
 
@@ -3620,7 +3474,6 @@ func (h *Handler) handleConfig(ctx context.Context, data *chatbot.BotCallbackDat
 	msgBuilder.WriteString("  /new - 创建新会话\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
 	msgBuilder.WriteString("  /fork - 派生(fork)当前会话\n")
-	msgBuilder.WriteString("  /compact - 压缩/总结当前会话\n")
 	msgBuilder.WriteString("  /todo - 查看当前任务进度\n")
 	msgBuilder.WriteString("  /diff - 查看文件变更\n")
 	msgBuilder.WriteString("  /sessions - 列出所有会话\n")
@@ -3667,29 +3520,6 @@ func (h *Handler) handleFork(ctx context.Context, data *chatbot.BotCallbackDataM
 
 // handleCompact 处理压缩/总结会话命令
 // 对应 TUI 中的 session.compact 操作（调用 summarize API）
-func (h *Handler) handleCompact(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
-	replier := chatbot.NewChatbotReplier()
-
-	sessionID, ok := h.adapter.GetSessionForUser(userID)
-	if !ok {
-		msg := "ℹ️ 当前没有活跃的会话"
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-		return nil, nil
-	}
-
-	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 正在压缩会话历史..."))
-
-	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
-		msg := fmt.Sprintf("❌ 压缩会话失败: %v", err)
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-		return nil, err
-	}
-
-	msg := fmt.Sprintf("✅ 会话 %s 已压缩总结\n\n会话历史已被 AI 摘要，上下文占用将减少。\n后续对话将延续本次会话。", sessionID[:min(8, len(sessionID))])
-	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-	return nil, nil
-}
-
 // handleTodo 处理查看任务进度命令
 // 对应 TUI 中的 todo.updated 事件展示
 func (h *Handler) handleTodo(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {

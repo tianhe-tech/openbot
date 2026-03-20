@@ -1,13 +1,17 @@
 package wecom
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
-	"strconv"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,19 +20,28 @@ import (
 	"github.com/user/opencode-gateway/internal/opencode"
 )
 
+const (
+	wecomAPIEndpoint = "https://qyapi.weixin.qq.com/cgi-bin"
+)
+
 // Config captures credentials required by Enterprise WeChat.
 type Config struct {
 	Token          string
 	EncodingAESKey string
 	CorpID         string
+	CorpSecret     string
 	AgentID        string
 }
 
 // Handler processes WeCom callbacks and forwards them to OpenCode.
 type Handler struct {
-	client  *opencode.Client
-	cfg     Config
-	adapter *base.BidirectionalAdapter
+	client      *opencode.Client
+	cfg         Config
+	adapter     *base.BidirectionalAdapter
+	httpClient  *http.Client
+	tokenMu     sync.Mutex
+	accessToken string
+	tokenExpiry time.Time
 }
 
 // NewHandler wires the adapter with an OpenCode client instance.
@@ -36,6 +49,9 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	h := &Handler{
 		client: client,
 		cfg:    cfg,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
 	}
 	h.adapter = base.NewBidirectionalAdapter("wecom", h)
 	return h
@@ -97,18 +113,23 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var envelope callbackEnvelope
-	if err := json.Unmarshal(body, &envelope); err != nil {
+	if err := h.parseCallbackEnvelope(body, &envelope); err != nil {
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
 
-	content := strings.TrimSpace(envelope.Text.Content)
-	if content == "" {
+	msg, parseErr := h.parseIncomingMessage(r.Context(), envelope)
+	if parseErr != nil {
+		http.Error(w, fmt.Sprintf("invalid message: %v", parseErr), http.StatusBadRequest)
+		return
+	}
+
+	if strings.TrimSpace(msg.Content) == "" {
 		http.Error(w, "empty message", http.StatusBadRequest)
 		return
 	}
 
-	reply, err := h.dispatch(r.Context(), envelope, content)
+	reply, err := h.dispatch(r.Context(), envelope, msg)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("forward failed: %v", err), http.StatusBadGateway)
 		return
@@ -122,33 +143,28 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 
 // dispatch routes the message: commands are handled inline; plain messages use
 // streaming so that incremental deltas are collected and returned as a reply.
-func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content string) (string, error) {
+func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomIncomingMessage) (string, error) {
 	userID := env.FromUserID
+	content := msg.Content
 
 	// command routing
-	if content == "/help" || content == "帮助" {
+	if msg.MsgType == "text" && (content == "/help" || content == "帮助") {
 		return h.handleHelp()
 	}
-	if content == "/fork" || content == "派生" {
+	if msg.MsgType == "text" && (content == "/fork" || content == "派生") {
 		return h.handleFork(ctx, userID)
 	}
-	if content == "/compact" || content == "/summarize" || content == "总结" {
-		return h.handleCompact(ctx, userID)
-	}
-	if content == "/todo" || content == "/todos" || content == "任务" {
+	if msg.MsgType == "text" && (content == "/todo" || content == "/todos" || content == "任务") {
 		return h.handleTodo(userID)
 	}
-	if content == "/diff" || content == "/changes" || content == "变更" {
+	if msg.MsgType == "text" && (content == "/diff" || content == "/changes" || content == "变更") {
 		return h.handleDiff(userID)
 	}
-	if content == "/abort" || content == "/stop" || content == "停止" {
+	if msg.MsgType == "text" && (content == "/abort" || content == "/stop" || content == "停止") {
 		return h.handleAbort(ctx, userID)
 	}
-	if content == "/status" || content == "状态" {
+	if msg.MsgType == "text" && (content == "/status" || content == "状态") {
 		return h.handleStatus(userID)
-	}
-	if strings.HasPrefix(content, "/memory") {
-		return h.handleMemory(userID, content)
 	}
 
 	// normal message  streaming session
@@ -164,16 +180,47 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
+	threadID := strings.TrimSpace(env.RoomID)
+	if threadID == "" {
+		threadID = userID
+	}
+
+	metadata := map[string]string{
+		"msg_type": env.MsgType,
+	}
+	sendContent := content
+	if len(msg.MediaFiles) > 0 && (msg.MsgType == "file" || msg.MsgType == "video") {
+		taskSessionID := sessionID
+		if strings.TrimSpace(taskSessionID) == "" {
+			taskSessionID = "new"
+		}
+		mediaCtx := base.MediaTaskContext{
+			Platform:    "wecom",
+			MessageType: msg.MsgType,
+			UserID:      userID,
+			SessionID:   taskSessionID,
+			MessageID:   env.MsgID,
+			Files:       msg.MediaFiles,
+		}
+		if mediaMD, mdErr := base.BuildMediaMetadata(mediaCtx); mdErr != nil {
+			log.Printf("wecom: failed to build media metadata: %v", mdErr)
+		} else {
+			for k, v := range mediaMD {
+				metadata[k] = v
+			}
+			sendContent = base.BuildMediaPromptPrefix(mediaCtx) + sendContent
+		}
+	}
+
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:   "wecom",
-		UserID:    userID,
-		ThreadID:  env.RoomID,
-		SessionID: sessionID,
-		Content:   content,
-		Streaming: true,
-		Metadata: map[string]string{
-			"msg_type": env.MsgType,
-		},
+		Channel:     "wecom",
+		UserID:      userID,
+		ThreadID:    threadID,
+		SessionID:   sessionID,
+		Content:     sendContent,
+		Streaming:   true,
+		Attachments: msg.Attachments,
+		Metadata:    metadata,
 	}, func(chunk string) error {
 		// First callback with a session-ID-like value is a mapping signal.
 		if !sessionMapped && strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
@@ -267,6 +314,444 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, content st
 	return reply, nil
 }
 
+type wecomIncomingMessage struct {
+	MsgType     string
+	Content     string
+	Attachments []opencode.Attachment
+	MediaFiles  []base.MediaFileRecord
+}
+
+func (h *Handler) parseIncomingMessage(ctx context.Context, env callbackEnvelope) (wecomIncomingMessage, error) {
+	msgType := strings.ToLower(strings.TrimSpace(env.MsgType))
+	if msgType == "" {
+		msgType = "text"
+	}
+
+	content := strings.TrimSpace(env.Text.Content)
+	mediaSessionID := "new"
+	if existingSessionID, ok := h.adapter.GetSessionForUser(env.FromUserID); ok && strings.TrimSpace(existingSessionID) != "" {
+		mediaSessionID = strings.TrimSpace(existingSessionID)
+	}
+
+	saveMediaRecord := func(kind, filename, mediaID, mimeType string, data []byte) (*base.MediaFileRecord, error) {
+		now := time.Now().UTC()
+		relDir := base.BuildMediaRelativeDir("wecom", env.FromUserID, mediaSessionID, now)
+		saved, err := base.SaveTempMedia(
+			base.MediaRootDirFromEnv(),
+			relDir,
+			kind,
+			env.MsgID,
+			filename,
+			mimeType,
+			data,
+			base.MediaTTLFromEnv(),
+			base.MediaMaxBytesFromEnv(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return &base.MediaFileRecord{
+			MessageID:    env.MsgID,
+			UserID:       env.FromUserID,
+			SessionID:    mediaSessionID,
+			Platform:     "wecom",
+			MsgType:      kind,
+			Filename:     saved.Filename,
+			Mime:         saved.Mime,
+			Size:         saved.Size,
+			SHA256:       saved.SHA256,
+			LocalPath:    saved.LocalPath,
+			RelativePath: saved.RelativePath,
+			CreatedAt:    saved.CreatedAt,
+			ExpireAt:     saved.ExpireAt,
+		}, nil
+	}
+
+	buildAttachment := func(mimeType string, data []byte, filename string) opencode.Attachment {
+		mimeType = strings.TrimSpace(mimeType)
+		if mimeType == "" {
+			mimeType = detectMimeByFilename(filename)
+		}
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		return opencode.Attachment{
+			Mime:     mimeType,
+			URL:      "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data),
+			Filename: filename,
+		}
+	}
+
+	switch msgType {
+	case "text":
+		if content == "" {
+			return wecomIncomingMessage{}, fmt.Errorf("empty text content")
+		}
+		return wecomIncomingMessage{MsgType: "text", Content: content}, nil
+	case "image", "pic":
+		if env.PicURL != "" {
+			dataURI, mimeType, err := h.downloadURLAsDataURI(ctx, env.PicURL, "image/jpeg")
+			if err != nil {
+				log.Printf("wecom: image url download failed: %v", err)
+			} else {
+				return wecomIncomingMessage{
+					MsgType: "image",
+					Content: fallbackContent(content, "[图片消息]"),
+					Attachments: []opencode.Attachment{{
+						Mime:     mimeType,
+						URL:      dataURI,
+						Filename: "wecom_image.jpg",
+					}},
+				}, nil
+			}
+		}
+		if env.MediaID != "" {
+			mediaData, mediaMime, fileName, err := h.downloadMediaBytes(ctx, env.MediaID)
+			if err != nil {
+				log.Printf("wecom: image media_id download failed: %v", err)
+			} else {
+				if fileName == "" {
+					fileName = "wecom_image.jpg"
+				}
+				att := buildAttachment(mediaMime, mediaData, fileName)
+				return wecomIncomingMessage{
+					MsgType:     "image",
+					Content:     fallbackContent(content, "[图片消息]"),
+					Attachments: []opencode.Attachment{att},
+				}, nil
+			}
+		}
+		return wecomIncomingMessage{MsgType: "image", Content: fallbackContent(content, "[图片消息]")}, nil
+	case "voice", "audio":
+		if env.MediaID != "" {
+			mediaData, mediaMime, fileName, err := h.downloadMediaBytes(ctx, env.MediaID)
+			if err != nil {
+				log.Printf("wecom: voice media_id download failed: %v", err)
+			} else {
+				if fileName == "" {
+					fileName = "wecom_voice.amr"
+				}
+				att := buildAttachment(mediaMime, mediaData, fileName)
+				return wecomIncomingMessage{
+					MsgType:     "voice",
+					Content:     fallbackContent(content, "[语音消息]"),
+					Attachments: []opencode.Attachment{att},
+				}, nil
+			}
+		}
+		return wecomIncomingMessage{MsgType: "voice", Content: fallbackContent(content, "[语音消息]")}, nil
+	case "video":
+		var attachments []opencode.Attachment
+		var mediaFiles []base.MediaFileRecord
+		if env.MediaID != "" {
+			mediaData, mediaMime, fileName, err := h.downloadMediaBytes(ctx, env.MediaID)
+			if err != nil {
+				log.Printf("wecom: video media_id download failed: %v", err)
+			} else {
+				if fileName == "" {
+					fileName = "wecom_video.mp4"
+				}
+				att := buildAttachment(mediaMime, mediaData, fileName)
+				attachments = append(attachments, att)
+				record, saveErr := saveMediaRecord("video", fileName, env.MediaID, att.Mime, mediaData)
+				if saveErr != nil {
+					log.Printf("wecom: save temp video failed: %v", saveErr)
+				} else {
+					mediaFiles = append(mediaFiles, *record)
+				}
+			}
+		}
+		return wecomIncomingMessage{
+			MsgType:     "video",
+			Content:     fallbackContent(content, "[视频消息]"),
+			Attachments: attachments,
+			MediaFiles:  mediaFiles,
+		}, nil
+	case "file":
+		var mediaFiles []base.MediaFileRecord
+		if env.MediaID != "" {
+			mediaData, mediaMime, fileName, err := h.downloadMediaBytes(ctx, env.MediaID)
+			if err != nil {
+				log.Printf("wecom: file media_id download failed: %v", err)
+			} else {
+				if fileName == "" {
+					fileName = "wecom_file.bin"
+				}
+				record, saveErr := saveMediaRecord("file", fileName, env.MediaID, mediaMime, mediaData)
+				if saveErr != nil {
+					log.Printf("wecom: save temp file failed: %v", saveErr)
+				} else {
+					mediaFiles = append(mediaFiles, *record)
+				}
+			}
+		}
+		return wecomIncomingMessage{
+			MsgType:    "file",
+			Content:    fallbackContent(content, fmt.Sprintf("[文件消息: %s]", firstNonEmpty(env.FileName, "未命名文件"))),
+			MediaFiles: mediaFiles,
+		}, nil
+	default:
+		return wecomIncomingMessage{MsgType: msgType, Content: fallbackContent(content, fmt.Sprintf("[%s消息]", msgType))}, nil
+	}
+}
+
+func (h *Handler) parseCallbackEnvelope(body []byte, out *callbackEnvelope) error {
+	if out == nil {
+		return fmt.Errorf("nil envelope")
+	}
+	if err := json.Unmarshal(body, out); err == nil {
+		if out.MsgType != "" || out.FromUserID != "" || out.Text.Content != "" {
+			out.normalize()
+			return nil
+		}
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return err
+	}
+
+	out.MsgType = firstNonEmpty(readRawString(raw, "msgtype"), readRawString(raw, "MsgType"))
+	out.Event = firstNonEmpty(readRawString(raw, "event"), readRawString(raw, "Event"))
+	out.FromUserID = firstNonEmpty(readRawString(raw, "from_userid"), readRawString(raw, "FromUserName"), readRawString(raw, "FromUserID"), readRawString(raw, "fromUserId"))
+	out.RoomID = firstNonEmpty(readRawString(raw, "roomid"), readRawString(raw, "RoomID"), readRawString(raw, "chatid"), readRawString(raw, "ChatID"))
+	out.MsgID = firstNonEmpty(readRawString(raw, "msgid"), readRawString(raw, "MsgId"), readRawString(raw, "MsgID"))
+	out.MediaID = firstNonEmpty(readRawString(raw, "media_id"), readRawString(raw, "MediaId"), readRawString(raw, "MediaID"))
+	out.PicURL = firstNonEmpty(readRawString(raw, "picurl"), readRawString(raw, "PicUrl"), readRawString(raw, "PicURL"))
+	out.FileName = firstNonEmpty(readRawString(raw, "filename"), readRawString(raw, "FileName"))
+	out.Format = firstNonEmpty(readRawString(raw, "format"), readRawString(raw, "Format"))
+
+	if nested, ok := raw["text"]; ok {
+		var textObj map[string]json.RawMessage
+		if err := json.Unmarshal(nested, &textObj); err == nil {
+			out.Text.Content = firstNonEmpty(readRawString(textObj, "content"), readRawString(textObj, "Content"))
+		}
+	}
+	if out.Text.Content == "" {
+		out.Text.Content = firstNonEmpty(readRawString(raw, "content"), readRawString(raw, "Content"))
+	}
+
+	out.normalize()
+	return nil
+}
+
+func (h *Handler) getAccessToken(ctx context.Context) (string, error) {
+	h.tokenMu.Lock()
+	defer h.tokenMu.Unlock()
+
+	if h.accessToken != "" && time.Now().Before(h.tokenExpiry) {
+		return h.accessToken, nil
+	}
+
+	corpID := strings.TrimSpace(h.cfg.CorpID)
+	corpSecret := strings.TrimSpace(h.cfg.CorpSecret)
+	if corpID == "" || corpSecret == "" {
+		return "", fmt.Errorf("missing WECOM_CORP_ID or WECOM_CORP_SECRET")
+	}
+
+	tokenURL := fmt.Sprintf("%s/gettoken?corpid=%s&corpsecret=%s", wecomAPIEndpoint, url.QueryEscape(corpID), url.QueryEscape(corpSecret))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		ErrCode     int    `json:"errcode"`
+		ErrMsg      string `json:"errmsg"`
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", err
+	}
+	if body.ErrCode != 0 || body.AccessToken == "" {
+		return "", fmt.Errorf("wecom token failed: errcode=%d errmsg=%s", body.ErrCode, body.ErrMsg)
+	}
+
+	h.accessToken = body.AccessToken
+	validFor := time.Duration(body.ExpiresIn) * time.Second
+	if validFor <= 0 {
+		validFor = 2 * time.Hour
+	}
+	refreshBefore := 2 * time.Minute
+	if validFor <= refreshBefore {
+		h.tokenExpiry = time.Now().Add(validFor / 2)
+	} else {
+		h.tokenExpiry = time.Now().Add(validFor - refreshBefore)
+	}
+
+	return h.accessToken, nil
+}
+
+func (h *Handler) downloadMediaBytes(ctx context.Context, mediaID string) ([]byte, string, string, error) {
+	if strings.TrimSpace(mediaID) == "" {
+		return nil, "", "", fmt.Errorf("empty media id")
+	}
+	token, err := h.getAccessToken(ctx)
+	if err != nil {
+		return nil, "", "", err
+	}
+	mediaURL := fmt.Sprintf("%s/media/get?access_token=%s&media_id=%s", wecomAPIEndpoint, url.QueryEscape(token), url.QueryEscape(mediaID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaURL, nil)
+	if err != nil {
+		return nil, "", "", err
+	}
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if strings.Contains(contentType, "application/json") {
+		var errResp struct {
+			ErrCode int    `json:"errcode"`
+			ErrMsg  string `json:"errmsg"`
+		}
+		if jErr := json.Unmarshal(body, &errResp); jErr == nil && errResp.ErrCode != 0 {
+			return nil, "", "", fmt.Errorf("wecom media get failed: errcode=%d errmsg=%s", errResp.ErrCode, errResp.ErrMsg)
+		}
+	}
+
+	fileName := extractFilenameFromDisposition(resp.Header.Get("Content-Disposition"))
+	contentType = strings.TrimSpace(strings.Split(contentType, ";")[0])
+	if contentType == "" {
+		contentType = detectMimeByFilename(fileName)
+	}
+	return body, contentType, fileName, nil
+}
+
+func (h *Handler) downloadURLAsDataURI(ctx context.Context, rawURL, defaultMime string) (string, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+	mimeType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	if mimeType == "" {
+		mimeType = strings.TrimSpace(defaultMime)
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(body), mimeType, nil
+}
+
+func readRawString(raw map[string]json.RawMessage, key string) string {
+	val, ok := raw[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(val, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	var n json.Number
+	if err := json.Unmarshal(val, &n); err == nil {
+		return strings.TrimSpace(n.String())
+	}
+	return strings.TrimSpace(string(bytes.Trim(val, `"`)))
+}
+
+func fallbackContent(content, fallback string) string {
+	if strings.TrimSpace(content) != "" {
+		return strings.TrimSpace(content)
+	}
+	return fallback
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func extractFilenameFromDisposition(disposition string) string {
+	if strings.TrimSpace(disposition) == "" {
+		return ""
+	}
+	_, params, err := mime.ParseMediaType(disposition)
+	if err != nil {
+		return ""
+	}
+	if v, ok := params["filename*"]; ok {
+		if idx := strings.Index(v, "''"); idx >= 0 {
+			if decoded, decErr := url.QueryUnescape(v[idx+2:]); decErr == nil {
+				return strings.TrimSpace(decoded)
+			}
+		}
+	}
+	if v, ok := params["filename"]; ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func detectMimeByFilename(name string) string {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(name)))
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".mp4":
+		return "video/mp4"
+	case ".mov":
+		return "video/quicktime"
+	case ".amr":
+		return "audio/amr"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".pdf":
+		return "application/pdf"
+	case ".doc":
+		return "application/msword"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".ppt":
+		return "application/vnd.ms-powerpoint"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".txt", ".md", ".log":
+		return "text/plain"
+	default:
+		return ""
+	}
+}
+
 //  command handlers
 
 func (h *Handler) handleHelp() (string, error) {
@@ -275,152 +760,13 @@ func (h *Handler) handleHelp() (string, error) {
  可用命令：
 /help 或 帮助      - 显示此帮助
 /fork 或 派生      - 派生当前会话（保留历史，开启新分支）
-/compact 或 总结   - 压缩会话历史，减少上下文占用
 /todo 或 任务      - 查看当前任务进度列表
 /diff 或 变更      - 查看本次会话的文件变更摘要
 /abort 或 停止     - 中止正在运行的任务
 /status 或 状态    - 查看当前会话状态
-/memory           - 查看长期记忆
-/memory pin <内容> - 固定一条高优先级记忆
-/memory pin <category> <内容> - 按分类固定记忆
-/memory unpin <关键词> - 按关键词删除记忆
-/memory unpin #<序号> - 按列表序号删除记忆
-/memory export       - 导出当前用户记忆快照
-/memory import <base64> - 导入记忆快照（覆盖）
-/memory merge-import <base64> - 合并导入记忆快照（不覆盖）
-/memory clear      - 清空当前用户记忆
-/memory compact    - 压缩去重当前用户记忆
 
  直接发送消息即可与 AI 对话`
 	return helpText, nil
-}
-
-func (h *Handler) handleMemory(userID, content string) (string, error) {
-	normalizeCategory := func(raw string) string {
-		switch strings.ToLower(strings.TrimSpace(raw)) {
-		case "profile", "preference", "project", "environment", "model", "conversation":
-			return strings.ToLower(strings.TrimSpace(raw))
-		default:
-			return "preference"
-		}
-	}
-
-	parts := strings.Fields(strings.TrimSpace(content))
-	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
-		limit := 10
-		if len(parts) >= 3 {
-			if strings.EqualFold(parts[2], "all") {
-				limit = 0
-			} else if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
-				limit = n
-			}
-		}
-		facts := h.client.ListUserMemory("wecom", userID, limit)
-		if len(facts) == 0 {
-			return "ℹ️ 当前没有已记录的长期记忆", nil
-		}
-		var b strings.Builder
-		b.WriteString("🧠 长期记忆（Top 10）\n")
-		for i, f := range facts {
-			b.WriteString(fmt.Sprintf("%d. [%s][P%d] %s\n", i+1, f.Category, f.Importance, f.Text))
-		}
-		return b.String(), nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "clear") {
-		if err := h.client.ClearUserMemory("wecom", userID); err != nil {
-			return "❌ 清空 memory 失败: " + err.Error(), nil
-		}
-		return "✅ 已清空当前用户长期记忆", nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "compact") {
-		removed, err := h.client.CompactUserMemory("wecom", userID)
-		if err != nil {
-			return "❌ 压缩 memory 失败: " + err.Error(), nil
-		}
-		return fmt.Sprintf("✅ memory 压缩完成，移除 %d 条冗余记录", removed), nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "pin") {
-		category := "preference"
-		text := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if len(parts) >= 4 {
-			candidate := normalizeCategory(parts[2])
-			if candidate == strings.ToLower(strings.TrimSpace(parts[2])) {
-				category = candidate
-				text = strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
-			}
-		}
-		if text == "" {
-			return "❌ 用法: /memory pin <内容> 或 /memory pin <category> <内容>", nil
-		}
-		if err := h.client.PinUserMemory("wecom", userID, text, category); err != nil {
-			return "❌ 固定 memory 失败: " + err.Error(), nil
-		}
-		return "✅ 已固定高优先级记忆（category=" + category + "）", nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "unpin") {
-		keyword := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if keyword == "" {
-			return "❌ 用法: /memory unpin <关键词>", nil
-		}
-		if strings.HasPrefix(keyword, "#") {
-			rawRank := strings.TrimPrefix(keyword, "#")
-			rank, convErr := strconv.Atoi(rawRank)
-			if convErr != nil || rank <= 0 {
-				return "❌ 序号格式错误，用法: /memory unpin #<序号>", nil
-			}
-			ok, err := h.client.RemoveUserMemoryByRank("wecom", userID, rank)
-			if err != nil {
-				return "❌ 删除 memory 失败: " + err.Error(), nil
-			}
-			if ok {
-				return "✅ 已按序号删除记忆", nil
-			}
-			return "ℹ️ 未找到对应序号记忆", nil
-		}
-		removed, err := h.client.UnpinUserMemory("wecom", userID, keyword)
-		if err != nil {
-			return "❌ 删除 memory 失败: " + err.Error(), nil
-		}
-		return fmt.Sprintf("✅ 已删除 %d 条匹配记忆", removed), nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "export") {
-		snapshot, err := h.client.ExportUserMemory("wecom", userID)
-		if err != nil {
-			return "❌ 导出 memory 失败: " + err.Error(), nil
-		}
-		return "📦 memory 导出（base64）:\n" + snapshot, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			return "❌ 用法: /memory import <base64>", nil
-		}
-		count, err := h.client.ImportUserMemory("wecom", userID, payload)
-		if err != nil {
-			return "❌ 导入 memory 失败: " + err.Error(), nil
-		}
-		return fmt.Sprintf("✅ memory 导入完成，共 %d 条", count), nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "merge-import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			return "❌ 用法: /memory merge-import <base64>", nil
-		}
-		count, err := h.client.MergeImportUserMemory("wecom", userID, payload)
-		if err != nil {
-			return "❌ 合并导入 memory 失败: " + err.Error(), nil
-		}
-		return fmt.Sprintf("✅ memory 合并导入完成，共 %d 条", count), nil
-	}
-
-	return "❌ 命令格式错误\n\n用法:\n/memory\n/memory show [all|N]\n/memory pin <内容>\n/memory pin <category> <内容>\n/memory unpin <关键词>\n/memory unpin #<序号>\n/memory export\n/memory import <base64>\n/memory merge-import <base64>\n/memory clear\n/memory compact\n\ncategory: profile|preference|project|environment|model|conversation", nil
 }
 
 func (h *Handler) handleFork(ctx context.Context, userID string) (string, error) {
@@ -435,18 +781,6 @@ func (h *Handler) handleFork(ctx context.Context, userID string) (string, error)
 	h.adapter.MapUserToSession(userID, newSessionID)
 	return fmt.Sprintf(" 已派生新会话\n原: %s  新: %s\n继续对话将使用新的派生会话",
 		sessionID[:min(8, len(sessionID))], newSessionID[:min(8, len(newSessionID))]), nil
-}
-
-func (h *Handler) handleCompact(ctx context.Context, userID string) (string, error) {
-	sessionID, ok := h.adapter.GetSessionForUser(userID)
-	if !ok {
-		return "ℹ 当前没有活跃的会话", nil
-	}
-	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
-		return "", fmt.Errorf("compact session: %w", err)
-	}
-	return fmt.Sprintf(" 会话 %s 已压缩总结\n上下文占用将减少，后续对话继续本次会话。",
-		sessionID[:min(8, len(sessionID))]), nil
 }
 
 func (h *Handler) handleTodo(userID string) (string, error) {
@@ -535,10 +869,27 @@ type callbackEnvelope struct {
 	Event      string       `json:"event"`
 	FromUserID string       `json:"from_userid"`
 	RoomID     string       `json:"roomid"`
+	MsgID      string       `json:"msgid"`
+	MediaID    string       `json:"media_id"`
+	PicURL     string       `json:"picurl"`
+	FileName   string       `json:"filename"`
+	Format     string       `json:"format"`
 	Text       textEnvelope `json:"text"`
 }
 
 // textEnvelope contains the user provided text.
 type textEnvelope struct {
 	Content string `json:"content"`
+}
+
+func (e *callbackEnvelope) normalize() {
+	e.MsgType = strings.ToLower(strings.TrimSpace(e.MsgType))
+	e.FromUserID = strings.TrimSpace(e.FromUserID)
+	e.RoomID = strings.TrimSpace(e.RoomID)
+	e.MsgID = strings.TrimSpace(e.MsgID)
+	e.MediaID = strings.TrimSpace(e.MediaID)
+	e.PicURL = strings.TrimSpace(e.PicURL)
+	e.FileName = strings.TrimSpace(e.FileName)
+	e.Format = strings.TrimSpace(e.Format)
+	e.Text.Content = strings.TrimSpace(e.Text.Content)
 }
