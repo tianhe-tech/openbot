@@ -339,8 +339,10 @@ func (h *Handler) parseIncomingMessage(ctx context.Context, env callbackEnvelope
 	saveMediaRecord := func(kind, filename, mediaID, mimeType string, data []byte) (*base.MediaFileRecord, error) {
 		now := time.Now().UTC()
 		relDir := base.BuildMediaRelativeDir("wecom", env.FromUserID, mediaSessionID, now)
+		// Use OpenCode working directory for media storage so skills can access the files
+		mediaRoot := base.MediaRootDirForOpenCode(h.client.Directory())
 		saved, err := base.SaveTempMedia(
-			base.MediaRootDirFromEnv(),
+			mediaRoot,
 			relDir,
 			kind,
 			env.MsgID,

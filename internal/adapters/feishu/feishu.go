@@ -1202,8 +1202,10 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 	saveMediaRecord := func(kind, filename, mime string, data []byte) (*base.MediaFileRecord, error) {
 		now := time.Now().UTC()
 		relDir := base.BuildMediaRelativeDir("feishu", userID, mediaSessionID, now)
+		// Use OpenCode working directory for media storage so skills can access the files
+		mediaRoot := base.MediaRootDirForOpenCode(h.client.Directory())
 		saved, err := base.SaveTempMedia(
-			base.MediaRootDirFromEnv(),
+			mediaRoot,
 			relDir,
 			kind,
 			messageID,
@@ -1304,20 +1306,38 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 
 		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil, "", nil
 
-	case "video":
-		var vid feishuVideoContent
-		if err := json.Unmarshal([]byte(rawContent), &vid); err != nil {
-			log.Printf("feishu: ⚠️ parse video content failed: %v", err)
-			return "请分析这个视频的内容。", nil, nil, "", nil
+	case "video", "media":
+		// 飞书的视频消息类型是 "media" 而非 "video"
+		// 尝试解析两种格式
+		var fileKey, duration string
+		var fileName string
+
+		// 先尝试解析 media 格式（飞书实际发送的格式）
+		var mediaContent feishuMediaContent
+		if err := json.Unmarshal([]byte(rawContent), &mediaContent); err == nil && mediaContent.FileKey != "" {
+			fileKey = mediaContent.FileKey
+			duration = mediaContent.Duration
+			fileName = mediaContent.FileName
+			log.Printf("feishu: parsed as media format - fileKey=%s, fileName=%s, duration=%s", fileKey, fileName, duration)
+		} else {
+			// 回退到 video 格式
+			var vid feishuVideoContent
+			if err := json.Unmarshal([]byte(rawContent), &vid); err != nil {
+				log.Printf("feishu: ⚠️ parse video/media content failed: %v", err)
+				return "请分析这个视频的内容。", nil, nil, "", nil
+			}
+			fileKey = vid.FileKey
+			duration = vid.Duration
+			log.Printf("feishu: parsed as video format - fileKey=%s, duration=%s", fileKey, duration)
 		}
 
-		durMs, _ := strconv.Atoi(strings.TrimSpace(vid.Duration))
+		durMs, _ := strconv.Atoi(strings.TrimSpace(duration))
 		durSec := durMs / 1000
 		if durSec == 0 && durMs > 0 {
 			durSec = 1
 		}
 
-		if vid.FileKey == "" {
+		if fileKey == "" {
 			videoPrompt := "请分析这个视频的内容。"
 			if durSec > 0 {
 				videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
@@ -1326,16 +1346,21 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		}
 
 		// 下载视频到本地
-		videoBytes, videoMime, bytesErr := h.downloadFeishuMediaBytes(ctx, messageID, vid.FileKey, "video")
+		videoBytes, videoMime, bytesErr := h.downloadFeishuMediaBytes(ctx, messageID, fileKey, "video")
 		if bytesErr != nil {
 			log.Printf("feishu: ⚠️ video bytes download with type=video failed: %v, retry with type=file", bytesErr)
-			videoBytes, videoMime, bytesErr = h.downloadFeishuMediaBytes(ctx, messageID, vid.FileKey, "file")
+			videoBytes, videoMime, bytesErr = h.downloadFeishuMediaBytes(ctx, messageID, fileKey, "file")
 		}
 		var videoRecord *base.MediaFileRecord
 		if bytesErr != nil {
 			log.Printf("feishu: ⚠️ video temp save skipped, download bytes failed: %v", bytesErr)
 		} else {
-			record, saveErr := saveMediaRecord("video", "feishu_video.mp4", videoMime, videoBytes)
+			// 使用文件名或默认名称
+			videoFileName := fileName
+			if videoFileName == "" {
+				videoFileName = "feishu_video.mp4"
+			}
+			record, saveErr := saveMediaRecord("video", videoFileName, videoMime, videoBytes)
 			if saveErr != nil {
 				log.Printf("feishu: ⚠️ failed to save temp video file: %v", saveErr)
 			} else {
@@ -1344,55 +1369,91 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 			}
 		}
 
-		// 检查是否有视频处理 skill
-		videoSkillName := h.client.FindVideoSkill(ctx)
-		if videoSkillName != "" && videoRecord != nil {
-			log.Printf("feishu: 🎯 Found video skill: %s, will use skill to process", videoSkillName)
-			// 使用 skill 处理，不添加到 mediaFiles，让 AI 通过 skill 自己读取文件
-			videoPrompt := fmt.Sprintf("请处理这个视频文件：\n文件路径: %s\n文件大小: %d bytes\n时长: %d秒", videoRecord.LocalPath, videoRecord.Size, durSec)
-			return videoPrompt, nil, nil, videoSkillName, nil
-		}
+		// 视频消息处理流程（和图片一样自动选择模型）：
+		// 1. 有明确支持视频的模型 → 直接发送视频
+		// 2. 有图片模型但无视频模型 → Gateway 提取帧图片 → 发送帧图片
+		// 3. 都没有 → 返回错误
 
-		// 检查是否有支持视频的模型
-		if !h.client.HasVideoCapableModel() {
-			// 没有 video skill，也没有支持视频的模型
-			log.Printf("feishu: ⚠️ No video skill and no video-capable model found")
-			videoPrompt := "⚠️ 视频处理暂不可用。"
+		// 1. 检查是否有明确支持视频的模型
+		if h.client.HasVideoCapableModel() {
+			var mediaFiles []base.MediaFileRecord
 			if videoRecord != nil {
-				videoPrompt = fmt.Sprintf("⚠️ 视频处理暂不可用。\n\n视频已保存到: %s\n大小: %d bytes\n时长: %d秒\n\n请配置 video-analyzer skill 或使用支持视频的模型来处理视频文件。", videoRecord.LocalPath, videoRecord.Size, durSec)
+				mediaFiles = append(mediaFiles, *videoRecord)
 			}
-			return videoPrompt, nil, nil, "", nil
-		}
+			log.Printf("feishu: ✅ Using video-capable model to process video directly")
+			dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, fileKey, "video")
+			if err != nil {
+				log.Printf("feishu: ⚠️ video download with type=video failed: %v, retry with type=file", err)
+				dataURI, mime, err = h.downloadFeishuMediaAsDataURI(ctx, messageID, fileKey, "file")
+			}
+			if err != nil {
+				log.Printf("feishu: ⚠️ video download failed: %v", err)
+				videoPrompt := "请分析这个视频的内容。"
+				if durSec > 0 {
+					videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
+				}
+				if videoRecord != nil {
+					videoPrompt = fmt.Sprintf("视频文件已保存到: %s\n文件大小: %d bytes\n请分析这个视频。", videoRecord.LocalPath, videoRecord.Size)
+				}
+				return videoPrompt, nil, mediaFiles, "", nil
+			}
 
-		// 有支持视频的模型，添加到 mediaFiles 让多模态模型处理
-		var mediaFiles []base.MediaFileRecord
-		if videoRecord != nil {
-			mediaFiles = append(mediaFiles, *videoRecord)
-		}
-		log.Printf("feishu: 📝 No video skill found, but found video-capable model, will use multimodal model")
-		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, vid.FileKey, "video")
-		if err != nil {
-			log.Printf("feishu: ⚠️ video download with type=video failed: %v, retry with type=file", err)
-			dataURI, mime, err = h.downloadFeishuMediaAsDataURI(ctx, messageID, vid.FileKey, "file")
-		}
-		if err != nil {
-			log.Printf("feishu: ⚠️ video download failed: %v", err)
+			log.Printf("feishu: ✅ video downloaded (mime=%s, len=%d)", mime, len(dataURI))
 			videoPrompt := "请分析这个视频的内容。"
 			if durSec > 0 {
 				videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
 			}
-			if videoRecord != nil {
-				videoPrompt = fmt.Sprintf("视频文件已保存到: %s\n文件大小: %d bytes\n请分析这个视频。", videoRecord.LocalPath, videoRecord.Size)
-			}
-			return videoPrompt, nil, mediaFiles, "", nil
+			return videoPrompt, []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, "", nil
 		}
 
-		log.Printf("feishu: ✅ video downloaded (mime=%s, len=%d)", mime, len(dataURI))
-		videoPrompt := "请分析这个视频的内容。"
-		if durSec > 0 {
-			videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
+		// 2. 有图片模型 → Gateway 提取帧图片，然后发送帧图片（和图片一样处理）
+		if h.client.HasImageCapableModel() {
+			if videoRecord != nil {
+				log.Printf("feishu: 🔄 No video-capable model, extracting frames from video...")
+				frames, extractErr := base.ExtractVideoFrames(ctx, videoRecord.LocalPath, h.client.Directory(), 10)
+				if extractErr != nil {
+					log.Printf("feishu: ⚠️ Failed to extract frames: %v", extractErr)
+					videoPrompt := fmt.Sprintf("⚠️ 视频帧提取失败: %v\n\n视频已保存到: %s", extractErr, videoRecord.LocalPath)
+					return videoPrompt, nil, nil, "", nil
+				}
+				log.Printf("feishu: ✅ Extracted %d frames from video", len(frames))
+				// 将帧图片作为附件发送（和图片一样）
+				var frameAttachments []opencode.Attachment
+				for i, frame := range frames {
+					frameDataURI, err := base.ReadFileAsDataURI(frame.FramePath)
+					if err != nil {
+						log.Printf("feishu: ⚠️ Failed to read frame %d: %v", i, err)
+						continue
+					}
+					frameAttachments = append(frameAttachments, opencode.Attachment{
+						Mime:     "image/jpeg",
+						URL:      frameDataURI,
+						Filename: fmt.Sprintf("frame_%d.jpg", frame.FrameNumber),
+					})
+				}
+				if len(frameAttachments) > 0 {
+					log.Printf("feishu: 📎 Sending %d frame images as attachments", len(frameAttachments))
+					videoPrompt := "这是一个视频的关键帧截图，请分析视频内容。"
+					if durSec > 0 {
+						videoPrompt = fmt.Sprintf("这是一个视频的关键帧截图（视频时长: %d秒），请分析视频内容。", durSec)
+					}
+					return videoPrompt, frameAttachments, nil, "", nil
+				}
+			}
+			videoPrompt := "⚠️ 视频帧提取失败。"
+			if videoRecord != nil {
+				videoPrompt = fmt.Sprintf("⚠️ 视频帧提取失败。\n\n视频已保存到: %s", videoRecord.LocalPath)
+			}
+			return videoPrompt, nil, nil, "", nil
 		}
-		return videoPrompt, []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, "", nil
+
+		// 3. 既没有视频模型也没有图片模型
+		log.Printf("feishu: ⚠️ No video-capable model and no image-capable model found")
+		videoPrompt := "⚠️ 视频处理暂不可用。"
+		if videoRecord != nil {
+			videoPrompt = fmt.Sprintf("⚠️ 视频处理暂不可用。\n\n视频已保存到: %s\n大小: %d bytes\n时长: %d秒\n\n请配置支持视频或图片的模型。", videoRecord.LocalPath, videoRecord.Size, durSec)
+		}
+		return videoPrompt, nil, nil, "", nil
 
 	case "file":
 		var fileContent feishuFileContent
@@ -1711,6 +1772,14 @@ type feishuAudioContent struct {
 type feishuVideoContent struct {
 	FileKey  string `json:"file_key"`
 	Duration string `json:"duration"` // 毫秒
+}
+
+// feishuMediaContent 媒体消息（飞书视频消息类型是 media 而非 video）
+type feishuMediaContent struct {
+	FileKey  string `json:"file_key"`
+	FileName string `json:"file_name"`
+	ImageKey string `json:"image_key"` // 视频封面图
+	Duration string `json:"duration"`  // 毫秒
 }
 
 // feishuFileContent 文件消息

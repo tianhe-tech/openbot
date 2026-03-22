@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -149,6 +150,12 @@ func main() {
 	schedulerCfg := scheduler.DefaultTaskSchedulerConfig()
 	taskScheduler := scheduler.NewTaskScheduler(ocClient, schedulerCfg)
 	cronScheduler := scheduler.NewCronScheduler(taskScheduler)
+
+	// Set cron task storage path for persistence
+	cronStoragePath := filepath.Join(cfg.OpenCodeDirectory, "tmp", "cron_tasks.json")
+	cronScheduler.SetStoragePath(cronStoragePath)
+	log.Printf("main: cron tasks will be persisted to %s", cronStoragePath)
+
 	webhookHandler := scheduler.NewWebhookHandler(taskScheduler, cronScheduler)
 
 	// Create adapters

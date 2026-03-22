@@ -201,8 +201,12 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		s.sessionID[:8])
 
 	if s.completed {
-		log.Printf("opencode: ignoring event for completed session %s", s.sessionID[:8])
-		return nil
+		// 即使 completed，仍然处理权限和问题请求（skill 可能在 session.idle 后才请求权限）
+		if eventType != "permission.asked" && eventType != "question.asked" {
+			log.Printf("opencode: ignoring event for completed session %s (type=%s)", s.sessionID[:8], eventType)
+			return nil
+		}
+		log.Printf("opencode: processing %s event for completed session %s (skill may need permission)", eventType, s.sessionID[:8])
 	}
 
 	// 仅处理与当前session相关的事件

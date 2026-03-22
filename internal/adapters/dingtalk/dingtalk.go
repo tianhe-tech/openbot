@@ -463,7 +463,10 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 
 	case "video":
-		// 视频消息：下载到本地缓存，然后检查是否有视频处理 skill
+		// 视频消息处理流程（和图片一样自动选择模型）：
+		// 1. 有明确支持视频的模型 → 直接发送视频
+		// 2. 有图片模型但无视频模型 → Gateway 提取帧图片 → 发送帧图片
+		// 3. 都没有 → 返回错误
 		log.Printf("dingtalk stream: 🎬 [VIDEO] received from %s", userID)
 		var vidContent videoContent
 		if data.Content != nil {
@@ -478,8 +481,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				} else {
 					now := time.Now().UTC()
 					relDir := base.BuildMediaRelativeDir("dingtalk", userID, mediaSessionID, now)
+					mediaRoot := base.MediaRootDirForOpenCode(h.client.Directory())
 					saved, saveErr := base.SaveTempMedia(
-						base.MediaRootDirFromEnv(),
+						mediaRoot,
 						relDir,
 						"video",
 						msgID,
@@ -494,22 +498,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 					} else {
 						log.Printf("  - 🗂️ Video temp saved: %s (size: %d bytes)", saved.LocalPath, saved.Size)
 
-						// 计算视频时长
 						durRaw := int(vidContent.Duration)
 						durSec := durRaw
 						if durRaw >= 1000 {
 							durSec = durRaw / 1000
 						}
 
-						// 检查是否有视频处理 skill
-						videoSkillName = h.client.FindVideoSkill(ctx)
-						if videoSkillName != "" {
-							log.Printf("  - 🎯 Found video skill: %s, will use skill to process", videoSkillName)
-							// 使用 skill 处理，在消息中包含视频文件路径
-							// 注意：不添加到 mediaFiles，让 AI 通过 skill 自己读取文件
-							content = fmt.Sprintf("请处理这个视频文件：\n文件路径: %s\n文件大小: %d bytes\n时长: %d秒", saved.LocalPath, saved.Size, durSec)
-						} else if h.client.HasVideoCapableModel() {
-							// 没有找到 skill，但有支持视频的模型，添加到 mediaFiles 让多模态模型处理
+						// 1. 检查是否有明确支持视频的模型
+						if h.client.HasVideoCapableModel() {
 							mediaFiles = append(mediaFiles, base.MediaFileRecord{
 								MessageID:    msgID,
 								UserID:       userID,
@@ -525,11 +521,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 								CreatedAt:    saved.CreatedAt,
 								ExpireAt:     saved.ExpireAt,
 							})
-							log.Printf("  - 📝 No video skill found, but found video-capable model, added to mediaFiles")
+							log.Printf("  - ✅ Using video-capable model to process video directly")
 							dataURI, mime, err := h.downloadMediaAsDataURI(ctx, vidContent.DownloadCode, "video/mp4")
 							if err != nil {
 								log.Printf("  - ⚠️ Failed to create data URI for video: %v", err)
-								content = fmt.Sprintf("视频文件已保存到: %s\n文件大小: %d bytes\n请分析这个视频。", saved.LocalPath, saved.Size)
+								content = fmt.Sprintf("请分析这个视频（文件已保存到: %s，大小: %d bytes）。", saved.LocalPath, saved.Size)
 							} else {
 								mediaInfo = map[string]interface{}{
 									"type": "video",
@@ -542,10 +538,43 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 									content = "请分析这个视频的内容。"
 								}
 							}
+						} else if h.client.HasImageCapableModel() {
+							// 2. 有图片模型 → Gateway 提取帧图片，然后发送帧图片（和图片一样处理）
+							log.Printf("  - 🔄 No video-capable model, extracting frames from video...")
+							frames, extractErr := base.ExtractVideoFrames(ctx, saved.LocalPath, h.client.Directory(), 10)
+							if extractErr != nil {
+								log.Printf("  - ⚠️ Failed to extract frames: %v", extractErr)
+								content = fmt.Sprintf("⚠️ 视频帧提取失败: %v\n\n视频已保存到: %s", extractErr, saved.LocalPath)
+							} else {
+								log.Printf("  - ✅ Extracted %d frames from video", len(frames))
+								// 将帧图片作为附件发送（和图片一样）
+								for i, frame := range frames {
+									frameDataURI, err := base.ReadFileAsDataURI(frame.FramePath)
+									if err != nil {
+										log.Printf("  - ⚠️ Failed to read frame %d: %v", i, err)
+										continue
+									}
+									extraAttachments = append(extraAttachments, opencode.Attachment{
+										Mime:     "image/jpeg",
+										URL:      frameDataURI,
+										Filename: fmt.Sprintf("frame_%d.jpg", frame.FrameNumber),
+									})
+								}
+								if len(extraAttachments) > 0 {
+									log.Printf("  - 📎 Sending %d frame images as attachments", len(extraAttachments))
+									if durSec > 0 {
+										content = fmt.Sprintf("这是一个视频的关键帧截图（视频时长: %d秒），请分析视频内容。", durSec)
+									} else {
+										content = "这是一个视频的关键帧截图，请分析视频内容。"
+									}
+								} else {
+									content = fmt.Sprintf("⚠️ 视频帧提取失败。\n\n视频已保存到: %s", saved.LocalPath)
+								}
+							}
 						} else {
-							// 没有 video skill，也没有支持视频的模型
-							log.Printf("  - ⚠️ No video skill and no video-capable model found")
-							content = fmt.Sprintf("⚠️ 视频处理暂不可用。\n\n视频已保存到: %s\n大小: %d bytes\n时长: %d秒\n\n请配置 video-analyzer skill 或使用支持视频的模型来处理视频文件。", saved.LocalPath, saved.Size, durSec)
+							// 3. 既没有视频模型也没有图片模型
+							log.Printf("  - ⚠️ No video-capable model and no image-capable model found")
+							content = fmt.Sprintf("⚠️ 视频处理暂不可用。\n\n视频已保存到: %s\n大小: %d bytes\n时长: %d秒\n\n请配置支持视频或图片的模型。", saved.LocalPath, saved.Size, durSec)
 						}
 					}
 				}

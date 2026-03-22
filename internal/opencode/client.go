@@ -701,7 +701,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 sendMessage:
 	// ========== 澧炲己娑堟伅鍐呭==========
-	// 娣诲姞skill鎻愮ず锛堜粎鍦╯ession寮€濮嬫椂锛?
+	// 娣诲姞skill鎻愮ず锛堜粎鍦╯ession寮€嬫椂锛?
 	enhancedContent := c.enhanceContentWithSkillHint(payload.Content, sessionID)
 	effectiveContent := enhancedContent
 
@@ -714,9 +714,25 @@ sendMessage:
 		return Response{}, fmt.Errorf("opencode: media preprocessing: %w", preprocessErr)
 	}
 
+	// ========== Video Skill 模型选择 ==========
+	// 如果使用 video-analyzer skill，需要选择支持视觉的模型来处理提取的关键帧
+	if mediaModel == nil && payload.Agent != "" {
+		agentLower := strings.ToLower(payload.Agent)
+		if strings.Contains(agentLower, "video") || strings.Contains(agentLower, "视频") {
+			// 查找支持视觉的模型
+			if visionModel, ok := c.selectFallbackMediaModel(true, false, false); ok && visionModel != nil {
+				mediaModel = visionModel
+				log.Printf("opencode: 🎬 video skill detected - session=%s forcing vision model=%s/%s",
+					sessionID[:8], visionModel.ProviderID, visionModel.ModelID)
+			} else {
+				log.Printf("opencode: ⚠️ video skill detected but no vision-capable model found for session %s", sessionID[:8])
+			}
+		}
+	}
+
 	var mainModelOverride *opencode.SessionPromptParamsModel
 	if mediaModel != nil {
-		// 鏈夊浘鐗?瑙嗛/闊抽绂佷欢锛屽己鍒朵娇鐢ㄥ鎬佹ā鍨嬶紙浠呮湰娆堬級
+		// 鏈夊浘鐗?瑙嗛/闊抽绂佷欢锛屾垨 video skill锛屽己鍒朵娇鐢ㄥ鎬佹ā鍨嬶紙浠呮湰娆堬級
 		mainModelOverride = &opencode.SessionPromptParamsModel{
 			ProviderID: opencode.F(mediaModel.ProviderID),
 			ModelID:    opencode.F(mediaModel.ModelID),
@@ -2236,7 +2252,9 @@ func (c *Client) getCurrentSessionModel(ctx context.Context, sessionID string) (
 
 func hasAttachmentType(att Attachment, prefix string) bool {
 	m := strings.ToLower(strings.TrimSpace(att.Mime))
-	return strings.HasPrefix(m, prefix)
+	result := strings.HasPrefix(m, prefix)
+	log.Printf("opencode: hasAttachmentType check - mime='%s', prefix='%s', result=%t", m, prefix, result)
+	return result
 }
 
 func capabilitySupportsModality(cap *ModelCapability, modality string) bool {
@@ -2280,9 +2298,15 @@ func maybeVisionCapableByModelID(modelID string) bool {
 
 func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID string, payload *MessagePayload, effectiveContent *string) (*ModelConfig, error) {
 	if payload == nil || len(payload.Attachments) == 0 {
+		log.Printf("opencode: preprocessAttachmentsForSession - no attachments (payload=%v, len=%d)", payload != nil, len(payload.Attachments))
 		return nil, nil
 	}
 	c.mediaDebugf("preprocess start: session=%s attachments=%d", sessionID[:min(8, len(sessionID))], len(payload.Attachments))
+
+	// 打印所有附件信息
+	for i, att := range payload.Attachments {
+		log.Printf("opencode: attachment[%d] - mime='%s', url_len=%d, filename='%s'", i, att.Mime, len(att.URL), att.Filename)
+	}
 
 	needImage := false
 	needVideo := false
@@ -2304,6 +2328,8 @@ func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID 
 			mediaAttachments = append(mediaAttachments, att)
 		}
 	}
+
+	log.Printf("opencode: media detection result - needImage=%t, needVideo=%t, needAudio=%t", needImage, needVideo, needAudio)
 
 	if !needImage && !needVideo && !needAudio {
 		c.mediaDebugf("no image/video/audio attachments, skip preprocess")
@@ -2398,8 +2424,8 @@ func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) 
 
 	// Pass 2: metadata-missing fallback (common in some OpenAI-compatible providers).
 	// For image recognition, prefer known vision-capable model IDs (e.g., Kimi, Qwen).
-	// NOTE: For video, we don't use heuristic because video support is rare and may cause errors.
-	if needImage && !needVideo && !needAudio {
+	// For video, we also use vision-capable models (they will analyze extracted frames).
+	if (needImage || needVideo) && !needAudio {
 		for _, k := range keys {
 			cap := c.modelCatalog[k]
 			if cap == nil {
@@ -2407,7 +2433,7 @@ func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) 
 			}
 			if maybeVisionCapableByModelID(cap.ModelID) {
 				cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
-				log.Printf("opencode: selected model %s/%s by heuristic (vision-capable model ID)", cfg.ProviderID, cfg.ModelID)
+				log.Printf("opencode: selected model %s/%s by heuristic (vision-capable model ID) for image=%t video=%t", cfg.ProviderID, cfg.ModelID, needImage, needVideo)
 				return cfg, true
 			}
 		}
@@ -2417,8 +2443,30 @@ func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) 
 	return nil, false
 }
 
-// HasVideoCapableModel checks if any model in the catalog supports video input.
+// HasVideoCapableModel checks if any model in the catalog explicitly supports video input.
+// NOTE: This only returns true for models that explicitly declare video support.
+// Models that only support images should use video skill to extract frames.
 func (c *Client) HasVideoCapableModel() bool {
+	c.modelCatalogMu.RLock()
+	defer c.modelCatalogMu.RUnlock()
+
+	// Only check for explicit video support
+	for _, cap := range c.modelCatalog {
+		if cap == nil {
+			continue
+		}
+		if capabilitySupportsModality(cap, "video") {
+			log.Printf("opencode: HasVideoCapableModel - found model %s/%s with explicit video support", cap.ProviderID, cap.ModelID)
+			return true
+		}
+	}
+	log.Printf("opencode: HasVideoCapableModel - no model with explicit video support found")
+	return false
+}
+
+// HasImageCapableModel checks if any model in the catalog supports image input.
+// This is used for video skill workflow (extract frames, then analyze with vision model).
+func (c *Client) HasImageCapableModel() bool {
 	c.modelCatalogMu.RLock()
 	defer c.modelCatalogMu.RUnlock()
 
@@ -2426,10 +2474,12 @@ func (c *Client) HasVideoCapableModel() bool {
 		if cap == nil {
 			continue
 		}
-		if capabilitySupportsModality(cap, "video") {
+		if capabilitySupportsModality(cap, "image") || maybeVisionCapableByModelID(cap.ModelID) {
+			log.Printf("opencode: HasImageCapableModel - found model %s/%s with image support", cap.ProviderID, cap.ModelID)
 			return true
 		}
 	}
+	log.Printf("opencode: HasImageCapableModel - no model with image support found")
 	return false
 }
 
