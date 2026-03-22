@@ -4,6 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
+	"strings"
+
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/card"
 
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
@@ -21,6 +24,7 @@ import (
 
 // 简单的应答机器人实现
 func OnChatBotMessageReceived(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+	fmt.Printf("received chatbot callback, data=[%+v]\n", data)
 	replyMsg := []byte(fmt.Sprintf("msg received: [%s]", data.Text.Content))
 
 	chatbotReplier := chatbot.NewChatbotReplier()
@@ -73,10 +77,27 @@ func OnCardCallbackReceived(ctx context.Context, request *card.CardRequest) (*ca
 // go run example/*.go --client_id your-client-id --client_secret your-client-secret
 func main() {
 	var clientId, clientSecret string
-	flag.StringVar(&clientId, "client_id", "", "your-client-id")
-	flag.StringVar(&clientSecret, "client_secret", "", "your-client-secret")
+	flag.StringVar(&clientId, "client_id", "", "DingTalk client id")
+	flag.StringVar(&clientSecret, "client_secret", "", "DingTalk client secret")
 
 	flag.Parse()
+
+	clientId = strings.TrimSpace(clientId)
+	clientSecret = strings.TrimSpace(clientSecret)
+
+	if clientId == "" {
+		clientId = strings.TrimSpace(os.Getenv("DINGTALK_CLIENT_ID"))
+	}
+	if clientSecret == "" {
+		clientSecret = strings.TrimSpace(os.Getenv("DINGTALK_CLIENT_SECRET"))
+	}
+
+	if clientId == "" || clientSecret == "" {
+		fmt.Println("缺少凭证: 请通过参数或环境变量提供 client_id/client_secret")
+		fmt.Println("示例1: go run .\\test\\dingtalk_stream_receive_check.go -client_id <id> -client_secret <secret>")
+		fmt.Println("示例2(PS): $env:DINGTALK_CLIENT_ID=\"<id>\"; $env:DINGTALK_CLIENT_SECRET=\"<secret>\"; go run .\\test\\dingtalk_stream_receive_check.go")
+		os.Exit(1)
+	}
 
 	logger.SetLogger(logger.NewStdTestLoggerWithDebug())
 
@@ -93,7 +114,8 @@ func main() {
 
 	err := cli.Start(context.Background())
 	if err != nil {
-		panic(err)
+		fmt.Printf("启动 Stream 失败: %v\n", err)
+		os.Exit(1)
 	}
 
 	defer cli.Close()

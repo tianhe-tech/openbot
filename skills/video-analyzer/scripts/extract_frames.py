@@ -27,7 +27,7 @@ def check_ffmpeg() -> bool:
 
 
 def get_video_info(video_path: str) -> Dict[str, Any]:
-    """Get video metadata using ffprobe."""
+    """Get video metadata using ffprobe or OpenCV fallback."""
     cmd = [
         'ffprobe', '-v', 'quiet', '-print_format', 'json',
         '-show_format', '-show_streams', video_path
@@ -36,12 +36,40 @@ def get_video_info(video_path: str) -> Dict[str, Any]:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return json.loads(result.stdout)
-    except Exception as e:
-        raise RuntimeError(f"Failed to get video info: {e}")
+    except Exception:
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video: {video_path}")
+            
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if fps > 0 else 0
+            
+            cap.release()
+            
+            return {
+                "streams": [{
+                    "codec_type": "video",
+                    "width": width,
+                    "height": height,
+                    "r_frame_rate": f"{int(fps)}/1",
+                    "avg_frame_rate": f"{int(fps)}/1"
+                }],
+                "format": {
+                    "filename": video_path,
+                    "duration": str(duration),
+                    "size": "0"
+                }
+            }
+        except ImportError:
+            raise RuntimeError("Neither ffprobe nor OpenCV is available")
 
 
 def extract_all_frames(video_path: str, output_dir: str, fps: float = 1.0) -> List[str]:
-    """Extract frames at specified FPS for analysis."""
+    """Extract frames at specified FPS for analysis using ffmpeg or OpenCV fallback."""
     output_pattern = os.path.join(output_dir, 'frame_%04d.jpg')
     
     cmd = [
@@ -53,8 +81,39 @@ def extract_all_frames(video_path: str, output_dir: str, fps: float = 1.0) -> Li
     
     try:
         subprocess.run(cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Frame extraction failed: {e}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video: {video_path}")
+            
+            video_fps = cap.get(cv2.CAP_PROP_FPS)
+            if video_fps <= 0:
+                video_fps = fps
+            
+            frame_interval = int(round(video_fps / fps))
+            if frame_interval < 1:
+                frame_interval = 1
+            
+            frame_count = 0
+            saved_count = 0
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if frame_count % frame_interval == 0:
+                    frame_path = os.path.join(output_dir, f'frame_{saved_count:04d}.jpg')
+                    cv2.imwrite(frame_path, frame)
+                    saved_count += 1
+                
+                frame_count += 1
+            
+            cap.release()
+        except ImportError:
+            raise RuntimeError("Neither ffmpeg nor OpenCV is available")
     
     frames = sorted([f for f in os.listdir(output_dir) if f.startswith('frame_') and f.endswith('.jpg')])
     return [os.path.join(output_dir, f) for f in frames]

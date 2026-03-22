@@ -4,14 +4,12 @@ go 1.24.3
 
 require (
 	github.com/aliyun/alibabacloud-nls-go-sdk v1.1.1
-	github.com/gorilla/websocket v1.5.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sst/opencode-sdk-go v0.19.2
 )
-
-replace github.com/open-dingtalk/dingtalk-stream-sdk-go => ./third_party/dingtalk-stream-sdk-go
 
 require (
 	github.com/aliyun/alibaba-cloud-sdk-go v1.61.1376 // indirect

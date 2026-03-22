@@ -226,19 +226,28 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		// 先尝试查找待处理的权限请求
 		permission, ok := h.client.GetLatestPendingPermission(sessionID)
 		if ok {
-			log.Printf("feishu: user %s replied '%s' to permission %s (session: %s)",
-				userLabel, content, permission.ID, sessionID[:min(8, len(sessionID))])
+			log.Printf("feishu: user %s replied '%s' (bytes=% X) to permission %s (session: %s)",
+				userLabel, content, []byte(content), permission.ID, sessionID[:min(8, len(sessionID))])
 
-			if err := h.client.AnswerQuestion(ctx, permission.ID, content); err != nil {
-				msg := fmt.Sprintf("❌ 权限回复失败: %v", err)
-				_ = h.sendTextChunks(ctx, target, msg)
+			englishResponse := parsePermissionReply(content)
+			if englishResponse == "" {
+				log.Printf("feishu: unrecognized permission reply from %s: raw=%q bytes=% X", userLabel, content, []byte(content))
+				_ = h.sendTextChunks(ctx, target, "❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许")
+				return "handled", nil
+			}
+
+			log.Printf("feishu: resolved permission reply '%s' -> %s for %s", content, englishResponse, permission.ID)
+
+			if err := h.client.RespondToPermission(ctx, permission.ID, englishResponse); err != nil {
+				log.Printf("feishu: RespondToPermission failed for %s: %v", permission.ID, err)
+				_ = h.sendTextChunks(ctx, target, "❌ 权限回复失败，请重试")
 				return "", err
 			}
 
-			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", content)
+			displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
 			_ = h.sendTextChunks(ctx, target, msg)
-			log.Printf("feishu: successfully answered permission %s, continuing with original SSE listener", permission.ID)
-			// 返回空字符串表示已处理，不需要作为新消息发送给 OpenCode
+			log.Printf("feishu: successfully answered permission %s (%s)", permission.ID, englishResponse)
 			return "handled", nil
 		}
 
@@ -326,6 +335,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleStatus(ctx, target, msg.UserID)
 	}
 
+	// Handle /summary command to trigger context compression
+	if content == "/summary" || content == "压缩" || content == "总结" {
+		return h.handleSummary(ctx, target, msg.UserID)
+	}
+
 	// Handle /clear command to clear/delete current session
 	if content == "/clear" || content == "清除" {
 		return h.handleClear(ctx, target, msg.UserID, msg.ChatID)
@@ -334,11 +348,6 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// Handle /model command to get/set model
 	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
 		return h.handleModel(ctx, target, msg.UserID, content)
-	}
-
-	// Handle /memory command for persistent user memory
-	if strings.HasPrefix(content, "/memory") {
-		return h.handleMemory(ctx, target, msg.UserID, content)
 	}
 
 	// Handle /thinking command to toggle reasoning output
@@ -382,11 +391,6 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleFork(ctx, target, msg.UserID)
 	}
 
-	// Handle /compact command to compact/summarize the current session
-	if content == "/compact" || content == "/summarize" || content == "总结" {
-		return h.handleCompact(ctx, target, msg.UserID)
-	}
-
 	// Handle /todo command to show current todo list
 	if content == "/todo" || content == "/todos" || content == "任务" {
 		return h.handleTodo(ctx, target, msg.UserID)
@@ -407,6 +411,23 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleAnswer(ctx, target, msg.UserID, content)
 	}
 	// ========== 特殊命令处理结束 ==========
+
+	// Parse agent specification: @agent_name message content
+	var agentName string
+	if strings.HasPrefix(content, "@") {
+		parts := strings.SplitN(content[1:], " ", 2)
+		if len(parts) == 2 {
+			agentName = parts[0]
+			content = parts[1]
+			log.Printf("feishu: using agent '%s' for message", agentName)
+		}
+	}
+
+	// 如果有视频 skill 且用户没有指定 agent，使用视频 skill
+	if msg.VideoSkillName != "" && agentName == "" {
+		agentName = msg.VideoSkillName
+		log.Printf("feishu: auto-using video skill '%s' for video message", agentName)
+	}
 
 	sessionID, _ = h.adapter.GetSessionForUser(msg.UserID)
 	var fullReply strings.Builder
@@ -624,6 +645,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		ThreadID:    threadID,
 		SessionID:   sessionID,
 		Content:     sendContent,
+		Agent:       agentName,
 		Streaming:   true,
 		Attachments: msg.Attachments,
 		Metadata:    metadata,
@@ -753,7 +775,7 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 		mediaSessionID = strings.TrimSpace(existingSessionID)
 	}
 
-	content, attachments, mediaFiles, err := h.parseFeishuMessageContent(ctx, messageType, *event.Event.Message.Content, messageID, userID, mediaSessionID)
+	content, attachments, mediaFiles, videoSkillName, err := h.parseFeishuMessageContent(ctx, messageType, *event.Event.Message.Content, messageID, userID, mediaSessionID)
 	if err != nil {
 		log.Printf("❌ feishu: 解析消息内容失败: %v", err)
 		return fmt.Errorf("feishu: parse content: %w", err)
@@ -783,14 +805,15 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 	}
 
 	_, err = h.handleIncomingMessage(ctx, incomingMessage{
-		UserID:      userID,
-		ChatID:      chatID,
-		ChatType:    chatType,
-		MessageID:   messageID,
-		Content:     content,
-		MessageType: messageType,
-		Attachments: attachments,
-		MediaFiles:  mediaFiles,
+		UserID:         userID,
+		ChatID:         chatID,
+		ChatType:       chatType,
+		MessageID:      messageID,
+		Content:        content,
+		MessageType:    messageType,
+		Attachments:    attachments,
+		MediaFiles:     mediaFiles,
+		VideoSkillName: videoSkillName,
 	})
 
 	if err != nil {
@@ -1170,8 +1193,8 @@ func extractNLSRecognizedText(raw string) string {
 	return ""
 }
 
-// parseFeishuMessageContent \u6839\u636e\u6d88\u606f\u7c7b\u578b\u89e3\u6790\u98de\u4e66\u6d88\u606f\uff0c\u8fd4\u56de\u6587\u5b57\u5185\u5bb9\u548c\u9644\u4ef6\u5217\u8868\u3002
-func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawContent, messageID, userID, sessionID string) (string, []opencode.Attachment, []base.MediaFileRecord, error) {
+// parseFeishuMessageContent 根据消息类型解析飞书消息，返回文字内容、附件列表和视频 skill 名称。
+func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawContent, messageID, userID, sessionID string) (string, []opencode.Attachment, []base.MediaFileRecord, string, error) {
 	mediaSessionID := strings.TrimSpace(sessionID)
 	if mediaSessionID == "" {
 		mediaSessionID = "new"
@@ -1179,8 +1202,10 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 	saveMediaRecord := func(kind, filename, mime string, data []byte) (*base.MediaFileRecord, error) {
 		now := time.Now().UTC()
 		relDir := base.BuildMediaRelativeDir("feishu", userID, mediaSessionID, now)
+		// Use OpenCode working directory for media storage so skills can access the files
+		mediaRoot := base.MediaRootDirForOpenCode(h.client.Directory())
 		saved, err := base.SaveTempMedia(
-			base.MediaRootDirFromEnv(),
+			mediaRoot,
 			relDir,
 			kind,
 			messageID,
@@ -1214,20 +1239,20 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 	switch msgType {
 	case "text":
 		text, err := parseFeishuText(rawContent)
-		return text, nil, nil, err
+		return text, nil, nil, "", err
 
 	case "image":
 		var img feishuImageContent
 		if err := json.Unmarshal([]byte(rawContent), &img); err != nil || img.ImageKey == "" {
-			return "[图片消息]", nil, nil, nil
+			return "请分析这张图片的内容。", nil, nil, "", nil
 		}
 		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, img.ImageKey, "image")
 		if err != nil {
 			log.Printf("feishu: ⚠️ image download failed: %v", err)
-			return "[图片消息]", nil, nil, nil
+			return "请分析这张图片的内容。", nil, nil, "", nil
 		}
 		log.Printf("feishu: ✅ image downloaded (mime=%s, len=%d)", mime, len(dataURI))
-		return "[图片消息]", []opencode.Attachment{{Mime: mime, URL: dataURI}}, nil, nil
+		return "请分析这张图片的内容。", []opencode.Attachment{{Mime: mime, URL: dataURI}}, nil, "", nil
 
 	case "audio", "voice":
 		var aud feishuAudioContent
@@ -1239,7 +1264,7 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		if err := json.Unmarshal([]byte(rawContent), &aud); err != nil {
 			asrStatus = "parse_failed"
 			log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
-			return "[语音消息]", nil, nil, nil
+			return "[语音消息]", nil, nil, "", nil
 		}
 		durMs, _ := strconv.Atoi(aud.Duration)
 		durSec := durMs / 1000
@@ -1267,7 +1292,7 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 					asrTextLen = len(text)
 					asrStatus = "ok"
 					log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
-					return fmt.Sprintf("[语音转文字] %s", text), nil, nil, nil
+					return fmt.Sprintf("[语音转文字] %s", text), nil, nil, "", nil
 				} else {
 					log.Printf("feishu: ⚠️ NLS returned empty text")
 					asrStatus = "empty"
@@ -1279,82 +1304,174 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 
 		log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
 
-		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil, nil
+		return fmt.Sprintf("[语音消息，时长: %d秒]", durSec), nil, nil, "", nil
 
-	case "video":
-		var vid feishuVideoContent
-		if err := json.Unmarshal([]byte(rawContent), &vid); err != nil {
-			log.Printf("feishu: ⚠️ parse video content failed: %v", err)
-			return "[视频消息]", nil, nil, nil
+	case "video", "media":
+		// 飞书的视频消息类型是 "media" 而非 "video"
+		// 尝试解析两种格式
+		var fileKey, duration string
+		var fileName string
+
+		// 先尝试解析 media 格式（飞书实际发送的格式）
+		var mediaContent feishuMediaContent
+		if err := json.Unmarshal([]byte(rawContent), &mediaContent); err == nil && mediaContent.FileKey != "" {
+			fileKey = mediaContent.FileKey
+			duration = mediaContent.Duration
+			fileName = mediaContent.FileName
+			log.Printf("feishu: parsed as media format - fileKey=%s, fileName=%s, duration=%s", fileKey, fileName, duration)
+		} else {
+			// 回退到 video 格式
+			var vid feishuVideoContent
+			if err := json.Unmarshal([]byte(rawContent), &vid); err != nil {
+				log.Printf("feishu: ⚠️ parse video/media content failed: %v", err)
+				return "请分析这个视频的内容。", nil, nil, "", nil
+			}
+			fileKey = vid.FileKey
+			duration = vid.Duration
+			log.Printf("feishu: parsed as video format - fileKey=%s, duration=%s", fileKey, duration)
 		}
 
-		durMs, _ := strconv.Atoi(strings.TrimSpace(vid.Duration))
+		durMs, _ := strconv.Atoi(strings.TrimSpace(duration))
 		durSec := durMs / 1000
 		if durSec == 0 && durMs > 0 {
 			durSec = 1
 		}
 
-		if vid.FileKey == "" {
+		if fileKey == "" {
+			videoPrompt := "请分析这个视频的内容。"
 			if durSec > 0 {
-				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil, nil
+				videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
 			}
-			return "[视频消息]", nil, nil, nil
+			return videoPrompt, nil, nil, "", nil
 		}
 
-		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, vid.FileKey, "video")
-		if err != nil {
-			log.Printf("feishu: ⚠️ video download with type=video failed: %v, retry with type=file", err)
-			dataURI, mime, err = h.downloadFeishuMediaAsDataURI(ctx, messageID, vid.FileKey, "file")
-		}
-		if err != nil {
-			log.Printf("feishu: ⚠️ video download failed: %v", err)
-			if durSec > 0 {
-				return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), nil, nil, nil
-			}
-			return "[视频消息]", nil, nil, nil
-		}
-
-		videoBytes, videoMime, bytesErr := h.downloadFeishuMediaBytes(ctx, messageID, vid.FileKey, "video")
+		// 下载视频到本地
+		videoBytes, videoMime, bytesErr := h.downloadFeishuMediaBytes(ctx, messageID, fileKey, "video")
 		if bytesErr != nil {
 			log.Printf("feishu: ⚠️ video bytes download with type=video failed: %v, retry with type=file", bytesErr)
-			videoBytes, videoMime, bytesErr = h.downloadFeishuMediaBytes(ctx, messageID, vid.FileKey, "file")
+			videoBytes, videoMime, bytesErr = h.downloadFeishuMediaBytes(ctx, messageID, fileKey, "file")
 		}
-		var mediaFiles []base.MediaFileRecord
+		var videoRecord *base.MediaFileRecord
 		if bytesErr != nil {
 			log.Printf("feishu: ⚠️ video temp save skipped, download bytes failed: %v", bytesErr)
 		} else {
-			record, saveErr := saveMediaRecord("video", "feishu_video.mp4", videoMime, videoBytes)
+			// 使用文件名或默认名称
+			videoFileName := fileName
+			if videoFileName == "" {
+				videoFileName = "feishu_video.mp4"
+			}
+			record, saveErr := saveMediaRecord("video", videoFileName, videoMime, videoBytes)
 			if saveErr != nil {
 				log.Printf("feishu: ⚠️ failed to save temp video file: %v", saveErr)
 			} else {
-				mediaFiles = append(mediaFiles, *record)
-				log.Printf("feishu: 🗂️ video temp saved: %s", record.LocalPath)
+				videoRecord = record
+				log.Printf("feishu: 🗂️ video temp saved: %s (size: %d bytes)", record.LocalPath, record.Size)
 			}
 		}
 
-		log.Printf("feishu: ✅ video downloaded (mime=%s, len=%d)", mime, len(dataURI))
-		if durSec > 0 {
-			return fmt.Sprintf("[视频消息，时长: %d秒]", durSec), []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, nil
+		// 视频消息处理流程（和图片一样自动选择模型）：
+		// 1. 有明确支持视频的模型 → 直接发送视频
+		// 2. 有图片模型但无视频模型 → Gateway 提取帧图片 → 发送帧图片
+		// 3. 都没有 → 返回错误
+
+		// 1. 检查是否有明确支持视频的模型
+		if h.client.HasVideoCapableModel() {
+			var mediaFiles []base.MediaFileRecord
+			if videoRecord != nil {
+				mediaFiles = append(mediaFiles, *videoRecord)
+			}
+			log.Printf("feishu: ✅ Using video-capable model to process video directly")
+			dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, fileKey, "video")
+			if err != nil {
+				log.Printf("feishu: ⚠️ video download with type=video failed: %v, retry with type=file", err)
+				dataURI, mime, err = h.downloadFeishuMediaAsDataURI(ctx, messageID, fileKey, "file")
+			}
+			if err != nil {
+				log.Printf("feishu: ⚠️ video download failed: %v", err)
+				videoPrompt := "请分析这个视频的内容。"
+				if durSec > 0 {
+					videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
+				}
+				if videoRecord != nil {
+					videoPrompt = fmt.Sprintf("视频文件已保存到: %s\n文件大小: %d bytes\n请分析这个视频。", videoRecord.LocalPath, videoRecord.Size)
+				}
+				return videoPrompt, nil, mediaFiles, "", nil
+			}
+
+			log.Printf("feishu: ✅ video downloaded (mime=%s, len=%d)", mime, len(dataURI))
+			videoPrompt := "请分析这个视频的内容。"
+			if durSec > 0 {
+				videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
+			}
+			return videoPrompt, []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, "", nil
 		}
-		return "[视频消息]", []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, nil
+
+		// 2. 有图片模型 → Gateway 提取帧图片，然后发送帧图片（和图片一样处理）
+		if h.client.HasImageCapableModel() {
+			if videoRecord != nil {
+				log.Printf("feishu: 🔄 No video-capable model, extracting frames from video...")
+				frames, extractErr := base.ExtractVideoFrames(ctx, videoRecord.LocalPath, h.client.Directory(), 10)
+				if extractErr != nil {
+					log.Printf("feishu: ⚠️ Failed to extract frames: %v", extractErr)
+					videoPrompt := fmt.Sprintf("⚠️ 视频帧提取失败: %v\n\n视频已保存到: %s", extractErr, videoRecord.LocalPath)
+					return videoPrompt, nil, nil, "", nil
+				}
+				log.Printf("feishu: ✅ Extracted %d frames from video", len(frames))
+				// 将帧图片作为附件发送（和图片一样）
+				var frameAttachments []opencode.Attachment
+				for i, frame := range frames {
+					frameDataURI, err := base.ReadFileAsDataURI(frame.FramePath)
+					if err != nil {
+						log.Printf("feishu: ⚠️ Failed to read frame %d: %v", i, err)
+						continue
+					}
+					frameAttachments = append(frameAttachments, opencode.Attachment{
+						Mime:     "image/jpeg",
+						URL:      frameDataURI,
+						Filename: fmt.Sprintf("frame_%d.jpg", frame.FrameNumber),
+					})
+				}
+				if len(frameAttachments) > 0 {
+					log.Printf("feishu: 📎 Sending %d frame images as attachments", len(frameAttachments))
+					videoPrompt := "这是一个视频的关键帧截图，请分析视频内容。"
+					if durSec > 0 {
+						videoPrompt = fmt.Sprintf("这是一个视频的关键帧截图（视频时长: %d秒），请分析视频内容。", durSec)
+					}
+					return videoPrompt, frameAttachments, nil, "", nil
+				}
+			}
+			videoPrompt := "⚠️ 视频帧提取失败。"
+			if videoRecord != nil {
+				videoPrompt = fmt.Sprintf("⚠️ 视频帧提取失败。\n\n视频已保存到: %s", videoRecord.LocalPath)
+			}
+			return videoPrompt, nil, nil, "", nil
+		}
+
+		// 3. 既没有视频模型也没有图片模型
+		log.Printf("feishu: ⚠️ No video-capable model and no image-capable model found")
+		videoPrompt := "⚠️ 视频处理暂不可用。"
+		if videoRecord != nil {
+			videoPrompt = fmt.Sprintf("⚠️ 视频处理暂不可用。\n\n视频已保存到: %s\n大小: %d bytes\n时长: %d秒\n\n请配置支持视频或图片的模型。", videoRecord.LocalPath, videoRecord.Size, durSec)
+		}
+		return videoPrompt, nil, nil, "", nil
 
 	case "file":
 		var fileContent feishuFileContent
 		if err := json.Unmarshal([]byte(rawContent), &fileContent); err != nil {
 			log.Printf("feishu: ⚠️ parse file content failed: %v", err)
-			return "[文件消息]", nil, nil, nil
+			return "[文件消息]", nil, nil, "", nil
 		}
 		if strings.TrimSpace(fileContent.FileKey) == "" {
-			return "[文件消息]", nil, nil, nil
+			return "[文件消息]", nil, nil, "", nil
 		}
 
 		fileBytes, fileMime, err := h.downloadFeishuMediaBytes(ctx, messageID, fileContent.FileKey, "file")
 		if err != nil {
 			log.Printf("feishu: ⚠️ file download failed: %v", err)
 			if strings.TrimSpace(fileContent.FileName) != "" {
-				return fmt.Sprintf("[文件消息: %s]", strings.TrimSpace(fileContent.FileName)), nil, nil, nil
+				return fmt.Sprintf("[文件消息: %s]", strings.TrimSpace(fileContent.FileName)), nil, nil, "", nil
 			}
-			return "[文件消息]", nil, nil, nil
+			return "[文件消息]", nil, nil, "", nil
 		}
 
 		fileName := strings.TrimSpace(fileContent.FileName)
@@ -1366,24 +1483,24 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		if saveErr != nil {
 			log.Printf("feishu: ⚠️ failed to save temp file: %v", saveErr)
 			if fileName != "" {
-				return fmt.Sprintf("[文件消息: %s]", fileName), nil, nil, nil
+				return fmt.Sprintf("[文件消息: %s]", fileName), nil, nil, "", nil
 			}
-			return "[文件消息]", nil, nil, nil
+			return "[文件消息]", nil, nil, "", nil
 		}
 		log.Printf("feishu: 🗂️ file temp saved: %s", record.LocalPath)
-		return fmt.Sprintf("[文件消息: %s]", fileName), nil, []base.MediaFileRecord{*record}, nil
+		return fmt.Sprintf("[文件消息: %s]", fileName), nil, []base.MediaFileRecord{*record}, "", nil
 
 	case "post":
 		var post feishuPostContent
 		if err := json.Unmarshal([]byte(rawContent), &post); err != nil {
-			return "[图文消息]", nil, nil, nil
+			return "请分析这些内容。", nil, nil, "", nil
 		}
 		lang := post.ZhCN
 		if lang == nil {
 			lang = post.EnUS
 		}
 		if lang == nil {
-			return "[图文消息]", nil, nil, nil
+			return "请分析这些内容。", nil, nil, "", nil
 		}
 		var textParts []string
 		var attachments []opencode.Attachment
@@ -1406,22 +1523,23 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 					dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, elem.ImageKey, "image")
 					if err != nil {
 						log.Printf("feishu: ⚠️ post image #%d download failed: %v", imgIdx, err)
-						textParts = append(textParts, fmt.Sprintf("[图片%d]", imgIdx))
 						continue
 					}
-					textParts = append(textParts, fmt.Sprintf("[图片%d]", imgIdx))
-					attachments = append(attachments, opencode.Attachment{Mime: mime, URL: dataURI})
+					attachments = append(attachments, opencode.Attachment{Mime: mime, URL: dataURI, Filename: fmt.Sprintf("feishu_image_%d.jpg", imgIdx)})
 				}
 			}
 		}
 		text := strings.Join(textParts, "\n")
-		if text == "" {
+		// 如果用户没有提供文字，且只有图片，给默认提示
+		if text == "" && len(attachments) > 0 {
+			text = "请分析这张图片的内容。"
+		} else if text == "" {
 			text = "[图文消息]"
 		}
-		return text, attachments, nil, nil
+		return text, attachments, nil, "", nil
 
 	default:
-		return fmt.Sprintf("[%s消息]", msgType), nil, nil, nil
+		return fmt.Sprintf("[%s消息]", msgType), nil, nil, "", nil
 	}
 }
 
@@ -1558,7 +1676,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		mediaSessionID = strings.TrimSpace(existingSessionID)
 	}
 
-	content, attachments, mediaFiles, parseErr := h.parseFeishuMessageContent(r.Context(), msgType, envelope.Event.Message.Content,
+	content, attachments, mediaFiles, videoSkillName, parseErr := h.parseFeishuMessageContent(r.Context(), msgType, envelope.Event.Message.Content,
 		func() string {
 			return messageID
 		}(), userID, mediaSessionID)
@@ -1582,14 +1700,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reply, err := h.handleIncomingMessage(r.Context(), incomingMessage{
-		UserID:      userID,
-		ChatID:      envelope.Event.Message.ChatID,
-		ChatType:    chatType,
-		MessageID:   messageID,
-		Content:     content,
-		MessageType: msgType,
-		Attachments: attachments,
-		MediaFiles:  mediaFiles,
+		UserID:         userID,
+		ChatID:         envelope.Event.Message.ChatID,
+		ChatType:       chatType,
+		MessageID:      messageID,
+		Content:        content,
+		MessageType:    msgType,
+		Attachments:    attachments,
+		MediaFiles:     mediaFiles,
+		VideoSkillName: videoSkillName,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("forward failed: %v", err), http.StatusBadGateway)
@@ -1655,6 +1774,14 @@ type feishuVideoContent struct {
 	Duration string `json:"duration"` // 毫秒
 }
 
+// feishuMediaContent 媒体消息（飞书视频消息类型是 media 而非 video）
+type feishuMediaContent struct {
+	FileKey  string `json:"file_key"`
+	FileName string `json:"file_name"`
+	ImageKey string `json:"image_key"` // 视频封面图
+	Duration string `json:"duration"`  // 毫秒
+}
+
 // feishuFileContent 文件消息
 type feishuFileContent struct {
 	FileKey  string `json:"file_key"`
@@ -1687,14 +1814,15 @@ type chatTarget struct {
 }
 
 type incomingMessage struct {
-	UserID      string
-	ChatID      string
-	ChatType    string
-	MessageID   string
-	Content     string
-	MessageType string
-	Attachments []opencode.Attachment // 图片/音频等附件
-	MediaFiles  []base.MediaFileRecord
+	UserID         string
+	ChatID         string
+	ChatType       string
+	MessageID      string
+	Content        string
+	MessageType    string
+	Attachments    []opencode.Attachment // 图片/音频等附件
+	MediaFiles     []base.MediaFileRecord
+	VideoSkillName string // 视频处理 skill 名称（如果有）
 }
 
 func parseFeishuText(raw string) (string, error) {
@@ -1922,8 +2050,8 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 /new 或 /reset - 创建新会话
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
-/compact 或 总结 - 压缩会话历史（减少上下文占用）
 /sessions 或 /list - 列出所有会话
+/summary 或 压缩 - 压缩会话上下文（释放token空间）
 
 📋 任务追踪（对应 TUI 实时看板）：
 /todo 或 任务 - 查看 AI 当前的任务进度
@@ -1932,16 +2060,6 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 🤖 模型配置：
 /model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
-/memory - 查看已记录的长期记忆
-/memory pin <内容> - 固定一条高优先级记忆
-/memory pin <category> <内容> - 按分类固定记忆
-/memory unpin <关键词> - 按关键词删除记忆
-/memory unpin #<序号> - 按列表序号删除记忆
-/memory export - 导出当前用户记忆快照
-/memory import <base64> - 导入记忆快照（覆盖）
-/memory merge-import <base64> - 合并导入记忆快照（不覆盖）
-/memory clear - 清空当前用户记忆
-/memory compact - 压缩去重当前用户记忆
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -2006,159 +2124,6 @@ func (h *Handler) handleThinking(ctx context.Context, target chatTarget, content
 		_ = h.sendTextChunks(ctx, target, msg)
 		return "handled", nil
 	}
-}
-
-func (h *Handler) handleMemory(ctx context.Context, target chatTarget, userID, content string) (string, error) {
-	normalizeCategory := func(raw string) string {
-		switch strings.ToLower(strings.TrimSpace(raw)) {
-		case "profile", "preference", "project", "environment", "model", "conversation":
-			return strings.ToLower(strings.TrimSpace(raw))
-		default:
-			return "preference"
-		}
-	}
-
-	parts := strings.Fields(strings.TrimSpace(content))
-	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
-		limit := 10
-		if len(parts) >= 3 {
-			if strings.EqualFold(parts[2], "all") {
-				limit = 0
-			} else if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
-				limit = n
-			}
-		}
-		facts := h.client.ListUserMemory("feishu", userID, limit)
-		if len(facts) == 0 {
-			_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有已记录的长期记忆")
-			return "handled", nil
-		}
-		var b strings.Builder
-		b.WriteString("🧠 长期记忆（Top 10）\n")
-		for i, f := range facts {
-			b.WriteString(fmt.Sprintf("%d. [%s][P%d] %s\n", i+1, f.Category, f.Importance, f.Text))
-		}
-		_ = h.sendTextChunks(ctx, target, b.String())
-		return "handled", nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "clear") {
-		if err := h.client.ClearUserMemory("feishu", userID); err != nil {
-			_ = h.sendTextChunks(ctx, target, "❌ 清空 memory 失败: "+err.Error())
-			return "handled", nil
-		}
-		_ = h.sendTextChunks(ctx, target, "✅ 已清空当前用户长期记忆")
-		return "handled", nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "compact") {
-		removed, err := h.client.CompactUserMemory("feishu", userID)
-		if err != nil {
-			_ = h.sendTextChunks(ctx, target, "❌ 压缩 memory 失败: "+err.Error())
-			return "handled", nil
-		}
-		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ memory 压缩完成，移除 %d 条冗余记录", removed))
-		return "handled", nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "pin") {
-		category := "preference"
-		text := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if len(parts) >= 4 {
-			candidate := normalizeCategory(parts[2])
-			if candidate == strings.ToLower(strings.TrimSpace(parts[2])) {
-				category = candidate
-				text = strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
-			}
-		}
-		if text == "" {
-			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory pin <内容> 或 /memory pin <category> <内容>")
-			return "handled", nil
-		}
-		if err := h.client.PinUserMemory("feishu", userID, text, category); err != nil {
-			_ = h.sendTextChunks(ctx, target, "❌ 固定 memory 失败: "+err.Error())
-			return "handled", nil
-		}
-		_ = h.sendTextChunks(ctx, target, "✅ 已固定高优先级记忆（category="+category+"）")
-		return "handled", nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "unpin") {
-		keyword := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if keyword == "" {
-			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory unpin <关键词>")
-			return "handled", nil
-		}
-		if strings.HasPrefix(keyword, "#") {
-			rawRank := strings.TrimPrefix(keyword, "#")
-			rank, convErr := strconv.Atoi(rawRank)
-			if convErr != nil || rank <= 0 {
-				_ = h.sendTextChunks(ctx, target, "❌ 序号格式错误，用法: /memory unpin #<序号>")
-				return "handled", nil
-			}
-			ok, err := h.client.RemoveUserMemoryByRank("feishu", userID, rank)
-			if err != nil {
-				_ = h.sendTextChunks(ctx, target, "❌ 删除 memory 失败: "+err.Error())
-				return "handled", nil
-			}
-			if ok {
-				_ = h.sendTextChunks(ctx, target, "✅ 已按序号删除记忆")
-			} else {
-				_ = h.sendTextChunks(ctx, target, "ℹ️ 未找到对应序号记忆")
-			}
-			return "handled", nil
-		}
-		removed, err := h.client.UnpinUserMemory("feishu", userID, keyword)
-		if err != nil {
-			_ = h.sendTextChunks(ctx, target, "❌ 删除 memory 失败: "+err.Error())
-			return "handled", nil
-		}
-		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ 已删除 %d 条匹配记忆", removed))
-		return "handled", nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "export") {
-		snapshot, err := h.client.ExportUserMemory("feishu", userID)
-		if err != nil {
-			_ = h.sendTextChunks(ctx, target, "❌ 导出 memory 失败: "+err.Error())
-			return "handled", nil
-		}
-		_ = h.sendTextChunks(ctx, target, "📦 memory 导出（base64）:\n"+snapshot)
-		return "handled", nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory import <base64>")
-			return "handled", nil
-		}
-		count, err := h.client.ImportUserMemory("feishu", userID, payload)
-		if err != nil {
-			_ = h.sendTextChunks(ctx, target, "❌ 导入 memory 失败: "+err.Error())
-			return "handled", nil
-		}
-		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ memory 导入完成，共 %d 条", count))
-		return "handled", nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "merge-import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			_ = h.sendTextChunks(ctx, target, "❌ 用法: /memory merge-import <base64>")
-			return "handled", nil
-		}
-		count, err := h.client.MergeImportUserMemory("feishu", userID, payload)
-		if err != nil {
-			_ = h.sendTextChunks(ctx, target, "❌ 合并导入 memory 失败: "+err.Error())
-			return "handled", nil
-		}
-		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ memory 合并导入完成，共 %d 条", count))
-		return "handled", nil
-	}
-
-	_ = h.sendTextChunks(ctx, target, "❌ 命令格式错误\n\n用法:\n/memory\n/memory show [all|N]\n/memory pin <内容>\n/memory pin <category> <内容>\n/memory unpin <关键词>\n/memory unpin #<序号>\n/memory export\n/memory import <base64>\n/memory merge-import <base64>\n/memory clear\n/memory compact\n\ncategory: profile|preference|project|environment|model|conversation")
-	return "handled", nil
 }
 
 // handleFinal 处理最终输出模式开关命令（全局）
@@ -2339,6 +2304,27 @@ func (h *Handler) handleStatus(ctx context.Context, target chatTarget, userID st
 	msgBuilder.WriteString(fmt.Sprintf("创建时间: %s", info.Created))
 
 	_ = h.sendTextChunks(ctx, target, msgBuilder.String())
+	return "handled", nil
+}
+
+// handleSummary 处理上下文压缩命令
+func (h *Handler) handleSummary(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话")
+		return "handled", nil
+	}
+
+	// 发送提示消息
+	_ = h.sendTextChunks(ctx, target, "⏳ 正在进行上下文压缩...")
+
+	// 调用 summary API
+	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 上下文压缩失败: %v", err))
+		return "", err
+	}
+
+	_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ 上下文压缩完成\n\n会话 %s 的历史消息已被总结压缩，上下文空间已释放。", sessionID[:min(8, len(sessionID))]))
 	return "handled", nil
 }
 
@@ -2577,7 +2563,6 @@ func (h *Handler) handleConfig(ctx context.Context, target chatTarget, userID st
 	msgBuilder.WriteString("  /new - 创建新会话\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
 	msgBuilder.WriteString("  /fork - 派生(fork)当前会话\n")
-	msgBuilder.WriteString("  /compact - 压缩/总结当前会话\n")
 	msgBuilder.WriteString("  /todo - 查看当前任务进度\n")
 	msgBuilder.WriteString("  /diff - 查看文件变更\n")
 	msgBuilder.WriteString("  /sessions - 列出所有会话\n")
@@ -2692,7 +2677,25 @@ func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, c
 	}
 
 	// 提交答案
-	log.Printf("feishu: submitting answer '%s' for question %s", answer, questionID)
+	log.Printf("feishu: submitting answer '%s' for question %s (isPermission=%v)", answer, questionID, question.IsPermission)
+
+	if question.IsPermission {
+		englishResponse := parsePermissionReply(answer)
+		if englishResponse == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许")
+			return "handled", nil
+		}
+		if err := h.client.RespondToPermission(ctx, questionID, englishResponse); err != nil {
+			_ = h.sendTextChunks(ctx, target, "❌ 权限回复失败，请重试")
+			log.Printf("feishu: RespondToPermission failed for %s: %v", questionID, err)
+			return "", err
+		}
+		displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+		msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
+		_ = h.sendTextChunks(ctx, target, msg)
+		log.Printf("feishu: answered permission %s (%s) successfully", questionID, englishResponse)
+		return "handled", nil
+	}
 
 	if err := h.client.AnswerQuestion(ctx, questionID, answer); err != nil {
 		msg := fmt.Sprintf("❌ 提交答案失败: %v", err)
@@ -2706,6 +2709,41 @@ func (h *Handler) handleAnswer(ctx context.Context, target chatTarget, userID, c
 	log.Printf("feishu: answered question %s successfully", questionID)
 
 	return "handled", nil
+}
+
+// parsePermissionReply maps user input (any locale/encoding) to a canonical English
+// API value: "once" (allow once), "reject" (deny), "always" (always allow), or "" (unrecognized).
+func parsePermissionReply(content string) string {
+	norm := strings.ToLower(strings.TrimSpace(content))
+	// Strip common punctuation and zero-width chars
+	norm = strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', ',', '，', '.', '。', '!', '！', '?', '？', '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		}
+		return r
+	}, norm)
+
+	alwaysTokens := []string{"3", "always", "始终允许", "始终", "一直允许", "总是允许", "濮嬬粓鍏佽", "濮嬬粓", "涓€鐩村厑璁", "鎬绘槸鍏佽"}
+	rejectTokens := []string{"2", "deny", "reject", "no", "n", "拒绝", "不同意", "不允许", "取消", "鎷掔粷", "涓嶅悓鎰", "鍙栨秷", "涓嶅厑璁"}
+	allowTokens := []string{"1", "allow", "yes", "y", "ok", "okay", "允许", "同意", "确认", "可以", "行", "鍏佽", "鍚屾剰", "纭", "鍙互"}
+
+	for _, t := range alwaysTokens {
+		if strings.Contains(norm, strings.ToLower(t)) {
+			return "always"
+		}
+	}
+	for _, t := range rejectTokens {
+		if strings.Contains(norm, strings.ToLower(t)) {
+			return "reject"
+		}
+	}
+	for _, t := range allowTokens {
+		if strings.Contains(norm, strings.ToLower(t)) {
+			return "once"
+		}
+	}
+	return ""
 }
 
 func (h *Handler) buildPendingRequirementHint(userID string) string {
@@ -3123,25 +3161,6 @@ func (h *Handler) handleFork(ctx context.Context, target chatTarget, userID stri
 }
 
 // handleCompact 处理压缩/总结会话命令（对应 TUI session.compact）
-func (h *Handler) handleCompact(ctx context.Context, target chatTarget, userID string) (string, error) {
-	sessionID, ok := h.adapter.GetSessionForUser(userID)
-	if !ok {
-		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话")
-		return "handled", nil
-	}
-
-	_ = h.sendTextChunks(ctx, target, "⏳ 正在压缩会话历史...")
-
-	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
-		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 压缩会话失败: %v", err))
-		return "", err
-	}
-
-	msg := fmt.Sprintf("✅ 会话 %s 已压缩总结\n\n会话历史已被 AI 摘要，上下文占用将减少。", sessionID[:min(8, len(sessionID))])
-	_ = h.sendTextChunks(ctx, target, msg)
-	return "handled", nil
-}
-
 // handleTodo 处理查看任务进度命令（对应 TUI todo.updated 事件展示）
 func (h *Handler) handleTodo(ctx context.Context, target chatTarget, userID string) (string, error) {
 	sessionID, ok := h.adapter.GetSessionForUser(userID)

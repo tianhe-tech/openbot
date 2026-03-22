@@ -27,6 +27,7 @@ type MessageSender interface {
 type StreamingSessionHandler struct {
 	sessionID          string
 	callback           StreamCallback
+	eventCallback      StreamEventCallback
 	lastContent        string
 	lastUpdateTime     time.Time
 	lastEventTime      time.Time // 最后一次收到SSE事件的时间
@@ -54,10 +55,11 @@ type StreamingSessionHandler struct {
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
-func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool) *StreamingSessionHandler {
+func NewStreamingSessionHandler(sessionID string, callback StreamCallback, eventCallback StreamEventCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool) *StreamingSessionHandler {
 	h := &StreamingSessionHandler{
 		sessionID:      sessionID,
 		callback:       callback,
+		eventCallback:  eventCallback,
 		lastUpdateTime: time.Now(),
 		onComplete:     onComplete,
 		client:         client,
@@ -75,6 +77,62 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, onCom
 		}
 	})
 	return h
+}
+
+func (s *StreamingSessionHandler) emitEvent(kind StreamEventKind, content string, question *Question, todos []TodoItem, diff []FileDiff, rawType string) {
+	if s.eventCallback == nil {
+		return
+	}
+	evt := StreamEvent{
+		Kind:      kind,
+		SessionID: s.sessionID,
+		Content:   content,
+		Question:  question,
+		Todos:     todos,
+		Diff:      diff,
+		RawType:   rawType,
+	}
+	if err := s.eventCallback(evt); err != nil {
+		log.Printf("opencode: stream event callback error (kind=%s, session=%s): %v", kind, s.sessionID[:min(8, len(s.sessionID))], err)
+	}
+}
+
+func (s *StreamingSessionHandler) emitEventFromChunk(chunk string) {
+	if chunk == "" {
+		return
+	}
+
+	if chunk == FlushSignal {
+		s.emitEvent(StreamEventFlush, "", nil, nil, nil, "flush")
+		return
+	}
+
+	if strings.HasPrefix(chunk, ThinkingSignalPrefix) {
+		s.emitEvent(StreamEventThinking, strings.TrimPrefix(chunk, ThinkingSignalPrefix), nil, nil, nil, "thinking")
+		return
+	}
+
+	if strings.HasPrefix(chunk, ToolSignalPrefix) {
+		s.emitEvent(StreamEventTool, strings.TrimPrefix(chunk, ToolSignalPrefix), nil, nil, nil, "tool")
+		return
+	}
+
+	if strings.HasPrefix(chunk, StepSignalPrefix) {
+		s.emitEvent(StreamEventStep, strings.TrimPrefix(chunk, StepSignalPrefix), nil, nil, nil, "step")
+		return
+	}
+
+	if strings.HasPrefix(chunk, TodoSignalPrefix) {
+		s.emitEvent(StreamEventTodo, strings.TrimPrefix(chunk, TodoSignalPrefix), nil, nil, nil, "todo")
+		return
+	}
+
+	if strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
+		s.emitEvent(StreamEventSessionReady, chunk, nil, nil, nil, "session")
+		return
+	}
+
+	s.emitEvent(StreamEventTextDelta, chunk, nil, nil, nil, "text")
 }
 
 // NewEventDispatcher creates a new event dispatcher.
@@ -143,8 +201,12 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		s.sessionID[:8])
 
 	if s.completed {
-		log.Printf("opencode: ignoring event for completed session %s", s.sessionID[:8])
-		return nil
+		// 即使 completed，仍然处理权限和问题请求（skill 可能在 session.idle 后才请求权限）
+		if eventType != "permission.asked" && eventType != "question.asked" {
+			log.Printf("opencode: ignoring event for completed session %s (type=%s)", s.sessionID[:8], eventType)
+			return nil
+		}
+		log.Printf("opencode: processing %s event for completed session %s (skill may need permission)", eventType, s.sessionID[:8])
 	}
 
 	// 仅处理与当前session相关的事件
@@ -206,6 +268,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					}
 				}
 			} else {
+				s.emitEventFromChunk(incremental)
 				s.lastContent += incremental
 				if !s.contentSent {
 					s.stopWaitingTimer()
@@ -250,6 +313,15 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		if err := s.callback(questionMsg); err != nil {
 			log.Printf("opencode: question/permission callback error: %v", err)
 		} else {
+			if question != nil {
+				if question.IsPermission {
+					s.emitEvent(StreamEventPermissionAsked, questionMsg, question, nil, nil, eventType)
+				} else {
+					s.emitEvent(StreamEventQuestionAsked, questionMsg, question, nil, nil, eventType)
+				}
+			} else {
+				s.emitEvent(StreamEventQuestionAsked, questionMsg, nil, nil, nil, eventType)
+			}
 			log.Printf("opencode: %s message sent via callback successfully", event.Type)
 			s.contentSent = true
 		}
@@ -277,7 +349,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: session status changed for session %s", s.sessionID[:8])
 
 	case "session.error":
+		rawJSON := event.JSON.RawJSON()
+		log.Printf("opencode: 🔴 session.error RAW JSON: %s", rawJSON)
 		errorMsg := s.extractSessionError(event)
+		log.Printf("opencode: 🔴 session.error extracted message: %q", errorMsg)
 		if errorMsg == "" {
 			errorMsg = "⚠️ OpenCode 会话发生错误，请稍后重试。"
 		} else {
@@ -287,6 +362,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		if err := s.callback(errorMsg); err != nil {
 			log.Printf("opencode: session.error callback error: %v", err)
 		} else {
+			s.emitEvent(StreamEventError, errorMsg, nil, nil, nil, eventType)
 			s.contentSent = true
 		}
 
@@ -298,6 +374,8 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		newSessionMsg := "\n\n💡 会话已重置，发送新消息即可自动开始新的对话。"
 		if err := s.callback(newSessionMsg); err != nil {
 			log.Printf("opencode: session.error new-session hint error: %v", err)
+		} else {
+			s.emitEvent(StreamEventInfo, newSessionMsg, nil, nil, nil, eventType)
 		}
 
 	case "message.part.delta":
@@ -324,6 +402,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					if err := s.callback(reasoningChunk); err != nil {
 						log.Printf("opencode: message.part.delta reasoning callback error: %v", err)
 					} else {
+						s.emitEventFromChunk(reasoningChunk)
 						s.lastContent += reasoningChunk
 						if !s.contentSent {
 							s.stopWaitingTimer()
@@ -369,6 +448,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					log.Printf("opencode: message.part.delta callback error: %v", err)
 					// 不更新缓存：让下一个 message.part.updated 快照把这部分内容补发
 				} else {
+					s.emitEventFromChunk(delta)
 					// callback 成功后才提交缓存，确保"缓存 == 已送达"
 					if partID != "" {
 						existing, _ := s.partTextCache.Load(partID)
@@ -390,6 +470,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		todos := extractTodosFromEvent(event)
 		if todos != nil {
 			s.sessionTodos = todos
+			s.emitEvent(StreamEventTodoSnapshot, "", nil, todos, nil, eventType)
 			log.Printf("opencode: todos updated for session %s (%d items)", s.sessionID[:8], len(todos))
 
 			summary := formatTodoSummaryFromTodos(todos)
@@ -399,6 +480,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					if err := s.callback(TodoSignalPrefix + summary); err != nil {
 						log.Printf("opencode: todo auto-push callback error: %v", err)
 					} else {
+						s.emitEventFromChunk(TodoSignalPrefix + summary)
 						s.lastTodoSummary = summary
 						s.lastTodoPushTime = now
 						if !s.contentSent {
@@ -415,6 +497,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		diff := extractDiffFromEvent(event)
 		if len(diff) > 0 {
 			s.sessionDiff = diff
+			s.emitEvent(StreamEventDiffSnapshot, "", nil, nil, diff, eventType)
 			log.Printf("opencode: session diff updated for session %s (%d files)", s.sessionID[:8], len(diff))
 		}
 
@@ -743,9 +826,13 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 		MessageID string `json:"messageID"`
 		Error     struct {
 			Type    string `json:"type"`
+			Name    string `json:"name"`
 			Message string `json:"message"`
 			Code    string `json:"code"`
 			Detail  string `json:"detail"`
+			Data    struct {
+				Message string `json:"message"`
+			} `json:"data"`
 		} `json:"error"`
 		Message string `json:"message"`
 		Detail  string `json:"detail"`
@@ -758,18 +845,23 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 	}
 
 	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
-		log.Printf("opencode: failed to parse session.error event: %v", err)
+		log.Printf("opencode: failed to parse session.error event: %v, raw: %s", err, raw)
 		return ""
 	}
 
 	props := wrapper.Properties
+	log.Printf("opencode: session.error parsed props: Error.Name=%q, Error.Message=%q, Error.Data.Message=%q, Message=%q, Detail=%q, Reason=%q, Code=%q",
+		props.Error.Name, props.Error.Message, props.Error.Data.Message, props.Message, props.Detail, props.Reason, props.Code)
 
 	var parts []string
 
-	if props.Error.Message != "" {
+	if props.Error.Data.Message != "" {
+		parts = append(parts, props.Error.Data.Message)
+	}
+	if props.Error.Message != "" && props.Error.Message != props.Error.Data.Message {
 		parts = append(parts, props.Error.Message)
 	}
-	if props.Message != "" && props.Message != props.Error.Message {
+	if props.Message != "" && props.Message != props.Error.Message && props.Message != props.Error.Data.Message {
 		parts = append(parts, props.Message)
 	}
 	if props.Detail != "" {
@@ -792,6 +884,9 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 	}
 	if code == "" {
 		code = props.Error.Type
+	}
+	if code == "" {
+		code = props.Error.Name
 	}
 
 	message := strings.Join(parts, "; ")
@@ -1199,6 +1294,7 @@ func (s *StreamingSessionHandler) notifyCompletion() {
 		diffMsg := s.FormatDiffSummary()
 		if diffMsg != "" {
 			_ = s.callback(diffMsg)
+			s.emitEvent(StreamEventDiffSummary, diffMsg, nil, nil, s.sessionDiff, "session.diff.summary")
 		}
 	}
 
@@ -1206,6 +1302,7 @@ func (s *StreamingSessionHandler) notifyCompletion() {
 	// 这发生在 SSE goroutine 持有 s.mu 期间，确保在 SendMessageStreaming 返回之前
 	// 最终内容已经发送完毕，避免任何竞态条件。
 	_ = s.callback(FlushSignal)
+	s.emitEventFromChunk(FlushSignal)
 
 	if s.onComplete != nil {
 		go s.onComplete()

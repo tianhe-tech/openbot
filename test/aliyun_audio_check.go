@@ -1,3 +1,5 @@
+//go:build aliyun_audio_check
+
 package main
 
 import (

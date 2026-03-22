@@ -1,4 +1,4 @@
-﻿package dingtalk
+package dingtalk
 
 import (
 	"bytes"
@@ -19,7 +19,7 @@ import (
 
 	nls "github.com/aliyun/alibabacloud-nls-go-sdk"
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
-	"github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
+	dtclient "github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
 	"github.com/user/opencode-gateway/internal/scheduler"
@@ -114,7 +114,7 @@ type Handler struct {
 	client          *opencode.Client
 	cfg             Config
 	adapter         *base.BidirectionalAdapter
-	streamClient    *client.StreamClient
+	streamClient    *dtclient.StreamClient
 	cronScheduler   *scheduler.CronScheduler // 定时任务调度器
 	processedMsgIDs sync.Map                 // map[string]time.Time - 已处理的消息ID及其时间戳
 	cleanupOnce     sync.Once                // 确保清理goroutine只启动一次
@@ -127,9 +127,9 @@ type Handler struct {
 }
 
 // NewHandler wires the adapter with an OpenCode client.
-func NewHandler(client *opencode.Client, cfg Config) *Handler {
+func NewHandler(ocClient *opencode.Client, cfg Config) *Handler {
 	h := &Handler{
-		client:         client,
+		client:         ocClient,
 		cfg:            cfg,
 		allowedUserSet: make(map[string]struct{}),
 	}
@@ -187,29 +187,22 @@ func (h *Handler) Start(ctx context.Context) error {
 	}
 
 	log.Println("dingtalk: starting Stream mode connection...")
-	log.Printf("dingtalk: using ClientID: %s...", h.cfg.ClientID[:20])
+	log.Printf("dingtalk: using ClientID: %s...", h.cfg.ClientID[:min(20, len(h.cfg.ClientID))])
 
-	// Create Stream client
-	h.streamClient = client.NewStreamClient(
-		client.WithAppCredential(
-			client.NewAppCredentialConfig(h.cfg.ClientID, h.cfg.ClientSecret),
+	// Create Stream client. Use SDK router registration like the working check script.
+	h.streamClient = dtclient.NewStreamClient(
+		dtclient.WithAppCredential(
+			dtclient.NewAppCredentialConfig(h.cfg.ClientID, h.cfg.ClientSecret),
 		),
 	)
-
-	// Register callback for chat bot messages
 	h.streamClient.RegisterChatBotCallbackRouter(h.onChatBotMessageReceived)
 
-	// Start in background
-	go func() {
-		log.Println("dingtalk: starting Stream client connection...")
-		if err := h.streamClient.Start(ctx); err != nil {
-			log.Printf("dingtalk stream error: %v", err)
-		} else {
-			log.Println("dingtalk: Stream client connected successfully")
-		}
-	}()
+	log.Println("dingtalk: starting Stream client connection...")
+	if err := h.streamClient.Start(ctx); err != nil {
+		return fmt.Errorf("dingtalk: failed to start Stream client: %w", err)
+	}
 
-	log.Println("dingtalk: Stream mode client started (connecting in background)")
+	log.Println("dingtalk: Stream client connected successfully")
 	return nil
 }
 
@@ -266,18 +259,30 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	content := strings.TrimSpace(data.Text.Content)
-	userID := data.SenderStaffId
+	senderStaffID := strings.TrimSpace(data.SenderStaffId)
+	senderID := strings.TrimSpace(data.SenderId)
+	userID := senderStaffID
+	if userID == "" {
+		userID = senderID
+	}
 	conversationID := data.ConversationId
 
-	if !h.isUserAllowed(userID) {
-		log.Printf("dingtalk stream: blocked user %s by whitelist", userID)
+	if !h.isUserAllowedAny(senderStaffID, senderID) {
+		log.Printf("dingtalk stream: blocked user by whitelist (senderStaffId=%s, senderId=%s, resolved=%s)", senderStaffID, senderID, userID)
 		replier := chatbot.NewChatbotReplier()
 		//ownerUserID := h.currentOwnerUserID()
-		msg := fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人开通权限。", userID)
+		msg := fmt.Sprintf("❌ 当前机器人未对您开放（staffId=%s, senderId=%s），请联系机器人主人开通权限。", senderStaffID, senderID)
 		// if ownerUserID != "" {
 		// 	msg = fmt.Sprintf("❌ 当前机器人未对您开放（您的userID: %s），请联系机器人主人（%s）开通权限。", userID, data.SenderNick)
 		// }
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	if userID == "" {
+		log.Printf("dingtalk stream: cannot resolve sender user id (senderStaffId=%s, senderId=%s)", senderStaffID, senderID)
+		replier := chatbot.NewChatbotReplier()
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 无法识别您的用户标识（staffId/senderId 都为空），请联系管理员检查机器人权限配置。"))
 		return nil, nil
 	}
 
@@ -286,6 +291,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	var mediaInfo map[string]interface{}
 	var extraAttachments []opencode.Attachment // 用于 richText 等多附件场景
 	var mediaFiles []base.MediaFileRecord
+	var videoSkillName string // 视频处理 skill 名称
 	mediaSessionID := "new"
 	if existingSessionID, ok := h.adapter.GetSessionForUser(userID); ok && strings.TrimSpace(existingSessionID) != "" {
 		mediaSessionID = strings.TrimSpace(existingSessionID)
@@ -339,9 +345,15 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				}
 			}
 		}
-		content = "[图片消息]"
+		// 图片消息：构建合理的提示文本
+		// 如果有用户输入的文字就用文字，否则给模型一个识别图片的提示
+		content = ""
 		if data.Text.Content != "" {
 			content = data.Text.Content
+		}
+		// 如果用户没有提供文字说明，给模型一个默认提示
+		if content == "" {
+			content = "请分析这张图片的内容。"
 		}
 
 	case "audio", "voice":
@@ -451,7 +463,10 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 
 	case "video":
-		// 视频消息：下载为 data URI 并作为附件转发给 OpenCode
+		// 视频消息处理流程（和图片一样自动选择模型）：
+		// 1. 有明确支持视频的模型 → 直接发送视频
+		// 2. 有图片模型但无视频模型 → Gateway 提取帧图片 → 发送帧图片
+		// 3. 都没有 → 返回错误
 		log.Printf("dingtalk stream: 🎬 [VIDEO] received from %s", userID)
 		var vidContent videoContent
 		if data.Content != nil {
@@ -460,26 +475,15 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			if err := json.Unmarshal(contentBytes, &vidContent); err != nil {
 				log.Printf("  - ⚠️ Failed to parse video content: %v", err)
 			} else if vidContent.DownloadCode != "" {
-				dataURI, mime, err := h.downloadMediaAsDataURI(ctx, vidContent.DownloadCode, "video/mp4")
-				if err != nil {
-					log.Printf("  - ⚠️ Failed to download video: %v", err)
-				} else {
-					log.Printf("  - ✅ Video downloaded as data URI (mime=%s, len=%d)", mime, len(dataURI))
-					mediaInfo = map[string]interface{}{
-						"type": "video",
-						"url":  dataURI,
-						"mime": mime,
-					}
-				}
-
 				videoBytes, videoMime, videoErr := h.downloadMediaBytes(ctx, vidContent.DownloadCode, "video/mp4")
 				if videoErr != nil {
-					log.Printf("  - ⚠️ Failed to save temp video (download bytes): %v", videoErr)
+					log.Printf("  - ⚠️ Failed to download video: %v", videoErr)
 				} else {
 					now := time.Now().UTC()
 					relDir := base.BuildMediaRelativeDir("dingtalk", userID, mediaSessionID, now)
+					mediaRoot := base.MediaRootDirForOpenCode(h.client.Directory())
 					saved, saveErr := base.SaveTempMedia(
-						base.MediaRootDirFromEnv(),
+						mediaRoot,
 						relDir,
 						"video",
 						msgID,
@@ -492,33 +496,93 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 					if saveErr != nil {
 						log.Printf("  - ⚠️ Failed to save temp video file: %v", saveErr)
 					} else {
-						mediaFiles = append(mediaFiles, base.MediaFileRecord{
-							MessageID:    msgID,
-							UserID:       userID,
-							SessionID:    mediaSessionID,
-							Platform:     "dingtalk",
-							MsgType:      "video",
-							Filename:     saved.Filename,
-							Mime:         saved.Mime,
-							Size:         saved.Size,
-							SHA256:       saved.SHA256,
-							LocalPath:    saved.LocalPath,
-							RelativePath: saved.RelativePath,
-							CreatedAt:    saved.CreatedAt,
-							ExpireAt:     saved.ExpireAt,
-						})
-						log.Printf("  - 🗂️ Video temp saved: %s", saved.LocalPath)
+						log.Printf("  - 🗂️ Video temp saved: %s (size: %d bytes)", saved.LocalPath, saved.Size)
+
+						durRaw := int(vidContent.Duration)
+						durSec := durRaw
+						if durRaw >= 1000 {
+							durSec = durRaw / 1000
+						}
+
+						// 1. 检查是否有明确支持视频的模型
+						if h.client.HasVideoCapableModel() {
+							mediaFiles = append(mediaFiles, base.MediaFileRecord{
+								MessageID:    msgID,
+								UserID:       userID,
+								SessionID:    mediaSessionID,
+								Platform:     "dingtalk",
+								MsgType:      "video",
+								Filename:     saved.Filename,
+								Mime:         saved.Mime,
+								Size:         saved.Size,
+								SHA256:       saved.SHA256,
+								LocalPath:    saved.LocalPath,
+								RelativePath: saved.RelativePath,
+								CreatedAt:    saved.CreatedAt,
+								ExpireAt:     saved.ExpireAt,
+							})
+							log.Printf("  - ✅ Using video-capable model to process video directly")
+							dataURI, mime, err := h.downloadMediaAsDataURI(ctx, vidContent.DownloadCode, "video/mp4")
+							if err != nil {
+								log.Printf("  - ⚠️ Failed to create data URI for video: %v", err)
+								content = fmt.Sprintf("请分析这个视频（文件已保存到: %s，大小: %d bytes）。", saved.LocalPath, saved.Size)
+							} else {
+								mediaInfo = map[string]interface{}{
+									"type": "video",
+									"url":  dataURI,
+									"mime": mime,
+								}
+								if durSec > 0 {
+									content = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
+								} else {
+									content = "请分析这个视频的内容。"
+								}
+							}
+						} else if h.client.HasImageCapableModel() {
+							// 2. 有图片模型 → Gateway 提取帧图片，然后发送帧图片（和图片一样处理）
+							log.Printf("  - 🔄 No video-capable model, extracting frames from video...")
+							frames, extractErr := base.ExtractVideoFrames(ctx, saved.LocalPath, h.client.Directory(), 10)
+							if extractErr != nil {
+								log.Printf("  - ⚠️ Failed to extract frames: %v", extractErr)
+								content = fmt.Sprintf("⚠️ 视频帧提取失败: %v\n\n视频已保存到: %s", extractErr, saved.LocalPath)
+							} else {
+								log.Printf("  - ✅ Extracted %d frames from video", len(frames))
+								// 将帧图片作为附件发送（和图片一样）
+								for i, frame := range frames {
+									frameDataURI, err := base.ReadFileAsDataURI(frame.FramePath)
+									if err != nil {
+										log.Printf("  - ⚠️ Failed to read frame %d: %v", i, err)
+										continue
+									}
+									extraAttachments = append(extraAttachments, opencode.Attachment{
+										Mime:     "image/jpeg",
+										URL:      frameDataURI,
+										Filename: fmt.Sprintf("frame_%d.jpg", frame.FrameNumber),
+									})
+								}
+								if len(extraAttachments) > 0 {
+									log.Printf("  - 📎 Sending %d frame images as attachments", len(extraAttachments))
+									if durSec > 0 {
+										content = fmt.Sprintf("这是一个视频的关键帧截图（视频时长: %d秒），请分析视频内容。", durSec)
+									} else {
+										content = "这是一个视频的关键帧截图，请分析视频内容。"
+									}
+								} else {
+									content = fmt.Sprintf("⚠️ 视频帧提取失败。\n\n视频已保存到: %s", saved.LocalPath)
+								}
+							}
+						} else {
+							// 3. 既没有视频模型也没有图片模型
+							log.Printf("  - ⚠️ No video-capable model and no image-capable model found")
+							content = fmt.Sprintf("⚠️ 视频处理暂不可用。\n\n视频已保存到: %s\n大小: %d bytes\n时长: %d秒\n\n请配置支持视频或图片的模型。", saved.LocalPath, saved.Size, durSec)
+						}
 					}
 				}
 			}
 		}
+		// 如果内容为空，设置默认提示
 		if content == "" {
-			durRaw := int(vidContent.Duration)
-			durSec := durRaw
-			if durRaw >= 1000 {
-				durSec = durRaw / 1000
-			}
-			content = fmt.Sprintf("[视频消息，时长: %d秒]", durSec)
+			content = "请分析这个视频的内容。"
 		}
 
 	case "file":
@@ -596,7 +660,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				imgIndex := 0
 				failedImages := 0
 				for _, item := range rtContent.RichText {
-					switch item.Type {
+					// 钉钉 richText 中文字元素可能没有 type 字段，只有 text 字段
+					itemType := item.Type
+					if itemType == "" && item.Text != "" {
+						itemType = "text"
+					}
+
+					switch itemType {
 					case "text":
 						if t := strings.TrimSpace(item.Text); t != "" {
 							textParts = append(textParts, t)
@@ -646,7 +716,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 							})
 						}
 					default:
-						log.Printf("  - ⚠️ Unknown richText item type: %s", item.Type)
+						// 如果有 text 字段但没有 type，也当作文本处理
+						if t := strings.TrimSpace(item.Text); t != "" {
+							textParts = append(textParts, t)
+						} else {
+							log.Printf("  - ⚠️ Unknown richText item type: %s (text=%s)", item.Type, item.Text)
+						}
 					}
 				}
 				if failedImages > 0 {
@@ -655,8 +730,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				content = strings.Join(textParts, " ")
 			}
 		}
+		// richText 消息：如果用户没有提供文字，且只有图片，给默认提示
 		if content == "" && len(extraAttachments) > 0 {
-			content = fmt.Sprintf("[图文消息，含 %d 张图片]", len(extraAttachments))
+			content = "请分析这张图片的内容。"
 		} else if content == "" {
 			content = "[图文消息]"
 		}
@@ -699,10 +775,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	// 先尝试把非命令文本当作“待确认问题”的直接回复（无需 /answer）。
-	if !strings.HasPrefix(strings.TrimSpace(content), "/") {
+	// 仅对纯文本消息启用，避免图片/语音/文件等非文本消息被误当成权限或问题回复而提前消费。
+	isPlainTextMessage := msgType == "" || msgType == "text"
+	if isPlainTextMessage && !strings.HasPrefix(strings.TrimSpace(content), "/") {
 		if result, err := h.handleQuickReply(ctx, data, userID, content); result != nil || err != nil {
 			return result, err
 		}
+	} else if !isPlainTextMessage {
+		log.Printf("dingtalk stream: skip quick reply for non-text message (msgType=%s, user=%s)", msgType, userID)
 	}
 
 	// Handle special commands
@@ -734,6 +814,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleStatus(ctx, data, userID)
 	}
 
+	// Handle /summary command to trigger context compression
+	if content == "/summary" || content == "压缩" || content == "总结" {
+		return h.handleSummary(ctx, data, userID)
+	}
+
 	// Handle /clear command to clear/delete current session
 	if content == "/clear" || content == "清除" {
 		return h.handleClear(ctx, data, userID)
@@ -742,11 +827,6 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Handle /model command to get/set model
 	if strings.HasPrefix(content, "/model") || strings.HasPrefix(content, "/provider") {
 		return h.handleModel(ctx, data, userID, content)
-	}
-
-	// Handle /memory commands for persistent user memory
-	if strings.HasPrefix(content, "/memory") {
-		return h.handleMemory(ctx, data, userID, content)
 	}
 
 	// Handle /thinking command to toggle reasoning output
@@ -796,11 +876,6 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleFork(ctx, data, userID)
 	}
 
-	// Handle /compact command to compact/summarize the current session
-	if content == "/compact" || content == "/summarize" || content == "总结" {
-		return h.handleCompact(ctx, data, userID)
-	}
-
 	// Handle /todo command to show current todo list
 	if content == "/todo" || content == "/todos" || content == "任务" {
 		return h.handleTodo(ctx, data, userID)
@@ -837,6 +912,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			content = parts[1]
 			log.Printf("dingtalk stream: using agent '%s' for message", agentName)
 		}
+	}
+
+	// 如果有视频 skill 且用户没有指定 agent，使用视频 skill
+	if videoSkillName != "" && agentName == "" {
+		agentName = videoSkillName
+		log.Printf("dingtalk stream: auto-using video skill '%s' for video message", agentName)
 	}
 
 	if h.isNonOwnerReadOnly(userID) {
@@ -878,7 +959,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	callbackCalled := false
 	var thinkingBuffer strings.Builder
 	thinkingSent := false
-	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled()
+	preferAICardForAllReplies := h.shouldPreferAICardForOpenCodeReply()
+	if preferAICardForAllReplies {
+		log.Printf("dingtalk stream: AI Card is enabled for all OpenCode replies for user %s", userID)
+	}
+	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled() || preferAICardForAllReplies
 
 	formatThinkingBlock := func(content string) string {
 		trimmed := strings.TrimSpace(content)
@@ -889,7 +974,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	sendReply := func(msg string) error {
-		return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+		if !preferAICardForAllReplies {
+			return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+		}
+		return h.sendReplyWithAICardFallback(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+	}
+	sendFinalReply := func(msg string) error {
+		return sendReply(msg)
 	}
 
 	sendContent := content
@@ -921,7 +1012,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 	}
 
-	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
+	response, err := h.client.SendMessageStreamingWithEvents(sendCtx, opencode.MessagePayload{
 		Channel:     "dingtalk",
 		UserID:      userID,
 		ThreadID:    conversationID,
@@ -1016,12 +1107,16 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 			toSend := fullReply.String()[lastSentLength:]
 			if len(toSend) > 0 {
-				log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
-				if err := sendReply(toSend); err != nil {
-					log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
+				if preferAICardForAllReplies {
+					log.Printf("dingtalk stream: flush signal received with %d bytes; deferring final delivery to AI Card path", len(toSend))
 				} else {
-					lastSentLength = len(fullReply.String())
-					log.Printf("dingtalk stream: ✅ flush send done")
+					log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
+					if err := sendReply(toSend); err != nil {
+						log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
+					} else {
+						lastSentLength = len(fullReply.String())
+						log.Printf("dingtalk stream: ✅ flush send done")
+					}
 				}
 			}
 			return nil
@@ -1030,7 +1125,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		// 🔍 诊断：记录内容 callback
 		if len(chunk) > 0 && !strings.HasPrefix(chunk, "ses_") {
 			log.Printf("dingtalk stream: 🔍 CONTENT CALLBACK - len=%d, prefix='%s'",
-				len(chunk), chunk[:min(50, len(chunk))])
+				len(chunk), truncateForLog(chunk, 50))
 		}
 
 		// 处理特殊消息：权限请求、问题确认、等待提示等需要立即发送的消息
@@ -1039,7 +1134,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			strings.HasPrefix(chunk, "🔐") || strings.HasPrefix(chunk, "❓") ||
 			strings.HasPrefix(chunk, "🤔💭") {
 			// 这些是需要立即发送的提示消息
-			log.Printf("dingtalk stream: 📤 sending immediate message: %s", chunk[:min(50, len(chunk))])
+			log.Printf("dingtalk stream: 📤 sending immediate message: %s", truncateForLog(chunk, 50))
 			if err := sendReply(chunk); err != nil {
 				log.Printf("dingtalk stream: ⚠️ failed to send immediate message: %v", err)
 				// 发送失败时的处理：
@@ -1083,6 +1178,26 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			}
 		}
 
+		return nil
+	}, func(event opencode.StreamEvent) error {
+		switch event.Kind {
+		case opencode.StreamEventSessionReady:
+			if strings.TrimSpace(event.SessionID) == "" {
+				return nil
+			}
+			sessionMappingMu.Lock()
+			if !sessionMapped {
+				h.adapter.MapUserToSession(userID, event.SessionID)
+				h.adapter.MapSessionData(event.SessionID, "channel", data.SessionWebhook)
+				sessionMapped = true
+				log.Printf("dingtalk stream: structured session ready mapped user %s -> %s", userID, event.SessionID)
+			}
+			sessionMappingMu.Unlock()
+		case opencode.StreamEventTodoSnapshot:
+			log.Printf("dingtalk stream: structured todo snapshot received (%d items, session=%s)", len(event.Todos), event.SessionID)
+		case opencode.StreamEventDiffSnapshot:
+			log.Printf("dingtalk stream: structured diff snapshot received (%d files, session=%s)", len(event.Diff), event.SessionID)
+		}
 		return nil
 	})
 
@@ -1149,7 +1264,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			return "(none)"
 		}(),
 		len(accumulatedContent), lastSentLength, response.Reply != "",
-		accumulatedContent[:min(50, len(accumulatedContent))])
+		truncateForLog(accumulatedContent, 50))
 
 	// Send final complete reply (only if we have synchronous content)
 	// For async mode, the SSE callbacks already sent the content
@@ -1163,7 +1278,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			}
 		}
 
-		if err := sendReply(response.Reply); err != nil {
+		if err := sendFinalReply(response.Reply); err != nil {
 			log.Printf("dingtalk stream: failed to reply: %v", err)
 			return nil, err
 		}
@@ -1188,7 +1303,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 				// 🔧 修复：只发送未发送的部分，避免重复，使用 Robot API
 				unsentContent := accumulatedContent[lastSentLength:]
-				if err := sendReply(unsentContent); err != nil {
+				if err := sendFinalReply(unsentContent); err != nil {
 					log.Printf("dingtalk stream: ❌ failed to send final message: %v", err)
 					// 不返回错误，避免影响session映射
 				} else {
@@ -1218,6 +1333,38 @@ func (h *Handler) isUserAllowed(userID string) bool {
 	}
 	_, ok := h.allowedUserSet[strings.TrimSpace(userID)]
 	return ok
+}
+
+func (h *Handler) isUserAllowedAny(userIDs ...string) bool {
+	h.whitelistMu.RLock()
+	defer h.whitelistMu.RUnlock()
+
+	if len(h.allowedUserSet) == 0 {
+		return true
+	}
+
+	for _, id := range userIDs {
+		normalized := strings.TrimSpace(id)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := h.allowedUserSet[normalized]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+func truncateForLog(s string, maxRunes int) string {
+	if maxRunes <= 0 || s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
 }
 
 // handleListSkills handles the /skills command to list available agents.
@@ -1747,8 +1894,8 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /new 或 /reset - 创建新会话
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
-/compact 或 总结 - 压缩会话历史（减少上下文占用）
 /sessions 或 /list - 列出所有会话
+/summary 或 压缩 - 压缩会话上下文（释放token空间）
 
 📋 任务追踪（对应 TUI 实时看板）：
 /todo 或 任务 - 查看 AI 当前的任务进度
@@ -1757,16 +1904,6 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 🤖 模型配置：
 /model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
-/memory - 查看已记录的长期记忆
-/memory pin <内容> - 固定一条高优先级记忆
-/memory pin <category> <内容> - 按分类固定记忆
-/memory unpin <关键词> - 按关键词删除记忆
-/memory unpin #<序号> - 按列表序号删除记忆
-/memory export - 导出当前用户记忆快照
-/memory import <base64> - 导入记忆快照（覆盖）
-/memory merge-import <base64> - 合并导入记忆快照（不覆盖）
-/memory clear - 清空当前用户记忆
-/memory compact - 压缩去重当前用户记忆
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -1813,184 +1950,6 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 		return nil, err
 	}
 
-	return nil, nil
-}
-
-func (h *Handler) handleMemory(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
-	normalizeCategory := func(raw string) string {
-		switch strings.ToLower(strings.TrimSpace(raw)) {
-		case "profile", "preference", "project", "environment", "model", "conversation":
-			return strings.ToLower(strings.TrimSpace(raw))
-		default:
-			return "preference"
-		}
-	}
-
-	parts := strings.Fields(strings.TrimSpace(content))
-	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "show")) {
-		limit := 10
-		if len(parts) >= 3 {
-			if strings.EqualFold(parts[2], "all") {
-				limit = 0
-			} else if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
-				limit = n
-			}
-		}
-		facts := h.client.ListUserMemory("dingtalk", userID, limit)
-		if len(facts) == 0 {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 当前没有已记录的长期记忆"))
-			return nil, nil
-		}
-		var b strings.Builder
-		b.WriteString("🧠 长期记忆（Top 10）\n")
-		for i, f := range facts {
-			b.WriteString(fmt.Sprintf("%d. [%s][P%d] %s\n", i+1, f.Category, f.Importance, f.Text))
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(b.String()))
-		return nil, nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "clear") {
-		if err := h.client.ClearUserMemory("dingtalk", userID); err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 清空 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已清空当前用户长期记忆"))
-		return nil, nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "compact") {
-		removed, err := h.client.CompactUserMemory("dingtalk", userID)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 压缩 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 压缩完成，移除 %d 条冗余记录", removed)))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "pin") {
-		category := "preference"
-		text := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if len(parts) >= 4 {
-			candidate := normalizeCategory(parts[2])
-			if candidate == strings.ToLower(strings.TrimSpace(parts[2])) {
-				category = candidate
-				text = strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]+" "+parts[2]))
-			}
-		}
-		if text == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory pin <内容> 或 /memory pin <category> <内容>"))
-			return nil, nil
-		}
-		if err := h.client.PinUserMemory("dingtalk", userID, text, category); err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 固定 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已固定高优先级记忆（category="+category+"）"))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "unpin") {
-		keyword := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if keyword == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory unpin <关键词>"))
-			return nil, nil
-		}
-		if strings.HasPrefix(keyword, "#") {
-			rawRank := strings.TrimPrefix(keyword, "#")
-			rank, convErr := strconv.Atoi(rawRank)
-			if convErr != nil || rank <= 0 {
-				reply := chatbot.NewChatbotReplier()
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 序号格式错误，用法: /memory unpin #<序号>"))
-				return nil, nil
-			}
-			ok, err := h.client.RemoveUserMemoryByRank("dingtalk", userID, rank)
-			if err != nil {
-				reply := chatbot.NewChatbotReplier()
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 删除 memory 失败: "+err.Error()))
-				return nil, nil
-			}
-			reply := chatbot.NewChatbotReplier()
-			if ok {
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已按序号删除记忆"))
-			} else {
-				_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 未找到对应序号记忆"))
-			}
-			return nil, nil
-		}
-		removed, err := h.client.UnpinUserMemory("dingtalk", userID, keyword)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 删除 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ 已删除 %d 条匹配记忆", removed)))
-		return nil, nil
-	}
-
-	if len(parts) >= 2 && strings.EqualFold(parts[1], "export") {
-		snapshot, err := h.client.ExportUserMemory("dingtalk", userID)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 导出 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("📦 memory 导出（base64）:\n"+snapshot))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory import <base64>"))
-			return nil, nil
-		}
-		count, err := h.client.ImportUserMemory("dingtalk", userID, payload)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 导入 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 导入完成，共 %d 条", count)))
-		return nil, nil
-	}
-
-	if len(parts) >= 3 && strings.EqualFold(parts[1], "merge-import") {
-		payload := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
-		if payload == "" {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /memory merge-import <base64>"))
-			return nil, nil
-		}
-		count, err := h.client.MergeImportUserMemory("dingtalk", userID, payload)
-		if err != nil {
-			reply := chatbot.NewChatbotReplier()
-			_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 合并导入 memory 失败: "+err.Error()))
-			return nil, nil
-		}
-		reply := chatbot.NewChatbotReplier()
-		_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("✅ memory 合并导入完成，共 %d 条", count)))
-		return nil, nil
-	}
-
-	usage := "❌ 命令格式错误\n\n用法:\n/memory\n/memory show [all|N]\n/memory pin <内容>\n/memory pin <category> <内容>\n/memory unpin <关键词>\n/memory unpin #<序号>\n/memory export\n/memory import <base64>\n/memory merge-import <base64>\n/memory clear\n/memory compact\n\ncategory: profile|preference|project|environment|model|conversation"
-	reply := chatbot.NewChatbotReplier()
-	_ = reply.SimpleReplyText(ctx, data.SessionWebhook, []byte(usage))
 	return nil, nil
 }
 
@@ -2224,20 +2183,11 @@ func (h *Handler) buildPendingRequirementHint(userID string) string {
 
 // isQuickReply 检查是否是快捷回复（权限回复或问题选项）
 func (h *Handler) isQuickReply(content string) bool {
-	lower := strings.TrimSpace(strings.ToLower(content))
+	if replyToPermissionResponse(content) != "" {
+		return true
+	}
 
-	// 权限相关回复
-	permissionReplies := []string{
-		"允许", "拒绝", "始终允许", "始终",
-		"allow", "deny", "always", "reject",
-		"yes", "no", "y", "n", "ok", "cancel",
-		"确认", "取消",
-	}
-	for _, r := range permissionReplies {
-		if lower == r {
-			return true
-		}
-	}
+	lower := normalizePermissionReplyText(content)
 
 	// 数字选项（1-9）
 	if len(lower) == 1 && lower[0] >= '1' && lower[0] <= '9' {
@@ -2297,6 +2247,48 @@ func (h *Handler) isQuickReply(content string) bool {
 	return false
 }
 
+// replyToPermissionResponse maps any form of user permission reply to the canonical English
+// API value: "once" (allow once), "reject" (deny), "always" (always allow), or "" (unrecognized).
+func replyToPermissionResponse(content string) string {
+	normalized := normalizePermissionReplyText(content)
+
+	alwaysTokens := []string{"3", "always", "始终允许", "始终", "一直允许", "总是允许", "濮嬬粓鍏佽", "濮嬬粓", "涓€鐩村厑璁", "鎬绘槸鍏佽"}
+	rejectTokens := []string{"2", "deny", "reject", "no", "n", "拒绝", "不同意", "不允许", "取消", "鎷掔粷", "涓嶅悓鎰", "鍙栨秷", "涓嶅厑璁"}
+	allowTokens := []string{"1", "allow", "yes", "y", "ok", "okay", "允许", "同意", "确认", "可以", "行", "鍏佽", "鍚屾剰", "纭", "鍙互"}
+
+	if containsAnyPermissionToken(normalized, alwaysTokens) {
+		return "always"
+	}
+	if containsAnyPermissionToken(normalized, rejectTokens) {
+		return "reject"
+	}
+	if containsAnyPermissionToken(normalized, allowTokens) {
+		return "once"
+	}
+	return ""
+}
+func normalizePermissionReplyText(content string) string {
+	raw := strings.TrimSpace(strings.ToLower(content))
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '，', ',', '。', '.', '！', '!', '？', '?', '：', ':', ';', '；', '（', '）', '(', ')', '“', '”', '"', '\'', '、', '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		default:
+			return r
+		}
+	}, raw)
+}
+
+func containsAnyPermissionToken(text string, tokens []string) bool {
+	for _, token := range tokens {
+		t := normalizePermissionReplyText(token)
+		if t != "" && strings.Contains(text, t) {
+			return true
+		}
+	}
+	return false
+}
+
 // handleQuickReply 处理快捷回复（权限或问题选项）
 func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
@@ -2313,31 +2305,35 @@ func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbac
 	// 先尝试查找待处理的权限请求
 	permission, ok := h.client.GetLatestPendingPermission(sessionID)
 	if ok {
-		log.Printf("dingtalk: user %s replied '%s' to permission %s (session: %s)",
-			userID, content, permission.ID, sessionID[:min(8, len(sessionID))])
+		log.Printf("dingtalk: user %s replied '%s' (bytes=% X) to permission %s (session: %s)",
+			userID, content, []byte(content), permission.ID, sessionID[:min(8, len(sessionID))])
 
-		if h.isNonOwnerReadOnly(userID) {
-			log.Printf("dingtalk: read-only user %s quick-replied permission %s, force reject", userID, permission.ID)
-			if err := h.client.AnswerQuestion(ctx, permission.ID, "拒绝"); err != nil {
-				msg := fmt.Sprintf("❌ 只读策略拒绝权限时失败: %v", err)
-				_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-				return nil, err
-			}
-			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("🔒 当前为只读模式（非 owner），已自动拒绝本次写权限请求"))
+		// 直接映射为英文 API 值，绕过所有中文解析链
+		englishResponse := replyToPermissionResponse(content)
+		if englishResponse == "" {
+			log.Printf("dingtalk: unrecognized permission reply from %s: raw=%q bytes=% X", userID, content, []byte(content))
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook,
+				[]byte("❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许"))
 			return []byte("handled"), nil
 		}
 
-		if err := h.client.AnswerQuestion(ctx, permission.ID, content); err != nil {
-			msg := fmt.Sprintf("❌ 权限回复失败: %v", err)
-			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		if h.isNonOwnerReadOnly(userID) {
+			log.Printf("dingtalk: read-only user %s, forcing permission to reject", userID)
+			englishResponse = "reject"
+		}
+
+		log.Printf("dingtalk: resolved permission reply '%s' -> %s for %s", content, englishResponse, permission.ID)
+
+		if err := h.client.RespondToPermission(ctx, permission.ID, englishResponse); err != nil {
+			log.Printf("dingtalk: RespondToPermission failed for %s: %v", permission.ID, err)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 权限回复失败，请重试"))
 			return nil, err
 		}
 
-		msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", content)
+		displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+		msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-		log.Printf("dingtalk: successfully answered permission %s, continuing with original SSE listener", permission.ID)
-		// ⚠️ 重要：返回 handled 阻止将"允许"作为新消息发送给 OpenCode
-		// 原来的 SSE 监听器会继续接收权限回复后的事件
+		log.Printf("dingtalk: successfully responded to permission %s (%s)", permission.ID, englishResponse)
 		return []byte("handled"), nil
 	}
 
@@ -3095,6 +3091,41 @@ func (h *Handler) sendReplyBySource(ctx context.Context, sessionWebhook, convers
 	return h.sendReplyRobot(ctx, conversationID, userID, content)
 }
 
+func (h *Handler) shouldPreferAICardForOpenCodeReply() bool {
+	cardCfg := getCardSendConfig()
+	if !cardCfg.Enabled {
+		return false
+	}
+	return strings.TrimSpace(h.cfg.ClientID) != "" && strings.TrimSpace(h.cfg.ClientSecret) != ""
+}
+
+func (h *Handler) sendReplyWithAICardFallback(ctx context.Context, sessionWebhook, conversationType, conversationID, userID, content string) error {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+
+	cardCfg := getCardSendConfig()
+	if !cardCfg.Enabled {
+		log.Printf("dingtalk stream: send_mode=fallback reason=aicard_disabled content_len=%d", len(content))
+		return h.sendReplyBySource(ctx, sessionWebhook, conversationType, conversationID, userID, content)
+	}
+
+	cardCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if err := SendStreamingAICard(cardCtx, h.cfg.ClientID, h.cfg.ClientSecret, userID, content); err == nil {
+		log.Printf("dingtalk stream: send_mode=aicard content_len=%d", len(content))
+		return nil
+	} else {
+		log.Printf("dingtalk stream: send_mode=fallback reason=aicard_error content_len=%d err=%v", len(content), err)
+		if !cardCfg.AutoDowngrade {
+			return fmt.Errorf("aicard send failed and auto downgrade disabled: %w", err)
+		}
+	}
+
+	return h.sendReplyBySource(ctx, sessionWebhook, conversationType, conversationID, userID, content)
+}
+
 func isGroupConversation(conversationType string) bool {
 	t := strings.ToLower(strings.TrimSpace(conversationType))
 	if t == "" {
@@ -3227,6 +3258,38 @@ func (h *Handler) handleStatus(ctx context.Context, data *chatbot.BotCallbackDat
 
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String())); err != nil {
 		log.Printf("dingtalk: failed to send status: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleSummary 处理上下文压缩命令
+func (h *Handler) handleSummary(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	// 获取当前session
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	// 发送提示消息
+	msg := "⏳ 正在进行上下文压缩..."
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+
+	// 调用 summary API
+	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
+		errMsg := fmt.Sprintf("❌ 上下文压缩失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(errMsg))
+		return nil, err
+	}
+
+	successMsg := fmt.Sprintf("✅ 上下文压缩完成\n\n会话 %s 的历史消息已被总结压缩，上下文空间已释放。", sessionID[:8])
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(successMsg)); err != nil {
+		log.Printf("dingtalk: failed to send summary response: %v", err)
 		return nil, err
 	}
 
@@ -3503,7 +3566,6 @@ func (h *Handler) handleConfig(ctx context.Context, data *chatbot.BotCallbackDat
 	msgBuilder.WriteString("  /new - 创建新会话\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
 	msgBuilder.WriteString("  /fork - 派生(fork)当前会话\n")
-	msgBuilder.WriteString("  /compact - 压缩/总结当前会话\n")
 	msgBuilder.WriteString("  /todo - 查看当前任务进度\n")
 	msgBuilder.WriteString("  /diff - 查看文件变更\n")
 	msgBuilder.WriteString("  /sessions - 列出所有会话\n")
@@ -3550,29 +3612,6 @@ func (h *Handler) handleFork(ctx context.Context, data *chatbot.BotCallbackDataM
 
 // handleCompact 处理压缩/总结会话命令
 // 对应 TUI 中的 session.compact 操作（调用 summarize API）
-func (h *Handler) handleCompact(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
-	replier := chatbot.NewChatbotReplier()
-
-	sessionID, ok := h.adapter.GetSessionForUser(userID)
-	if !ok {
-		msg := "ℹ️ 当前没有活跃的会话"
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-		return nil, nil
-	}
-
-	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 正在压缩会话历史..."))
-
-	if err := h.client.SummarizeSession(ctx, sessionID); err != nil {
-		msg := fmt.Sprintf("❌ 压缩会话失败: %v", err)
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-		return nil, err
-	}
-
-	msg := fmt.Sprintf("✅ 会话 %s 已压缩总结\n\n会话历史已被 AI 摘要，上下文占用将减少。\n后续对话将延续本次会话。", sessionID[:min(8, len(sessionID))])
-	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-	return nil, nil
-}
-
 // handleTodo 处理查看任务进度命令
 // 对应 TUI 中的 todo.updated 事件展示
 func (h *Handler) handleTodo(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {

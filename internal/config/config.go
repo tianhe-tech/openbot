@@ -56,6 +56,7 @@ func Load() (Config, error) {
 			Token:          os.Getenv("WECOM_TOKEN"),
 			EncodingAESKey: os.Getenv("WECOM_AES_KEY"),
 			CorpID:         os.Getenv("WECOM_CORP_ID"),
+			CorpSecret:     os.Getenv("WECOM_CORP_SECRET"),
 			AgentID:        os.Getenv("WECOM_AGENT_ID"),
 		},
 		FeiShu: feishu.Config{
@@ -92,10 +93,9 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("missing OPENCODE_ENDPOINT")
 	}
 
-	if cfg.DingTalk.OwnerUserID == "" {
-		return cfg, fmt.Errorf("missing DINGTALK_OWNER_USERID")
+	if cfg.DingTalk.OwnerUserID != "" {
+		cfg.DingTalk.UserWhitelist = []string{cfg.DingTalk.OwnerUserID}
 	}
-	cfg.DingTalk.UserWhitelist = []string{cfg.DingTalk.OwnerUserID}
 
 	return cfg, nil
 }

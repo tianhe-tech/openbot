@@ -2,8 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -21,6 +24,7 @@ type CronScheduler struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	parser         cron.Parser // cron表达式解析器
+	storagePath    string      // 持久化存储路径
 }
 
 // NewCronScheduler 创建定时任务调度器
@@ -38,12 +42,31 @@ func NewCronScheduler(taskScheduler *TaskScheduler) *CronScheduler {
 		ctx:            ctx,
 		cancel:         cancel,
 		parser:         parser,
+		storagePath:    "", // 默认不持久化，需要通过 SetStoragePath 设置
+	}
+}
+
+// SetStoragePath 设置持久化存储路径
+func (cs *CronScheduler) SetStoragePath(path string) {
+	cs.storagePath = path
+	// 确保目录存在
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("cron-scheduler: failed to create storage directory: %v", err)
 	}
 }
 
 // Start 启动定时任务调度器
 func (cs *CronScheduler) Start() error {
 	log.Println("cron-scheduler: starting cron scheduler")
+
+	// 加载持久化的任务
+	if cs.storagePath != "" {
+		if err := cs.loadTasks(); err != nil {
+			log.Printf("cron-scheduler: failed to load tasks: %v", err)
+		}
+	}
+
 	cs.cron.Start()
 	log.Println("cron-scheduler: cron scheduler started")
 	return nil
@@ -52,10 +75,89 @@ func (cs *CronScheduler) Start() error {
 // Stop 停止定时任务调度器
 func (cs *CronScheduler) Stop() error {
 	log.Println("cron-scheduler: stopping cron scheduler")
+
+	// 保存任务到持久化存储
+	if cs.storagePath != "" {
+		if err := cs.saveTasks(); err != nil {
+			log.Printf("cron-scheduler: failed to save tasks: %v", err)
+		}
+	}
+
 	cs.cancel()
 	ctx := cs.cron.Stop()
 	<-ctx.Done()
 	log.Println("cron-scheduler: cron scheduler stopped")
+	return nil
+}
+
+// saveTasks 保存任务到文件
+func (cs *CronScheduler) saveTasks() error {
+	cs.tasksMu.RLock()
+	tasks := make([]*ScheduledTask, 0, len(cs.scheduledTasks))
+	for _, task := range cs.scheduledTasks {
+		tasks = append(tasks, task)
+	}
+	cs.tasksMu.RUnlock()
+
+	data, err := json.MarshalIndent(tasks, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal tasks: %w", err)
+	}
+
+	// 写入临时文件，然后重命名（原子操作）
+	tmpPath := cs.storagePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("write tasks file: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, cs.storagePath); err != nil {
+		return fmt.Errorf("rename tasks file: %w", err)
+	}
+
+	log.Printf("cron-scheduler: saved %d tasks to %s", len(tasks), cs.storagePath)
+	return nil
+}
+
+// loadTasks 从文件加载任务
+func (cs *CronScheduler) loadTasks() error {
+	data, err := os.ReadFile(cs.storagePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("cron-scheduler: no existing tasks file at %s", cs.storagePath)
+			return nil
+		}
+		return fmt.Errorf("read tasks file: %w", err)
+	}
+
+	var tasks []*ScheduledTask
+	if err := json.Unmarshal(data, &tasks); err != nil {
+		return fmt.Errorf("unmarshal tasks: %w", err)
+	}
+
+	loadedCount := 0
+	for _, task := range tasks {
+		// 重新计算下次运行时间
+		schedule, err := cs.parser.Parse(task.CronExpr)
+		if err != nil {
+			log.Printf("cron-scheduler: invalid cron expression for task %s: %v", task.ID, err)
+			continue
+		}
+		nextRun := schedule.Next(time.Now())
+		task.NextRunTime = &nextRun
+
+		// 保存到内存
+		cs.scheduledTasks[task.ID] = task
+
+		// 如果任务启用，添加到cron调度器
+		if task.Enabled {
+			if err := cs.enableTask(task.ID); err != nil {
+				log.Printf("cron-scheduler: failed to enable task %s: %v", task.ID, err)
+			}
+		}
+		loadedCount++
+	}
+
+	log.Printf("cron-scheduler: loaded %d tasks from %s", loadedCount, cs.storagePath)
 	return nil
 }
 
@@ -94,6 +196,9 @@ func (cs *CronScheduler) AddScheduledTask(task *ScheduledTask) error {
 	log.Printf("cron-scheduler: added scheduled task '%s' (cron: %s, enabled: %t)",
 		task.Name, task.CronExpr, task.Enabled)
 
+	// 自动保存
+	cs.autoSave()
+
 	return nil
 }
 
@@ -117,6 +222,10 @@ func (cs *CronScheduler) RemoveScheduledTask(taskID string) error {
 	cs.cronIDsMu.Unlock()
 
 	log.Printf("cron-scheduler: removed scheduled task '%s'", task.Name)
+
+	// 自动保存
+	cs.autoSave()
+
 	return nil
 }
 
@@ -152,6 +261,10 @@ func (cs *CronScheduler) UpdateScheduledTask(task *ScheduledTask) error {
 	}
 
 	log.Printf("cron-scheduler: updated scheduled task '%s'", task.Name)
+
+	// 自动保存
+	cs.autoSave()
+
 	return nil
 }
 
@@ -167,7 +280,12 @@ func (cs *CronScheduler) EnableTask(taskID string) error {
 	task.UpdatedAt = time.Now()
 	cs.tasksMu.Unlock()
 
-	return cs.enableTask(taskID)
+	if err := cs.enableTask(taskID); err != nil {
+		return err
+	}
+
+	cs.autoSave()
+	return nil
 }
 
 // DisableTask 禁用定时任务
@@ -183,6 +301,7 @@ func (cs *CronScheduler) DisableTask(taskID string) error {
 	cs.tasksMu.Unlock()
 
 	cs.disableTask(taskID)
+	cs.autoSave()
 	return nil
 }
 
@@ -354,5 +473,15 @@ func (cs *CronScheduler) GetStats() map[string]interface{} {
 		"enabled_tasks":         enabledCount,
 		"disabled_tasks":        totalTasks - enabledCount,
 		"cron_entries":          len(cs.cron.Entries()),
+	}
+}
+
+// autoSave 自动保存任务（如果配置了存储路径）
+func (cs *CronScheduler) autoSave() {
+	if cs.storagePath == "" {
+		return
+	}
+	if err := cs.saveTasks(); err != nil {
+		log.Printf("cron-scheduler: auto-save failed: %v", err)
 	}
 }

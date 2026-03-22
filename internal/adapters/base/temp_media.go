@@ -1,11 +1,15 @@
 package base
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +35,25 @@ type TempMediaSaved struct {
 func MediaRootDirFromEnv() string {
 	if v := strings.TrimSpace(os.Getenv("MEDIA_TEMP_ROOT")); v != "" {
 		return v
+	}
+	return filepath.Join(os.TempDir(), "openbot-media")
+}
+
+// MediaRootDirForOpenCode returns the media storage directory within OpenCode's working directory.
+// This ensures skill scripts can access the stored media files.
+// Priority: MEDIA_TEMP_ROOT (if absolute) > opencodeDir/tmp > system temp
+func MediaRootDirForOpenCode(opencodeDir string) string {
+	// If MEDIA_TEMP_ROOT is set and is an absolute path, use it
+	if v := strings.TrimSpace(os.Getenv("MEDIA_TEMP_ROOT")); v != "" {
+		if filepath.IsAbs(v) {
+			return v
+		}
+		// Relative path: resolve relative to opencodeDir
+		return filepath.Join(opencodeDir, v)
+	}
+	// Default: store within OpenCode working directory so skills can access
+	if opencodeDir != "" {
+		return filepath.Join(opencodeDir, "tmp", "media")
 	}
 	return filepath.Join(os.TempDir(), "openbot-media")
 }
@@ -159,4 +182,148 @@ func guessExtByMime(mime string) string {
 	default:
 		return ".bin"
 	}
+}
+
+// ExtractedFrame represents an extracted video frame
+type ExtractedFrame struct {
+	FramePath   string `json:"frame_path"`
+	FrameNumber int    `json:"frame_number"`
+	Timestamp   string `json:"timestamp"`
+}
+
+// ExtractVideoFrames extracts keyframes from a video file using the video-analyzer skill script.
+// Returns a list of extracted frame paths.
+func ExtractVideoFrames(ctx context.Context, videoPath, opencodeDir string, maxFrames int) ([]ExtractedFrame, error) {
+	// Find the extract_frames.py script
+	scriptPath := findExtractFramesScript(opencodeDir)
+	if scriptPath == "" {
+		return nil, fmt.Errorf("extract_frames.py script not found")
+	}
+
+	// Create output directory for frames
+	outputDir := filepath.Join(filepath.Dir(videoPath), "frames")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create frames output dir: %w", err)
+	}
+
+	// Run the extraction script
+	args := []string{
+		scriptPath,
+		videoPath,
+		"--output-dir", outputDir,
+		fmt.Sprintf("--max-frames=%d", maxFrames),
+		"--json",
+	}
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "python", args...)
+	} else {
+		cmd = exec.CommandContext(ctx, "python3", args...)
+	}
+
+	output, err := cmd.Output()
+	if err != nil {
+		// Try with just "python" on non-Windows
+		if runtime.GOOS != "windows" {
+			cmd = exec.CommandContext(ctx, "python", args...)
+			output, err = cmd.Output()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("extract frames failed: %w, output: %s", err, string(output))
+		}
+	}
+
+	// Parse the JSON output
+	var result struct {
+		Success bool             `json:"success"`
+		Frames  []ExtractedFrame `json:"frames"`
+		Error   string           `json:"error"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("parse extraction result: %w", err)
+	}
+	if !result.Success {
+		return nil, fmt.Errorf("extraction failed: %s", result.Error)
+	}
+
+	return result.Frames, nil
+}
+
+// findExtractFramesScript finds the extract_frames.py script location
+func findExtractFramesScript(opencodeDir string) string {
+	// Check common locations
+	candidates := []string{
+		filepath.Join(opencodeDir, ".opencode", "skills", "video-analyzer", "scripts", "extract_frames.py"),
+	}
+
+	// Add user config directory based on OS
+	if runtime.GOOS == "windows" {
+		if home, err := os.UserHomeDir(); err == nil {
+			candidates = append(candidates,
+				filepath.Join(home, ".config", "opencode", "skills", "video-analyzer", "scripts", "extract_frames.py"),
+			)
+		}
+	} else {
+		candidates = append(candidates,
+			filepath.Join(os.Getenv("HOME"), ".config", "opencode", "skills", "video-analyzer", "scripts", "extract_frames.py"),
+			"/root/.config/opencode/skills/video-analyzer/scripts/extract_frames.py",
+		)
+	}
+
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+// ReadFileAsDataURI reads a file and returns it as a data URI
+func ReadFileAsDataURI(filePath string) (string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+
+	// Determine MIME type based on extension
+	ext := strings.ToLower(filepath.Ext(filePath))
+	var mime string
+	switch ext {
+	case ".jpg", ".jpeg":
+		mime = "image/jpeg"
+	case ".png":
+		mime = "image/png"
+	case ".gif":
+		mime = "image/gif"
+	case ".webp":
+		mime = "image/webp"
+	default:
+		mime = "image/jpeg"
+	}
+
+	return fmt.Sprintf("data:%s;base64,%s", mime, encodeBase64(data)), nil
+}
+
+func encodeBase64(data []byte) string {
+	const base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	result := make([]byte, 0, (len(data)+2)/3*4)
+
+	for i := 0; i < len(data); i += 3 {
+		var n uint32
+		remaining := len(data) - i
+
+		if remaining >= 3 {
+			n = uint32(data[i])<<16 | uint32(data[i+1])<<8 | uint32(data[i+2])
+			result = append(result, base64Chars[n>>18&0x3F], base64Chars[n>>12&0x3F], base64Chars[n>>6&0x3F], base64Chars[n&0x3F])
+		} else if remaining == 2 {
+			n = uint32(data[i])<<16 | uint32(data[i+1])<<8
+			result = append(result, base64Chars[n>>18&0x3F], base64Chars[n>>12&0x3F], base64Chars[n>>6&0x3F], '=')
+		} else {
+			n = uint32(data[i]) << 16
+			result = append(result, base64Chars[n>>18&0x3F], base64Chars[n>>12&0x3F], '=', '=')
+		}
+	}
+
+	return string(result)
 }
