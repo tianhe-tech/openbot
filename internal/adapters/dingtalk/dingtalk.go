@@ -71,10 +71,15 @@ type fileContent struct {
 
 // richTextItem 图文消息中的单个元素
 type richTextItem struct {
-	Type                string `json:"type"`                          // "text" or "picture"
+	Type                string `json:"type"`                          // "text", "picture", "video", "file" 等
 	Text                string `json:"text,omitempty"`                // type=text 时有值
-	DownloadCode        string `json:"downloadCode,omitempty"`        // type=picture 时有值
+	DownloadCode        string `json:"downloadCode,omitempty"`        // type=picture/video/file 时有值
 	PictureDownloadCode string `json:"pictureDownloadCode,omitempty"` // type=picture 时有值（旧版API专用）
+	VideoDownloadCode   string `json:"videoDownloadCode,omitempty"`   // type=video 时可能的字段
+	FileDownloadCode    string `json:"fileDownloadCode,omitempty"`    // type=file 时可能的字段
+	FileName            string `json:"fileName,omitempty"`            // 文件名
+	Duration            int    `json:"duration,omitempty"`            // 视频时长（毫秒）
+	Size                int64  `json:"size,omitempty"`                // 文件大小
 }
 
 // richTextContent 图文混合消息内容
@@ -102,6 +107,7 @@ type Config struct {
 	AutoAnswer        bool // 是否自动回答问题（选择首选选项）
 	UserWhitelist     []string
 	OwnerUserID       string
+	NonOwnerPlanMode  bool // 非owner用户是否自动使用plan模式
 	// 阿里云 NLS 语音识别配置（可选，不填则语音消息以占位文本转发）
 	AliyunNLSAkID   string // 阿里云 AccessKey ID
 	AliyunNLSAkKey  string // 阿里云 AccessKey Secret
@@ -666,6 +672,10 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 						itemType = "text"
 					}
 
+					// 调试日志：打印每个 item 的详细信息
+					itemJSON, _ := json.Marshal(item)
+					log.Printf("  - RichText item: type=%s, JSON=%s", itemType, string(itemJSON))
+
 					switch itemType {
 					case "text":
 						if t := strings.TrimSpace(item.Text); t != "" {
@@ -683,24 +693,10 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 							failedImages++
 							continue
 						}
-						log.Printf("  - 📷 图片 #%d，downloadCode=%s, pictureCode=%s",
-							imgIndex,
-							func() string {
-								if item.DownloadCode != "" {
-									return item.DownloadCode[:min(20, len(item.DownloadCode))]
-								}
-								return "(empty)"
-							}(),
-							func() string {
-								if item.PictureDownloadCode != "" {
-									return item.PictureDownloadCode[:min(20, len(item.PictureDownloadCode))]
-								}
-								return "(empty)"
-							}(),
-						)
+						log.Printf("  - 📷 图片 #%d，downloadCode=%s",
+							imgIndex, picCode[:min(20, len(picCode))])
 						dataURI, mime, err := h.downloadMediaAsDataURI(ctx, picCode, "image/jpeg")
 						if err != nil && item.PictureDownloadCode != "" && picCode != item.PictureDownloadCode {
-							// 用 downloadCode 失败，尝试 pictureDownloadCode
 							log.Printf("  - ↩️ RichText image #%d: retrying with pictureDownloadCode after error: %v", imgIndex, err)
 							dataURI, mime, err = h.downloadMediaAsDataURI(ctx, item.PictureDownloadCode, "image/jpeg")
 						}
@@ -715,12 +711,105 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 								Filename: fmt.Sprintf("dingtalk_image_%d.jpg", imgIndex),
 							})
 						}
+					case "video":
+						// 处理 richText 中的视频
+						videoCode := item.DownloadCode
+						if videoCode == "" {
+							videoCode = item.VideoDownloadCode
+						}
+						if videoCode == "" {
+							log.Printf("  - ⚠️ RichText video: no download code, item=%+v", item)
+							continue
+						}
+						log.Printf("  - 🎬 RichText 视频，downloadCode=%s", videoCode[:min(20, len(videoCode))])
+						videoBytes, videoMime, videoErr := h.downloadMediaBytes(ctx, videoCode, "video/mp4")
+						if videoErr != nil {
+							log.Printf("  - ⚠️ Failed to download richText video: %v", videoErr)
+						} else {
+							now := time.Now().UTC()
+							relDir := base.BuildMediaRelativeDir("dingtalk", userID, mediaSessionID, now)
+							mediaRoot := base.MediaRootDirForOpenCode(h.client.Directory())
+							saved, saveErr := base.SaveTempMedia(
+								mediaRoot, relDir, "video", msgID, "dingtalk_video.mp4",
+								videoMime, videoBytes,
+								base.MediaTTLFromEnv(), base.MediaMaxBytesFromEnv(),
+							)
+							if saveErr != nil {
+								log.Printf("  - ⚠️ Failed to save richText video: %v", saveErr)
+							} else {
+								log.Printf("  - ✅ RichText video saved: %s (size: %d bytes)", saved.LocalPath, saved.Size)
+								mediaFiles = append(mediaFiles, base.MediaFileRecord{
+									MessageID:    msgID,
+									UserID:       userID,
+									SessionID:    mediaSessionID,
+									Platform:     "dingtalk",
+									MsgType:      "video",
+									Filename:     saved.Filename,
+									Mime:         saved.Mime,
+									Size:         saved.Size,
+									SHA256:       saved.SHA256,
+									LocalPath:    saved.LocalPath,
+									RelativePath: saved.RelativePath,
+									CreatedAt:    saved.CreatedAt,
+									ExpireAt:     saved.ExpireAt,
+								})
+								videoSkillName = h.client.FindVideoSkill(ctx)
+							}
+						}
+					case "file":
+						// 处理 richText 中的文件
+						fileCode := item.DownloadCode
+						if fileCode == "" {
+							fileCode = item.FileDownloadCode
+						}
+						if fileCode == "" {
+							log.Printf("  - ⚠️ RichText file: no download code, item=%+v", item)
+							continue
+						}
+						log.Printf("  - 📄 RichText 文件，downloadCode=%s", fileCode[:min(20, len(fileCode))])
+						fileBytes, fileMime, fileErr := h.downloadMediaBytes(ctx, fileCode, "application/octet-stream")
+						if fileErr != nil {
+							log.Printf("  - ⚠️ Failed to download richText file: %v", fileErr)
+						} else {
+							fileName := item.FileName
+							if fileName == "" {
+								fileName = "dingtalk_file.bin"
+							}
+							now := time.Now().UTC()
+							relDir := base.BuildMediaRelativeDir("dingtalk", userID, mediaSessionID, now)
+							saved, saveErr := base.SaveTempMedia(
+								base.MediaRootDirFromEnv(), relDir, "file", msgID, fileName,
+								fileMime, fileBytes,
+								base.MediaTTLFromEnv(), base.MediaMaxBytesFromEnv(),
+							)
+							if saveErr != nil {
+								log.Printf("  - ⚠️ Failed to save richText file: %v", saveErr)
+							} else {
+								log.Printf("  - ✅ RichText file saved: %s (size: %d bytes)", saved.LocalPath, saved.Size)
+								mediaFiles = append(mediaFiles, base.MediaFileRecord{
+									MessageID:    msgID,
+									UserID:       userID,
+									SessionID:    mediaSessionID,
+									Platform:     "dingtalk",
+									MsgType:      "file",
+									Filename:     saved.Filename,
+									Mime:         saved.Mime,
+									Size:         saved.Size,
+									SHA256:       saved.SHA256,
+									LocalPath:    saved.LocalPath,
+									RelativePath: saved.RelativePath,
+									CreatedAt:    saved.CreatedAt,
+									ExpireAt:     saved.ExpireAt,
+								})
+							}
+						}
 					default:
 						// 如果有 text 字段但没有 type，也当作文本处理
 						if t := strings.TrimSpace(item.Text); t != "" {
 							textParts = append(textParts, t)
-						} else {
-							log.Printf("  - ⚠️ Unknown richText item type: %s (text=%s)", item.Type, item.Text)
+						} else if item.Type != "" {
+							// 未知的类型，打印完整信息便于调试
+							log.Printf("  - ⚠️ Unknown richText item type: %s, full item: %+v", item.Type, item)
 						}
 					}
 				}
@@ -876,6 +965,16 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleFork(ctx, data, userID)
 	}
 
+	// Handle /undo command to revert last message
+	if content == "/undo" || content == "/revert" || content == "撤销" {
+		return h.handleUndo(ctx, data, userID)
+	}
+
+	// Handle /redo command to unrevert (redo) last undone message
+	if content == "/redo" || content == "/unrevert" || content == "重做" {
+		return h.handleRedo(ctx, data, userID)
+	}
+
 	// Handle /todo command to show current todo list
 	if content == "/todo" || content == "/todos" || content == "任务" {
 		return h.handleTodo(ctx, data, userID)
@@ -920,7 +1019,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		log.Printf("dingtalk stream: auto-using video skill '%s' for video message", agentName)
 	}
 
-	if h.isNonOwnerReadOnly(userID) {
+	// 非owner用户自动使用plan模式（如果配置了NonOwnerPlanMode且用户未指定agent）
+	if agentName == "" && h.cfg.NonOwnerPlanMode && h.isNonOwnerReadOnly(userID) {
+		agentName = "plan"
+		log.Printf("dingtalk stream: auto-using plan agent for non-owner user %s", userID)
+	}
+
+	// 非owner用户且未使用plan agent时，添加只读guard
+	if h.isNonOwnerReadOnly(userID) && agentName != "plan" {
 		content = h.withReadOnlyGuard(content)
 	}
 
@@ -1894,6 +2000,8 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 /new 或 /reset - 创建新会话
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
+/undo 或 撤销 - 撤销上一次操作
+/redo 或 重做 - 重做已撤销的操作
 /sessions 或 /list - 列出所有会话
 /summary 或 压缩 - 压缩会话上下文（释放token空间）
 
@@ -3573,6 +3681,58 @@ func (h *Handler) handleConfig(ctx context.Context, data *chatbot.BotCallbackDat
 	msgBuilder.WriteString("  /help - 查看帮助")
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String()))
+	return nil, nil
+}
+
+// handleUndo 处理撤销命令
+// 对应 TUI 中的 /undo 操作
+func (h *Handler) handleUndo(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	session, err := h.client.RevertSession(ctx, sessionID, "")
+	if err != nil {
+		msg := fmt.Sprintf("❌ 撤销失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf("↩️ 已撤销上一次操作\n\n会话: %s\n版本: %s\n\n可以使用 /redo 恢复",
+		sessionID[:min(8, len(sessionID))], session.Version)
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	log.Printf("dingtalk: reverted session %s to version %s for user %s", sessionID[:8], session.Version, userID)
+	return nil, nil
+}
+
+// handleRedo 处理重做命令
+// 对应 TUI 中的 /redo 操作
+func (h *Handler) handleRedo(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		msg := "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, nil
+	}
+
+	session, err := h.client.UnrevertSession(ctx, sessionID)
+	if err != nil {
+		msg := fmt.Sprintf("❌ 重做失败: %v", err)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+		return nil, err
+	}
+
+	msg := fmt.Sprintf("↪️ 已重做操作\n\n会话: %s\n版本: %s",
+		sessionID[:min(8, len(sessionID))], session.Version)
+	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	log.Printf("dingtalk: unreverted session %s to version %s for user %s", sessionID[:8], session.Version, userID)
 	return nil, nil
 }
 

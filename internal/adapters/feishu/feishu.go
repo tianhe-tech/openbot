@@ -391,6 +391,16 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleFork(ctx, target, msg.UserID)
 	}
 
+	// Handle /undo command to revert last message
+	if content == "/undo" || content == "/revert" || content == "撤销" {
+		return h.handleUndo(ctx, target, msg.UserID)
+	}
+
+	// Handle /redo command to unrevert (redo) last undone message
+	if content == "/redo" || content == "/unrevert" || content == "重做" {
+		return h.handleRedo(ctx, target, msg.UserID)
+	}
+
 	// Handle /todo command to show current todo list
 	if content == "/todo" || content == "/todos" || content == "任务" {
 		return h.handleTodo(ctx, target, msg.UserID)
@@ -2050,6 +2060,8 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 /new 或 /reset - 创建新会话
 /clear 或 清除 - 删除当前会话
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
+/undo 或 撤销 - 撤销上一次操作
+/redo 或 重做 - 重做已撤销的操作
 /sessions 或 /list - 列出所有会话
 /summary 或 压缩 - 压缩会话上下文（释放token空间）
 
@@ -3132,6 +3144,48 @@ func (h *Handler) sendCronTaskHelp(ctx context.Context, target chatTarget) (stri
 💡 提示: 任务会在指定时间自动执行，结果会发送到当前会话`
 
 	_ = h.sendTextChunks(ctx, target, helpMsg)
+	return "handled", nil
+}
+
+// handleUndo 处理撤销命令（对应 TUI /undo 操作）
+func (h *Handler) handleUndo(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话")
+		return "handled", nil
+	}
+
+	session, err := h.client.RevertSession(ctx, sessionID, "")
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 撤销失败: %v", err))
+		return "", err
+	}
+
+	msg := fmt.Sprintf("↩️ 已撤销上一次操作\n\n会话: %s\n版本: %s\n\n可以使用 /redo 恢复",
+		sessionID[:min(8, len(sessionID))], session.Version)
+	_ = h.sendTextChunks(ctx, target, msg)
+	log.Printf("feishu: reverted session %s to version %s for user %s", sessionID[:8], session.Version, userID)
+	return "handled", nil
+}
+
+// handleRedo 处理重做命令（对应 TUI /redo 操作）
+func (h *Handler) handleRedo(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话")
+		return "handled", nil
+	}
+
+	session, err := h.client.UnrevertSession(ctx, sessionID)
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 重做失败: %v", err))
+		return "", err
+	}
+
+	msg := fmt.Sprintf("↪️ 已重做操作\n\n会话: %s\n版本: %s",
+		sessionID[:min(8, len(sessionID))], session.Version)
+	_ = h.sendTextChunks(ctx, target, msg)
+	log.Printf("feishu: unreverted session %s to version %s for user %s", sessionID[:8], session.Version, userID)
 	return "handled", nil
 }
 

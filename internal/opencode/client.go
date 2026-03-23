@@ -903,6 +903,43 @@ func (c *Client) ExecuteShell(ctx context.Context, sessionID, command string) (*
 	})
 }
 
+// RevertSession undoes the last message in the session.
+// If messageID is provided, reverts to that specific message.
+// If messageID is empty, fetches the last message and reverts it.
+// Returns the updated session state.
+func (c *Client) RevertSession(ctx context.Context, sessionID, messageID string) (*opencode.Session, error) {
+	// If messageID is not provided, get the last message from the session
+	if messageID == "" {
+		messages, err := c.sdk.Session.Messages(ctx, sessionID, opencode.SessionMessagesParams{
+			Directory: opencode.F(c.directory),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get messages: %w", err)
+		}
+		if messages == nil || len(*messages) == 0 {
+			return nil, fmt.Errorf("no messages to revert")
+		}
+		// Get the last message (most recent)
+		lastMessage := (*messages)[len(*messages)-1]
+		messageID = lastMessage.Info.ID
+		log.Printf("opencode: auto-detected last message ID for revert: %s", messageID)
+	}
+
+	params := opencode.SessionRevertParams{
+		Directory: opencode.F(c.directory),
+		MessageID: opencode.F(messageID),
+	}
+	return c.sdk.Session.Revert(ctx, sessionID, params)
+}
+
+// UnrevertSession redoes a previously reverted message in the session.
+// Returns the updated session state.
+func (c *Client) UnrevertSession(ctx context.Context, sessionID string) (*opencode.Session, error) {
+	return c.sdk.Session.Unrevert(ctx, sessionID, opencode.SessionUnrevertParams{
+		Directory: opencode.F(c.directory),
+	})
+}
+
 // ListSessions retrieves all sessions.
 func (c *Client) ListSessions(ctx context.Context) ([]opencode.Session, error) {
 	result, err := c.sdk.Session.List(ctx, opencode.SessionListParams{})
