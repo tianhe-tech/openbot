@@ -114,11 +114,13 @@
 ## 🛠️ 高级命令
 
 ### `/cmd <command>`
-直接执行技能脚本命令。
+在当前会话中执行 shell 命令，并返回命令输出结果。
 
 **示例：**
 ```
-/cmd websearch.py "OpenCode SDK"
+/cmd ls -la
+/cmd cat README.md
+/cmd git status
 ```
 
 ### `/answer <question_id> <answer>`

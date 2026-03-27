@@ -2156,13 +2156,13 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
    - 回复 '允许' 或序号确认授权
 
 💡 使用技巧：
-• @agent_name 消息 - 调用特定技能
+• @build / @plan / @chat 消息 - 调用特定 agent（Build/Plan/Chat 模式）
 • 任务进行中可发 /todo 查看进度
 • 完成后自动显示文件变更摘要
 • /fork 创建当前上下文的副本继续探索
 
 🛠️ 高级命令：
-/cmd <command> - 执行技能脚本
+/cmd <command> - 在当前会话中执行 shell 命令
 /answer <answer> - 回答最近的待确认问题（可选：/answer <question_id> <answer>）
 /crontask - 管理定时任务`
 
