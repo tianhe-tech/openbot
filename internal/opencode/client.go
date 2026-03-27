@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -14,12 +15,10 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -37,21 +36,27 @@ var ErrDuplicateRequest = errors.New("opencode: duplicate request detected")
 var ErrMaxRetriesExceeded = errors.New("opencode: max retries exceeded")
 
 const (
-	// DefaultMaxTokens 榛樿鏈€澶oken鏁帮紙褰撴棤娉曡幏鍙栨ā鍨嬮厤缃椂浣跨敤锛?
+	// ContextUsageThreshold 上下文使用率达到此阈值时创建新session (默认80%)
+	ContextUsageThreshold = 0.8
+	// SummaryThreshold 上下文使用率达到此阈值时开始总结 (默认60%)
+	SummaryThreshold = 0.6
+	// DefaultMaxTokens 默认最大token数（当无法获取模型配置时使用）
 	DefaultMaxTokens = 4096
-	// EstimatedTokensPerMessage 浼扮畻姣忔潯娑堟伅鐨勫钩鍧噒oken鏁?
+	// EstimatedTokensPerMessage 估算每条消息的平均token数
 	EstimatedTokensPerMessage = 200
-	// FallbackMaxMessages 闄嶇骇鏂规锛氭寜娑堟伅鏁板垽鏂紙褰搕oken浼扮畻涓嶅彲鐢ㄦ椂锛?
+	// FallbackMaxMessages 降级方案：按消息数判断（当token估算不可用时）
 	FallbackMaxMessages = 50
 
-	// MaxRetries 鏈€澶ч噸璇曟鏁?
+	// MaxRetries 最大重试次数
 	MaxRetries = 3
-	// InitialRetryDelay 鍒濆閲嶈瘯寤惰繜
+	// InitialRetryDelay 初始重试延迟
 	InitialRetryDelay = 2 * time.Second
-	// MaxRetryDelay 鏈€澶ч噸璇曞欢杩?
+	// MaxRetryDelay 最大重试延迟
 	MaxRetryDelay = 30 * time.Second
-	// RequestDeduplicationWindow 璇锋眰鍘婚噸鏃堕棿绐楀彛锛堝彧闃叉蹇€熼噸澶嶇偣鍑伙級
+	// RequestDeduplicationWindow 请求去重时间窗口（只防止快速重复点击）
 	RequestDeduplicationWindow = 30 * time.Second
+	// ProviderCatalogCacheTTL provider/model 目录缓存时长
+	ProviderCatalogCacheTTL = 30 * time.Second
 )
 
 // Response represents the minimal data we expect back from OpenCode.
@@ -63,12 +68,11 @@ type Response struct {
 	Raw       map[string]interface{} `json:"raw,omitempty"`
 }
 
-// Attachment 琛ㄧず闄勪欢锛堝浘鐗囥€佽闊炽€佽棰戠瓑濯掍綋鏂囦欢锛?
-// URL 蹇呴』鏄?data URI 鏍煎紡锛歞ata:<mime>;base64,<base64data>
+// Attachment represents a media attachment encoded as data URI.
 type Attachment struct {
-	Mime     string `json:"mime"`               // MIME 绫诲瀷锛屽 image/jpeg銆乮mage/png
-	URL      string `json:"url"`                // data URI: data:<mime>;base64,<base64>
-	Filename string `json:"filename,omitempty"` // 鍙€夋枃浠跺悕
+	Mime     string `json:"mime"`
+	URL      string `json:"url"`
+	Filename string `json:"filename,omitempty"`
 }
 
 // MessagePayload collects the metadata adapters send to OpenCode.
@@ -78,10 +82,10 @@ type MessagePayload struct {
 	ThreadID    string            `json:"thread_id,omitempty"`
 	SessionID   string            `json:"session_id,omitempty"`
 	Content     string            `json:"content"`
-	Agent       string            `json:"agent,omitempty"`     // 鍙€夛細鎸囧畾浣跨敤鐨刟gent/skill鍚嶇О
-	Streaming   bool              `json:"streaming,omitempty"` // 鏄惁浣跨敤娴佸紡杩斿洖
+	Agent       string            `json:"agent,omitempty"`     // 可选：指定使用的agent/skill名称
+	Streaming   bool              `json:"streaming,omitempty"` // 是否使用流式返回
+	Attachments []Attachment      `json:"attachments,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
-	Attachments []Attachment      `json:"attachments,omitempty"` // 闄勪欢锛堝浘鐗?璇煶/瑙嗛锛?
 }
 
 // StreamCallback defines a callback for streaming responses.
@@ -90,49 +94,37 @@ type StreamCallback func(chunk string) error
 // EventHandler defines a callback for incoming OpenCode events.
 type EventHandler func(ctx context.Context, event *opencode.EventListResponse) error
 
-// ServerUnavailableHandler is invoked when OpenCode server is unreachable.
-// Typical use is to ensure `opencode serve` is running.
-type ServerUnavailableHandler func(ctx context.Context, reason string) (string, error)
-
-// ModelConfig 瀛樺偍妯″瀷閰嶇疆淇℃伅
+// ModelConfig 存储模型配置信息
 type ModelConfig struct {
-	ProviderID    string // 鎻愪緵鍟咺D (濡?"anthropic", "openai")
-	ModelID       string // 妯″瀷ID (濡?"claude-3-opus", "gpt-4")
-	ContextLength int    // 妯″瀷涓婁笅鏂囬暱搴?
+	ProviderID    string // 提供商ID (如 "anthropic", "openai")
+	ModelID       string // 模型ID (如 "claude-3-opus", "gpt-4")
+	ContextLength int    // 模型上下文长度
 	LastUpdated   time.Time
 }
 
-// ModelCapability stores model input/output modality capabilities.
-type ModelCapability struct {
-	ProviderID       string
-	ModelID          string
-	InputModalities  map[string]bool
-	OutputModalities map[string]bool
-}
-
-// RequestRecord 璁板綍宸插鐞嗙殑璇锋眰鐢ㄤ簬鍘婚噸
+// RequestRecord 记录已处理的请求用于去重
 type RequestRecord struct {
 	Hash      string
 	Response  Response
 	Timestamp time.Time
-	InFlight  bool // 鏄惁姝ｅ湪澶勭悊涓?
+	InFlight  bool // 是否正在处理中
 }
 
-// RetryConfig 閲嶈瘯閰嶇疆
+// RetryConfig 重试配置
 type RetryConfig struct {
 	MaxRetries      int
 	InitialDelay    time.Duration
 	MaxDelay        time.Duration
-	RetryableErrors []string // 鍙噸璇曠殑閿欒绫诲瀷鍏抽敭瀛?
+	RetryableErrors []string // 可重试的错误类型关键字
 }
 
-// QuestionOption 琛ㄧず闂閫夐」
+// QuestionOption 表示问题选项
 type QuestionOption struct {
 	Label       string `json:"label"`
 	Description string `json:"description"`
 }
 
-// QuestionItem 琛ㄧず鍗曚釜瀛愰棶棰?
+// QuestionItem 表示单个子问题
 type QuestionItem struct {
 	Header   string           `json:"header"`
 	Question string           `json:"question"`
@@ -140,17 +132,15 @@ type QuestionItem struct {
 	Options  []QuestionOption `json:"options"`
 }
 
-// TodoItem represents a single TODO item tracked by OpenCode during a session.
-// Mirrors the "todo.updated" SSE event structure from the OpenCode server.
+// TodoItem mirrors the todo.updated payload.
 type TodoItem struct {
 	ID       string `json:"id"`
-	Task     string `json:"task"`     // 鍏煎鏃у瓧娈?
-	Content  string `json:"content"`  // OpenCode SDK todo.updated 褰撳墠瀛楁
-	Status   string `json:"status"`   // "pending", "in_progress", "completed", "cancelled"
-	Priority string `json:"priority"` // "high", "medium", "low"
+	Task     string `json:"task"`
+	Content  string `json:"content"`
+	Status   string `json:"status"`
+	Priority string `json:"priority"`
 }
 
-// Text returns the human-readable todo text with backward/forward compatibility.
 func (t TodoItem) Text() string {
 	if strings.TrimSpace(t.Content) != "" {
 		return t.Content
@@ -158,25 +148,23 @@ func (t TodoItem) Text() string {
 	return t.Task
 }
 
-// PriorityLabel returns a user-friendly priority label.
 func (t TodoItem) PriorityLabel() string {
 	switch strings.ToLower(strings.TrimSpace(t.Priority)) {
 	case "high":
-		return "high"
+		return "高"
 	case "medium":
-		return "medium"
+		return "中"
 	case "low":
-		return "low"
+		return "低"
 	default:
 		if strings.TrimSpace(t.Priority) == "" {
-			return "unset"
+			return "未设置"
 		}
 		return t.Priority
 	}
 }
 
-// FileDiff represents changes to a single file within a session.
-// Mirrors the "session.diff" SSE event structure from the OpenCode server.
+// FileDiff mirrors the session.diff payload.
 type FileDiff struct {
 	Path    string `json:"path"`
 	Added   int    `json:"added"`
@@ -188,76 +176,75 @@ type Question struct {
 	ID           string         `json:"id"`
 	SessionID    string         `json:"session_id"`
 	MessageID    string         `json:"message_id"`
-	Text         string         `json:"text"`          // 绠€鍖栫殑闂鏂囨湰锛堝悜鍚庡吋瀹癸級
-	Options      []string       `json:"options"`       // 绠€鍖栫殑閫夐」鍒楄〃锛堝悜鍚庡吋瀹癸級
-	Questions    []QuestionItem `json:"questions"`     // 璇︾粏鐨勫瓙闂鍒楄〃锛堟柊鐗堬級
-	IsPermission bool           `json:"is_permission"` // 鏄惁鏄潈闄愯姹?
-	Directory    string         `json:"directory"`     // 鏉冮檺璇锋眰鐨勫伐浣滅洰褰?
+	Text         string         `json:"text"`          // 简化的问题文本（向后兼容）
+	Options      []string       `json:"options"`       // 简化的选项列表（向后兼容）
+	Questions    []QuestionItem `json:"questions"`     // 详细的子问题列表（新版）
+	IsPermission bool           `json:"is_permission"` // 是否是权限请求
+	Directory    string         `json:"directory"`     // 权限请求的工作目录
 	CreatedAt    time.Time      `json:"created_at"`
 }
 
 // Client knows how to talk to the remote OpenCode service using the official SDK.
 type Client struct {
-	sdk               *opencode.Client
-	endpoint          string
-	apiKey            string
-	basicAuthHeader   string
-	httpClient        *http.Client
-	eventHandlers     []EventHandler
-	eventListenerMu   sync.RWMutex
-	sessionHandlers   sync.Map     // map[sessionID]EventHandler for fast lookup
-	activeHandlers    sync.Map     // map[sessionID]*StreamingSessionHandler for todo/diff access
-	messageToSession  sync.Map     // map[messageID]sessionID for events with only messageID
-	messageRoles      sync.Map     // map[messageID]role ("user"/"assistant") for filtering user message delta events
-	sessionMu         sync.RWMutex // 鐢ㄤ簬淇濇姢 session 鐩稿叧鎿嶄綔
-	sessions          sync.Map     // map[threadID]sessionID
-	sessionLocks      sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
-	sessionsMu        sync.RWMutex // 淇濇姢 sessions 鐨勮鍐?
-	messageCount      sync.Map     // map[sessionID]int tracks messages per session
-	tokenCount        sync.Map     // map[sessionID]int tracks estimated tokens per session
-	modelConfig       sync.Map     // map[sessionID]*ModelConfig caches model config per session
-	sessionModel      sync.Map     // map[sessionID]*ModelConfig tracks latest provider/model seen in assistant replies
-	sessionOverride   sync.Map     // map[sessionID]*ModelConfig stores user-selected model via /model
-	requestCache      sync.Map     // map[requestHash]*RequestRecord 璇锋眰鍘婚噸缂撳瓨
-	runningSessions   sync.Map     // map[sessionID]bool 璺熻釜姝ｅ湪杩愯鐨剆ession
-	pendingQuestions  sync.Map     // map[questionID]*Question 寰呭洖绛旂殑闂
-	modelCatalogMu    sync.RWMutex
-	modelCatalog      map[string]*ModelCapability // key: providerID/modelID
-	defaultModelMu    sync.RWMutex
-	defaultModel      *ModelConfig
-	directory         string
-	timeout           time.Duration // 榛樿瓒呮椂鏃堕棿
-	retryConfig       RetryConfig   // 閲嶈瘯閰嶇疆
-	debugMediaRouting bool          // 鏄惁鍚敤澶氭ā鎬佽矾鐢辫皟璇曟棩蹇?
-	enableSkillHint   bool          // 鏄惁鍦ㄦ秷鎭腑娣诲姞skill鎻愮ず
-	skillHintCache    []string      // 缂撳瓨鐨勫彲鐢╯kill鍒楄〃
-	skillCacheMu      sync.RWMutex
-	lastHealthCheck   time.Time    // 鏈€鍚庝竴娆″仴搴锋鏌ユ椂闂?
-	isHealthy         bool         // OpenCode server鏄惁鍋ュ悍
-	healthCheckMu     sync.RWMutex // 淇濇姢鍋ュ悍鐘舵€?
-	thinkingEnabled   atomic.Bool  // 鏄惁杈撳嚭 reasoning/thinking 鍐呭
-	finalOnlyEnabled  atomic.Bool  // 鏄惁浠呭湪缁撴潫鏃跺彂閫佹渶缁堝洖澶?
-	stepEnabled       atomic.Bool  // 鏄惁鏄剧ず step-start/step-finish 涓棿姝ラ
-	serverUnavailable ServerUnavailableHandler
-	unavailableMu     sync.Mutex
-	lastUnavailableAt time.Time
-	unavailableDelay  time.Duration
-	messageQueue      *MessageQueue
+	sdk              *opencode.Client
+	endpoint         string
+	apiKey           string
+	httpClient       *http.Client
+	eventHandlers    []EventHandler
+	eventListenerMu  sync.RWMutex
+	sessionHandlers  sync.Map     // map[sessionID]EventHandler for fast lookup
+	messageToSession sync.Map     // map[messageID]sessionID for events with only messageID
+	messageRoles     sync.Map     // map[messageID]role("user"/"assistant")
+	sessionMu        sync.RWMutex // 用于保护 session 相关操作
+	sessions         sync.Map     // map[threadID]sessionID
+	sessionLocks     sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
+	sessionsMu       sync.RWMutex // 保护 sessions 的读写
+	messageCount     sync.Map     // map[sessionID]int tracks messages per session
+	tokenCount       sync.Map     // map[sessionID]int tracks estimated tokens per session
+	sessionSummary   sync.Map     // map[sessionID]string stores session summaries
+	modelConfig      sync.Map     // map[sessionID]*ModelConfig caches model config per session
+	requestCache     sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
+	runningSessions  sync.Map     // map[sessionID]bool 跟踪正在运行的session
+	pendingQuestions sync.Map     // map[questionID]*Question 待回答的问题
+	todoCache        sync.Map     // map[sessionID][]TodoItem
+	diffCache        sync.Map     // map[sessionID][]FileDiff
+	userMemory       sync.Map     // map[channel:userID][]UserMemoryFact
+	directory        string
+	timeout          time.Duration // 默认超时时间
+	retryConfig      RetryConfig   // 重试配置
+	enableSkillHint  bool          // 是否在消息中添加skill提示
+	skillHintCache   []string      // 缓存的可用skill列表
+	skillCacheMu     sync.RWMutex
+	showThinking     bool
+	finalOnly        bool
+	showSteps        bool
+	modeMu           sync.RWMutex
+	lastHealthCheck  time.Time    // 最后一次健康检查时间
+	isHealthy        bool         // OpenCode server是否健康
+	healthCheckMu    sync.RWMutex // 保护健康状态
+	modelOverride    sync.Map     // map[sessionID]opencode.SessionPromptParamsModel
+	providerCacheMu  sync.RWMutex
+	providerCacheAt  time.Time
+	providerCache    []Provider
+	capabilityCache  map[string]modelCapability // key: lower(provider/model)
+	defaultModelHint *opencode.SessionPromptParamsModel
 }
 
 // Option mutates a client during construction.
 type Option func(*Client)
+
+// UserMemoryFact is the adapter-facing memory record format.
+type UserMemoryFact struct {
+	Text       string `json:"text"`
+	Category   string `json:"category"`
+	Importance int    `json:"importance"`
+}
 
 // WithDirectory sets the working directory for sessions.
 func WithDirectory(dir string) Option {
 	return func(c *Client) {
 		c.directory = dir
 	}
-}
-
-// Directory returns the current working directory context used by OpenCode APIs.
-func (c *Client) Directory() string {
-	return strings.TrimSpace(c.directory)
 }
 
 // WithTimeout sets the default timeout for OpenCode operations.
@@ -288,79 +275,40 @@ func WithSkillHint(enable bool) Option {
 	}
 }
 
-// WithDebugMediaRouting enables detailed media routing debug logs.
-func WithDebugMediaRouting(enable bool) Option {
+// WithServerUnavailableHandler keeps backward compatibility with previous options API.
+func WithServerUnavailableHandler(handler func(ctx context.Context, reason string) (string, error)) Option {
 	return func(c *Client) {
-		c.debugMediaRouting = enable
-	}
-}
-
-// WithServerUnavailableHandler installs a self-healing hook used when the
-// OpenCode server is unreachable (for example connection refused on /event).
-func WithServerUnavailableHandler(handler ServerUnavailableHandler) Option {
-	return func(c *Client) {
-		c.serverUnavailable = handler
-	}
-}
-
-func parseEnvBool(key string) bool {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return false
-	}
-	b, err := strconv.ParseBool(v)
-	if err == nil {
-		return b
-	}
-	switch strings.ToLower(v) {
-	case "1", "y", "yes", "on", "enable", "enabled":
-		return true
-	default:
-		return false
+		if handler == nil {
+			return
+		}
+		c.eventHandlers = append(c.eventHandlers, func(ctx context.Context, event *opencode.EventListResponse) error {
+			return nil
+		})
 	}
 }
 
 // NewClient builds a Client instance using the official OpenCode SDK.
 func NewClient(endpoint, apiKey string, opts ...Option) *Client {
-	sdkOptions := []option.RequestOption{
-		option.WithBaseURL(endpoint),
-	}
-	trimmedAPIKey := strings.TrimSpace(apiKey)
-	serverPassword := strings.TrimSpace(os.Getenv("OPENCODE_SERVER_PASSWORD"))
-	basicAuthHeader := ""
-	if serverPassword != "" {
-		username := strings.TrimSpace(os.Getenv("OPENCODE_SERVER_USERNAME"))
-		if username == "" {
-			username = "opencode"
-		}
-		encoded := base64.StdEncoding.EncodeToString([]byte(username + ":" + serverPassword))
-		basicAuthHeader = "Basic " + encoded
-		sdkOptions = append(sdkOptions, option.WithHeader("Authorization", basicAuthHeader))
-	} else if trimmedAPIKey != "" {
-		sdkOptions = append(sdkOptions,
-			option.WithHeader("Authorization", "Bearer "+trimmedAPIKey),
-			option.WithHeader("X-API-Key", trimmedAPIKey),
-		)
-	}
-
 	client := &Client{
-		sdk:             opencode.NewClient(sdkOptions...),
-		endpoint:        strings.TrimRight(endpoint, "/"),
-		apiKey:          trimmedAPIKey,
-		basicAuthHeader: basicAuthHeader,
+		sdk: opencode.NewClient(
+			option.WithBaseURL(endpoint),
+			// option.WithAPIKey(apiKey), // If SDK supports API key authentication
+		),
+		endpoint: strings.TrimRight(endpoint, "/"),
+		apiKey:   apiKey,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
 		eventHandlers: make([]EventHandler, 0),
 		directory:     ".",
-		timeout:       1200 * time.Second, // 20鍒嗛挓瓒呮椂锛岀粰澶嶆潅浠诲姟锛堝妯″瀷寰皟銆佸ぇ瑙勬ā浠ｇ爜鐢熸垚锛夎冻澶熸椂闂?
+		timeout:       1200 * time.Second, // 20分钟超时，给复杂任务（如模型微调、大规模代码生成）足够时间
 		retryConfig: RetryConfig{
 			MaxRetries:   MaxRetries,
 			InitialDelay: InitialRetryDelay,
 			MaxDelay:     MaxRetryDelay,
 			RetryableErrors: []string{
-				// 娉ㄦ剰锛氫笉鍖呮嫭 "context deadline exceeded"锛屽洜涓鸿秴鏃舵剰鍛崇潃浠诲姟闇€瑕佹洿闀挎椂闂?
-				// 閲嶈瘯浼氬鑷撮噸澶嶅彂閫佽姹傚埌OpenCode
+				// 注意：不包括 "context deadline exceeded"，因为超时意味着任务需要更长时间
+				// 重试会导致重复发送请求到OpenCode
 				"connection refused",
 				"connection reset",
 				"temporarily unavailable",
@@ -369,29 +317,19 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 				"500",
 			},
 		},
-		enableSkillHint:   false, // 榛樿绂佺敤skill鎻愮ず
-		debugMediaRouting: parseEnvBool("OPENBOT_DEBUG_MEDIA_ROUTING"),
-		modelCatalog:      make(map[string]*ModelCapability),
-		isHealthy:         false,
-		lastHealthCheck:   time.Time{},
-		unavailableDelay:  20 * time.Second,
+		enableSkillHint: false,       // 默认禁用skill提示
+		isHealthy:       false,       // 初始状态未知
+		lastHealthCheck: time.Time{}, // 未检查过
 	}
 
 	for _, opt := range opts {
 		opt(client)
 	}
 
-	client.thinkingEnabled.Store(parseEnvBool("OPENBOT_SHOW_THINKING"))
-	log.Printf("opencode: thinking output enabled=%t (env OPENBOT_SHOW_THINKING)", client.thinkingEnabled.Load())
-	client.finalOnlyEnabled.Store(parseEnvBool("OPENBOT_FINAL_ONLY"))
-	log.Printf("opencode: final-only output enabled=%t (env OPENBOT_FINAL_ONLY)", client.finalOnlyEnabled.Load())
-	client.stepEnabled.Store(parseEnvBool("OPENBOT_SHOW_STEPS"))
-	log.Printf("opencode: step output enabled=%t (env OPENBOT_SHOW_STEPS)", client.stepEnabled.Load())
-
-	// 鍚姩鍚庡彴娓呯悊鍗忕▼
+	// 启动后台清理协程
 	go client.cleanupRequestCache()
 
-	// 鍚姩鍚庤繘琛岄娆″仴搴锋鏌?
+	// 启动后进行首次健康检查
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -399,35 +337,10 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 			log.Printf("opencode: initial health check failed: %v", err)
 		} else {
 			log.Printf("opencode: initial health check succeeded")
-			if err := client.refreshModelCatalog(ctx); err != nil {
-				log.Printf("opencode: initial model catalog fetch failed: %v", err)
-			} else {
-				log.Printf("opencode: initial model catalog loaded")
-			}
 		}
 	}()
 
-	client.messageQueue = NewMessageQueue(func(ctx context.Context, payload MessagePayload, cb StreamCallback, eventCb StreamEventCallback) (Response, error) {
-		if cb == nil && eventCb == nil {
-			return client.SendMessage(ctx, payload)
-		}
-		return client.SendMessageStreamingWithEvents(ctx, payload, cb, eventCb)
-	}, 4)
-
 	return client
-}
-
-func (c *Client) applyAuthHeaders(header http.Header) {
-	if c.basicAuthHeader != "" {
-		header.Set("Authorization", c.basicAuthHeader)
-		header.Del("X-API-Key")
-		return
-	}
-	if c.apiKey == "" {
-		return
-	}
-	header.Set("Authorization", "Bearer "+c.apiKey)
-	header.Set("X-API-Key", c.apiKey)
 }
 
 // Ready reports if the client has enough data to operate.
@@ -435,43 +348,10 @@ func (c *Client) Ready() bool {
 	return c.sdk != nil
 }
 
-// SetThinkingEnabled toggles whether reasoning/thinking stream is emitted to adapters.
-func (c *Client) SetThinkingEnabled(enabled bool) {
-	c.thinkingEnabled.Store(enabled)
-	log.Printf("opencode: thinking output toggled to %t", enabled)
-}
-
-// IsThinkingEnabled reports whether reasoning/thinking stream emission is enabled.
-func (c *Client) IsThinkingEnabled() bool {
-	return c.thinkingEnabled.Load()
-}
-
-// SetFinalOnlyEnabled toggles whether adapters should buffer final output until completion.
-func (c *Client) SetFinalOnlyEnabled(enabled bool) {
-	c.finalOnlyEnabled.Store(enabled)
-	log.Printf("opencode: final-only output toggled to %t", enabled)
-}
-
-// IsFinalOnlyEnabled reports whether final-only output mode is enabled.
-func (c *Client) IsFinalOnlyEnabled() bool {
-	return c.finalOnlyEnabled.Load()
-}
-
-// SetStepEnabled toggles whether step lifecycle messages are emitted to adapters.
-func (c *Client) SetStepEnabled(enabled bool) {
-	c.stepEnabled.Store(enabled)
-	log.Printf("opencode: step output toggled to %t", enabled)
-}
-
-// IsStepEnabled reports whether step lifecycle messages are enabled.
-func (c *Client) IsStepEnabled() bool {
-	return c.stepEnabled.Load()
-}
-
 // CheckHealth checks if the OpenCode server is running and accessible.
 // It caches the result for 10 seconds to avoid excessive health checks.
 func (c *Client) CheckHealth(ctx context.Context) error {
-	// 妫€鏌ョ紦瀛樼殑鍋ュ悍鐘舵€侊紙10绉掑唴锛?
+	// 检查缓存的健康状态（10秒内）
 	c.healthCheckMu.RLock()
 	if time.Since(c.lastHealthCheck) < 10*time.Second && c.isHealthy {
 		c.healthCheckMu.RUnlock()
@@ -479,7 +359,7 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	}
 	c.healthCheckMu.RUnlock()
 
-	// 鎵ц鍋ュ悍妫€鏌ワ細灏濊瘯鍒楀嚭sessions
+	// 执行健康检查：尝试列出sessions
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -490,40 +370,12 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	if err != nil {
 		c.isHealthy = false
 		c.healthCheckMu.Unlock()
-		c.maybeHandleServerUnavailable(context.Background(), err, "health-check")
-		return c.formatHealthCheckError(err)
+		return fmt.Errorf("opencode server不可用: %w\n\n💡 请确保：\n1. OpenCode server已启动\n2. 服务地址配置正确 (%s)\n3. 网络连接正常", err, c.endpoint)
 	}
 	c.isHealthy = true
 	c.healthCheckMu.Unlock()
 
 	return nil
-}
-
-func (c *Client) formatHealthCheckError(err error) error {
-	var apiErr *opencode.Error
-	if errors.As(err, &apiErr) {
-		switch apiErr.StatusCode {
-		case http.StatusUnauthorized:
-			return fmt.Errorf("opencode server unauthorized (401): %w; endpoint=%s", err, c.endpoint)
-		case http.StatusForbidden:
-			return fmt.Errorf("opencode server forbidden (403): %w", err)
-		case http.StatusNotFound:
-			return fmt.Errorf("opencode server endpoint not found (404): %w; endpoint=%s", err, c.endpoint)
-		default:
-			return fmt.Errorf("opencode server status %d: %w; endpoint=%s", apiErr.StatusCode, err, c.endpoint)
-		}
-	}
-
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return fmt.Errorf("opencode server unreachable: %w; endpoint=%s", err, c.endpoint)
-	}
-
-	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("opencode server health check timeout: %w; endpoint=%s", err, c.endpoint)
-	}
-
-	return fmt.Errorf("opencode server unavailable: %w; endpoint=%s", err, c.endpoint)
 }
 
 // IsHealthy returns the cached health status.
@@ -533,12 +385,49 @@ func (c *Client) IsHealthy() bool {
 	return c.isHealthy
 }
 
+func (c *Client) applyAuthHeaders(header http.Header) {
+	if header == nil {
+		return
+	}
+	if c.apiKey != "" {
+		header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+}
+
+func (c *Client) maybeHandleServerUnavailable(ctx context.Context, err error, source string) {
+	if err == nil {
+		return
+	}
+	log.Printf("opencode: %s unavailable: %v", source, err)
+
+	// Best-effort health refresh for better user-facing diagnostics.
+	checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if healthErr := c.CheckHealth(checkCtx); healthErr != nil {
+		log.Printf("opencode: health check failed after %s error: %v", source, healthErr)
+	}
+}
+
 // SendMessage forwards an adapter payload to OpenCode and returns its response.
-// 娉ㄦ剰锛歄penCode鏀寔涓ょ妯″紡锛?
-// 1. POST /session/:id/message - 鍚屾妯″紡锛岀瓑寰呭搷搴斿悗杩斿洖
-// 2. POST /session/:id/prompt_async - 寮傛妯″紡锛岀珛鍗宠繑鍥?04锛岄€氳繃浜嬩欢娴佽幏鍙栫粨鏋?
-// 瀵逛簬闀挎椂闂翠换鍔★紝搴旇浣跨敤寮傛妯″紡+浜嬩欢鐩戝惉
+// 注意：OpenCode支持两种模式：
+// 1. POST /session/:id/message - 同步模式，等待响应后返回
+// 2. POST /session/:id/prompt_async - 异步模式，立即返回204，通过事件流获取结果
+// 对于长时间任务，应该使用异步模式+事件监听
 func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Response, error) {
+	log.Printf("opencode: TRACE ENTER_SENDMESSAGE channel=%s user=%s thread=%s streaming=%t attachments=%d",
+		payload.Channel,
+		payload.UserID,
+		payload.ThreadID,
+		payload.Streaming,
+		len(payload.Attachments),
+	)
+	log.Printf("opencode: SendMessage called (channel=%s, user=%s, thread=%s, streaming=%t, attachments=%d)",
+		payload.Channel,
+		payload.UserID,
+		payload.ThreadID,
+		payload.Streaming,
+		len(payload.Attachments),
+	)
 	if !c.Ready() {
 		return Response{}, fmt.Errorf("opencode: client not configured")
 	}
@@ -547,34 +436,34 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		return Response{}, ErrEmptyPayload
 	}
 
-	// ========== 鍋ュ悍妫€鏌ワ細纭繚OpenCode server宸插惎鍔?==========
+	// ========== 健康检查：确保OpenCode server已启动 ==========
 	if err := c.CheckHealth(ctx); err != nil {
 		return Response{}, err
 	}
 
-	// ========== 璇锋眰鍘婚噸妫€鏌ワ紙浠呴槻姝㈠揩閫熼噸澶嶇偣鍑伙級==========
+	// ========== 请求去重检查（仅防止快速重复点击）==========
 	requestHash := generateRequestHash(payload)
 	if record, isDuplicate := c.checkAndMarkRequest(requestHash); isDuplicate {
 		if !record.InFlight {
-			// 宸插畬鎴愮殑璇锋眰锛岃繑鍥炵紦瀛樼殑鍝嶅簲锛堝揩閫熷搷搴旓級
-			// 杩欎笉鏄湡姝ｇ殑閲嶅锛屽彧鏄紦瀛樺懡涓?
+			// 已完成的请求，返回缓存的响应（快速响应）
+			// 这不是真正的重复，只是缓存命中
 			return record.Response, nil
 		}
-		// 璇锋眰姝ｅ湪澶勭悊涓紙30绉掑唴鐨勫揩閫熼噸澶嶇偣鍑伙級
+		// 请求正在处理中（30秒内的快速重复点击）
 		log.Printf("opencode: duplicate request detected, request is still processing (in-flight)")
 		return Response{}, ErrDuplicateRequest
 	}
 
-	// 纭繚璇锋眰瀹屾垚鏃舵洿鏂扮姸鎬?
+	// 确保请求完成时更新状态
 	defer func() {
-		// 濡傛灉鍙戠敓panic锛屾竻鐞嗚姹傜姸鎬?
+		// 如果发生panic，清理请求状态
 		if r := recover(); r != nil {
 			c.failRequest(requestHash)
 			panic(r)
 		}
 	}()
 
-	// 浣跨敤鐙珛鐨刢ontext鐢ㄤ簬session鍒涘缓锛岄伩鍏嶈澶栭儴context鍙栨秷褰卞搷
+	// 使用独立的context用于session创建，避免被外部context取消影响
 	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer sessionCancel()
 
@@ -583,7 +472,7 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 	threadLock.Lock()
 	sessionID := payload.SessionID
 
-	// 馃攳 璇婃柇鏃ュ織锛氳褰?session 鏌ユ壘璇锋眰
+	// 🔍 诊断日志：记录 session 查找请求
 	log.Printf("opencode: session lookup - channel=%s, userID=%s, threadID=%s, requestingSessionID=%s",
 		payload.Channel, payload.UserID, payload.ThreadID, sessionID)
 
@@ -591,13 +480,13 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
 			foundSessionID := sid.(string)
 
-			// 馃攳 璇婃柇鏃ュ織锛氭鏌?session 鏄惁灞炰簬褰撳墠鐢ㄦ埛
-			// 閫氳繃鏌ヨ adapter 鐨勬槧灏勬潵楠岃瘉锛堝鏋滃彲鐢級
+			// 🔍 诊断日志：检查 session 是否属于当前用户
+			// 通过查询 adapter 的映射来验证（如果可用）
 			log.Printf("opencode: found cached session %s for threadID %s (requested by %s user %s)",
 				foundSessionID[:8], payload.ThreadID, payload.Channel, payload.UserID)
 
-			// 璀﹀憡锛氬彲鑳藉瓨鍦?session 娣风敤
-			log.Printf("opencode: 鈿狅笍 WARNING - ThreadID %s is mapped to session %s, but cannot verify ownership!",
+			// 警告：可能存在 session 混用
+			log.Printf("opencode: ⚠️ WARNING - ThreadID %s is mapped to session %s, but cannot verify ownership!",
 				payload.ThreadID, foundSessionID[:8])
 
 			sessionID = foundSessionID
@@ -608,11 +497,11 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 	// Create new session if needed
 	if sessionID == "" {
-		// 馃攳 璇婃柇鏃ュ織锛氬垱寤烘柊 session
+		// 🔍 诊断日志：创建新 session
 		log.Printf("opencode: creating new session - channel=%s, userID=%s, threadID=%s",
 			payload.Channel, payload.UserID, payload.ThreadID)
 
-		// 灏?adapter 鍜?user 淇℃伅缂栫爜鍒?Title 涓紝鏍煎紡: [adapter:userId] threadId
+		// 将 adapter 和 user 信息编码到 Title 中，格式: [adapter:userId] threadId
 		sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
 
 		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
@@ -626,39 +515,40 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		sessionID = session.ID
 		if payload.ThreadID != "" {
 			c.sessions.Store(payload.ThreadID, sessionID)
-			// 馃攳 璇婃柇鏃ュ織锛氳褰?session 鏄犲皠
+			// 🔍 诊断日志：记录 session 映射
 			log.Printf("opencode: mapped threadID %s -> sessionID %s (for %s user %s)",
 				payload.ThreadID, sessionID[:8], payload.Channel, payload.UserID)
 		}
 		c.messageCount.Store(sessionID, 0)
 		c.tokenCount.Store(sessionID, 0)
 
-		// 鑾峰彇妯″瀷閰嶇疆
+		// 获取模型配置
 		go c.fetchAndCacheModelConfig(context.Background(), sessionID)
 
 		log.Printf("opencode: created new session %s for thread %s", sessionID[:8], payload.ThreadID)
 	} else {
-		// 馃攳 璇婃柇鏃ュ織锛氬鐢ㄧ幇鏈?session
+		// 🔍 诊断日志：复用现有 session
 		log.Printf("opencode: reusing existing sessionID %s for %s user %s (threadID %s)",
 			sessionID[:8], payload.Channel, payload.UserID, payload.ThreadID)
 
-		// 楠岃瘉 session 鏄惁浠嶇劧鏈夋晥锛圤penCode Server 閲嶅惎鍚?session 鍙兘澶辨晥锛?
+		// 验证 session 是否仍然有效（OpenCode Server 重启后 session 可能失效）
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, checkErr := c.GetSession(checkCtx, sessionID)
 		checkCancel()
 		if checkErr != nil {
-			log.Printf("opencode: 鈿狅笍 session %s is stale (err: %v), creating new session",
+			log.Printf("opencode: ⚠️ session %s is stale (err: %v), creating new session",
 				sessionID[:8], checkErr)
 
-			// 娓呴櫎鏃ф槧灏?
+			// 清除旧映射
 			if payload.ThreadID != "" {
 				c.sessions.Delete(payload.ThreadID)
 			}
 			c.messageCount.Delete(sessionID)
 			c.tokenCount.Delete(sessionID)
 			c.modelConfig.Delete(sessionID)
+			c.modelOverride.Delete(sessionID)
 
-			// 鍒涘缓鏂?session
+			// 创建新 session
 			sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
 			newSession, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
 				Title: opencode.F(sessionTitle),
@@ -671,94 +561,111 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			sessionID = newSession.ID
 			if payload.ThreadID != "" {
 				c.sessions.Store(payload.ThreadID, sessionID)
-				log.Printf("opencode: 馃攧 remapped threadID %s -> new sessionID %s (replaced stale session)",
+				log.Printf("opencode: 🔄 remapped threadID %s -> new sessionID %s (replaced stale session)",
 					payload.ThreadID, sessionID[:8])
 			}
 			c.messageCount.Store(sessionID, 0)
 			c.tokenCount.Store(sessionID, 0)
 			go c.fetchAndCacheModelConfig(context.Background(), sessionID)
-			// 璺宠繃鍚庣画鐨?token 妫€鏌ワ紝鐩存帴浣跨敤鏂?session
+			// 跳过后续的 token 检查，直接使用新 session
 			threadLock.Unlock()
+			log.Printf("opencode: stale session replaced, continue to send message with new session %s", sessionID[:min(8, len(sessionID))])
 			goto sendMessage
 		}
 
-		// 妫€鏌ヤ笂涓嬫枃浣跨敤鎯呭喌锛堜粎璁板綍鏃ュ織锛孫penCode鑷姩绠＄悊涓婁笅鏂囧帇缂╋級
-		msgCount := c.loadCounter(&c.messageCount, sessionID)
-		currentTokens := c.loadCounter(&c.tokenCount, sessionID)
+		// 检查是否需要总结或创建新session
+		count, _ := c.messageCount.Load(sessionID)
+		msgCount := count.(int)
+		tokens, _ := c.tokenCount.Load(sessionID)
+		currentTokens := tokens.(int)
 
-		// 浼扮畻褰撳墠娑堟伅鐨則oken鏁?
+		// 估算当前消息的token数
 		estimatedMsgTokens := estimateTokens(payload.Content)
 		projectedTokens := currentTokens + estimatedMsgTokens
 
-		// 鑾峰彇妯″瀷涓婁笅鏂囬暱搴?
+		// 获取模型上下文长度
 		maxContextTokens := c.getMaxContextLength(sessionID)
 		contextUsage := float64(projectedTokens) / float64(maxContextTokens)
 
 		log.Printf("opencode: session %s - messages: %d, tokens: %d/%d (%.1f%%), estimated msg tokens: %d",
 			sessionID[:8], msgCount, currentTokens, maxContextTokens, contextUsage*100, estimatedMsgTokens)
+
+		// 如果上下文使用率超过阈值，创建新session
+		if contextUsage >= ContextUsageThreshold {
+			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, creating new session",
+				sessionID[:8], contextUsage*100, ContextUsageThreshold*100)
+
+			// 总结旧session
+			if err := c.SummarizeSession(ctx, sessionID); err != nil {
+				log.Printf("opencode: failed to summarize session %s: %v", sessionID, err)
+			}
+
+			// 获取总结内容
+			summary := ""
+			if sum, ok := c.sessionSummary.Load(sessionID); ok {
+				summary = sum.(string)
+			}
+
+			// 创建新session，标题包含历史信息
+			title := fmt.Sprintf("%s-%s-续", payload.Channel, payload.UserID)
+			if summary != "" {
+				title = fmt.Sprintf("%s-%s (之前讨论: %s)", payload.Channel, payload.UserID, truncateString(summary, 50))
+			}
+
+			newSession, err := c.sdk.Session.New(ctx, opencode.SessionNewParams{
+				Title: opencode.F(title),
+			})
+			if err != nil {
+				log.Printf("opencode: failed to create new session: %v, continuing with current", err)
+			} else {
+				sessionID = newSession.ID
+				if payload.ThreadID != "" {
+					c.sessions.Store(payload.ThreadID, sessionID)
+				}
+				c.messageCount.Store(sessionID, 0)
+				c.tokenCount.Store(sessionID, 0)
+
+				// 获取新session的模型配置
+				go c.fetchAndCacheModelConfig(context.Background(), sessionID)
+
+				// 如果有总结，将总结作为系统消息添加到新session的上下文
+				if summary != "" {
+					contextMsg := fmt.Sprintf("[上一轮对话总结]: %s\n\n[用户新消息]: %s", summary, payload.Content)
+					payload.Content = contextMsg
+					estimatedMsgTokens = estimateTokens(contextMsg) // 重新估算
+					log.Printf("opencode: created new session %s with context from previous session", sessionID)
+				} else {
+					log.Printf("opencode: created new session %s for thread %s", sessionID, payload.ThreadID)
+				}
+			}
+		} else if contextUsage >= SummaryThreshold && msgCount%5 == 0 {
+			// 在达到总结阈值后，每5条消息尝试总结一次（后台异步）
+			log.Printf("opencode: session %s context usage %.1f%% >= summary threshold %.1f%%, scheduling background summary",
+				sessionID[:8], contextUsage*100, SummaryThreshold*100)
+			go func(sid string) {
+				sumCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := c.SummarizeSession(sumCtx, sid); err != nil {
+					log.Printf("opencode: background summarization failed for session %s: %v", sid, err)
+				}
+			}(sessionID)
+		}
 	}
 	threadLock.Unlock()
 
 sendMessage:
-	// ========== 澧炲己娑堟伅鍐呭==========
-	// 娣诲姞skill鎻愮ず锛堜粎鍦╯ession寮€嬫椂锛?
+	// ========== 增强消息内容 ==========
+	// 添加skill提示（仅在session开始时）
 	enhancedContent := c.enhanceContentWithSkillHint(payload.Content, sessionID)
-	effectiveContent := enhancedContent
-
-	// ========== 澶氭ā鎬佸吋瀹瑰鐞?==========
-	// 妫€鏌ユ秷鎭被鍨嬶紝閫夋嫨鍚堥€傜殑妯″瀷
-	mediaModel, preprocessErr := c.preprocessAttachmentsForSession(ctx, sessionID, &payload, &effectiveContent)
-	if preprocessErr != nil {
-		log.Printf("opencode: media preprocessing failed for session %s: %v", sessionID[:8], preprocessErr)
-		c.failRequest(requestHash)
-		return Response{}, fmt.Errorf("opencode: media preprocessing: %w", preprocessErr)
-	}
-
-	// ========== Video Skill 模型选择 ==========
-	// 如果使用 video-analyzer skill，需要选择支持视觉的模型来处理提取的关键帧
-	if mediaModel == nil && payload.Agent != "" {
-		agentLower := strings.ToLower(payload.Agent)
-		if strings.Contains(agentLower, "video") || strings.Contains(agentLower, "视频") {
-			// 查找支持视觉的模型
-			if visionModel, ok := c.selectFallbackMediaModel(true, false, false); ok && visionModel != nil {
-				mediaModel = visionModel
-				log.Printf("opencode: 🎬 video skill detected - session=%s forcing vision model=%s/%s",
-					sessionID[:8], visionModel.ProviderID, visionModel.ModelID)
-			} else {
-				log.Printf("opencode: ⚠️ video skill detected but no vision-capable model found for session %s", sessionID[:8])
-			}
-		}
-	}
-
-	var mainModelOverride *opencode.SessionPromptParamsModel
-	if mediaModel != nil {
-		// 鏈夊浘鐗?瑙嗛/闊抽绂佷欢锛屾垨 video skill锛屽己鍒朵娇鐢ㄥ鎬佹ā鍨嬶紙浠呮湰娆堬級
-		mainModelOverride = &opencode.SessionPromptParamsModel{
-			ProviderID: opencode.F(mediaModel.ProviderID),
-			ModelID:    opencode.F(mediaModel.ModelID),
-		}
-		log.Printf("opencode: 🖼️ multimodal message - session=%s forcing model=%s/%s attachments=%d",
-			sessionID[:8], mediaModel.ProviderID, mediaModel.ModelID, len(payload.Attachments))
-	} else {
-		// 鏃堕檮浠剁函鏂囨湰锛屾樉寮忔寚瀹氫細璇濈殑榛樿妯″瀷锛堥槻姝 OpenCode 绠＄悊鐨勬ā鍨嬭瀺鍚堬級
-		mainModelOverride = c.getSessionDefaultModel(sessionID)
-		if mainModelOverride != nil {
-			log.Printf("opencode: 📝 text message - session=%s using default model=%s/%s",
-				sessionID[:8], mainModelOverride.ProviderID.Value, mainModelOverride.ModelID.Value)
-		} else {
-			log.Printf("opencode: 📝 text message - session=%s no default model, using OpenCode server default",
-				sessionID[:8])
-		}
-	}
 
 	// Build message parts
 	parts := []opencode.SessionPromptParamsPartUnion{}
 
 	// Add agent part if specified
-	// Note: OpenCode鏀寔澶氱妯″紡锛?
-	// - chat: 鏅€氬璇濇ā寮忥紝鏃犻渶纭
-	// - plan: 瑙勫垝妯″紡锛屼細鐢熸垚璁″垝
-	// - build: 鏋勫缓妯″紡锛岄渶瑕佺敤鎴风‘璁ゆ墠鎵ц锛堝彲鑳藉鑷寸瓑寰咃級
+	// Note: OpenCode支持多种模式：
+	// - chat: 普通对话模式，无需确认
+	// - plan: 规划模式，会生成计划
+	// - build: 构建模式，需要用户确认才执行（可能导致等待）
 	if payload.Agent != "" {
 		parts = append(parts, opencode.AgentPartInputParam{
 			Name: opencode.F(payload.Agent),
@@ -767,43 +674,65 @@ sendMessage:
 		log.Printf("opencode: using agent '%s' for session %s", payload.Agent, sessionID[:8])
 	}
 
-	// Add text content (浣跨敤澧炲己鍚庣殑鍐呭)
+	// Add text content (使用增强后的内容)
 	parts = append(parts, opencode.TextPartInputParam{
-		Text: opencode.F(effectiveContent),
+		Text: opencode.F(enhancedContent),
 		Type: opencode.F(opencode.TextPartInputTypeText),
 	})
 
-	// Add file attachments (images, audio, video as data URIs)
-	for _, att := range payload.Attachments {
-		if att.URL == "" || att.Mime == "" {
+	log.Printf("opencode: payload attachments count=%d", len(payload.Attachments))
+	// Add file parts from adapter attachments so OpenCode can perform multimodal understanding.
+	for idx, attachment := range payload.Attachments {
+		urlValue := strings.TrimSpace(attachment.URL)
+		if urlValue == "" {
 			continue
 		}
-		fp := opencode.FilePartInputParam{
+
+		mimeValue := strings.TrimSpace(attachment.Mime)
+		if mimeValue == "" {
+			if inferredMime := inferMimeFromDataURI(urlValue); inferredMime != "" {
+				mimeValue = inferredMime
+			}
+		}
+		if mimeValue == "" {
+			mimeValue = "application/octet-stream"
+		}
+
+		filePart := opencode.FilePartInputParam{
 			Type: opencode.F(opencode.FilePartInputTypeFile),
-			Mime: opencode.F(att.Mime),
-			URL:  opencode.F(att.URL),
+			Mime: opencode.F(mimeValue),
+			URL:  opencode.F(urlValue),
 		}
-		if att.Filename != "" {
-			fp.Filename = opencode.F(att.Filename)
+		if name := strings.TrimSpace(attachment.Filename); name != "" {
+			filePart.Filename = opencode.F(name)
 		}
-		parts = append(parts, fp)
-		log.Printf("opencode: added %s attachment (%s, %d bytes data URI) to session %s",
-			att.Mime, att.Filename, len(att.URL), sessionID[:8])
+
+		parts = append(parts, filePart)
+		log.Printf("opencode: attached file part #%d for session %s (mime=%s, url_len=%d)", idx+1, sessionID[:8], mimeValue, len(urlValue))
 	}
 
-	// 娴佸紡妯″紡涓嬫敼鐢ㄥ紓姝?prompt_async锛岄伩鍏嶉暱浠诲姟瀵艰嚧 context deadline
-	if payload.Streaming {
+	modelOverride, modelReason := c.selectModelOverride(ctx, sessionID, payload)
+	log.Printf("opencode: modelOverride selected=%t reason=%s", modelOverride != nil, modelReason)
+	if modelOverride != nil {
+		log.Printf("opencode: selected model %s/%s for session %s (%s)", modelOverride.ProviderID.Value, modelOverride.ModelID.Value, sessionID[:8], modelReason)
+	}
+
+	// 流式模式下默认使用异步 prompt_async；但当已选定模型覆盖时，改走同步 prompt
+	// 以确保 provider/model 绑定在服务端稳定生效。
+	if payload.Streaming && modelOverride == nil {
 		c.runningSessions.Store(sessionID, true)
-		if err := c.sendPromptAsync(ctx, sessionID, parts, mainModelOverride); err != nil {
+		if err := c.sendPromptAsync(ctx, sessionID, parts, modelOverride); err != nil {
 			c.runningSessions.Delete(sessionID)
 			c.failRequest(requestHash)
 			return Response{}, fmt.Errorf("opencode: prompt_async: %w", err)
 		}
 
-		// 浠呯粺璁＄敤鎴锋秷鎭湰韬殑tokens锛屽洖澶嶅湪浜嬩欢娴佷腑鑾峰彇
-		c.incrementCounter(&c.messageCount, sessionID, 1)
-		estimatedMsgTokens := estimateTokens(effectiveContent)
-		c.incrementCounter(&c.tokenCount, sessionID, estimatedMsgTokens)
+		// 仅统计用户消息本身的tokens，回复在事件流中获取
+		count, _ := c.messageCount.LoadOrStore(sessionID, 0)
+		c.messageCount.Store(sessionID, count.(int)+1)
+		estimatedMsgTokens := estimateTokens(payload.Content)
+		tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
+		c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens)
 
 		response := Response{
 			Reply:     "",
@@ -816,13 +745,18 @@ sendMessage:
 		return response, nil
 	}
 
-	// ========== 浣跨敤閲嶈瘯鏈哄埗鍙戦€佹秷鎭?==========
-	// 鏍囪session涓鸿繍琛岀姸鎬?
+	if payload.Streaming && modelOverride != nil {
+		log.Printf("opencode: streaming request for session %s will use sync prompt to enforce model override %s/%s",
+			sessionID[:min(8, len(sessionID))], modelOverride.ProviderID.Value, modelOverride.ModelID.Value)
+	}
+
+	// ========== 使用重试机制发送消息 ==========
+	// 标记session为运行状态
 	c.runningSessions.Store(sessionID, true)
 
-	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, mainModelOverride)
+	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, modelOverride)
 
-	// 娓呴櫎杩愯鐘舵€?
+	// 清除运行状态
 	c.runningSessions.Delete(sessionID)
 
 	if err != nil {
@@ -834,15 +768,14 @@ sendMessage:
 	reply := extractReplyFromMessage(result)
 
 	// Increment message count and token count for this session
-	c.incrementCounter(&c.messageCount, sessionID, 1)
+	count, _ := c.messageCount.LoadOrStore(sessionID, 0)
+	c.messageCount.Store(sessionID, count.(int)+1)
 
-	// 鏇存柊token璁℃暟锛堜及绠楃敤鎴锋秷鎭?+ AI鍥炲锛?
-	estimatedMsgTokens := estimateTokens(effectiveContent)
+	// 更新token计数（估算用户消息 + AI回复）
+	estimatedMsgTokens := estimateTokens(payload.Content)
 	estimatedReplyTokens := estimateTokens(reply)
-	c.incrementCounter(&c.tokenCount, sessionID, estimatedMsgTokens+estimatedReplyTokens)
-
-	// 缂撳瓨鏈瀹為檯浣跨敤鐨勬ā鍨嬩俊鎭紙鑻DK杩斿洖锛?
-	c.updateSessionModel(sessionID, result.Info.ProviderID, result.Info.ModelID)
+	tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
+	c.tokenCount.Store(sessionID, tokens.(int)+estimatedMsgTokens+estimatedReplyTokens)
 
 	response := Response{
 		Reply:     reply,
@@ -851,24 +784,28 @@ sendMessage:
 		Trace:     sessionID,
 	}
 
+	// ========== 缓存成功响应用于去重 ==========
+	c.completeRequest(requestHash, response)
+
 	return response, nil
 }
 
+// GetSession retrieves session details.
 func (c *Client) GetSession(ctx context.Context, sessionID string) (*opencode.Session, error) {
 	return c.sdk.Session.Get(ctx, sessionID, opencode.SessionGetParams{})
 }
 
 // GetSessionStatus retrieves the status of a session.
-// 鏍规嵁OpenCode鏂囨。锛孏ET /session/status 杩斿洖鎵€鏈塻ession鐨勭姸鎬?
-// 鐘舵€佸寘鎷細idle, running, error绛?
+// 根据OpenCode文档，GET /session/status 返回所有session的状态
+// 状态包括：idle, running, error等
 func (c *Client) GetSessionStatus(ctx context.Context, sessionID string) (string, error) {
-	// TODO: SDK鍙兘闇€瑕佹坊鍔燬essionStatus鏂规硶
-	// 鐩墠鍙互閫氳繃GetSession鏉ヨ幏鍙栫姸鎬?
+	// TODO: SDK可能需要添加SessionStatus方法
+	// 目前可以通过GetSession来获取状态
 	_, err := c.GetSession(ctx, sessionID)
 	if err != nil {
 		return "", err
 	}
-	// 鏍规嵁session瀵硅薄鎺ㄦ柇鐘舵€?
+	// 根据session对象推断状态
 	return "unknown", nil
 }
 
@@ -886,6 +823,160 @@ func (c *Client) ListAgents(ctx context.Context) ([]opencode.Agent, error) {
 	return *result, nil
 }
 
+// FindVideoSkill picks the most likely video-capable skill/agent name.
+func (c *Client) FindVideoSkill(ctx context.Context) string {
+	agents, err := c.ListAgents(ctx)
+	if err != nil || len(agents) == 0 {
+		return ""
+	}
+
+	bestName := ""
+	bestScore := -1
+	for _, agent := range agents {
+		name := strings.TrimSpace(agent.Name)
+		if name == "" {
+			continue
+		}
+		text := strings.ToLower(strings.TrimSpace(agent.Name + " " + agent.Description + " " + agent.Prompt + " " + string(agent.Mode)))
+		score := 0
+		switch {
+		case strings.Contains(text, "video-analyzer") || strings.Contains(text, "video analyzer"):
+			score += 12
+		case strings.Contains(text, "video_understanding"):
+			score += 11
+		}
+		for _, token := range []string{"video", "vision", "frame", "media", "analy", "clip", "movie"} {
+			if strings.Contains(text, token) {
+				score += 2
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			bestName = name
+		}
+	}
+
+	if bestScore <= 0 {
+		return ""
+	}
+	return bestName
+}
+
+// RevertSession reverts session state to a previous point.
+func (c *Client) RevertSession(ctx context.Context, sessionID, messageID string) (*opencode.Session, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, fmt.Errorf("opencode: revert session: empty session id")
+	}
+	if strings.TrimSpace(c.endpoint) == "" {
+		return nil, fmt.Errorf("opencode: revert session unavailable: missing endpoint")
+	}
+
+	apiURL, err := url.JoinPath(c.endpoint, "session", sessionID, "revert")
+	if err != nil {
+		apiURL = fmt.Sprintf("%s/session/%s/revert", strings.TrimRight(c.endpoint, "/"), sessionID)
+	}
+	if strings.TrimSpace(messageID) != "" {
+		u, parseErr := url.Parse(apiURL)
+		if parseErr == nil {
+			q := u.Query()
+			q.Set("messageID", strings.TrimSpace(messageID))
+			u.RawQuery = q.Encode()
+			apiURL = u.String()
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: revert session request: %w", err)
+	}
+	c.applyAuthHeaders(req.Header)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: revert session do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("opencode: revert session status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return c.GetSession(ctx, sessionID)
+	}
+
+	var session opencode.Session
+	if err := json.Unmarshal(trimmed, &session); err == nil && strings.TrimSpace(session.ID) != "" {
+		return &session, nil
+	}
+
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err == nil && len(bytes.TrimSpace(envelope.Data)) > 0 {
+		if decodeErr := json.Unmarshal(envelope.Data, &session); decodeErr == nil {
+			return &session, nil
+		}
+	}
+
+	return c.GetSession(ctx, sessionID)
+}
+
+// UnrevertSession restores the latest reverted session state.
+func (c *Client) UnrevertSession(ctx context.Context, sessionID string) (*opencode.Session, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, fmt.Errorf("opencode: unrevert session: empty session id")
+	}
+	if strings.TrimSpace(c.endpoint) == "" {
+		return nil, fmt.Errorf("opencode: unrevert session unavailable: missing endpoint")
+	}
+
+	apiURL, err := url.JoinPath(c.endpoint, "session", sessionID, "unrevert")
+	if err != nil {
+		apiURL = fmt.Sprintf("%s/session/%s/unrevert", strings.TrimRight(c.endpoint, "/"), sessionID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: unrevert session request: %w", err)
+	}
+	c.applyAuthHeaders(req.Header)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: unrevert session do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("opencode: unrevert session status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return c.GetSession(ctx, sessionID)
+	}
+
+	var session opencode.Session
+	if err := json.Unmarshal(trimmed, &session); err == nil && strings.TrimSpace(session.ID) != "" {
+		return &session, nil
+	}
+
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err == nil && len(bytes.TrimSpace(envelope.Data)) > 0 {
+		if decodeErr := json.Unmarshal(envelope.Data, &session); decodeErr == nil {
+			return &session, nil
+		}
+	}
+
+	return c.GetSession(ctx, sessionID)
+}
+
 // ExecuteCommand executes a command in the session context.
 // This can be used to directly invoke skill scripts like websearch.py
 func (c *Client) ExecuteCommand(ctx context.Context, sessionID, command string) (*opencode.SessionCommandResponse, error) {
@@ -897,47 +988,231 @@ func (c *Client) ExecuteCommand(ctx context.Context, sessionID, command string) 
 
 // ExecuteShell executes a shell command in the session context.
 func (c *Client) ExecuteShell(ctx context.Context, sessionID, command string) (*opencode.AssistantMessage, error) {
-	return c.sdk.Session.Shell(ctx, sessionID, opencode.SessionShellParams{
+	result, err := c.sdk.Session.Shell(ctx, sessionID, opencode.SessionShellParams{
+		Agent:     opencode.F("build"),
 		Command:   opencode.F(command),
 		Directory: opencode.F(c.directory),
 	})
-}
-
-// RevertSession undoes the last message in the session.
-// If messageID is provided, reverts to that specific message.
-// If messageID is empty, fetches the last message and reverts it.
-// Returns the updated session state.
-func (c *Client) RevertSession(ctx context.Context, sessionID, messageID string) (*opencode.Session, error) {
-	// If messageID is not provided, get the last message from the session
-	if messageID == "" {
-		messages, err := c.sdk.Session.Messages(ctx, sessionID, opencode.SessionMessagesParams{
-			Directory: opencode.F(c.directory),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to get messages: %w", err)
-		}
-		if messages == nil || len(*messages) == 0 {
-			return nil, fmt.Errorf("no messages to revert")
-		}
-		// Get the last message (most recent)
-		lastMessage := (*messages)[len(*messages)-1]
-		messageID = lastMessage.Info.ID
-		log.Printf("opencode: auto-detected last message ID for revert: %s", messageID)
+	if err == nil {
+		return result, nil
 	}
 
-	params := opencode.SessionRevertParams{
-		Directory: opencode.F(c.directory),
-		MessageID: opencode.F(messageID),
+	if !isMissingShellAgentError(err) {
+		return nil, err
 	}
-	return c.sdk.Session.Revert(ctx, sessionID, params)
+
+	log.Printf("opencode: shell SDK call failed with missing-agent validation, retrying via HTTP fallback (session=%s): %v",
+		sessionID[:min(8, len(sessionID))], err)
+
+	fallbackResult, fallbackErr := c.executeShellViaHTTP(ctx, sessionID, command, "build")
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("opencode: shell failed (sdk=%v, fallback=%w)", err, fallbackErr)
+	}
+
+	return fallbackResult, nil
 }
 
-// UnrevertSession redoes a previously reverted message in the session.
-// Returns the updated session state.
-func (c *Client) UnrevertSession(ctx context.Context, sessionID string) (*opencode.Session, error) {
-	return c.sdk.Session.Unrevert(ctx, sessionID, opencode.SessionUnrevertParams{
-		Directory: opencode.F(c.directory),
-	})
+// ExecuteShellOutput executes a shell command and returns human-readable output text.
+func (c *Client) ExecuteShellOutput(ctx context.Context, sessionID, command string) (string, error) {
+	msg, err := c.ExecuteShell(ctx, sessionID, command)
+	if err != nil {
+		return "", err
+	}
+
+	if text := extractTextFromAssistantMessage(msg); strings.TrimSpace(text) != "" {
+		log.Printf("opencode: shell output extracted from assistant message (session=%s, cmd=%q, chars=%d)",
+			sessionID[:min(8, len(sessionID))], command, len(text))
+		return text, nil
+	}
+
+	if strings.TrimSpace(sessionID) != "" {
+		fallbackCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if reply, _, fetchErr := c.fetchLatestAssistantReply(fallbackCtx, sessionID); fetchErr == nil {
+			if strings.TrimSpace(reply) != "" {
+				log.Printf("opencode: shell output extracted from latest session message (session=%s, cmd=%q, chars=%d)",
+					sessionID[:min(8, len(sessionID))], command, len(reply))
+				return reply, nil
+			}
+		}
+	}
+
+	if msg != nil && strings.TrimSpace(msg.ID) != "" {
+		return fmt.Sprintf("(命令已执行，但未返回可解析文本。message_id=%s)", msg.ID), nil
+	}
+
+	return "", nil
+}
+
+func extractTextFromAssistantMessage(msg *opencode.AssistantMessage) string {
+	if msg == nil {
+		return ""
+	}
+
+	rawJSON := strings.TrimSpace(msg.JSON.RawJSON())
+	if rawJSON != "" {
+		if text := extractTextFromAssistantMessageJSON([]byte(rawJSON)); strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
+
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return ""
+	}
+
+	return extractTextFromAssistantMessageJSON(raw)
+}
+
+func extractTextFromAssistantMessageJSON(raw []byte) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+
+	collectString := func(v interface{}, keys ...string) string {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		cur := interface{}(m)
+		for _, k := range keys {
+			next, ok := cur.(map[string]interface{})
+			if !ok {
+				return ""
+			}
+			cur, ok = next[k]
+			if !ok {
+				return ""
+			}
+		}
+		s, _ := cur.(string)
+		return strings.TrimSpace(s)
+	}
+
+	partsValue, ok := obj["parts"].([]interface{})
+	if !ok || len(partsValue) == 0 {
+		if content, ok := obj["content"].(string); ok {
+			return strings.TrimSpace(content)
+		}
+		return ""
+	}
+
+	textParts := make([]string, 0, len(partsValue))
+	for _, part := range partsValue {
+		partMap, ok := part.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		candidates := []string{
+			collectString(partMap, "text"),
+			collectString(partMap, "content"),
+			collectString(partMap, "stdout"),
+			collectString(partMap, "output"),
+			collectString(partMap, "result"),
+			collectString(partMap, "text", "value"),
+			collectString(partMap, "content", "text"),
+			collectString(partMap, "content", "value"),
+		}
+
+		for _, c := range candidates {
+			if c != "" {
+				textParts = append(textParts, c)
+				break
+			}
+		}
+	}
+
+	return strings.TrimSpace(strings.Join(textParts, "\n"))
+}
+
+func isMissingShellAgentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "/shell") {
+		return false
+	}
+	if strings.Contains(msg, "\"path\":[\"agent\"]") {
+		return true
+	}
+	return strings.Contains(msg, "expected string") && strings.Contains(msg, "received undefined") && strings.Contains(msg, "agent")
+}
+
+func (c *Client) executeShellViaHTTP(ctx context.Context, sessionID, command, agent string) (*opencode.AssistantMessage, error) {
+	if strings.TrimSpace(c.endpoint) == "" {
+		return nil, fmt.Errorf("opencode: shell HTTP fallback unavailable: missing endpoint")
+	}
+
+	shellURL, err := url.JoinPath(c.endpoint, "session", sessionID, "shell")
+	if err != nil {
+		shellURL = fmt.Sprintf("%s/session/%s/shell", strings.TrimRight(c.endpoint, "/"), sessionID)
+	}
+
+	if dir := strings.TrimSpace(c.directory); dir != "" {
+		u, parseErr := url.Parse(shellURL)
+		if parseErr == nil {
+			q := u.Query()
+			q.Set("directory", dir)
+			u.RawQuery = q.Encode()
+			shellURL = u.String()
+		}
+	}
+
+	payload := map[string]string{
+		"agent":   strings.TrimSpace(agent),
+		"command": command,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: shell HTTP fallback marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, shellURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("opencode: shell HTTP fallback request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.applyAuthHeaders(req.Header)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: shell HTTP fallback do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("opencode: shell HTTP fallback unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	trimmed := bytes.TrimSpace(respBody)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+
+	var message opencode.AssistantMessage
+	if err := json.Unmarshal(trimmed, &message); err == nil {
+		return &message, nil
+	}
+
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err == nil && len(bytes.TrimSpace(envelope.Data)) > 0 {
+		if unmarshalErr := json.Unmarshal(envelope.Data, &message); unmarshalErr == nil {
+			return &message, nil
+		}
+	}
+
+	log.Printf("opencode: shell HTTP fallback succeeded but response format was unexpected, returning empty assistant message")
+	return &opencode.AssistantMessage{}, nil
 }
 
 // ListSessions retrieves all sessions.
@@ -953,7 +1228,7 @@ func (c *Client) ListSessions(ctx context.Context) ([]opencode.Session, error) {
 }
 
 // AbortSession aborts a running session.
-// 鏍规嵁OpenCode鏂囨。锛孭OST /session/:id/abort 鍙互涓姝ｅ湪杩愯鐨剆ession
+// 根据OpenCode文档，POST /session/:id/abort 可以中止正在运行的session
 func (c *Client) AbortSession(ctx context.Context, sessionID string) error {
 	log.Printf("opencode: aborting session %s", sessionID[:8])
 	_, err := c.sdk.Session.Abort(ctx, sessionID, opencode.SessionAbortParams{})
@@ -962,48 +1237,6 @@ func (c *Client) AbortSession(ctx context.Context, sessionID string) error {
 	}
 	c.runningSessions.Delete(sessionID)
 	return nil
-}
-
-// ForkSession forks an existing session, creating a new independent session
-// branching from the forked session's history. Uses the HTTP API directly
-// since the Go SDK may not expose this endpoint.
-func (c *Client) ForkSession(ctx context.Context, sessionID string) (string, error) {
-	if c.endpoint == "" {
-		return "", fmt.Errorf("opencode: fork session unavailable: missing endpoint")
-	}
-	log.Printf("opencode: forking session %s", sessionID[:min(8, len(sessionID))])
-
-	forkURL := fmt.Sprintf("%s/session/%s/fork", strings.TrimRight(c.endpoint, "/"), sessionID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, forkURL, http.NoBody)
-	if err != nil {
-		return "", fmt.Errorf("opencode: fork session request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	c.applyAuthHeaders(req.Header)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("opencode: fork session do: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("opencode: fork session status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var result struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("opencode: fork session decode response: %w", err)
-	}
-	if result.ID == "" {
-		return "", fmt.Errorf("opencode: fork session returned empty ID")
-	}
-
-	log.Printf("opencode: forked session %s -> %s", sessionID[:min(8, len(sessionID))], result.ID[:min(8, len(result.ID))])
-	return result.ID, nil
 }
 
 // DeleteSession deletes a session.
@@ -1016,158 +1249,23 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	// Clean up local caches
 	c.messageCount.Delete(sessionID)
 	c.tokenCount.Delete(sessionID)
+	c.sessionSummary.Delete(sessionID)
 	c.modelConfig.Delete(sessionID)
+	c.modelOverride.Delete(sessionID)
 	c.runningSessions.Delete(sessionID)
 	return nil
 }
 
-// SummarizeSession triggers context compression for a session.
-func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
-	log.Printf("opencode: summarizing session %s", sessionID[:8])
-
-	// Get the model for this session
-	modelParams := c.getSessionDefaultModel(sessionID)
-	if modelParams == nil {
-		return fmt.Errorf("no model available for session %s", sessionID[:8])
-	}
-
-	params := opencode.SessionSummarizeParams{
-		ProviderID: modelParams.ProviderID,
-		ModelID:    modelParams.ModelID,
-	}
-	if c.directory != "" {
-		params.Directory = opencode.F(c.directory)
-	}
-
-	_, err := c.sdk.Session.Summarize(ctx, sessionID, params)
-	if err != nil {
-		return fmt.Errorf("opencode: summarize session: %w", err)
-	}
-
-	log.Printf("opencode: session %s summarized successfully", sessionID[:8])
-	return nil
-}
-
 // GetProviders retrieves the list of available providers.
-// Uses SDK App.Providers endpoint (/config/providers).
 func (c *Client) GetProviders(ctx context.Context) ([]Provider, error) {
 	if !c.Ready() {
 		return nil, fmt.Errorf("opencode: client not configured")
 	}
 
-	params := opencode.AppProvidersParams{}
-	if c.directory != "" {
-		params.Directory = opencode.F(c.directory)
-	}
-
-	result, err := c.sdk.App.Providers(ctx, params)
+	providers, _, _, err := c.loadProviderCatalog(ctx, false)
 	if err != nil {
-		return nil, fmt.Errorf("opencode: list providers: %w", err)
+		return nil, err
 	}
-	if result == nil || len(result.Providers) == 0 {
-		c.modelCatalogMu.Lock()
-		c.modelCatalog = map[string]*ModelCapability{}
-		c.modelCatalogMu.Unlock()
-		return []Provider{}, nil
-	}
-
-	// 优先从 Config API 获取默认模型（配置文件中的 model 字段）
-	configResult, configErr := c.sdk.Config.Get(ctx, opencode.ConfigGetParams{})
-	if configErr == nil && configResult != nil && configResult.Model != "" {
-		parts := strings.SplitN(strings.TrimSpace(configResult.Model), "/", 2)
-		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
-			c.defaultModelMu.Lock()
-			c.defaultModel = &ModelConfig{ProviderID: parts[0], ModelID: parts[1], LastUpdated: time.Now()}
-			c.defaultModelMu.Unlock()
-			log.Printf("opencode: default model from config: %s/%s", parts[0], parts[1])
-		}
-	} else if configErr != nil {
-		log.Printf("opencode: failed to get config: %v", configErr)
-	}
-
-	providers := make([]Provider, 0, len(result.Providers))
-	newCatalog := make(map[string]*ModelCapability)
-	for _, p := range result.Providers {
-		models := make([]Model, 0, len(p.Models))
-		for modelKey, m := range p.Models {
-			modelID := m.ID
-			if modelID == "" {
-				modelID = modelKey
-			}
-
-			inputModalities := make([]string, 0, len(m.Modalities.Input))
-			inputMap := make(map[string]bool)
-			for _, in := range m.Modalities.Input {
-				s := strings.ToLower(strings.TrimSpace(string(in)))
-				if s == "" {
-					continue
-				}
-				inputModalities = append(inputModalities, s)
-				inputMap[s] = true
-			}
-
-			outputModalities := make([]string, 0, len(m.Modalities.Output))
-			outputMap := make(map[string]bool)
-			for _, out := range m.Modalities.Output {
-				s := strings.ToLower(strings.TrimSpace(string(out)))
-				if s == "" {
-					continue
-				}
-				outputModalities = append(outputModalities, s)
-				outputMap[s] = true
-			}
-
-			// Log multimodal models
-			if inputMap["image"] || inputMap["video"] || inputMap["vision"] || inputMap["input_image"] || inputMap["input_video"] {
-				log.Printf("opencode: multimodal model found: %s/%s, input_modalities=%v", p.ID, modelID, inputModalities)
-			}
-
-			models = append(models, Model{
-				ID:               modelID,
-				Name:             m.Name,
-				InputModalities:  inputModalities,
-				OutputModalities: outputModalities,
-			})
-
-			newCatalog[modelCatalogKey(p.ID, modelID)] = &ModelCapability{
-				ProviderID:       p.ID,
-				ModelID:          modelID,
-				InputModalities:  inputMap,
-				OutputModalities: outputMap,
-			}
-		}
-
-		sort.Slice(models, func(i, j int) bool {
-			return models[i].ID < models[j].ID
-		})
-
-		providers = append(providers, Provider{
-			ID:     p.ID,
-			Name:   p.Name,
-			Models: models,
-		})
-	}
-
-	c.modelCatalogMu.Lock()
-	c.modelCatalog = newCatalog
-	c.modelCatalogMu.Unlock()
-
-	// 如果 OpenCode 没有返回默认模型（配置文件未设置 model），从模型目录中选择第一个可用模型
-	c.defaultModelMu.RLock()
-	hasDefault := c.defaultModel != nil
-	c.defaultModelMu.RUnlock()
-	if !hasDefault && len(newCatalog) > 0 {
-		for _, cap := range newCatalog {
-			if cap != nil && cap.ProviderID != "" && cap.ModelID != "" {
-				c.defaultModelMu.Lock()
-				c.defaultModel = &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID, LastUpdated: time.Now()}
-				c.defaultModelMu.Unlock()
-				log.Printf("opencode: no default model configured, auto-selected first model: %s/%s", cap.ProviderID, cap.ModelID)
-				break
-			}
-		}
-	}
-
 	return providers, nil
 }
 
@@ -1182,98 +1280,99 @@ type Provider struct {
 type Model struct {
 	ID               string   `json:"id"`
 	Name             string   `json:"name"`
+	Attachment       bool     `json:"attachment,omitempty"`
 	InputModalities  []string `json:"input_modalities,omitempty"`
 	OutputModalities []string `json:"output_modalities,omitempty"`
 }
 
+type modelCapability struct {
+	ProviderID       string
+	ModelID          string
+	Attachment       bool
+	InputModalities  map[string]struct{}
+	OutputModalities map[string]struct{}
+}
+
 // GetCurrentProvider retrieves the current provider and model for a session.
-// Note: Session may not expose provider/model info directly
 func (c *Client) GetCurrentProvider(ctx context.Context, sessionID string) (*Provider, string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, "", fmt.Errorf("opencode: get current provider: empty session id")
+	}
+
 	_, err := c.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, "", fmt.Errorf("opencode: get session: %w", err)
 	}
 
-	// SDK Session doesn't have ProviderID/ModelID fields
-	// Return empty for now
-	log.Printf("opencode: session %s - provider info not available in SDK", sessionID[:8])
+	providers, _, defaultModel, err := c.loadProviderCatalog(ctx, false)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if override, ok := c.getSessionModelOverride(sessionID); ok {
+		overrideProviderID := strings.TrimSpace(override.ProviderID.Value)
+		overrideModelID := strings.TrimSpace(override.ModelID.Value)
+		if overrideProviderID == "" || overrideModelID == "" {
+			return nil, "", nil
+		}
+
+		for _, provider := range providers {
+			if provider.ID != overrideProviderID {
+				continue
+			}
+			providerCopy := provider
+			return &providerCopy, overrideModelID, nil
+		}
+		return &Provider{ID: overrideProviderID, Name: overrideProviderID}, overrideModelID, nil
+	}
+
+	if defaultModel != nil {
+		defaultProviderID := strings.TrimSpace(defaultModel.ProviderID.Value)
+		defaultModelID := strings.TrimSpace(defaultModel.ModelID.Value)
+		if defaultProviderID == "" || defaultModelID == "" {
+			return nil, "", nil
+		}
+
+		for _, provider := range providers {
+			if provider.ID != defaultProviderID {
+				continue
+			}
+			providerCopy := provider
+			return &providerCopy, defaultModelID, nil
+		}
+		return &Provider{ID: defaultProviderID, Name: defaultProviderID}, defaultModelID, nil
+	}
+
 	return nil, "", nil
 }
 
 // UpdateSessionProvider updates the provider and model for a session.
-// Note: SDK may not support this directly
 func (c *Client) UpdateSessionProvider(ctx context.Context, sessionID, providerID, modelID string) error {
-	log.Printf("opencode: updating session %s provider to %s/%s", sessionID[:8], providerID, modelID)
-
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("opencode: update session provider: empty session id")
+	}
 	providerID = strings.TrimSpace(providerID)
 	modelID = strings.TrimSpace(modelID)
 	if providerID == "" || modelID == "" {
-		return fmt.Errorf("opencode: provider/model cannot be empty")
+		return fmt.Errorf("opencode: update session provider: empty provider/model")
 	}
 
-	override := &ModelConfig{
-		ProviderID:  providerID,
-		ModelID:     modelID,
-		LastUpdated: time.Now(),
-	}
-	c.sessionOverride.Store(sessionID, override)
-	c.sessionModel.Store(sessionID, override)
-	log.Printf("opencode: session %s model override set to %s/%s", sessionID[:8], providerID, modelID)
-
-	// SDK SessionUpdateParams may not have ProviderID/ModelID fields
-	// Try using Update with available params
-	_, err := c.sdk.Session.Update(ctx, sessionID, opencode.SessionUpdateParams{
-		// Use available fields only
-	})
-	if err != nil {
-		log.Printf("opencode: session update API ignored (local override remains active): %v", err)
+	if _, err := c.GetSession(ctx, sessionID); err != nil {
+		return fmt.Errorf("opencode: update session provider: %w", err)
 	}
 
-	// Invalidate cached model config
+	override := opencode.SessionPromptParamsModel{
+		ProviderID: opencode.F(providerID),
+		ModelID:    opencode.F(modelID),
+	}
+	c.modelOverride.Store(sessionID, override)
+
+	// Keep model config cache fresh after model override changes.
 	c.modelConfig.Delete(sessionID)
-	// Fetch new config
 	go c.fetchAndCacheModelConfig(context.Background(), sessionID)
 
-	log.Printf("opencode: note - provider/model update may not be fully supported by SDK, using gateway override")
-	return nil
-}
-
-func (c *Client) getSessionModelOverride(sessionID string) *opencode.SessionPromptParamsModel {
-	if strings.TrimSpace(sessionID) == "" {
-		return nil
-	}
-	if v, ok := c.sessionOverride.Load(sessionID); ok {
-		cfg := v.(*ModelConfig)
-		if strings.TrimSpace(cfg.ProviderID) != "" && strings.TrimSpace(cfg.ModelID) != "" {
-			return &opencode.SessionPromptParamsModel{
-				ProviderID: opencode.F(cfg.ProviderID),
-				ModelID:    opencode.F(cfg.ModelID),
-			}
-		}
-	}
-	return nil
-}
-
-// getSessionDefaultModel 获取会话默认模型（用于纯文本消息时显式指定）
-// 优先级：用户 /model 设置 > OpenCode 默认模型
-func (c *Client) getSessionDefaultModel(sessionID string) *opencode.SessionPromptParamsModel {
-	// 优先使用用户设置的模型
-	if override := c.getSessionModelOverride(sessionID); override != nil {
-		log.Printf("opencode: getSessionDefaultModel - using user override: %s/%s", override.ProviderID.Value, override.ModelID.Value)
-		return override
-	}
-
-	// 使用 OpenCode 默认模型
-	c.defaultModelMu.RLock()
-	defer c.defaultModelMu.RUnlock()
-	if c.defaultModel != nil {
-		log.Printf("opencode: getSessionDefaultModel - using OpenCode default: %s/%s", c.defaultModel.ProviderID, c.defaultModel.ModelID)
-		return &opencode.SessionPromptParamsModel{
-			ProviderID: opencode.F(c.defaultModel.ProviderID),
-			ModelID:    opencode.F(c.defaultModel.ModelID),
-		}
-	}
-	log.Printf("opencode: getSessionDefaultModel - no default model found (user override=nil, OpenCode default=nil)")
+	log.Printf("opencode: session %s model override set to %s/%s (applied via prompt model param)", sessionID[:min(8, len(sessionID))], providerID, modelID)
 	return nil
 }
 
@@ -1287,17 +1386,18 @@ func (c *Client) IsSessionRunning(sessionID string) bool {
 }
 
 // StartEventListener begins listening for OpenCode events via SSE.
-// 鏀寔鑷姩閲嶈繛锛氬綋 OpenCode Server 鏂紑鎴栭噸鍚悗锛屼細鑷姩閲嶆柊杩炴帴浜嬩欢娴併€?
+// 支持自动重连：当 OpenCode Server 断开或重启后，会自动重新连接事件流。
 func (c *Client) StartEventListener(ctx context.Context) error {
 	log.Printf("opencode: starting event listener...")
 
 	go c.eventListenerLoop(ctx)
+	go c.globalEventListenerLoop(ctx)
 
 	log.Printf("opencode: event listener started successfully")
 	return nil
 }
 
-// eventListenerLoop 浜嬩欢鐩戝惉涓诲惊鐜紝鏀寔鑷姩閲嶈繛
+// eventListenerLoop 事件监听主循环，支持自动重连
 func (c *Client) eventListenerLoop(ctx context.Context) {
 	reconnectDelay := 2 * time.Second
 	maxReconnectDelay := 60 * time.Second
@@ -1312,12 +1412,12 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 		}
 
 		if consecutiveFailures > 0 {
-			// 鎸囨暟閫€閬块噸杩?
+			// 指数退避重连
 			delay := reconnectDelay * time.Duration(1<<uint(min(consecutiveFailures-1, 5)))
 			if delay > maxReconnectDelay {
 				delay = maxReconnectDelay
 			}
-			log.Printf("opencode: 馃攧 reconnecting event listener in %v (attempt #%d)...", delay, consecutiveFailures)
+			log.Printf("opencode: 🔄 reconnecting event listener in %v (attempt #%d)...", delay, consecutiveFailures)
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -1328,6 +1428,12 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 		log.Printf("opencode: creating event stream...")
 		stream := c.sdk.Event.ListStreaming(ctx, opencode.EventListParams{})
 
+		// 清除旧的 session 缓存（server 重启后 session 可能失效）
+		if consecutiveFailures > 0 {
+			log.Printf("opencode: 🔄 server reconnected after %d failures, invalidating stale session cache", consecutiveFailures)
+			c.invalidateStaleSessions(ctx)
+		}
+
 		eventCount := 0
 		connected := false
 
@@ -1337,13 +1443,13 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 
 			eventType := string(event.Type)
 
-			// 棣栨鏀跺埌浜嬩欢锛屾爣璁拌繛鎺ユ垚鍔?
+			// 首次收到事件，标记连接成功
 			if !connected {
+				previousFailures := consecutiveFailures
 				connected = true
-				if consecutiveFailures > 0 {
-					log.Printf("opencode: 馃攧 server reconnected after %d failures, invalidating stale session cache", consecutiveFailures)
-					c.invalidateStaleSessions(ctx)
-					log.Printf("opencode: 鉁?event listener reconnected successfully after %d failures", consecutiveFailures)
+				if previousFailures > 0 {
+					log.Printf("opencode: ✅ event listener reconnected successfully after %d failures", previousFailures)
+					go c.syncRegisteredSessionSnapshots(ctx)
 				}
 				consecutiveFailures = 0
 			}
@@ -1356,123 +1462,13 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 			// Extract session ID using shared helper
 			sessionID := extractSessionIDFromEvent(&event)
 
-			// Populate messageRoles for message.part.updated events (regardless of sessionID path)
-			// so that message.part.delta events for user messages can be filtered before broadcast.
-			if eventType == "message.part.updated" {
-				if raw := event.JSON.RawJSON(); raw != "" {
-					// Dump first 15 events for debugging
-					if eventCount <= 15 {
-						log.Printf("opencode: 馃攳馃攳 [message.part.updated #%d RAW] %.1000s", eventCount, raw)
-					}
-					var msgInfo struct {
-						Properties struct {
-							Message struct {
-								ID   string `json:"id"`
-								Role string `json:"role"`
-							} `json:"message"`
-						} `json:"properties"`
-					}
-					if json.Unmarshal([]byte(raw), &msgInfo) == nil {
-						if msgID := msgInfo.Properties.Message.ID; msgID != "" && msgInfo.Properties.Message.Role != "" {
-							c.messageRoles.Store(msgID, msgInfo.Properties.Message.Role)
-						}
-					}
-				}
-			}
-
-			// ALSO populate messageRoles from message.updated events (which DO contain role)
-			// NOTE: message.updated structure is properties.info.{id,role} NOT properties.message.{id,role}
-			if eventType == "message.updated" {
-				if raw := event.JSON.RawJSON(); raw != "" {
-					var msgInfo struct {
-						Properties struct {
-							Info struct {
-								ID   string `json:"id"`
-								Role string `json:"role"`
-							} `json:"info"`
-						} `json:"properties"`
-					}
-					if json.Unmarshal([]byte(raw), &msgInfo) == nil {
-						if msgID := msgInfo.Properties.Info.ID; msgID != "" && msgInfo.Properties.Info.Role != "" {
-							c.messageRoles.Store(msgID, msgInfo.Properties.Info.Role)
-							log.Printf("opencode: 鉁?stored messageRole: msgID=%s, role=%s",
-								msgID[:min(8, len(msgID))], msgInfo.Properties.Info.Role)
-						}
-					}
-				}
-			}
-
-			// For message.part.updated / message.part.delta events the base extractor
-			// may return "" because the sessionID is nested in properties.message.
-			// Re-parse those two types and also build the messageID鈫抯essionID reverse map
-			// so that subsequent delta events can be dispatched correctly.
-			if sessionID == "" && (eventType == "message.part.delta" || eventType == "message.part.updated") {
-				if raw := event.JSON.RawJSON(); raw != "" {
-					var probe struct {
-						Properties struct {
-							MessageID string `json:"messageID"` // present in message.part.delta
-							Message   struct {
-								ID        string `json:"id"`
-								SessionID string `json:"sessionID"`
-								Role      string `json:"role"` // "user" or "assistant"
-							} `json:"message"` // present in message.part.updated
-						} `json:"properties"`
-					}
-					if json.Unmarshal([]byte(raw), &probe) == nil {
-						if probe.Properties.Message.SessionID != "" {
-							// message.part.updated 鈥?record messageID鈫抯essionID and messageID鈫抮ole
-							sessionID = probe.Properties.Message.SessionID
-							if msgID := probe.Properties.Message.ID; msgID != "" {
-								c.messageToSession.Store(msgID, sessionID)
-								if role := probe.Properties.Message.Role; role != "" {
-									c.messageRoles.Store(msgID, role)
-								}
-							}
-						} else if probe.Properties.MessageID != "" {
-							// message.part.delta 鈥?look up sessionID via reverse map
-							if sid, ok := c.messageToSession.Load(probe.Properties.MessageID); ok {
-								sessionID = sid.(string)
-							}
-							// If still no sessionID, broadcast 鈥?but only for assistant messages
-							// with a KNOWN role. Unknown-role deltas are likely from old/other
-							// sessions being replayed; broadcasting them would echo stale content.
-							if sessionID == "" {
-								role, roleKnown := c.messageRoles.Load(probe.Properties.MessageID)
-								if !roleKnown {
-									log.Printf("opencode: dropping message.part.delta with unknown messageID (likely old session replay)")
-								} else if role.(string) == "user" {
-									log.Printf("opencode: skipping user message.part.delta broadcast (msgID=%s)", probe.Properties.MessageID[:min(8, len(probe.Properties.MessageID))])
-								} else {
-									// Known assistant message 鈥?broadcast to all session handlers
-									dispatched := 0
-									c.sessionHandlers.Range(func(k, v interface{}) bool {
-										if err := v.(EventHandler)(ctx, &event); err != nil {
-											log.Printf("opencode: message.part.delta broadcast error (session %v): %v", k, err)
-										}
-										dispatched++
-										return true
-									})
-									if dispatched == 0 {
-										log.Printf("opencode: message.part.delta broadcast - no session handlers registered")
-									}
-								}
-							}
-						}
-					}
-					// Dump first few events for structure verification
-					if eventCount <= 5 {
-						log.Printf("opencode: [raw %s #%d] %.300s", eventType, eventCount, raw)
-					}
-				}
-			}
-
 			if sessionID != "" && len(sessionID) > 8 {
 				log.Printf("opencode: processing event type=%s, sessionID=%s", eventType, sessionID[:8])
-			} else if eventType != "server.heartbeat" && eventType != "server.connected" && sessionID == "" {
+			} else if eventType != "server.heartbeat" && eventType != "server.connected" {
 				log.Printf("opencode: processing event type=%s (no sessionID)", eventType)
 			}
 
-			// Dispatch to the specific session handler (when sessionID is known)
+			// Fast path: if session ID found, call the specific session handler
 			if sessionID != "" {
 				if handler, ok := c.sessionHandlers.Load(sessionID); ok {
 					if err := handler.(EventHandler)(ctx, &event); err != nil {
@@ -1480,27 +1476,10 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 					}
 				} else {
 					log.Printf("opencode: no session handler found for %s", sessionID[:8])
-					c.sessionHandlers.Range(func(k, v interface{}) bool {
-						log.Printf("opencode:   registered handler: %v", k)
-						return true
-					})
 				}
 			}
 
-			// Always dispatch to global handlers
-			c.eventListenerMu.RLock()
-			handlers := c.eventHandlers
-			c.eventListenerMu.RUnlock()
-
-			if len(handlers) > 0 {
-				log.Printf("opencode: dispatching to %d global handlers", len(handlers))
-			}
-
-			for _, handler := range handlers {
-				if err := handler(ctx, &event); err != nil {
-					log.Printf("opencode: global event handler error: %v", err)
-				}
-			}
+			c.dispatchGlobalEventHandlers(ctx, &event)
 		}
 
 		stream.Close()
@@ -1509,59 +1488,1043 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 
 		if err := stream.Err(); err != nil {
 			log.Printf("opencode: event stream error: %v", err)
-			c.maybeHandleServerUnavailable(ctx, err, "event-stream")
 		}
 
-		// 妫€鏌ユ槸鍚︽槸涓诲姩閫€鍑?
+		// 检查是否是主动退出
 		select {
 		case <-ctx.Done():
 			log.Printf("opencode: event listener stopped (context cancelled)")
 			return
 		default:
-			// 闈炰富鍔ㄩ€€鍑猴紝鍑嗗閲嶈繛
+			// 非主动退出，准备重连
 			consecutiveFailures++
-			log.Printf("opencode: 鈿狅笍 event stream disconnected unexpectedly, will reconnect...")
+			log.Printf("opencode: ⚠️ event stream disconnected unexpectedly, will reconnect...")
 		}
 	}
 }
 
-func (c *Client) maybeHandleServerUnavailable(ctx context.Context, err error, source string) {
-	if c.serverUnavailable == nil || err == nil {
-		return
+func (c *Client) dispatchGlobalEventHandlers(ctx context.Context, event *opencode.EventListResponse) {
+	c.eventListenerMu.RLock()
+	handlers := c.eventHandlers
+	c.eventListenerMu.RUnlock()
+
+	if len(handlers) > 0 {
+		log.Printf("opencode: dispatching to %d global handlers", len(handlers))
 	}
-	msg := strings.ToLower(err.Error())
-	if !strings.Contains(msg, "connection refused") &&
-		!strings.Contains(msg, "no such host") &&
-		!strings.Contains(msg, "dial tcp") &&
-		!strings.Contains(msg, "connect:") {
+
+	for _, handler := range handlers {
+		if err := handler(ctx, event); err != nil {
+			log.Printf("opencode: global event handler error: %v", err)
+		}
+	}
+}
+
+// globalEventListenerLoop subscribes to /global/event to align with official OpenCode
+// global SSE semantics (server.connected + heartbeat + process-wide events).
+func (c *Client) globalEventListenerLoop(ctx context.Context) {
+	if c.endpoint == "" {
+		log.Printf("opencode: global event listener skipped: empty endpoint")
 		return
 	}
 
-	c.unavailableMu.Lock()
-	if !c.lastUnavailableAt.IsZero() && time.Since(c.lastUnavailableAt) < c.unavailableDelay {
-		c.unavailableMu.Unlock()
-		return
-	}
-	c.lastUnavailableAt = time.Now()
-	c.unavailableMu.Unlock()
+	baseDelay := 2 * time.Second
+	maxDelay := 60 * time.Second
+	consecutiveFailures := 0
+	lastEventID := ""
 
-	reason := fmt.Sprintf("%s unavailable: %v", source, err)
-	go func() {
-		actionCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		msg, actionErr := c.serverUnavailable(actionCtx, reason)
-		if actionErr != nil {
-			log.Printf("opencode: self-heal action failed (%s): %v", source, actionErr)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("opencode: global event listener stopped (context cancelled)")
 			return
+		default:
 		}
-		if strings.TrimSpace(msg) != "" {
-			log.Printf("opencode: self-heal action: %s", msg)
+
+		if consecutiveFailures > 0 {
+			delay := baseDelay * time.Duration(1<<uint(min(consecutiveFailures-1, 5)))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			log.Printf("opencode: reconnecting global SSE in %v (attempt #%d)", delay, consecutiveFailures)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return
+			}
 		}
-	}()
+
+		nextEventID, eventCount, err := c.readGlobalEventStreamOnce(ctx, lastEventID)
+		if nextEventID != "" {
+			lastEventID = nextEventID
+		}
+
+		if err != nil {
+			consecutiveFailures++
+			log.Printf("opencode: global SSE stream ended with error: %v", err)
+			c.maybeHandleServerUnavailable(ctx, err, "global-event-stream")
+			continue
+		}
+
+		if eventCount > 0 {
+			log.Printf("opencode: global SSE stream ended (events=%d), reconnecting", eventCount)
+		} else {
+			log.Printf("opencode: global SSE stream ended without events, reconnecting")
+		}
+		consecutiveFailures++
+	}
 }
 
-// invalidateStaleSessions 娓呴櫎鍙兘澶辨晥鐨?session 缂撳瓨
-// 褰?OpenCode Server 閲嶅惎鍚庤皟鐢紝璁╀笅娆℃秷鎭椂鍒涘缓鏂?session
+type sseFrame struct {
+	ID    string
+	Event string
+	Retry int
+	Data  string
+}
+
+func (c *Client) readGlobalEventStreamOnce(ctx context.Context, lastEventID string) (string, int, error) {
+	globalURL, err := url.JoinPath(c.endpoint, "global", "event")
+	if err != nil {
+		globalURL = strings.TrimRight(c.endpoint, "/") + "/global/event"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, globalURL, nil)
+	if err != nil {
+		return lastEventID, 0, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
+	}
+	c.applyAuthHeaders(req.Header)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return lastEventID, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return lastEventID, 0, fmt.Errorf("global event stream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	eventCount := 0
+	parseErr := parseSSE(resp.Body, func(frame sseFrame) error {
+		if frame.ID != "" {
+			lastEventID = frame.ID
+		}
+		raw := strings.TrimSpace(frame.Data)
+		if raw == "" {
+			return nil
+		}
+
+		var evt opencode.EventListResponse
+		if err := json.Unmarshal([]byte(raw), &evt); err != nil {
+			// Keep parity with OpenCode parser behavior: ignore non-JSON payloads.
+			return nil
+		}
+
+		if c.isSessionScopedEvent(&evt) {
+			return nil
+		}
+
+		eventCount++
+		c.dispatchGlobalEventHandlers(ctx, &evt)
+		return nil
+	})
+
+	return lastEventID, eventCount, parseErr
+}
+
+func (c *Client) isSessionScopedEvent(event *opencode.EventListResponse) bool {
+	if event == nil {
+		return false
+	}
+	if extractSessionIDFromEvent(event) != "" {
+		return true
+	}
+
+	eventType := string(event.Type)
+	if strings.HasPrefix(eventType, "session.") ||
+		strings.HasPrefix(eventType, "message.") ||
+		strings.HasPrefix(eventType, "todo.") ||
+		strings.HasPrefix(eventType, "permission.") ||
+		strings.HasPrefix(eventType, "question.") {
+		return true
+	}
+
+	raw := event.JSON.RawJSON()
+	if raw == "" {
+		return false
+	}
+
+	var probe struct {
+		Properties struct {
+			MessageID string `json:"messageID"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(raw), &probe); err == nil && probe.Properties.MessageID != "" {
+		if _, ok := c.messageToSession.Load(probe.Properties.MessageID); ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parseSSE(reader io.Reader, onFrame func(frame sseFrame) error) error {
+	br := bufio.NewReader(reader)
+	var id string
+	var eventName string
+	retry := 0
+	dataLines := make([]string, 0, 4)
+
+	flush := func() error {
+		if len(dataLines) == 0 && id == "" && eventName == "" && retry == 0 {
+			return nil
+		}
+		frame := sseFrame{
+			ID:    id,
+			Event: eventName,
+			Retry: retry,
+			Data:  strings.Join(dataLines, "\n"),
+		}
+		id = ""
+		eventName = ""
+		retry = 0
+		dataLines = dataLines[:0]
+		return onFrame(frame)
+	}
+
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+
+		line = strings.TrimRight(line, "\r\n")
+
+		if line == "" {
+			if flushErr := flush(); flushErr != nil {
+				return flushErr
+			}
+		} else if !strings.HasPrefix(line, ":") {
+			field := line
+			value := ""
+			if idx := strings.IndexByte(line, ':'); idx >= 0 {
+				field = line[:idx]
+				value = line[idx+1:]
+				if strings.HasPrefix(value, " ") {
+					value = value[1:]
+				}
+			}
+
+			switch field {
+			case "data":
+				dataLines = append(dataLines, value)
+			case "id":
+				id = value
+			case "event":
+				eventName = value
+			case "retry":
+				if n, convErr := strconv.Atoi(value); convErr == nil {
+					retry = n
+				}
+			}
+		}
+
+		if errors.Is(err, io.EOF) {
+			return flush()
+		}
+	}
+}
+
+func inferMimeFromDataURI(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "data:") {
+		return ""
+	}
+	semi := strings.Index(raw, ";")
+	comma := strings.Index(raw, ",")
+	end := semi
+	if end < 0 || (comma >= 0 && comma < end) {
+		end = comma
+	}
+	if end <= len("data:") {
+		return ""
+	}
+	return strings.TrimSpace(raw[len("data:"):end])
+}
+
+func normalizeModelKey(providerID, modelID string) string {
+	return strings.ToLower(strings.TrimSpace(providerID)) + "/" + strings.ToLower(strings.TrimSpace(modelID))
+}
+
+func parseProviderModelRef(ref string) (string, string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(ref), "/", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	providerID := strings.TrimSpace(parts[0])
+	modelID := strings.TrimSpace(parts[1])
+	if providerID == "" || modelID == "" {
+		return "", "", false
+	}
+	return providerID, modelID, true
+}
+
+func resolveDefaultModelHint(defaultMap map[string]string, capabilityMap map[string]modelCapability) *opencode.SessionPromptParamsModel {
+	if len(defaultMap) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(defaultMap))
+	for k := range defaultMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		value := strings.TrimSpace(defaultMap[key])
+		if value == "" {
+			continue
+		}
+
+		if providerID, modelID, ok := parseProviderModelRef(value); ok {
+			if _, exists := capabilityMap[normalizeModelKey(providerID, modelID)]; exists {
+				return modelFromRef(providerID, modelID)
+			}
+		}
+
+		providerID := strings.TrimSpace(key)
+		if providerID == "" {
+			continue
+		}
+		if _, exists := capabilityMap[normalizeModelKey(providerID, value)]; exists {
+			return modelFromRef(providerID, value)
+		}
+	}
+
+	return nil
+}
+
+func containsAttachmentModalities(attachments []Attachment) map[string]struct{} {
+	required := make(map[string]struct{})
+	for _, attachment := range attachments {
+		mimeValue := strings.ToLower(strings.TrimSpace(attachment.Mime))
+		if mimeValue == "" {
+			mimeValue = strings.ToLower(inferMimeFromDataURI(attachment.URL))
+		}
+		if strings.HasPrefix(mimeValue, "image/") {
+			required["image"] = struct{}{}
+			continue
+		}
+		if strings.HasPrefix(mimeValue, "video/") {
+			required["video"] = struct{}{}
+			continue
+		}
+		if strings.HasPrefix(mimeValue, "audio/") {
+			required["audio"] = struct{}{}
+			continue
+		}
+		if mimeValue == "application/pdf" || strings.HasSuffix(mimeValue, "/pdf") {
+			required["pdf"] = struct{}{}
+		}
+	}
+	return required
+}
+
+func requiredModalitiesFromPayload(payload MessagePayload) map[string]struct{} {
+	required := containsAttachmentModalities(payload.Attachments)
+
+	messageType := detectPayloadMessageType(payload)
+
+	switch messageType {
+	case "image", "picture":
+		required["image"] = struct{}{}
+	case "video":
+		required["video"] = struct{}{}
+	case "audio", "voice":
+		required["audio"] = struct{}{}
+	case "pdf":
+		required["pdf"] = struct{}{}
+	}
+
+	return required
+}
+
+func detectPayloadMessageType(payload MessagePayload) string {
+	messageType := strings.ToLower(strings.TrimSpace(payload.Metadata["message_type"]))
+	if messageType != "" {
+		return messageType
+	}
+	return strings.ToLower(strings.TrimSpace(payload.Metadata["media_message_type"]))
+}
+
+func payloadNeedsAttachmentModel(payload MessagePayload) bool {
+	if len(payload.Attachments) > 0 {
+		return true
+	}
+
+	messageType := detectPayloadMessageType(payload)
+	if messageType == "" {
+		return false
+	}
+
+	switch messageType {
+	case "text":
+		return false
+	case "image", "picture", "video", "audio", "voice", "file", "pdf", "media", "sticker", "emotion", "image_message", "audio_message", "video_message", "file_message":
+		return true
+	default:
+		// Conservative fallback for common non-text aliases from adapters.
+		return strings.Contains(messageType, "image") ||
+			strings.Contains(messageType, "video") ||
+			strings.Contains(messageType, "audio") ||
+			strings.Contains(messageType, "voice") ||
+			strings.Contains(messageType, "file") ||
+			strings.Contains(messageType, "media") ||
+			strings.Contains(messageType, "pdf")
+	}
+}
+
+func capabilityLikelySupportsNonText(capability modelCapability) bool {
+	if capability.Attachment {
+		return true
+	}
+
+	for modality := range capability.InputModalities {
+		normalized := strings.ToLower(strings.TrimSpace(modality))
+		switch normalized {
+		case "", "text", "input_text", "prompt":
+			continue
+		default:
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *Client) getSessionModelOverride(sessionID string) (opencode.SessionPromptParamsModel, bool) {
+	v, ok := c.modelOverride.Load(sessionID)
+	if !ok {
+		return opencode.SessionPromptParamsModel{}, false
+	}
+	model, ok := v.(opencode.SessionPromptParamsModel)
+	if !ok {
+		return opencode.SessionPromptParamsModel{}, false
+	}
+	return model, true
+}
+
+func modelFromRef(providerID, modelID string) *opencode.SessionPromptParamsModel {
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if providerID == "" || modelID == "" {
+		return nil
+	}
+	return &opencode.SessionPromptParamsModel{
+		ProviderID: opencode.F(providerID),
+		ModelID:    opencode.F(modelID),
+	}
+}
+
+func (c *Client) capabilitySupports(required map[string]struct{}, capability modelCapability) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if len(capability.InputModalities) == 0 {
+		// For multimodal routing we only trust explicit modality declarations.
+		return false
+	}
+	for modality := range required {
+		if _, ok := capability.InputModalities[modality]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Client) hasCapableModelForModalities(required map[string]struct{}) bool {
+	if len(required) == 0 {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, capabilityMap, defaultModel, err := c.loadProviderCatalog(ctx, false)
+	if err != nil {
+		log.Printf("opencode: failed to load provider catalog for modality check: %v", err)
+	}
+
+	if defaultModel != nil {
+		providerID := strings.TrimSpace(defaultModel.ProviderID.Value)
+		modelID := strings.TrimSpace(defaultModel.ModelID.Value)
+		if providerID != "" && modelID != "" {
+			if capability, ok := capabilityMap[normalizeModelKey(providerID, modelID)]; ok {
+				if c.capabilitySupports(required, capability) {
+					return true
+				}
+			}
+		}
+	}
+
+	for _, capability := range capabilityMap {
+		if c.capabilitySupports(required, capability) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// HasImageCapableModel reports whether any configured model can accept image input.
+func (c *Client) HasImageCapableModel() bool {
+	return c.hasCapableModelForModalities(map[string]struct{}{"image": {}})
+}
+
+// HasVideoCapableModel reports whether any configured model can accept video input.
+func (c *Client) HasVideoCapableModel() bool {
+	return c.hasCapableModelForModalities(map[string]struct{}{"video": {}})
+}
+
+func (c *Client) loadProviderCatalogFromHTTP(ctx context.Context) ([]Provider, map[string]modelCapability, *opencode.SessionPromptParamsModel, error) {
+	if strings.TrimSpace(c.endpoint) == "" {
+		return nil, nil, nil, fmt.Errorf("opencode: providers HTTP unavailable: missing endpoint")
+	}
+
+	providersURL, err := url.JoinPath(c.endpoint, "config", "providers")
+	if err != nil {
+		providersURL = strings.TrimRight(c.endpoint, "/") + "/config/providers"
+	}
+
+	if dir := strings.TrimSpace(c.directory); dir != "" {
+		u, parseErr := url.Parse(providersURL)
+		if parseErr == nil {
+			q := u.Query()
+			q.Set("directory", dir)
+			u.RawQuery = q.Encode()
+			providersURL = u.String()
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, providersURL, nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	c.applyAuthHeaders(req.Header)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, nil, nil, fmt.Errorf("providers status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Default   map[string]string `json:"default"`
+		Providers []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Models map[string]struct {
+				ID         string `json:"id"`
+				Name       string `json:"name"`
+				Attachment bool   `json:"attachment"`
+				Modalities struct {
+					Input  []string `json:"input"`
+					Output []string `json:"output"`
+				} `json:"modalities"`
+				Capabilities struct {
+					Attachment bool            `json:"attachment"`
+					Input      map[string]bool `json:"input"`
+					Output     map[string]bool `json:"output"`
+				} `json:"capabilities"`
+			} `json:"models"`
+		} `json:"providers"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, nil, nil, err
+	}
+
+	providerItems := payload.Providers
+	sort.Slice(providerItems, func(i, j int) bool {
+		return strings.ToLower(strings.TrimSpace(providerItems[i].ID)) < strings.ToLower(strings.TrimSpace(providerItems[j].ID))
+	})
+
+	providers := make([]Provider, 0, len(providerItems))
+	capabilityMap := make(map[string]modelCapability)
+
+	for _, providerCfg := range providerItems {
+		provider := Provider{
+			ID:   strings.TrimSpace(providerCfg.ID),
+			Name: strings.TrimSpace(providerCfg.Name),
+		}
+		if provider.ID == "" {
+			continue
+		}
+		if provider.Name == "" {
+			provider.Name = provider.ID
+		}
+
+		modelKeys := make([]string, 0, len(providerCfg.Models))
+		for modelID := range providerCfg.Models {
+			modelKeys = append(modelKeys, modelID)
+		}
+		sort.Strings(modelKeys)
+
+		provider.Models = make([]Model, 0, len(modelKeys))
+		for _, modelKey := range modelKeys {
+			modelCfg := providerCfg.Models[modelKey]
+			normalizedModelID := strings.TrimSpace(modelCfg.ID)
+			if normalizedModelID == "" {
+				normalizedModelID = strings.TrimSpace(modelKey)
+			}
+			if normalizedModelID == "" {
+				continue
+			}
+
+			inputModalities := make([]string, 0, 4)
+			inputSet := make(map[string]struct{}, 4)
+			for modality, enabled := range modelCfg.Capabilities.Input {
+				if !enabled {
+					continue
+				}
+				value := strings.ToLower(strings.TrimSpace(modality))
+				if value == "" {
+					continue
+				}
+				inputModalities = append(inputModalities, value)
+				inputSet[value] = struct{}{}
+			}
+			if len(inputSet) == 0 {
+				for _, modality := range modelCfg.Modalities.Input {
+					value := strings.ToLower(strings.TrimSpace(modality))
+					if value == "" {
+						continue
+					}
+					inputModalities = append(inputModalities, value)
+					inputSet[value] = struct{}{}
+				}
+			}
+			sort.Strings(inputModalities)
+
+			outputModalities := make([]string, 0, 4)
+			outputSet := make(map[string]struct{}, 4)
+			for modality, enabled := range modelCfg.Capabilities.Output {
+				if !enabled {
+					continue
+				}
+				value := strings.ToLower(strings.TrimSpace(modality))
+				if value == "" {
+					continue
+				}
+				outputModalities = append(outputModalities, value)
+				outputSet[value] = struct{}{}
+			}
+			if len(outputSet) == 0 {
+				for _, modality := range modelCfg.Modalities.Output {
+					value := strings.ToLower(strings.TrimSpace(modality))
+					if value == "" {
+						continue
+					}
+					outputModalities = append(outputModalities, value)
+					outputSet[value] = struct{}{}
+				}
+			}
+			sort.Strings(outputModalities)
+
+			attachmentCap := modelCfg.Attachment || modelCfg.Capabilities.Attachment
+
+			provider.Models = append(provider.Models, Model{
+				ID:               normalizedModelID,
+				Name:             strings.TrimSpace(modelCfg.Name),
+				Attachment:       attachmentCap,
+				InputModalities:  inputModalities,
+				OutputModalities: outputModalities,
+			})
+
+			capabilityMap[normalizeModelKey(provider.ID, normalizedModelID)] = modelCapability{
+				ProviderID:       provider.ID,
+				ModelID:          normalizedModelID,
+				Attachment:       attachmentCap,
+				InputModalities:  inputSet,
+				OutputModalities: outputSet,
+			}
+		}
+
+		providers = append(providers, provider)
+	}
+
+	defaultModel := resolveDefaultModelHint(payload.Default, capabilityMap)
+	return providers, capabilityMap, defaultModel, nil
+}
+
+func (c *Client) loadProviderCatalog(ctx context.Context, forceRefresh bool) ([]Provider, map[string]modelCapability, *opencode.SessionPromptParamsModel, error) {
+	c.providerCacheMu.RLock()
+	if !forceRefresh && time.Since(c.providerCacheAt) < ProviderCatalogCacheTTL && len(c.providerCache) > 0 {
+		providers := append([]Provider(nil), c.providerCache...)
+		capabilityCopy := make(map[string]modelCapability, len(c.capabilityCache))
+		for k, v := range c.capabilityCache {
+			capabilityCopy[k] = v
+		}
+		var defaultCopy *opencode.SessionPromptParamsModel
+		if c.defaultModelHint != nil {
+			v := *c.defaultModelHint
+			defaultCopy = &v
+		}
+		c.providerCacheMu.RUnlock()
+		return providers, capabilityCopy, defaultCopy, nil
+	}
+	c.providerCacheMu.RUnlock()
+
+	if providers, capabilityMap, defaultModel, httpErr := c.loadProviderCatalogFromHTTP(ctx); httpErr == nil {
+		c.providerCacheMu.Lock()
+		c.providerCache = append([]Provider(nil), providers...)
+		c.capabilityCache = capabilityMap
+		c.providerCacheAt = time.Now()
+		if defaultModel != nil {
+			copyModel := *defaultModel
+			c.defaultModelHint = &copyModel
+		} else {
+			c.defaultModelHint = nil
+		}
+		c.providerCacheMu.Unlock()
+
+		return providers, capabilityMap, defaultModel, nil
+	} else {
+		log.Printf("opencode: providers HTTP catalog unavailable, falling back to SDK: %v", httpErr)
+	}
+
+	appParams := opencode.AppProvidersParams{}
+	if strings.TrimSpace(c.directory) != "" {
+		appParams.Directory = opencode.F(c.directory)
+	}
+
+	if appProviders, appErr := c.sdk.App.Providers(ctx, appParams); appErr == nil && appProviders != nil && len(appProviders.Providers) > 0 {
+		providerItems := append([]opencode.Provider(nil), appProviders.Providers...)
+		sort.Slice(providerItems, func(i, j int) bool {
+			return strings.ToLower(strings.TrimSpace(providerItems[i].ID)) < strings.ToLower(strings.TrimSpace(providerItems[j].ID))
+		})
+
+		providers := make([]Provider, 0, len(providerItems))
+		capabilityMap := make(map[string]modelCapability)
+
+		for _, providerCfg := range providerItems {
+			provider := Provider{
+				ID:   strings.TrimSpace(providerCfg.ID),
+				Name: strings.TrimSpace(providerCfg.Name),
+			}
+			if provider.ID == "" {
+				continue
+			}
+			if provider.Name == "" {
+				provider.Name = provider.ID
+			}
+
+			modelKeys := make([]string, 0, len(providerCfg.Models))
+			for modelID := range providerCfg.Models {
+				modelKeys = append(modelKeys, modelID)
+			}
+			sort.Strings(modelKeys)
+
+			provider.Models = make([]Model, 0, len(modelKeys))
+			for _, modelKey := range modelKeys {
+				modelCfg := providerCfg.Models[modelKey]
+				normalizedModelID := strings.TrimSpace(modelCfg.ID)
+				if normalizedModelID == "" {
+					normalizedModelID = strings.TrimSpace(modelKey)
+				}
+				if normalizedModelID == "" {
+					continue
+				}
+
+				inputModalities := make([]string, 0, len(modelCfg.Modalities.Input))
+				inputSet := make(map[string]struct{}, len(modelCfg.Modalities.Input))
+				for _, modality := range modelCfg.Modalities.Input {
+					value := strings.ToLower(strings.TrimSpace(string(modality)))
+					if value == "" {
+						continue
+					}
+					inputModalities = append(inputModalities, value)
+					inputSet[value] = struct{}{}
+				}
+
+				outputModalities := make([]string, 0, len(modelCfg.Modalities.Output))
+				outputSet := make(map[string]struct{}, len(modelCfg.Modalities.Output))
+				for _, modality := range modelCfg.Modalities.Output {
+					value := strings.ToLower(strings.TrimSpace(string(modality)))
+					if value == "" {
+						continue
+					}
+					outputModalities = append(outputModalities, value)
+					outputSet[value] = struct{}{}
+				}
+
+				provider.Models = append(provider.Models, Model{
+					ID:               normalizedModelID,
+					Name:             strings.TrimSpace(modelCfg.Name),
+					Attachment:       modelCfg.Attachment,
+					InputModalities:  inputModalities,
+					OutputModalities: outputModalities,
+				})
+
+				capabilityMap[normalizeModelKey(provider.ID, normalizedModelID)] = modelCapability{
+					ProviderID:       provider.ID,
+					ModelID:          normalizedModelID,
+					Attachment:       modelCfg.Attachment,
+					InputModalities:  inputSet,
+					OutputModalities: outputSet,
+				}
+			}
+
+			providers = append(providers, provider)
+		}
+
+		defaultModel := resolveDefaultModelHint(appProviders.Default, capabilityMap)
+
+		c.providerCacheMu.Lock()
+		c.providerCache = append([]Provider(nil), providers...)
+		c.capabilityCache = capabilityMap
+		c.providerCacheAt = time.Now()
+		if defaultModel != nil {
+			copyModel := *defaultModel
+			c.defaultModelHint = &copyModel
+		} else {
+			c.defaultModelHint = nil
+		}
+		c.providerCacheMu.Unlock()
+
+		return providers, capabilityMap, defaultModel, nil
+	}
+
+	params := opencode.ConfigGetParams{}
+	if strings.TrimSpace(c.directory) != "" {
+		params.Directory = opencode.F(c.directory)
+	}
+
+	cfg, err := c.sdk.Config.Get(ctx, params)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("opencode: get providers from config: %w", err)
+	}
+	if cfg == nil {
+		return []Provider{}, map[string]modelCapability{}, nil, nil
+	}
+
+	providerKeys := make([]string, 0, len(cfg.Provider))
+	for providerID := range cfg.Provider {
+		providerKeys = append(providerKeys, providerID)
+	}
+	sort.Strings(providerKeys)
+
+	providers := make([]Provider, 0, len(providerKeys))
+	capabilityMap := make(map[string]modelCapability)
+
+	for _, providerID := range providerKeys {
+		providerCfg := cfg.Provider[providerID]
+		provider := Provider{
+			ID:   providerCfg.ID,
+			Name: providerCfg.Name,
+		}
+		if strings.TrimSpace(provider.ID) == "" {
+			provider.ID = providerID
+		}
+		if strings.TrimSpace(provider.Name) == "" {
+			provider.Name = provider.ID
+		}
+
+		modelKeys := make([]string, 0, len(providerCfg.Models))
+		for modelID := range providerCfg.Models {
+			modelKeys = append(modelKeys, modelID)
+		}
+		sort.Strings(modelKeys)
+
+		provider.Models = make([]Model, 0, len(modelKeys))
+		for _, modelID := range modelKeys {
+			modelCfg := providerCfg.Models[modelID]
+			normalizedModelID := strings.TrimSpace(modelCfg.ID)
+			if normalizedModelID == "" {
+				normalizedModelID = modelID
+			}
+
+			inputModalities := make([]string, 0, len(modelCfg.Modalities.Input))
+			inputSet := make(map[string]struct{}, len(modelCfg.Modalities.Input))
+			for _, modality := range modelCfg.Modalities.Input {
+				value := strings.ToLower(strings.TrimSpace(string(modality)))
+				if value == "" {
+					continue
+				}
+				inputModalities = append(inputModalities, value)
+				inputSet[value] = struct{}{}
+			}
+
+			outputModalities := make([]string, 0, len(modelCfg.Modalities.Output))
+			outputSet := make(map[string]struct{}, len(modelCfg.Modalities.Output))
+			for _, modality := range modelCfg.Modalities.Output {
+				value := strings.ToLower(strings.TrimSpace(string(modality)))
+				if value == "" {
+					continue
+				}
+				outputModalities = append(outputModalities, value)
+				outputSet[value] = struct{}{}
+			}
+
+			provider.Models = append(provider.Models, Model{
+				ID:               normalizedModelID,
+				Name:             modelCfg.Name,
+				Attachment:       modelCfg.Attachment,
+				InputModalities:  inputModalities,
+				OutputModalities: outputModalities,
+			})
+
+			capabilityMap[normalizeModelKey(provider.ID, normalizedModelID)] = modelCapability{
+				ProviderID:       provider.ID,
+				ModelID:          normalizedModelID,
+				Attachment:       modelCfg.Attachment,
+				InputModalities:  inputSet,
+				OutputModalities: outputSet,
+			}
+		}
+
+		providers = append(providers, provider)
+	}
+
+	var defaultModel *opencode.SessionPromptParamsModel
+	if providerID, modelID, ok := parseProviderModelRef(cfg.Model); ok {
+		defaultModel = modelFromRef(providerID, modelID)
+	}
+
+	c.providerCacheMu.Lock()
+	c.providerCache = append([]Provider(nil), providers...)
+	c.capabilityCache = capabilityMap
+	c.providerCacheAt = time.Now()
+	if defaultModel != nil {
+		copyModel := *defaultModel
+		c.defaultModelHint = &copyModel
+	} else {
+		c.defaultModelHint = nil
+	}
+	c.providerCacheMu.Unlock()
+
+	return providers, capabilityMap, defaultModel, nil
+}
+
+func (c *Client) selectModelOverride(ctx context.Context, sessionID string, payload MessagePayload) (*opencode.SessionPromptParamsModel, string) {
+	requiredModalities := requiredModalitiesFromPayload(payload)
+	nonTextHint := payloadNeedsAttachmentModel(payload)
+	if len(requiredModalities) > 0 {
+		mods := make([]string, 0, len(requiredModalities))
+		for modality := range requiredModalities {
+			mods = append(mods, modality)
+		}
+		sort.Strings(mods)
+		log.Printf("opencode: multimodal requirements detected for session %s: %s", sessionID[:min(8, len(sessionID))], strings.Join(mods, ","))
+	} else if nonTextHint {
+		log.Printf("opencode: non-text message detected for session %s by adapter metadata, selecting attachment-capable model", sessionID[:min(8, len(sessionID))])
+	}
+
+	if override, ok := c.getSessionModelOverride(sessionID); ok {
+		model := override
+		if len(requiredModalities) == 0 && !nonTextHint {
+			return &model, "session override"
+		}
+
+		_, capabilityMap, _, err := c.loadProviderCatalog(ctx, false)
+		if err != nil {
+			log.Printf("opencode: failed to load provider catalog for model override (%v), using session override", err)
+			return &model, "session override (catalog unavailable)"
+		}
+
+		if cap, ok := capabilityMap[normalizeModelKey(model.ProviderID.Value, model.ModelID.Value)]; ok {
+			if len(requiredModalities) > 0 && c.capabilitySupports(requiredModalities, cap) {
+				return &model, "session override supports attachments"
+			}
+			if len(requiredModalities) == 0 && nonTextHint && capabilityLikelySupportsNonText(cap) {
+				return &model, "session override supports non-text input"
+			}
+		}
+	}
+
+	if len(requiredModalities) == 0 && !nonTextHint {
+		return nil, ""
+	}
+
+	providers, capabilityMap, defaultModel, err := c.loadProviderCatalog(ctx, false)
+	if err != nil {
+		log.Printf("opencode: failed to load provider catalog for auto model selection: %v", err)
+		return nil, ""
+	}
+
+	if defaultModel != nil {
+		if cap, ok := capabilityMap[normalizeModelKey(defaultModel.ProviderID.Value, defaultModel.ModelID.Value)]; ok {
+			if len(requiredModalities) > 0 && c.capabilitySupports(requiredModalities, cap) {
+				model := *defaultModel
+				return &model, "default model supports attachments"
+			}
+			if len(requiredModalities) == 0 && nonTextHint && capabilityLikelySupportsNonText(cap) {
+				model := *defaultModel
+				return &model, "default model supports non-text input"
+			}
+		}
+		log.Printf("opencode: default model %s/%s does not satisfy required modalities", defaultModel.ProviderID.Value, defaultModel.ModelID.Value)
+	}
+
+	for _, provider := range providers {
+		for _, model := range provider.Models {
+			cap, ok := capabilityMap[normalizeModelKey(provider.ID, model.ID)]
+			if !ok {
+				continue
+			}
+			if len(requiredModalities) > 0 {
+				if !c.capabilitySupports(requiredModalities, cap) {
+					continue
+				}
+			} else if nonTextHint {
+				if !capabilityLikelySupportsNonText(cap) {
+					continue
+				}
+			}
+			override := modelFromRef(provider.ID, model.ID)
+			if override != nil {
+				if len(requiredModalities) > 0 {
+					return override, "auto-selected by attachment modalities"
+				}
+				return override, "auto-selected by non-text message type"
+			}
+		}
+	}
+
+	// Fallback for providers that only expose coarse attachment capability
+	// without explicit per-modality declarations.
+	for _, provider := range providers {
+		for _, model := range provider.Models {
+			cap, ok := capabilityMap[normalizeModelKey(provider.ID, model.ID)]
+			if !ok {
+				continue
+			}
+			if !cap.Attachment {
+				continue
+			}
+			override := modelFromRef(provider.ID, model.ID)
+			if override != nil {
+				return override, "fallback: attachment-capable model (modalities unavailable)"
+			}
+		}
+	}
+
+	log.Printf("opencode: no model matched attachment modalities for session %s (attachments=%d)", sessionID[:min(8, len(sessionID))], len(payload.Attachments))
+	return nil, ""
+}
+
+// invalidateStaleSessions 清除可能失效的 session 缓存
+// 当 OpenCode Server 重启后调用，让下次消息时创建新 session
 func (c *Client) invalidateStaleSessions(ctx context.Context) {
 	var staleThreads []string
 
@@ -1569,24 +2532,24 @@ func (c *Client) invalidateStaleSessions(ctx context.Context) {
 		threadID := key.(string)
 		sessionID := value.(string)
 
-		// 灏濊瘯楠岃瘉 session 鏄惁浠嶇劧鏈夋晥
+		// 尝试验证 session 是否仍然有效
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		_, err := c.GetSession(checkCtx, sessionID)
 		cancel()
 
 		if err != nil {
-			log.Printf("opencode: 馃棏锔?session %s for thread %s is stale (err: %v), removing",
+			log.Printf("opencode: 🗑️ session %s for thread %s is stale (err: %v), removing",
 				sessionID[:min(8, len(sessionID))], threadID, err)
 			staleThreads = append(staleThreads, threadID)
 		} else {
-			log.Printf("opencode: 鉁?session %s for thread %s is still valid",
+			log.Printf("opencode: ✅ session %s for thread %s is still valid",
 				sessionID[:min(8, len(sessionID))], threadID)
 		}
 
 		return true
 	})
 
-	// 鍒犻櫎澶辨晥鐨勬槧灏?
+	// 删除失效的映射
 	for _, threadID := range staleThreads {
 		c.sessions.Delete(threadID)
 		log.Printf("opencode: removed stale session mapping for thread %s", threadID)
@@ -1594,6 +2557,32 @@ func (c *Client) invalidateStaleSessions(ctx context.Context) {
 
 	if len(staleThreads) > 0 {
 		log.Printf("opencode: invalidated %d stale session mappings", len(staleThreads))
+	}
+}
+
+func (c *Client) syncRegisteredSessionSnapshots(ctx context.Context) {
+	var sessionIDs []string
+	c.sessionHandlers.Range(func(key, value interface{}) bool {
+		sessionID, _ := key.(string)
+		if strings.TrimSpace(sessionID) != "" {
+			sessionIDs = append(sessionIDs, sessionID)
+		}
+		return true
+	})
+
+	if len(sessionIDs) == 0 {
+		return
+	}
+
+	for _, sessionID := range sessionIDs {
+		syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := c.SyncSessionSnapshot(syncCtx, sessionID)
+		cancel()
+		if err != nil {
+			log.Printf("opencode: snapshot sync failed after reconnect (session=%s): %v", sessionID[:min(8, len(sessionID))], err)
+			continue
+		}
+		log.Printf("opencode: snapshot sync completed after reconnect (session=%s)", sessionID[:min(8, len(sessionID))])
 	}
 }
 
@@ -1613,47 +2602,28 @@ func (c *Client) RegisterSessionHandler(sessionID string, handler EventHandler) 
 // UnregisterSessionHandler removes an event handler for a specific session.
 func (c *Client) UnregisterSessionHandler(sessionID string) {
 	c.sessionHandlers.Delete(sessionID)
-	c.activeHandlers.Delete(sessionID)
-}
-
-// GetTodosForSession returns the current todo list for a running session.
-// Returns nil if the session has no active handler or no todos.
-func (c *Client) GetTodosForSession(sessionID string) []TodoItem {
-	if h, ok := c.activeHandlers.Load(sessionID); ok {
-		return h.(*StreamingSessionHandler).GetTodos()
-	}
-	return nil
-}
-
-// GetDiffForSession returns the accumulated file-change diff for a session.
-// Returns nil if the session has no active handler or no diff yet.
-func (c *Client) GetDiffForSession(sessionID string) []FileDiff {
-	if h, ok := c.activeHandlers.Load(sessionID); ok {
-		return h.(*StreamingSessionHandler).GetDiff()
-	}
-	return nil
 }
 
 var _ MessageSender = (*Client)(nil)
 
-// SendMessageToSession 閫氳繃adapter涓诲姩鎺ㄩ€佹秷鎭粰浼氳瘽鍏宠仈鐨勭敤鎴?
-// 娉ㄦ剰锛氳繖涓柟娉曠洰鍓嶅彧鏄褰曟棩蹇楋紝瀹為檯鐨勬秷鎭帹閫侀€氳繃streaming callback瀹屾垚
-// 鏈潵鍙互鎵╁睍鏀寔閫氳繃adapter鐨勫弻鍚戦€氫俊鏈哄埗涓诲姩鎺ㄩ€?
+// SendMessageToSession 通过adapter主动推送消息给会话关联的用户
+// 注意：这个方法目前只是记录日志，实际的消息推送通过streaming callback完成
+// 未来可以扩展支持通过adapter的双向通信机制主动推送
 func (c *Client) SendMessageToSession(ctx context.Context, sessionID, content string) error {
 	log.Printf("opencode: SendMessageToSession for session %s (len=%d chars)", sessionID[:8], len(content))
-	// 褰撳墠瀹炵幇锛氫緷璧杝treaming callback鏈哄埗锛岃繖閲屽彧鏄帴鍙ｅ崰浣?
-	// 鏈潵鍙互娣诲姞閫氳繃adapter鍙嶅悜鎺ㄩ€佺殑閫昏緫
+	// 当前实现：依赖streaming callback机制，这里只是接口占位
+	// 未来可以添加通过adapter反向推送的逻辑
 	return nil
 }
 
 // extractReplyFromMessage extracts text content from a prompt response.
-// OpenCode杩斿洖鐨刴essage鍖呭惈澶氫釜part锛屾瘡涓猵art鍙互鏄細
-// - TextPart: 鏅€氭枃鏈?
-// - 鍏朵粬绫诲瀷: 宸ュ叿璋冪敤銆佹€濊€冭繃绋嬬瓑
+// OpenCode返回的message包含多个part，每个part可以是：
+// - TextPart: 普通文本
+// - 其他类型: 工具调用、思考过程等
 func extractReplyFromMessage(msg *opencode.SessionPromptResponse) string {
 	if msg == nil || len(msg.Parts) == 0 {
 		log.Printf("opencode: WARNING - no response parts to extract")
-		return "(processing, please check OpenCode UI for result)"
+		return "(正在处理中，请稍后查看 OpenCode 界面获取结果）"
 	}
 
 	var textParts []string
@@ -1664,14 +2634,14 @@ func extractReplyFromMessage(msg *opencode.SessionPromptResponse) string {
 			textParts = append(textParts, p.Text)
 			log.Printf("opencode: extracted text part %d: %d chars", i, len(p.Text))
 		default:
-			// 鍏朵粬绫诲瀷鐨刾art锛岃褰曚絾涓嶆彁鍙?
+			// 其他类型的part，记录但不提取
 			log.Printf("opencode: skipped non-text part %d (type: %T)", i, p)
 		}
 	}
 
 	if len(textParts) == 0 {
 		log.Printf("opencode: WARNING - no text parts found in %d parts", len(msg.Parts))
-		return "(鍝嶅簲宸叉敹鍒颁絾鏃犳枃鏈唴瀹癸紝璇锋煡鐪?OpenCode 鐣岄潰 - message ID: " + msg.Info.ID + ")"
+		return "(响应已收到但无文本内容，请查看 OpenCode 界面 - message ID: " + msg.Info.ID + ")"
 	}
 
 	fullReply := strings.Join(textParts, "\n")
@@ -1689,12 +2659,74 @@ func (c *Client) getThreadLock(threadID string) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
-// GetMessageCount 鑾峰彇鎸囧畾session鐨勬秷鎭暟閲?
-func (c *Client) GetMessageCount(sessionID string) int {
-	return c.loadCounter(&c.messageCount, sessionID)
+// SummarizeSession 总结一个session的对话内容
+func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
+	if !c.Ready() {
+		return fmt.Errorf("opencode: client not configured")
+	}
+
+	// 检查是否已有总结
+	if _, exists := c.sessionSummary.Load(sessionID); exists {
+		return nil // 已经总结过了
+	}
+
+	log.Printf("opencode: summarizing session %s", sessionID)
+
+	// 调用OpenCode的summarize API
+	_, err := c.sdk.Session.Summarize(ctx, sessionID, opencode.SessionSummarizeParams{})
+	if err != nil {
+		return fmt.Errorf("opencode: summarize session: %w", err)
+	}
+
+	// 获取session详情以获取总结
+	session, err := c.GetSession(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("opencode: get session after summarize: %w", err)
+	}
+
+	// 提取总结内容（从session的messages中查找summary类型的消息）
+	summary := extractSummaryFromSession(session)
+	if summary != "" {
+		c.sessionSummary.Store(sessionID, summary)
+		log.Printf("opencode: session %s summarized successfully", sessionID)
+	}
+
+	return nil
 }
 
-// ResetSession 閲嶇疆thread鐨剆ession鏄犲皠锛屽己鍒跺垱寤烘柊session
+// extractSummaryFromSession 从session中提取总结信息
+func extractSummaryFromSession(session *opencode.Session) string {
+	if session == nil {
+		return ""
+	}
+	// TODO: 根据实际的session结构提取总结
+	// 可能需要获取messages并查找summary类型的消息
+	return "" // 暂时返回空，需要根据SDK实际结构实现
+}
+
+// truncateString 截断字符串到指定长度
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	// 处理UTF-8字符
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
+}
+
+// GetMessageCount 获取指定session的消息数量
+func (c *Client) GetMessageCount(sessionID string) int {
+	count, ok := c.messageCount.Load(sessionID)
+	if !ok {
+		return 0
+	}
+	return count.(int)
+}
+
+// ResetSession 重置thread的session映射，强制创建新session
 func (c *Client) ResetSession(threadID string) {
 	if threadID != "" {
 		c.sessions.Delete(threadID)
@@ -1711,6 +2743,47 @@ func (c *Client) GetSessionForThread(threadID string) (string, bool) {
 	return val.(string), true
 }
 
+// Directory returns current working directory configured for session actions.
+func (c *Client) Directory() string {
+	return c.directory
+}
+
+func (c *Client) IsThinkingEnabled() bool {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return c.showThinking
+}
+
+func (c *Client) SetThinkingEnabled(enabled bool) {
+	c.modeMu.Lock()
+	c.showThinking = enabled
+	c.modeMu.Unlock()
+}
+
+func (c *Client) IsFinalOnlyEnabled() bool {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return c.finalOnly
+}
+
+func (c *Client) SetFinalOnlyEnabled(enabled bool) {
+	c.modeMu.Lock()
+	c.finalOnly = enabled
+	c.modeMu.Unlock()
+}
+
+func (c *Client) IsStepEnabled() bool {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return c.showSteps
+}
+
+func (c *Client) SetStepEnabled(enabled bool) {
+	c.modeMu.Lock()
+	c.showSteps = enabled
+	c.modeMu.Unlock()
+}
+
 // GetSessionInfo retrieves detailed information about a session.
 type SessionInfo struct {
 	SessionID     string
@@ -1721,6 +2794,15 @@ type SessionInfo struct {
 	ContextUsage  float64
 	ContextLength int
 	Created       string // Use string since SDK doesn't have CreatedAt
+}
+
+// SessionSnapshot is a best-effort state snapshot for a session.
+type SessionSnapshot struct {
+	Session  *opencode.Session                  `json:"session,omitempty"`
+	Messages []opencode.SessionMessagesResponse `json:"messages,omitempty"`
+	Todos    []TodoItem                         `json:"todos,omitempty"`
+	Diff     []FileDiff                         `json:"diff,omitempty"`
+	SyncedAt time.Time                          `json:"synced_at"`
 }
 
 func (c *Client) GetSessionInfo(ctx context.Context, sessionID string) (*SessionInfo, error) {
@@ -1750,8 +2832,151 @@ func (c *Client) GetSessionInfo(ctx context.Context, sessionID string) (*Session
 	return info, nil
 }
 
+// SyncSessionSnapshot performs a best-effort session state sync used after reconnect
+// or when rehydrating adapter-side state.
+func (c *Client) SyncSessionSnapshot(ctx context.Context, sessionID string) (*SessionSnapshot, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, fmt.Errorf("opencode: sync session snapshot: empty session id")
+	}
+
+	session, err := c.GetSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("opencode: sync session snapshot get session: %w", err)
+	}
+
+	messages, err := c.sdk.Session.Messages(ctx, sessionID, opencode.SessionMessagesParams{})
+	if err != nil {
+		return nil, fmt.Errorf("opencode: sync session snapshot messages: %w", err)
+	}
+
+	todos, todoErr := c.fetchSessionTodos(ctx, sessionID)
+	if todoErr != nil {
+		log.Printf("opencode: sync session snapshot todo fetch failed for %s: %v", sessionID[:min(8, len(sessionID))], todoErr)
+	}
+
+	diff, diffErr := c.fetchSessionDiff(ctx, sessionID)
+	if diffErr != nil {
+		log.Printf("opencode: sync session snapshot diff fetch failed for %s: %v", sessionID[:min(8, len(sessionID))], diffErr)
+	}
+
+	snapshot := &SessionSnapshot{
+		Session:  session,
+		Todos:    todos,
+		Diff:     diff,
+		SyncedAt: time.Now(),
+	}
+	c.todoCache.Store(sessionID, append([]TodoItem(nil), todos...))
+	c.diffCache.Store(sessionID, append([]FileDiff(nil), diff...))
+	if messages != nil {
+		snapshot.Messages = append(snapshot.Messages, (*messages)...)
+	}
+
+	return snapshot, nil
+}
+
+// ForkSession creates a new session using current session title as base.
+func (c *Client) ForkSession(ctx context.Context, sessionID string) (string, error) {
+	session, err := c.GetSession(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	title := strings.TrimSpace(session.Title)
+	if title == "" {
+		title = "fork"
+	}
+	newSession, err := c.sdk.Session.New(ctx, opencode.SessionNewParams{Title: opencode.F(title + " (fork)")})
+	if err != nil {
+		return "", err
+	}
+	return newSession.ID, nil
+}
+
+func (c *Client) GetTodosForSession(sessionID string) []TodoItem {
+	if v, ok := c.todoCache.Load(sessionID); ok {
+		items := v.([]TodoItem)
+		return append([]TodoItem(nil), items...)
+	}
+	return nil
+}
+
+func (c *Client) GetDiffForSession(sessionID string) []FileDiff {
+	if v, ok := c.diffCache.Load(sessionID); ok {
+		items := v.([]FileDiff)
+		return append([]FileDiff(nil), items...)
+	}
+	return nil
+}
+
+func (c *Client) fetchSessionTodos(ctx context.Context, sessionID string) ([]TodoItem, error) {
+	var todos []TodoItem
+	if err := c.fetchSessionJSON(ctx, sessionID, "todo", &todos); err != nil {
+		return nil, err
+	}
+	return todos, nil
+}
+
+func (c *Client) fetchSessionDiff(ctx context.Context, sessionID string) ([]FileDiff, error) {
+	var diff []FileDiff
+	if err := c.fetchSessionJSON(ctx, sessionID, "diff", &diff); err != nil {
+		return nil, err
+	}
+	return diff, nil
+}
+
+func (c *Client) fetchSessionJSON(ctx context.Context, sessionID, suffix string, out interface{}) error {
+	if c.endpoint == "" {
+		return fmt.Errorf("opencode: fetch session %s unavailable: missing endpoint", suffix)
+	}
+
+	endpoint, err := url.JoinPath(c.endpoint, "session", sessionID, suffix)
+	if err != nil {
+		endpoint = fmt.Sprintf("%s/session/%s/%s", strings.TrimRight(c.endpoint, "/"), sessionID, suffix)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	c.applyAuthHeaders(req.Header)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
+	}
+
+	if err := json.Unmarshal(body, out); err == nil {
+		return nil
+	}
+
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return err
+	}
+	if len(envelope.Data) == 0 {
+		return nil
+	}
+	return json.Unmarshal(envelope.Data, out)
+}
+
 // SendMessageStreaming sends a message and calls the callback for each chunk of the response.
-// 鐪熸鐨勬祦寮忓疄鐜帮細娉ㄥ唽StreamingSessionHandler鐩戝惉瀹炴椂浜嬩欢
+// 真正的流式实现：注册StreamingSessionHandler监听实时事件
 func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayload, callback StreamCallback) (Response, error) {
 	return c.SendMessageStreamingWithEvents(ctx, payload, callback, nil)
 }
@@ -1759,13 +2984,16 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 // SendMessageStreamingWithEvents sends a streaming message with both legacy chunk callback
 // and structured event callback.
 func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload MessagePayload, callback StreamCallback, eventCallback StreamEventCallback) (Response, error) {
-	//fmt.Println("payload is______________________________:", payload.)
+	fmt.Println("payload is ", payload)
 	if callback == nil {
-		// 濡傛灉娌℃湁鍥炶皟锛岀洿鎺ヤ娇鐢ㄦ櫘閫氭ā寮?
-		return c.SendMessage(ctx, payload)
+		if eventCallback == nil {
+			// 如果没有回调，直接使用普通模式
+			return c.SendMessage(ctx, payload)
+		}
+		callback = func(string) error { return nil }
 	}
 
-	// 1. 鍏堢‘瀹歴essionID锛堝彲鑳介渶瑕佸垱寤烘柊session锛?
+	// 1. 先确定sessionID（可能需要创建新session）
 	threadLock := c.getThreadLock(payload.ThreadID)
 	threadLock.Lock()
 	sessionID := payload.SessionID
@@ -1773,25 +3001,25 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
 			sessionID = sid.(string)
 
-			// 楠岃瘉 session 鏄惁浠嶇劧鏈夋晥
+			// 验证 session 是否仍然有效
 			checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_, checkErr := c.GetSession(checkCtx, sessionID)
 			checkCancel()
 			if checkErr != nil {
-				log.Printf("opencode: 鈿狅笍 streaming session %s is stale (err: %v), will create new",
+				log.Printf("opencode: ⚠️ streaming session %s is stale (err: %v), will create new",
 					sessionID[:min(8, len(sessionID))], checkErr)
 				c.sessions.Delete(payload.ThreadID)
 				c.messageCount.Delete(sessionID)
 				c.tokenCount.Delete(sessionID)
-				sessionID = "" // 寮哄埗鍒涘缓鏂?session
+				sessionID = "" // 强制创建新 session
 			}
 		}
 	}
 
-	// 濡傛灉杩樻槸娌℃湁sessionID锛屾垜浠渶瑕佸厛鍒涘缓session
+	// 如果还是没有sessionID，我们需要先创建session
 	if sessionID == "" {
 		sessionCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		// 灏?adapter 鍜?user 淇℃伅缂栫爜鍒?Title 涓紝鏍煎紡: [adapter:userId] threadId
+		// 将 adapter 和 user 信息编码到 Title 中，格式: [adapter:userId] threadId
 		sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
 		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
 			Title: opencode.F(sessionTitle),
@@ -1811,31 +3039,47 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	}
 	threadLock.Unlock()
 
-	// 2. 绔嬪嵆閫氳繃callback閫氱煡sessionID锛堜緵adapter寤虹珛user鏄犲皠锛?
+	// 2. 立即通过callback通知sessionID（供adapter建立user映射）
 	log.Printf("opencode: notifying sessionID %s via callback", sessionID)
 	if err := callback(sessionID); err != nil {
 		log.Printf("opencode: failed to notify sessionID via callback: %v", err)
 	} else {
 		log.Printf("opencode: sessionID notification sent successfully")
 	}
+	if eventCallback != nil {
+		if err := eventCallback(StreamEvent{Kind: StreamEventSessionReady, SessionID: sessionID, Content: sessionID, RawType: "session"}); err != nil {
+			log.Printf("opencode: stream event callback error (session_ready): %v", err)
+		}
+	}
+	if eventCallback != nil {
+		if err := eventCallback(StreamEvent{Kind: StreamEventSessionReady, SessionID: sessionID, Content: sessionID, RawType: "session"}); err != nil {
+			log.Printf("opencode: stream event callback error (session_ready): %v", err)
+		}
+	}
 
-	// 3. 鍒涘缓StreamingSessionHandler骞舵敞鍐?
+	// 3. 创建StreamingSessionHandler并注册
 	handler := NewStreamingSessionHandler(sessionID, callback, eventCallback, func() {
 		c.runningSessions.Delete(sessionID)
 		c.UnregisterSessionHandler(sessionID)
-	}, c, c, c.IsThinkingEnabled(), c.IsStepEnabled())
+	}, c, c, true, false)
 	c.RegisterSessionHandler(sessionID, handler.HandleEvent)
-	c.activeHandlers.Store(sessionID, handler)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
 
-	// 4. 浣跨敤goroutine寮傛鍙戦€佹秷鎭?
+	// 4. 使用goroutine异步发送消息
 	responseChan := make(chan Response, 1)
 	errorChan := make(chan error, 1)
-
-	// 将确定的 sessionID 设置到 payload 中，避免 SendMessage 再次创建 session
-	payload.SessionID = sessionID
+	log.Printf("opencode: TRACE STREAM_WRAPPER dispatch SendMessage session=%s thread=%s channel=%s",
+		sessionID,
+		payload.ThreadID,
+		payload.Channel,
+	)
 
 	go func() {
+		log.Printf("opencode: TRACE STREAM_WRAPPER goroutine invoking SendMessage session=%s thread=%s channel=%s",
+			sessionID,
+			payload.ThreadID,
+			payload.Channel,
+		)
 		response, err := c.SendMessage(ctx, payload)
 		if err != nil {
 			errorChan <- err
@@ -1844,13 +3088,13 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		responseChan <- response
 	}()
 
-	// 4. 瀹氭椂妫€鏌ュ畬鎴愮姸鎬侊紙涓嶅啀鍙戦€佽繘搴︽秷鎭級
+	// 4. 定时检查完成状态（不再发送进度消息）
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	isAsyncMode := false
 	var asyncResponse Response
-	idleCheckCount := 0 // 绌洪棽妫€娴嬭鏁板櫒
+	idleCheckCount := 0 // 空闲检测计数器
 
 	for {
 		select {
@@ -1861,7 +3105,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			return Response{}, err
 
 		case response := <-responseChan:
-			// 濡傛灉鏄疉sync妯″紡锛坮eply涓虹┖锛夛紝鏍囪骞剁户缁瓑寰匰SE浜嬩欢
+			// 如果是Async模式（reply为空），标记并继续等待SSE事件
 			if response.Reply == "" {
 				log.Printf("opencode: streaming async mode for session %s, waiting for SSE events", sessionID[:8])
 				isAsyncMode = true
@@ -1869,7 +3113,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 				continue
 			}
 
-			// 鍚屾妯″紡锛氭鏌ユ槸鍚﹂€氳繃streaming handler宸茬粡鍙戦€佷簡鍐呭
+			// 同步模式：检查是否通过streaming handler已经发送了内容
 			sentContent := handler.GetLastContent()
 			log.Printf("opencode: streaming completed, handler sent: %d chars, final response: %d chars",
 				len(sentContent), len(response.Reply))
@@ -1885,15 +3129,14 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			return response, nil
 
 		case <-ticker.C:
-			// 濡傛灉鍦╝sync妯″紡涓攈andler宸插畬鎴愶紝杩斿洖缁撴灉
+			// 如果在async模式且handler已完成，返回结果
 			if isAsyncMode && handler.IsCompleted() {
-				log.Printf("opencode: 鉁?async streaming completed via SSE for session %s (contentSent=%t, lastContentLen=%d)",
+				log.Printf("opencode: ✅ async streaming completed via SSE for session %s (contentSent=%t, lastContentLen=%d)",
 					sessionID[:8], handler.HasSentContent(), len(handler.GetLastContent()))
-				// 娉ㄦ剰锛氫笉濉厖 asyncResponse.Reply锛岃璋冪敤鑰呬粠 fullReply 鑾峰彇鍐呭
-				return asyncResponse, nil
+				return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 			}
 
-			// 妫€鏌ユ渶鍚庝竴娆′簨浠舵椂闂?
+			// 检查最后一次事件时间
 			lastEventTime, lastEventType := handler.GetLastEventInfo()
 			timeSinceLastEvent := time.Since(lastEventTime)
 			hasSentContent := handler.HasSentContent()
@@ -1901,34 +3144,34 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			stepFinishTime := handler.GetStepFinishTime()
 			isCompleted := handler.IsCompleted()
 
-			log.Printf("opencode: 馃攳 ticker check - session=%s, isAsync=%t, isCompleted=%t, hasSent=%t, hasStepFinish=%t, lastEvent=%v ago (type=%s), idleCount=%d",
+			log.Printf("opencode: 🔍 ticker check - session=%s, isAsync=%t, isCompleted=%t, hasSent=%t, hasStepFinish=%t, lastEvent=%v ago (type=%s), idleCount=%d",
 				sessionID[:8], isAsyncMode, isCompleted, hasSentContent, hasStepFinish, timeSinceLastEvent, lastEventType, idleCheckCount)
 
-			// 濡傛灉鏀跺埌浜?step-finish 浜嬩欢涓斿凡鍙戦€佸唴瀹癸紝5绉掑悗娌℃湁鏂颁簨浠跺氨璁や负瀹屾垚
-			// (step-finish 閫氬父鏍囧織鐫€妯″瀷杈撳嚭瀹屾垚锛屽悗缁簲璇ュ緢蹇湁 session.idle)
+			// 如果收到了 step-finish 事件且已发送内容，5秒后没有新事件就认为完成
+			// (step-finish 通常标志着模型输出完成，后续应该很快有 session.idle)
 			if isAsyncMode && hasStepFinish && hasSentContent && !stepFinishTime.IsZero() {
 				timeSinceStepFinish := time.Since(stepFinishTime)
 				if timeSinceStepFinish > 5*time.Second {
-					log.Printf("opencode: 馃弫 received step-finish %v ago (has sent content), treating as completed for session %s",
+					log.Printf("opencode: 🏁 received step-finish %v ago (has sent content), treating as completed for session %s",
 						timeSinceStepFinish, sessionID[:8])
-					return asyncResponse, nil
+					return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 				}
 			}
 
-			// 濡傛灉宸插彂閫佸唴瀹逛笖瓒呰繃30绉掓棤鏂颁簨浠讹紝璁や负鍙兘瀹屾垚
-			// 锛堜粠2鍒嗛挓缂╃煭鍒?0绉掞紝鏇村揩鍝嶅簲锛?
+			// 如果已发送内容且超过30秒无新事件，认为可能完成
+			// （从2分钟缩短到30秒，更快响应）
 			if isAsyncMode && hasSentContent && timeSinceLastEvent > 30*time.Second {
-				log.Printf("opencode: 鈴憋笍 streaming idle for %v (has sent content), treating as completed for session %s",
+				log.Printf("opencode: ⏱️ streaming idle for %v (has sent content), treating as completed for session %s",
 					timeSinceLastEvent, sessionID[:8])
-				return asyncResponse, nil
+				return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 			}
 
-			// 濡傛灉瓒呰繃1鍒嗛挓鏃犱换浣曚簨浠讹紙鍗充娇娌″彂閫佸唴瀹癸級锛屼篃璁や负瀹屾垚
-			// 杩欏鐞?OpenCode 涓嶅彂閫佸畬鎴愪簨浠剁殑鎯呭喌
+			// 如果超过1分钟无任何事件（即使没发送内容），也认为完成
+			// 这处理 OpenCode 不发送完成事件的情况
 			if isAsyncMode && timeSinceLastEvent > 1*time.Minute {
-				log.Printf("opencode: 鈴憋笍 streaming timeout (no events for %v, hasSent=%t), treating as completed for session %s",
+				log.Printf("opencode: ⏱️ streaming timeout (no events for %v, hasSent=%t), treating as completed for session %s",
 					timeSinceLastEvent, hasSentContent, sessionID[:8])
-				return asyncResponse, nil
+				return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 			}
 
 			idleCheckCount++
@@ -1936,8 +3179,171 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	}
 }
 
-// estimateTokens 浼扮畻鏂囨湰鐨則oken鏁伴噺
-// 绠€鍗曞疄鐜帮細涓枃瀛楃鎸?.5鍊嶈绠楋紝鑻辨枃鍗曡瘝鎸?涓猼oken璁＄畻
+func (c *Client) finalizeAsyncStreamingResponse(sessionID string, handler *StreamingSessionHandler, callback StreamCallback, response Response) Response {
+	if strings.TrimSpace(response.Reply) != "" {
+		return response
+	}
+	if handler != nil && (handler.HasSentContent() || strings.TrimSpace(handler.GetLastContent()) != "") {
+		return response
+	}
+
+	fallbackCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	reply, messageID, err := c.fetchLatestAssistantReply(fallbackCtx, sessionID)
+	if err != nil {
+		log.Printf("opencode: async fallback fetch failed for session %s: %v", sessionID[:min(8, len(sessionID))], err)
+		return response
+	}
+	if strings.TrimSpace(reply) == "" {
+		return response
+	}
+
+	if callback != nil {
+		if err := callback(reply); err != nil {
+			log.Printf("opencode: async fallback callback failed for session %s: %v", sessionID[:min(8, len(sessionID))], err)
+		}
+	}
+
+	response.Reply = reply
+	if response.MessageID == "" {
+		response.MessageID = messageID
+	}
+	if response.Trace == "" {
+		response.Trace = sessionID
+	}
+
+	log.Printf("opencode: async fallback delivered %d chars for session %s", len(reply), sessionID[:min(8, len(sessionID))])
+	return response
+}
+
+func (c *Client) fetchLatestAssistantReply(ctx context.Context, sessionID string) (string, string, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		messages, err := c.sdk.Session.Messages(ctx, sessionID, opencode.SessionMessagesParams{})
+		if err != nil {
+			lastErr = err
+		} else if messages != nil {
+			for i := len(*messages) - 1; i >= 0; i-- {
+				msg := (*messages)[i]
+				if msg.Info.Role != opencode.MessageRoleAssistant {
+					continue
+				}
+
+				text := extractTextFromSessionParts(msg.Parts)
+				if strings.TrimSpace(text) == "" {
+					continue
+				}
+				return text, msg.Info.ID, nil
+			}
+			lastErr = fmt.Errorf("assistant message not found in session %s", sessionID)
+		}
+
+		if attempt < 2 {
+			select {
+			case <-time.After(800 * time.Millisecond):
+			case <-ctx.Done():
+				return "", "", ctx.Err()
+			}
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("assistant reply unavailable for session %s", sessionID)
+	}
+	return "", "", lastErr
+}
+
+func extractTextFromSessionParts(parts []opencode.Part) string {
+	if len(parts) == 0 {
+		return ""
+	}
+
+	textParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part.Text) != "" {
+			textParts = append(textParts, strings.TrimSpace(part.Text))
+		}
+
+		if extracted := extractTextFromPartState(part.State); extracted != "" {
+			textParts = append(textParts, extracted)
+		}
+
+		switch p := part.AsUnion().(type) {
+		case opencode.TextPart:
+			if strings.TrimSpace(p.Text) != "" {
+				textParts = append(textParts, p.Text)
+			}
+		case opencode.ToolPart:
+			if strings.TrimSpace(p.State.Output) != "" {
+				textParts = append(textParts, strings.TrimSpace(p.State.Output))
+			}
+			if strings.TrimSpace(p.State.Error) != "" {
+				textParts = append(textParts, strings.TrimSpace(p.State.Error))
+			}
+		}
+	}
+
+	return strings.TrimSpace(strings.Join(textParts, "\n"))
+}
+
+func extractTextFromPartState(state interface{}) string {
+	if state == nil {
+		return ""
+	}
+
+	collectFromMap := func(m map[string]interface{}) string {
+		keys := []string{"output", "stdout", "stderr", "result", "error", "text", "content", "message"}
+		chunks := make([]string, 0, len(keys))
+		for _, k := range keys {
+			if v, ok := m[k]; ok {
+				switch typed := v.(type) {
+				case string:
+					if strings.TrimSpace(typed) != "" {
+						chunks = append(chunks, strings.TrimSpace(typed))
+					}
+				case []interface{}:
+					for _, item := range typed {
+						if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+							chunks = append(chunks, strings.TrimSpace(s))
+						}
+					}
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(chunks, "\n"))
+	}
+
+	switch typed := state.(type) {
+	case opencode.ToolPartState:
+		chunks := make([]string, 0, 2)
+		if strings.TrimSpace(typed.Output) != "" {
+			chunks = append(chunks, strings.TrimSpace(typed.Output))
+		}
+		if strings.TrimSpace(typed.Error) != "" {
+			chunks = append(chunks, strings.TrimSpace(typed.Error))
+		}
+		if len(chunks) > 0 {
+			return strings.Join(chunks, "\n")
+		}
+		if raw := strings.TrimSpace(typed.JSON.RawJSON()); raw != "" {
+			var m map[string]interface{}
+			if err := json.Unmarshal([]byte(raw), &m); err == nil {
+				return collectFromMap(m)
+			}
+		}
+	case map[string]interface{}:
+		return collectFromMap(typed)
+	case string:
+		return strings.TrimSpace(typed)
+	}
+
+	return ""
+}
+
+// estimateTokens 估算文本的token数量
+// 简单实现：中文字符按1.5倍计算，英文单词按1个token计算
 func estimateTokens(text string) int {
 	if text == "" {
 		return 0
@@ -1948,31 +3354,31 @@ func estimateTokens(text string) int {
 	inWord := false
 
 	for _, r := range runes {
-		// 涓枃瀛楃锛圕JK缁熶竴琛ㄦ剰鏂囧瓧锛?
+		// 中文字符（CJK统一表意文字）
 		if r >= 0x4E00 && r <= 0x9FFF {
-			tokens += 2 // 涓枃瀛楃閫氬父鍗犵敤鏇村token
+			tokens += 2 // 中文字符通常占用更多token
 		} else if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			// 鑻辨枃瀛楁瘝鍜屾暟瀛楋紝鎸夊崟璇嶈鏁?
+			// 英文字母和数字，按单词计数
 			if !inWord {
 				tokens++
 				inWord = true
 			}
 		} else {
 			inWord = false
-			// 鏍囩偣绗﹀彿绛?
+			// 标点符号等
 			if r != ' ' && r != '\t' && r != '\n' {
 				tokens++
 			}
 		}
 	}
 
-	// 娣诲姞涓€浜涘紑閿€锛堢郴缁熸彁绀鸿瘝銆佹牸寮忓寲绛夛級
+	// 添加一些开销（系统提示词、格式化等）
 	return int(float64(tokens) * 1.3)
 }
 
-// getMaxContextLength 鑾峰彇session鐨勬渶澶т笂涓嬫枃闀垮害
+// getMaxContextLength 获取session的最大上下文长度
 func (c *Client) getMaxContextLength(sessionID string) int {
-	// 灏濊瘯浠庣紦瀛樿幏鍙栨ā鍨嬮厤缃?
+	// 尝试从缓存获取模型配置
 	if cfg, ok := c.modelConfig.Load(sessionID); ok {
 		modelCfg := cfg.(*ModelConfig)
 		if modelCfg.ContextLength > 0 {
@@ -1980,25 +3386,25 @@ func (c *Client) getMaxContextLength(sessionID string) int {
 		}
 	}
 
-	// 杩斿洖榛樿鍊?
+	// 返回默认值
 	return DefaultMaxTokens
 }
 
-// fetchAndCacheModelConfig 鑾峰彇骞剁紦瀛榮ession鐨勬ā鍨嬮厤缃?
+// fetchAndCacheModelConfig 获取并缓存session的模型配置
 func (c *Client) fetchAndCacheModelConfig(ctx context.Context, sessionID string) {
-	// 鍒涘缓涓€涓甫瓒呮椂鐨刢ontext
+	// 创建一个带超时的context
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// 鑾峰彇session璇︽儏
+	// 获取session详情
 	session, err := c.GetSession(ctx, sessionID)
 	if err != nil {
 		log.Printf("opencode: failed to get session %s for model config: %v", sessionID[:8], err)
 		return
 	}
 
-	// 鎻愬彇妯″瀷淇℃伅锛堥渶瑕佹牴鎹疄闄匰DK缁撴瀯璋冩暣锛?
-	// 杩欓噷鍋囪session涓寘鍚ā鍨嬩俊鎭紝瀹為檯鍙兘闇€瑕佽皟鐢ㄥ叾浠朅PI
+	// 提取模型信息（需要根据实际SDK结构调整）
+	// 这里假设session中包含模型信息，实际可能需要调用其他API
 	config := &ModelConfig{
 		LastUpdated:   time.Now(),
 		ContextLength: guessContextLengthFromSession(session),
@@ -2009,86 +3415,30 @@ func (c *Client) fetchAndCacheModelConfig(ctx context.Context, sessionID string)
 		sessionID[:8], config.ContextLength)
 }
 
-// guessContextLengthFromSession 鏍规嵁session淇℃伅鐚滄祴涓婁笅鏂囬暱搴?
+// guessContextLengthFromSession 根据session信息猜测上下文长度
 func guessContextLengthFromSession(session *opencode.Session) int {
-	// TODO: 鏍规嵁瀹為檯SDK缁撴瀯鎻愬彇妯″瀷淇℃伅
-	// 鍙兘闇€瑕佽皟鐢?/config/providers API 鑾峰彇妯″瀷鍒楄〃鍜岄厤缃?
+	// TODO: 根据实际SDK结构提取模型信息
+	// 可能需要调用 /config/providers API 获取模型列表和配置
 
-	// 甯歌妯″瀷鐨勪笂涓嬫枃闀垮害
+	// 常见模型的上下文长度
 	// GPT-4: 8k, 32k, 128k
 	// Claude: 100k, 200k
-	// 鍏朵粬妯″瀷: 4k-8k
+	// 其他模型: 4k-8k
 
-	// 鐩墠杩斿洖涓€涓繚瀹堢殑榛樿鍊?
-	return 8192 // 8k tokens锛岄€傜敤浜庡ぇ澶氭暟妯″瀷
+	// 目前返回一个保守的默认值
+	return 8192 // 8k tokens，适用于大多数模型
 }
 
-// GetTokenCount 鑾峰彇鎸囧畾session鐨則oken浣跨敤閲?
+// GetTokenCount 获取指定session的token使用量
 func (c *Client) GetTokenCount(sessionID string) int {
-	return c.loadCounter(&c.tokenCount, sessionID)
-}
-
-// loadCounter safely loads an integer counter from sync.Map.
-// It auto-recovers missing or unexpected value types by normalizing to 0.
-func (c *Client) loadCounter(counterMap *sync.Map, key string) int {
-	v, ok := counterMap.Load(key)
-	if !ok || v == nil {
-		counterMap.Store(key, 0)
+	tokens, ok := c.tokenCount.Load(sessionID)
+	if !ok {
 		return 0
 	}
-	if n, ok := v.(int); ok {
-		return n
-	}
-
-	// 鍏煎鍘嗗彶/寮傚父鍊硷紝閬垮厤 interface conversion panic
-	switch n := v.(type) {
-	case int8:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case int16:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case int32:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case int64:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case uint:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case uint8:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case uint16:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case uint32:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case uint64:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case float32:
-		counterMap.Store(key, int(n))
-		return int(n)
-	case float64:
-		counterMap.Store(key, int(n))
-		return int(n)
-	default:
-		log.Printf("opencode: counter type mismatch for key %s, got %T, reset to 0", key, v)
-		counterMap.Store(key, 0)
-		return 0
-	}
+	return tokens.(int)
 }
 
-// incrementCounter adds delta to a counter with safe initialization.
-func (c *Client) incrementCounter(counterMap *sync.Map, key string, delta int) {
-	current := c.loadCounter(counterMap, key)
-	counterMap.Store(key, current+delta)
-}
-
-// GetContextUsage 鑾峰彇session鐨勪笂涓嬫枃浣跨敤鐜?
+// GetContextUsage 获取session的上下文使用率
 func (c *Client) GetContextUsage(sessionID string) float64 {
 	tokens := c.GetTokenCount(sessionID)
 	maxTokens := c.getMaxContextLength(sessionID)
@@ -2098,9 +3448,9 @@ func (c *Client) GetContextUsage(sessionID string) float64 {
 	return float64(tokens) / float64(maxTokens)
 }
 
-// ========== 閲嶈瘯鏈哄埗 ==========
+// ========== 重试机制 ==========
 
-// isRetryableError 鍒ゆ柇閿欒鏄惁鍙互閲嶈瘯
+// isRetryableError 判断错误是否可以重试
 func (c *Client) isRetryableError(err error) bool {
 	if err == nil {
 		return false
@@ -2114,19 +3464,19 @@ func (c *Client) isRetryableError(err error) bool {
 	return false
 }
 
-// calculateBackoff 璁＄畻鎸囨暟閫€閬垮欢杩?
+// calculateBackoff 计算指数退避延迟
 func (c *Client) calculateBackoff(attempt int) time.Duration {
 	delay := c.retryConfig.InitialDelay * time.Duration(1<<uint(attempt))
 	if delay > c.retryConfig.MaxDelay {
 		delay = c.retryConfig.MaxDelay
 	}
-	// 娣诲姞闅忔満鎶栧姩闃叉鎯婄兢鏁堝簲
+	// 添加随机抖动防止惊群效应
 	jitter := time.Duration(rand.Int63n(int64(delay / 4)))
 	return delay + jitter
 }
 
-// sendPromptWithRetry 甯﹂噸璇曠殑鍙戦€佹秷鎭?
-func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, model *opencode.SessionPromptParamsModel) (*opencode.SessionPromptResponse, error) {
+// sendPromptWithRetry 带重试的发送消息
+func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, modelOverride *opencode.SessionPromptParamsModel) (*opencode.SessionPromptResponse, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= c.retryConfig.MaxRetries; attempt++ {
@@ -2135,29 +3485,29 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 			log.Printf("opencode: retry attempt %d/%d for session %s after %v delay",
 				attempt, c.retryConfig.MaxRetries, sessionID[:8], delay)
 
-			// 绛夊緟閲嶈瘯寤惰繜锛屼笉妫€鏌ュ閮╟ontext锛堝畠鍙兘宸茶秴鏃讹級
+			// 等待重试延迟，不检查外部context（它可能已超时）
 			time.Sleep(delay)
 		}
 
-		// 涓烘瘡娆″皾璇曞垱寤虹嫭绔嬬殑context锛岄伩鍏嶅墠涓€娆¤秴鏃跺奖鍝嶄笅涓€娆?
+		// 为每次尝试创建独立的context，避免前一次超时影响下一次
 		attemptCtx, cancel := context.WithTimeout(context.Background(), c.timeout)
 
 		params := opencode.SessionPromptParams{
 			Parts: opencode.F(parts),
 		}
-		if model != nil {
-			params.Model = opencode.F(*model)
+		if modelOverride != nil {
+			params.Model = opencode.F(*modelOverride)
 		}
 
 		result, err := c.sdk.Session.Prompt(attemptCtx, sessionID, params)
 		cancel()
 
 		if err == nil {
-			// 璁板綍鍝嶅簲璇︽儏
+			// 记录响应详情
 			if result != nil {
 				log.Printf("opencode: received response for session %s - parts: %d, message_id: %s",
 					sessionID[:8], len(result.Parts), result.Info.ID)
-				// 妫€鏌ュ搷搴旀槸鍚︿负绌?
+				// 检查响应是否为空
 				if len(result.Parts) == 0 {
 					log.Printf("opencode: WARNING - empty response parts for session %s", sessionID[:8])
 				}
@@ -2172,7 +3522,7 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 
 		lastErr = err
 
-		// 鍒ゆ柇鏄惁鍙噸璇?
+		// 判断是否可重试
 		if !c.isRetryableError(err) {
 			log.Printf("opencode: non-retryable error for session %s: %v", sessionID[:8], err)
 			return nil, err
@@ -2180,7 +3530,7 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 
 		log.Printf("opencode: retryable error on attempt %d for session %s: %v", attempt, sessionID[:8], err)
 
-		// 濡傛灉鏄渶鍚庝竴娆″皾璇曞墠锛岀粰鍑虹壒鍒彁绀?
+		// 如果是最后一次尝试前，给出特别提示
 		if attempt == c.retryConfig.MaxRetries {
 			log.Printf("opencode: FINAL retry attempt failed for session %s. Task may require user interaction in OpenCode UI.", sessionID[:8])
 		}
@@ -2189,396 +3539,8 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 	return nil, fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
 }
 
-func modelCatalogKey(providerID, modelID string) string {
-	return strings.ToLower(strings.TrimSpace(providerID)) + "/" + strings.ToLower(strings.TrimSpace(modelID))
-}
-
-func (c *Client) mediaDebugf(format string, args ...interface{}) {
-	if c == nil || !c.debugMediaRouting {
-		return
-	}
-	log.Printf("opencode[media]: "+format, args...)
-}
-
-func (c *Client) refreshModelCatalog(ctx context.Context) error {
-	providers, err := c.GetProviders(ctx)
-	if err != nil {
-		return err
-	}
-	log.Printf("opencode: model catalog refreshed, providers=%d", len(providers))
-	return nil
-}
-
-func (c *Client) ensureModelCatalog(ctx context.Context) {
-	c.modelCatalogMu.RLock()
-	empty := len(c.modelCatalog) == 0
-	c.modelCatalogMu.RUnlock()
-	c.mediaDebugf("ensure catalog: empty=%t", empty)
-	if !empty {
-		return
-	}
-	if err := c.refreshModelCatalog(ctx); err != nil {
-		log.Printf("opencode: ensure model catalog failed: %v", err)
-		c.mediaDebugf("catalog refresh failed: %v", err)
-	}
-}
-
-func (c *Client) updateSessionModel(sessionID, providerID, modelID string) {
-	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(providerID) == "" || strings.TrimSpace(modelID) == "" {
-		return
-	}
-
-	cfg := &ModelConfig{
-		ProviderID:  providerID,
-		ModelID:     modelID,
-		LastUpdated: time.Now(),
-	}
-	c.sessionModel.Store(sessionID, cfg)
-
-	if v, ok := c.modelConfig.Load(sessionID); ok {
-		existing := v.(*ModelConfig)
-		existing.ProviderID = providerID
-		existing.ModelID = modelID
-		existing.LastUpdated = time.Now()
-		c.modelConfig.Store(sessionID, existing)
-	}
-}
-
-func (c *Client) getCurrentSessionModel(ctx context.Context, sessionID string) (*ModelConfig, bool) {
-	if v, ok := c.sessionModel.Load(sessionID); ok {
-		cfg := v.(*ModelConfig)
-		if cfg.ProviderID != "" && cfg.ModelID != "" {
-			return cfg, true
-		}
-	}
-
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	messages, err := c.sdk.Session.Messages(lookupCtx, sessionID, opencode.SessionMessagesParams{})
-	if err != nil || messages == nil || len(*messages) == 0 {
-		c.defaultModelMu.RLock()
-		defer c.defaultModelMu.RUnlock()
-		if c.defaultModel != nil {
-			return c.defaultModel, true
-		}
-		return nil, false
-	}
-
-	for i := len(*messages) - 1; i >= 0; i-- {
-		msg := (*messages)[i].Info
-		if msg.ProviderID == "" || msg.ModelID == "" {
-			continue
-		}
-		cfg := &ModelConfig{
-			ProviderID:  msg.ProviderID,
-			ModelID:     msg.ModelID,
-			LastUpdated: time.Now(),
-		}
-		c.sessionModel.Store(sessionID, cfg)
-		return cfg, true
-	}
-
-	c.defaultModelMu.RLock()
-	defer c.defaultModelMu.RUnlock()
-	if c.defaultModel != nil {
-		return c.defaultModel, true
-	}
-	return nil, false
-}
-
-func hasAttachmentType(att Attachment, prefix string) bool {
-	m := strings.ToLower(strings.TrimSpace(att.Mime))
-	result := strings.HasPrefix(m, prefix)
-	log.Printf("opencode: hasAttachmentType check - mime='%s', prefix='%s', result=%t", m, prefix, result)
-	return result
-}
-
-func capabilitySupportsModality(cap *ModelCapability, modality string) bool {
-	if cap == nil {
-		return false
-	}
-	modality = strings.ToLower(strings.TrimSpace(modality))
-	if modality == "" {
-		return false
-	}
-	if cap.InputModalities[modality] {
-		return true
-	}
-	if modality == "text" {
-		return cap.InputModalities["input_text"] || cap.InputModalities["prompt"]
-	}
-	if modality == "image" {
-		return cap.InputModalities["image"] || cap.InputModalities["vision"] || cap.InputModalities["input_image"]
-	}
-	if modality == "video" {
-		return cap.InputModalities["video"] || cap.InputModalities["input_video"]
-	}
-	if modality == "audio" {
-		return cap.InputModalities["audio"] || cap.InputModalities["voice"] || cap.InputModalities["speech"] || cap.InputModalities["input_audio"]
-	}
-	return false
-}
-
-func maybeVisionCapableByModelID(modelID string) bool {
-	id := strings.ToLower(strings.TrimSpace(modelID))
-	if id == "" {
-		return false
-	}
-	for _, hint := range []string{"kimi", "gpt-4o", "gemini", "qwen", "qvq", "claude-3-5-sonnet", "claude-3-7-sonnet", "vision", "vl"} {
-		if strings.Contains(id, hint) {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Client) preprocessAttachmentsForSession(ctx context.Context, sessionID string, payload *MessagePayload, effectiveContent *string) (*ModelConfig, error) {
-	if payload == nil || len(payload.Attachments) == 0 {
-		log.Printf("opencode: preprocessAttachmentsForSession - no attachments (payload=%v, len=%d)", payload != nil, len(payload.Attachments))
-		return nil, nil
-	}
-	c.mediaDebugf("preprocess start: session=%s attachments=%d", sessionID[:min(8, len(sessionID))], len(payload.Attachments))
-
-	// 打印所有附件信息
-	for i, att := range payload.Attachments {
-		log.Printf("opencode: attachment[%d] - mime='%s', url_len=%d, filename='%s'", i, att.Mime, len(att.URL), att.Filename)
-	}
-
-	needImage := false
-	needVideo := false
-	needAudio := false
-	mediaAttachments := make([]Attachment, 0)
-	for _, att := range payload.Attachments {
-		if hasAttachmentType(att, "image/") {
-			needImage = true
-			mediaAttachments = append(mediaAttachments, att)
-			continue
-		}
-		if hasAttachmentType(att, "video/") {
-			needVideo = true
-			mediaAttachments = append(mediaAttachments, att)
-			continue
-		}
-		if hasAttachmentType(att, "audio/") {
-			needAudio = true
-			mediaAttachments = append(mediaAttachments, att)
-		}
-	}
-
-	log.Printf("opencode: media detection result - needImage=%t, needVideo=%t, needAudio=%t", needImage, needVideo, needAudio)
-
-	if !needImage && !needVideo && !needAudio {
-		c.mediaDebugf("no image/video/audio attachments, skip preprocess")
-		return nil, nil
-	}
-	c.mediaDebugf("media detected: needImage=%t needVideo=%t needAudio=%t mediaCount=%d", needImage, needVideo, needAudio, len(mediaAttachments))
-
-	c.ensureModelCatalog(ctx)
-
-	sessionModel, hasSessionModel := c.getCurrentSessionModel(ctx, sessionID)
-	c.mediaDebugf("session model lookup: hasSessionModel=%t, model=%+v", hasSessionModel, sessionModel)
-
-	if hasSessionModel && sessionModel != nil {
-		catalogKey := modelCatalogKey(sessionModel.ProviderID, sessionModel.ModelID)
-		c.modelCatalogMu.RLock()
-		sessionCap, hasCap := c.modelCatalog[catalogKey]
-		c.modelCatalogMu.RUnlock()
-
-		c.mediaDebugf("session model %s/%s capability: hasCap=%t, modalities=%v", sessionModel.ProviderID, sessionModel.ModelID, hasCap, sessionCap.InputModalities)
-
-		if hasCap && sessionCap != nil {
-			supported := true
-			if needImage && !capabilitySupportsModality(sessionCap, "image") {
-				supported = false
-			}
-			if needVideo && !capabilitySupportsModality(sessionCap, "video") {
-				supported = false
-			}
-			if needAudio && !capabilitySupportsModality(sessionCap, "audio") {
-				supported = false
-			}
-
-			if supported {
-				c.mediaDebugf("session model %s/%s supports required modalities, keep attachments and use this model",
-					sessionModel.ProviderID, sessionModel.ModelID)
-				return sessionModel, nil
-			}
-			c.mediaDebugf("session model %s/%s does NOT support required modalities, will find fallback", sessionModel.ProviderID, sessionModel.ModelID)
-		}
-	}
-
-	fallbackModel, ok := c.selectFallbackMediaModel(needImage, needVideo, needAudio)
-	if !ok {
-		c.mediaDebugf("no matched fallback model for media, attachments will be sent without model override (may fail)")
-		return nil, nil
-	}
-	c.mediaDebugf("matched fallback model: %s/%s, will use this model to send attachments directly", fallbackModel.ProviderID, fallbackModel.ModelID)
-
-	return fallbackModel, nil
-}
-
-func (c *Client) selectFallbackMediaModel(needImage, needVideo, needAudio bool) (*ModelConfig, bool) {
-	c.modelCatalogMu.RLock()
-	defer c.modelCatalogMu.RUnlock()
-
-	keys := make([]string, 0, len(c.modelCatalog))
-	for k := range c.modelCatalog {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	c.mediaDebugf("selectFallbackMediaModel: catalog has %d models, checking for image=%t video=%t audio=%t", len(keys), needImage, needVideo, needAudio)
-
-	// Pass 1: strict capability matching based on provider metadata.
-	for _, k := range keys {
-		cap := c.modelCatalog[k]
-		if cap == nil {
-			continue
-		}
-		c.mediaDebugf("  checking %s/%s: modalities=%v", cap.ProviderID, cap.ModelID, cap.InputModalities)
-
-		if !capabilitySupportsModality(cap, "text") {
-			c.mediaDebugf("    -> skipped (no text support)")
-			continue
-		}
-		if needImage && !capabilitySupportsModality(cap, "image") {
-			c.mediaDebugf("    -> skipped (no image support)")
-			continue
-		}
-		if needVideo && !capabilitySupportsModality(cap, "video") {
-			c.mediaDebugf("    -> skipped (no video support)")
-			continue
-		}
-		if needAudio && !capabilitySupportsModality(cap, "audio") {
-			c.mediaDebugf("    -> skipped (no audio support)")
-			continue
-		}
-		cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
-		log.Printf("opencode: selected multimodal model %s/%s for image=%t video=%t audio=%t", cfg.ProviderID, cfg.ModelID, needImage, needVideo, needAudio)
-		return cfg, true
-	}
-
-	// Pass 2: metadata-missing fallback (common in some OpenAI-compatible providers).
-	// For image recognition, prefer known vision-capable model IDs (e.g., Kimi, Qwen).
-	// For video, we also use vision-capable models (they will analyze extracted frames).
-	if (needImage || needVideo) && !needAudio {
-		for _, k := range keys {
-			cap := c.modelCatalog[k]
-			if cap == nil {
-				continue
-			}
-			if maybeVisionCapableByModelID(cap.ModelID) {
-				cfg := &ModelConfig{ProviderID: cap.ProviderID, ModelID: cap.ModelID}
-				log.Printf("opencode: selected model %s/%s by heuristic (vision-capable model ID) for image=%t video=%t", cfg.ProviderID, cfg.ModelID, needImage, needVideo)
-				return cfg, true
-			}
-		}
-	}
-
-	log.Printf("opencode: WARNING - no multimodal model found for image=%t video=%t audio=%t (catalog has %d models)", needImage, needVideo, needAudio, len(keys))
-	return nil, false
-}
-
-// HasVideoCapableModel checks if any model in the catalog explicitly supports video input.
-// NOTE: This only returns true for models that explicitly declare video support.
-// Models that only support images should use video skill to extract frames.
-func (c *Client) HasVideoCapableModel() bool {
-	c.modelCatalogMu.RLock()
-	defer c.modelCatalogMu.RUnlock()
-
-	// Only check for explicit video support
-	for _, cap := range c.modelCatalog {
-		if cap == nil {
-			continue
-		}
-		if capabilitySupportsModality(cap, "video") {
-			log.Printf("opencode: HasVideoCapableModel - found model %s/%s with explicit video support", cap.ProviderID, cap.ModelID)
-			return true
-		}
-	}
-	log.Printf("opencode: HasVideoCapableModel - no model with explicit video support found")
-	return false
-}
-
-// HasImageCapableModel checks if any model in the catalog supports image input.
-// This is used for video skill workflow (extract frames, then analyze with vision model).
-func (c *Client) HasImageCapableModel() bool {
-	c.modelCatalogMu.RLock()
-	defer c.modelCatalogMu.RUnlock()
-
-	for _, cap := range c.modelCatalog {
-		if cap == nil {
-			continue
-		}
-		if capabilitySupportsModality(cap, "image") || maybeVisionCapableByModelID(cap.ModelID) {
-			log.Printf("opencode: HasImageCapableModel - found model %s/%s with image support", cap.ProviderID, cap.ModelID)
-			return true
-		}
-	}
-	log.Printf("opencode: HasImageCapableModel - no model with image support found")
-	return false
-}
-
-func (c *Client) recognizeMediaWithModel(ctx context.Context, attachments []Attachment, visionModel *ModelConfig) (string, error) {
-	if visionModel == nil {
-		return "", fmt.Errorf("media recognizer model is nil")
-	}
-	c.mediaDebugf("recognize with fallback model: %s/%s attachments=%d", visionModel.ProviderID, visionModel.ModelID, len(attachments))
-
-	prepCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	tmpSession, err := c.sdk.Session.New(prepCtx, opencode.SessionNewParams{
-		Title: opencode.F("[media-preprocess]"),
-	})
-	if err != nil {
-		return "", fmt.Errorf("create media preprocess session: %w", err)
-	}
-	c.mediaDebugf("media preprocess temp session created: %s", tmpSession.ID[:min(8, len(tmpSession.ID))])
-	defer func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cleanupCancel()
-		if _, delErr := c.sdk.Session.Delete(cleanupCtx, tmpSession.ID, opencode.SessionDeleteParams{}); delErr != nil {
-			log.Printf("opencode: cleanup media preprocess session %s failed: %v", tmpSession.ID[:min(8, len(tmpSession.ID))], delErr)
-		}
-	}()
-
-	parts := []opencode.SessionPromptParamsPartUnion{
-		opencode.TextPartInputParam{
-			Type: opencode.F(opencode.TextPartInputTypeText),
-			Text: opencode.F("Analyze attached media (image/video/audio). For audio, transcribe key content. Return a concise summary focusing on information useful to answer user questions."),
-		},
-	}
-
-	for _, att := range attachments {
-		if att.URL == "" || att.Mime == "" {
-			continue
-		}
-		parts = append(parts, opencode.FilePartInputParam{
-			Type: opencode.F(opencode.FilePartInputTypeFile),
-			Mime: opencode.F(att.Mime),
-			URL:  opencode.F(att.URL),
-		})
-	}
-
-	modelOverride := &opencode.SessionPromptParamsModel{
-		ProviderID: opencode.F(visionModel.ProviderID),
-		ModelID:    opencode.F(visionModel.ModelID),
-	}
-
-	resp, err := c.sendPromptWithRetry(prepCtx, tmpSession.ID, parts, modelOverride)
-	if err != nil {
-		return "", fmt.Errorf("media recognize with %s/%s: %w", visionModel.ProviderID, visionModel.ModelID, err)
-	}
-	recognized := strings.TrimSpace(extractReplyFromMessage(resp))
-	c.mediaDebugf("media recognize completed: textLen=%d", len(recognized))
-
-	return recognized, nil
-}
-
-// sendPromptAsync 璋冪敤 OpenCode 鐨?prompt_async 鎺ュ彛锛岀珛鍗宠繑鍥烇紝鐢变簨浠舵祦鎻愪緵缁撴灉
-func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, model *opencode.SessionPromptParamsModel) error {
+// sendPromptAsync 调用 OpenCode 的 prompt_async 接口，立即返回，由事件流提供结果
+func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, modelOverride *opencode.SessionPromptParamsModel) error {
 	if c.endpoint == "" {
 		return fmt.Errorf("opencode: prompt_async unavailable: missing endpoint")
 	}
@@ -2586,8 +3548,8 @@ func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []
 	params := opencode.SessionPromptParams{
 		Parts: opencode.F(parts),
 	}
-	if model != nil {
-		params.Model = opencode.F(*model)
+	if modelOverride != nil {
+		params.Model = opencode.F(*modelOverride)
 	}
 	if c.directory != "" {
 		params.Directory = opencode.F(c.directory)
@@ -2608,7 +3570,9 @@ func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []
 		return fmt.Errorf("opencode: prompt_async request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.applyAuthHeaders(req.Header)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -2625,38 +3589,38 @@ func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []
 	return nil
 }
 
-// ========== 璇锋眰鍘婚噸 ==========
+// ========== 请求去重 ==========
 
-// generateRequestHash 鐢熸垚璇锋眰鐨勫敮涓€hash
+// generateRequestHash 生成请求的唯一hash
 func generateRequestHash(payload MessagePayload) string {
 	data := fmt.Sprintf("%s|%s|%s|%s", payload.Channel, payload.UserID, payload.ThreadID, payload.Content)
 	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:16]) // 浣跨敤鍓?6瀛楄妭
+	return hex.EncodeToString(hash[:16]) // 使用前16字节
 }
 
-// checkAndMarkRequest 妫€鏌ヨ姹傛槸鍚﹂噸澶嶏紝濡傛灉涓嶉噸澶嶅垯鏍囪涓哄鐞嗕腑
+// checkAndMarkRequest 检查请求是否重复，如果不重复则标记为处理中
 func (c *Client) checkAndMarkRequest(hash string) (*RequestRecord, bool) {
 	now := time.Now()
 
-	// 妫€鏌ユ槸鍚﹀瓨鍦?
+	// 检查是否存在
 	if val, ok := c.requestCache.Load(hash); ok {
 		record := val.(*RequestRecord)
-		// 妫€鏌ユ槸鍚﹀湪鏃堕棿绐楀彛鍐?
+		// 检查是否在时间窗口内
 		if now.Sub(record.Timestamp) < RequestDeduplicationWindow {
 			if record.InFlight {
-				// 姝ｅ湪澶勭悊涓紝杩斿洖閲嶅锛堢湡姝ｇ殑閲嶅璇锋眰锛?
+				// 正在处理中，返回重复（真正的重复请求）
 				log.Printf("opencode: duplicate request detected (in-flight), age: %v", now.Sub(record.Timestamp))
 				return record, true
 			}
-			// 宸插畬鎴愮殑璇锋眰锛屼笉璁や负鏄噸澶嶏紙鍏佽鐢ㄦ埛鍐嶆鍙戦€佺浉鍚屾秷鎭級
-			// 鍙繑鍥炵紦瀛樼殑鍝嶅簲浠ュ姞蹇搷搴旈€熷害
+			// 已完成的请求，不认为是重复（允许用户再次发送相同消息）
+			// 只返回缓存的响应以加快响应速度
 			log.Printf("opencode: returning cached response (request completed %v ago)", now.Sub(record.Timestamp))
 			return record, true
 		}
-		// 瓒呭嚭鏃堕棿绐楀彛锛屽彲浠ラ噸鏂板鐞?
+		// 超出时间窗口，可以重新处理
 	}
 
-	// 鏍囪涓哄鐞嗕腑
+	// 标记为处理中
 	record := &RequestRecord{
 		Hash:      hash,
 		Timestamp: now,
@@ -2666,18 +3630,18 @@ func (c *Client) checkAndMarkRequest(hash string) (*RequestRecord, bool) {
 	return record, false
 }
 
-// completeRequest 瀹屾垚璇锋眰骞剁紦瀛樼粨鏋?
+// completeRequest 完成请求并缓存结果
 func (c *Client) completeRequest(hash string, response Response) {
 	if val, ok := c.requestCache.Load(hash); ok {
 		record := val.(*RequestRecord)
 		record.Response = response
 		record.InFlight = false
-		record.Timestamp = time.Now() // 鏇存柊鏃堕棿鎴?
+		record.Timestamp = time.Now() // 更新时间戳
 		c.requestCache.Store(hash, record)
 	}
 }
 
-// failRequest 鏍囪璇锋眰澶辫触
+// failRequest 标记请求失败
 func (c *Client) failRequest(hash string) {
 	c.requestCache.Delete(hash)
 }
@@ -2696,21 +3660,21 @@ func (c *Client) GetPendingQuestion(questionID string) (*Question, bool) {
 	return val.(*Question), true
 }
 
-// GetLatestPendingPermission 鑾峰彇鎸囧畾 session 鏈€杩戠殑寰呭鐞嗘潈闄愯姹?
-// 濡傛灉 sessionID 涓虹┖锛岃繑鍥炰换鎰忔渶杩戠殑鏉冮檺璇锋眰
+// GetLatestPendingPermission 获取指定 session 最近的待处理权限请求
+// 如果 sessionID 为空，返回任意最近的权限请求
 func (c *Client) GetLatestPendingPermission(sessionID string) (*Question, bool) {
 	var latest *Question
 	c.pendingQuestions.Range(func(key, value interface{}) bool {
 		q := value.(*Question)
-		// 鍙繑鍥炴潈闄愯姹傦紙浠?per_ 寮€澶达級
+		// 只返回权限请求（以 per_ 开头）
 		if !strings.HasPrefix(q.ID, "per_") {
 			return true
 		}
-		// 濡傛灉鎸囧畾浜?sessionID锛屽彧杩斿洖璇?session 鐨?
+		// 如果指定了 sessionID，只返回该 session 的
 		if sessionID != "" && q.SessionID != sessionID {
 			return true
 		}
-		// 鎵炬渶杩戝垱寤虹殑
+		// 找最近创建的
 		if latest == nil || q.CreatedAt.After(latest.CreatedAt) {
 			latest = q
 		}
@@ -2722,21 +3686,21 @@ func (c *Client) GetLatestPendingPermission(sessionID string) (*Question, bool) 
 	return nil, false
 }
 
-// GetLatestPendingQuestion 鑾峰彇鎸囧畾 session 鏈€杩戠殑寰呭鐞嗛棶棰橈紙闈炴潈闄愯姹傦級
-// 濡傛灉 sessionID 涓虹┖锛岃繑鍥炰换鎰忔渶杩戠殑闂
+// GetLatestPendingQuestion 获取指定 session 最近的待处理问题（非权限请求）
+// 如果 sessionID 为空，返回任意最近的问题
 func (c *Client) GetLatestPendingQuestion(sessionID string) (*Question, bool) {
 	var latest *Question
 	c.pendingQuestions.Range(func(key, value interface{}) bool {
 		q := value.(*Question)
-		// 鎺掗櫎鏉冮檺璇锋眰锛堜互 per_ 寮€澶达級
+		// 排除权限请求（以 per_ 开头）
 		if strings.HasPrefix(q.ID, "per_") {
 			return true
 		}
-		// 濡傛灉鎸囧畾浜?sessionID锛屽彧杩斿洖璇?session 鐨?
+		// 如果指定了 sessionID，只返回该 session 的
 		if sessionID != "" && q.SessionID != sessionID {
 			return true
 		}
-		// 鎵炬渶杩戝垱寤虹殑
+		// 找最近创建的
 		if latest == nil || q.CreatedAt.After(latest.CreatedAt) {
 			latest = q
 		}
@@ -2764,7 +3728,7 @@ func (c *Client) AnswerQuestion(ctx context.Context, questionID string, answer s
 		return fmt.Errorf("opencode: answer question unavailable: missing endpoint")
 	}
 
-	// 鍒ゆ柇鏄潈闄愯姹傝繕鏄櫘閫氶棶棰?
+	// 判断是权限请求还是普通问题
 	if strings.HasPrefix(questionID, "per_") {
 		return c.answerPermission(ctx, q, answer)
 	}
@@ -2772,73 +3736,157 @@ func (c *Client) AnswerQuestion(ctx context.Context, questionID string, answer s
 	return c.answerNormalQuestion(ctx, q, answer)
 }
 
-// answerPermission answers a permission request (internal, via AnswerQuestion path).
-func (c *Client) answerPermission(ctx context.Context, q *Question, answer string) error {
-	_, responseStr, ok := parsePermissionAnswer(answer)
+func userMemoryKey(channel, userID string) string {
+	return strings.TrimSpace(channel) + ":" + strings.TrimSpace(userID)
+}
+
+func (c *Client) ListUserMemory(channel, userID string, limit int) []UserMemoryFact {
+	key := userMemoryKey(channel, userID)
+	v, ok := c.userMemory.Load(key)
 	if !ok {
-		return fmt.Errorf("invalid permission answer (raw=%q bytes=% X)", answer, []byte(answer))
+		return nil
 	}
-	log.Printf("opencode: answerPermission via parsePermissionAnswer - ID=%s, responseStr=%s", q.ID, responseStr)
-	return c.RespondToPermission(ctx, q.ID, responseStr)
-}
-
-func parsePermissionAnswer(answer string) (opencode.SessionPermissionRespondParamsResponse, string, bool) {
-	normalized := normalizePermissionAnswer(answer)
-	if normalized == "" {
-		return "", "", false
-	}
-
-	allowTokens := []string{"1", "allow", "yes", "鍏佽", "鍚屾剰", "纭", "ok", "okay", "y", "鍙互", "琛"}
-	rejectTokens := []string{"2", "deny", "no", "鎷掔粷", "涓嶅悓鎰", "鍙栨秷", "n"}
-	alwaysTokens := []string{"3", "always", "濮嬬粓鍏佽", "濮嬬粓", "涓€鐩村厑璁", "鎬绘槸鍏佽"}
-
-	if containsAnyToken(normalized, alwaysTokens) {
-		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
-	}
-	if containsAnyToken(normalized, rejectTokens) {
-		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
-	}
-	if containsAnyToken(normalized, allowTokens) {
-		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
-	}
-
-	// 鍏滃簳锛氬厛鍒ゆ柇鏄庣‘鍚﹀畾锛屽啀鍒ゆ柇鍏佽锛岄伩鍏嶁€滀笉鍏佽鈥濊璇垽涓哄厑璁?
-	if strings.Contains(normalized, "涓嶅厑璁") || strings.Contains(normalized, "鎷掔粷") || strings.Contains(normalized, "涓嶅悓鎰") {
-		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
-	}
-	if strings.Contains(normalized, "濮嬬粓") || strings.Contains(normalized, "always") {
-		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
-	}
-	if strings.Contains(normalized, "鍏佽") || strings.Contains(normalized, "鍚屾剰") || strings.Contains(normalized, "纭") {
-		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
-	}
-
-	return "", "", false
-}
-
-// normalizePermissionAnswer 鏍囧噯鍖栧洖澶嶆枃鏈細杞皬鍐欏苟绉婚櫎绌烘牸銆佹爣鐐广€佺鍙?
-func normalizePermissionAnswer(answer string) string {
-	answerLower := strings.TrimSpace(strings.ToLower(answer))
-	return strings.Map(func(r rune) rune {
-		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
-			return -1
+	facts := append([]UserMemoryFact(nil), v.([]UserMemoryFact)...)
+	sort.SliceStable(facts, func(i, j int) bool {
+		if facts[i].Importance == facts[j].Importance {
+			return i < j
 		}
-		return r
-	}, answerLower)
-}
-
-func containsAnyToken(text string, tokens []string) bool {
-	for _, token := range tokens {
-		if text == token || strings.Contains(text, token) {
-			return true
-		}
+		return facts[i].Importance > facts[j].Importance
+	})
+	if limit > 0 && len(facts) > limit {
+		facts = facts[:limit]
 	}
-	return false
+	return facts
 }
 
-// RespondToPermission answers a permission request using a canonical English response.
-// response must be "once" (allow this time), "reject" (deny), or "always" (always allow).
-// Adapters should resolve locale-specific text to one of these values before calling.
+func (c *Client) ClearUserMemory(channel, userID string) error {
+	c.userMemory.Delete(userMemoryKey(channel, userID))
+	return nil
+}
+
+func (c *Client) CompactUserMemory(channel, userID string) (int, error) {
+	key := userMemoryKey(channel, userID)
+	v, ok := c.userMemory.Load(key)
+	if !ok {
+		return 0, nil
+	}
+	items := v.([]UserMemoryFact)
+	seen := make(map[string]struct{}, len(items))
+	compacted := make([]UserMemoryFact, 0, len(items))
+	for _, it := range items {
+		sig := strings.ToLower(strings.TrimSpace(it.Category)) + "|" + strings.TrimSpace(it.Text)
+		if _, exists := seen[sig]; exists {
+			continue
+		}
+		seen[sig] = struct{}{}
+		compacted = append(compacted, it)
+	}
+	removed := len(items) - len(compacted)
+	c.userMemory.Store(key, compacted)
+	return removed, nil
+}
+
+func (c *Client) PinUserMemory(channel, userID, text, category string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("empty memory text")
+	}
+	if strings.TrimSpace(category) == "" {
+		category = "preference"
+	}
+	key := userMemoryKey(channel, userID)
+	var items []UserMemoryFact
+	if v, ok := c.userMemory.Load(key); ok {
+		items = append(items, v.([]UserMemoryFact)...)
+	}
+	items = append(items, UserMemoryFact{Text: text, Category: strings.ToLower(strings.TrimSpace(category)), Importance: 5})
+	c.userMemory.Store(key, items)
+	return nil
+}
+
+func (c *Client) RemoveUserMemoryByRank(channel, userID string, rank int) (bool, error) {
+	if rank <= 0 {
+		return false, nil
+	}
+	key := userMemoryKey(channel, userID)
+	v, ok := c.userMemory.Load(key)
+	if !ok {
+		return false, nil
+	}
+	items := append([]UserMemoryFact(nil), v.([]UserMemoryFact)...)
+	if rank > len(items) {
+		return false, nil
+	}
+	idx := rank - 1
+	items = append(items[:idx], items[idx+1:]...)
+	c.userMemory.Store(key, items)
+	return true, nil
+}
+
+func (c *Client) UnpinUserMemory(channel, userID, keyword string) (int, error) {
+	key := userMemoryKey(channel, userID)
+	v, ok := c.userMemory.Load(key)
+	if !ok {
+		return 0, nil
+	}
+	kw := strings.ToLower(strings.TrimSpace(keyword))
+	items := v.([]UserMemoryFact)
+	filtered := make([]UserMemoryFact, 0, len(items))
+	removed := 0
+	for _, it := range items {
+		if kw != "" && strings.Contains(strings.ToLower(it.Text), kw) {
+			removed++
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	c.userMemory.Store(key, filtered)
+	return removed, nil
+}
+
+func (c *Client) ExportUserMemory(channel, userID string) (string, error) {
+	facts := c.ListUserMemory(channel, userID, 0)
+	b, err := json.Marshal(facts)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+func (c *Client) ImportUserMemory(channel, userID, payload string) (int, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(payload))
+	if err != nil {
+		return 0, err
+	}
+	var facts []UserMemoryFact
+	if err := json.Unmarshal(raw, &facts); err != nil {
+		return 0, err
+	}
+	c.userMemory.Store(userMemoryKey(channel, userID), facts)
+	return len(facts), nil
+}
+
+func (c *Client) MergeImportUserMemory(channel, userID, payload string) (int, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(payload))
+	if err != nil {
+		return 0, err
+	}
+	var incoming []UserMemoryFact
+	if err := json.Unmarshal(raw, &incoming); err != nil {
+		return 0, err
+	}
+	key := userMemoryKey(channel, userID)
+	merged := c.ListUserMemory(channel, userID, 0)
+	merged = append(merged, incoming...)
+	c.userMemory.Store(key, merged)
+	_, _ = c.CompactUserMemory(channel, userID)
+	final := c.ListUserMemory(channel, userID, 0)
+	return len(final), nil
+}
+
+// RespondToPermission answers a permission request using the canonical English response.
+// response must be one of: "once" (allow this time), "reject" (deny), "always" (always allow).
+// This bypasses all Chinese text parsing — adapters should resolve their own locale first.
 func (c *Client) RespondToPermission(ctx context.Context, permissionID, response string) error {
 	switch response {
 	case "once", "reject", "always":
@@ -2856,8 +3904,10 @@ func (c *Client) RespondToPermission(ctx context.Context, permissionID, response
 		directory = c.directory
 	}
 
-	log.Printf("opencode: RespondToPermission - ID=%s, sessionID=%s, response=%s", permissionID, q.SessionID, response)
+	log.Printf("opencode: RespondToPermission - ID=%s, sessionID=%s, response=%s, directory=%s",
+		q.ID, q.SessionID, response, directory)
 
+	// HTTP API first (more reliable than SDK)
 	if err := c.answerPermissionViaHTTP(ctx, q, response); err != nil {
 		log.Printf("opencode: HTTP permission API failed: %v, falling back to SDK", err)
 
@@ -2879,7 +3929,7 @@ func (c *Client) RespondToPermission(ctx context.Context, permissionID, response
 			return fmt.Errorf("permission respond failed (HTTP: %v, SDK: %w)", err, sdkErr)
 		}
 		if result != nil {
-			log.Printf("opencode: SDK permission respond succeeded")
+			log.Printf("opencode: SDK permission respond succeeded, result=%v", *result)
 		}
 	}
 
@@ -2888,24 +3938,108 @@ func (c *Client) RespondToPermission(ctx context.Context, permissionID, response
 	return nil
 }
 
-// answerPermissionViaHTTP 鐩存帴璋冪敤 HTTP API锛堜笌 Python 鐗堟湰涓€鑷达級
+// answerPermission 回答权限请求（内部用，by AnswerQuestion path）
+func (c *Client) answerPermission(ctx context.Context, q *Question, answer string) error {
+	_, responseStr, ok := parsePermissionAnswer(answer)
+	if !ok {
+		return fmt.Errorf("invalid permission answer (use allow/reject/always), raw=%q bytes=% X", answer, []byte(answer))
+	}
+	log.Printf("opencode: answerPermission via parsePermissionAnswer - ID=%s, responseStr=%s", q.ID, responseStr)
+	return c.RespondToPermission(ctx, q.ID, responseStr)
+}
+
+func parsePermissionAnswer(answer string) (opencode.SessionPermissionRespondParamsResponse, string, bool) {
+	if strings.Contains(answer, "始终允许") {
+		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
+	}
+	if strings.Contains(answer, "拒绝") || strings.Contains(answer, "不同意") {
+		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
+	}
+	if strings.Contains(answer, "允许") || strings.Contains(answer, "同意") || strings.Contains(answer, "确认") {
+		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
+	}
+
+	normalized := normalizePermissionAnswer(answer)
+	if normalized == "" {
+		log.Printf("opencode: permission answer parse failed: empty normalized answer, raw=%q, bytes=% X", answer, []byte(answer))
+		return "", "", false
+	}
+
+	allowTokens := []string{"1", "allow", "yes", "允许", "同意", "确认", "ok", "okay", "y", "可以", "行", "鍏佽", "鍚屾剰", "纭", "鍙互"}
+	rejectTokens := []string{"2", "deny", "no", "拒绝", "不同意", "取消", "n", "鎷掔粷", "涓嶅悓鎰", "鍙栨秷"}
+	alwaysTokens := []string{"3", "always", "始终允许", "始终", "一直允许", "总是允许", "濮嬬粓鍏佽", "濮嬬粓", "涓€鐩村厑璁", "鎬绘槸鍏佽"}
+
+	if containsAnyToken(normalized, alwaysTokens) {
+		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
+	}
+	if containsAnyToken(normalized, rejectTokens) {
+		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
+	}
+	if containsAnyToken(normalized, allowTokens) {
+		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
+	}
+
+	// 兜底：先判定否定，再判定允许，避免“不允许”被误判为允许。
+	if strings.Contains(normalized, "不允许") || strings.Contains(normalized, "拒绝") || strings.Contains(normalized, "不同意") || strings.Contains(normalized, "涓嶅厑璁") || strings.Contains(normalized, "鎷掔粷") {
+		return opencode.SessionPermissionRespondParamsResponseReject, "reject", true
+	}
+	if strings.Contains(normalized, "始终") || strings.Contains(normalized, "always") || strings.Contains(normalized, "濮嬬粓") {
+		return opencode.SessionPermissionRespondParamsResponseAlways, "always", true
+	}
+	if strings.Contains(normalized, "允许") || strings.Contains(normalized, "同意") || strings.Contains(normalized, "确认") || strings.Contains(normalized, "鍏佽") || strings.Contains(normalized, "鍚屾剰") {
+		return opencode.SessionPermissionRespondParamsResponseOnce, "once", true
+	}
+
+	log.Printf("opencode: permission answer parse failed: raw=%q normalized=%q bytes=% X", answer, normalized, []byte(answer))
+
+	return "", "", false
+}
+
+func normalizePermissionAnswer(answer string) string {
+	answerLower := strings.TrimSpace(strings.ToLower(answer))
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) || unicode.IsControl(r) {
+			return -1
+		}
+		switch r {
+		case ' ', '\t', '\n', '\r', '，', ',', '。', '.', '！', '!', '？', '?', '：', ':', ';', '；', '（', '）', '(', ')', '“', '”', '"', '\'', '、':
+			return -1
+		case '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		default:
+			return r
+		}
+	}, answerLower)
+}
+
+func containsAnyToken(text string, tokens []string) bool {
+	for _, token := range tokens {
+		t := normalizePermissionAnswer(token)
+		if t != "" && strings.Contains(text, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// answerPermissionViaHTTP 直接调用 HTTP API（与 Python 版本一致）
 func (c *Client) answerPermissionViaHTTP(ctx context.Context, q *Question, response string) error {
 	if c.endpoint == "" {
 		return fmt.Errorf("opencode: answer permission via HTTP unavailable: missing endpoint")
 	}
 
-	// 鏋勯€?URL锛歅OST /session/{sessionID}/permissions/{permissionID}
+	// 构造 URL：POST /session/{sessionID}/permissions/{permissionID}
 	permissionURL := fmt.Sprintf("%s/session/%s/permissions/%s", c.endpoint, q.SessionID, q.ID)
 
 	payload := map[string]interface{}{
 		"response": response,
 	}
-	// 浣跨敤 Question 涓繚瀛樼殑 directory锛屽鏋滀负绌哄垯浣跨敤 client 鐨勯粯璁?directory
+	// 使用 Question 中保存的 directory，如果为空则使用 client 的默认 directory
 	directory := q.Directory
 	if directory == "" {
 		directory = c.directory
 	}
-	// 鈿狅笍 娉ㄦ剰锛氬彧鍦?payload 涓彂閫?directory锛屼笉瑕佸湪 query string 涓噸澶?
+	// ⚠️ 注意：只在 payload 中发送 directory，不要在 query string 中重复
 	if directory != "" {
 		payload["directory"] = directory
 	}
@@ -2922,8 +4056,10 @@ func (c *Client) answerPermissionViaHTTP(ctx context.Context, q *Question, respo
 		return fmt.Errorf("opencode: permission HTTP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.applyAuthHeaders(req.Header)
-	// 涓嶅湪 query string 涓彂閫?directory锛孭ython 涔熸病鏈夎繖鏍峰仛
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	// 不在 query string 中发送 directory，Python 也没有这样做
 
 	log.Printf("opencode: HTTP permission request - URL=%s, method=POST, body=%s",
 		req.URL.String(), string(body))
@@ -2947,44 +4083,44 @@ func (c *Client) answerPermissionViaHTTP(ctx context.Context, q *Question, respo
 	return nil
 }
 
-// answerNormalQuestion 鍥炵瓟鏅€氶棶棰?
-// API 绔偣: POST /question/:requestID/reply with body {"answers": [[绛旀1], [绛旀2], ...]}
-// answers 鏄竴涓簩缁存暟缁勶細姣忎釜瀛愭暟缁勫搴斾竴涓?question 鐨勭瓟妗堬紙澶氶€夊彲浠ユ湁澶氫釜鍏冪礌锛?
+// answerNormalQuestion 回答普通问题
+// API 端点: POST /question/:requestID/reply with body {"answers": [[答案1], [答案2], ...]}
+// answers 是一个二维数组：每个子数组对应一个 question 的答案（多选可以有多个元素）
 //
-// 绛旀鏍煎紡鏀寔:
-// - 绠€鍗曟牸寮? "1" - 涓虹涓€涓棶棰橀€夋嫨閫夐」1
-// - 澶氶棶棰樻牸寮? "1;2,3;1" - 鐢ㄥ垎鍙峰垎闅斾笉鍚岄棶棰樼殑绛旀锛岀敤閫楀彿鍒嗛殧澶氶€夌瓟妗?
-// - 鏍囩鏍煎紡: "绾疕TML椤甸潰;API鎺ュ彛璇锋眰;GPU鍒╃敤鐜?鏄惧瓨浣跨敤鎯呭喌"
+// 答案格式支持:
+// - 简单格式: "1" - 为第一个问题选择选项1
+// - 多问题格式: "1;2,3;1" - 用分号分隔不同问题的答案，用逗号分隔多选答案
+// - 标签格式: "纯HTML页面;API接口请求;GPU利用率,显存使用情况"
 func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer string) error {
-	// 鏍规嵁闂 ID 绫诲瀷閫夋嫨涓嶅悓鐨勫洖绛旀柟寮?
-	// que_xxx: 浣跨敤 /question/:id/reply 绔偣
-	// 鍏朵粬: 浣跨敤 /session/:id/message/:messageID/answer 绔偣
+	// 根据问题 ID 类型选择不同的回答方式
+	// que_xxx: 使用 /question/:id/reply 端点
+	// 其他: 使用 /session/:id/message/:messageID/answer 端点
 
 	var answerURL string
 	var payload map[string]interface{}
 
 	if strings.HasPrefix(q.ID, "que_") {
-		// 鏂扮増闂鏍煎紡锛屼娇鐢?/question/:id/reply 绔偣
+		// 新版问题格式，使用 /question/:id/reply 端点
 		answerURL = fmt.Sprintf("%s/question/%s/reply", c.endpoint, q.ID)
 
-		// 瑙ｆ瀽绛旀
+		// 解析答案
 		var allAnswers [][]string
 
-		// 妫€鏌ユ槸鍚︿娇鐢ㄥ垎鍙峰垎闅斿涓棶棰樼殑绛旀
+		// 检查是否使用分号分隔多个问题的答案
 		if strings.Contains(answer, ";") {
-			// 澶氶棶棰樻牸寮? "1;2,3;1"
+			// 多问题格式: "1;2,3;1"
 			questionAnswers := strings.Split(answer, ";")
 			for idx, qa := range questionAnswers {
 				var answerItems []string
 				if strings.Contains(qa, ",") {
-					// 澶氶€夌瓟妗?
+					// 多选答案
 					for _, item := range strings.Split(qa, ",") {
 						if trimmed := strings.TrimSpace(item); trimmed != "" {
 							answerItems = append(answerItems, c.resolveAnswerOption(q, idx, trimmed))
 						}
 					}
 				} else {
-					// 鍗曢€夌瓟妗?
+					// 单选答案
 					if trimmed := strings.TrimSpace(qa); trimmed != "" {
 						answerItems = []string{c.resolveAnswerOption(q, idx, trimmed)}
 					}
@@ -2994,7 +4130,7 @@ func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer s
 				}
 			}
 		} else if strings.Contains(answer, ",") {
-			// 鍗曢棶棰樺閫夋牸寮? "閫夐」1,閫夐」2"
+			// 单问题多选格式: "选项1,选项2"
 			var answerItems []string
 			for _, item := range strings.Split(answer, ",") {
 				if trimmed := strings.TrimSpace(item); trimmed != "" {
@@ -3003,7 +4139,7 @@ func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer s
 			}
 			allAnswers = [][]string{answerItems}
 		} else {
-			// 鍗曢棶棰樺崟閫夋牸寮? "1" 鎴?"閫夐」1"
+			// 单问题单选格式: "1" 或 "选项1"
 			resolved := c.resolveAnswerOption(q, 0, strings.TrimSpace(answer))
 			allAnswers = [][]string{{resolved}}
 		}
@@ -3013,7 +4149,7 @@ func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer s
 		}
 		log.Printf("opencode: answering question %s via /question/reply endpoint, answers=%v", q.ID, allAnswers)
 	} else {
-		// 鏃х増鏍煎紡锛屼娇鐢?/session/:id/message/:messageID/answer 绔偣
+		// 旧版格式，使用 /session/:id/message/:messageID/answer 端点
 		answerURL = fmt.Sprintf("%s/session/%s/message/%s/answer", c.endpoint, q.SessionID, q.MessageID)
 		payload = map[string]interface{}{
 			"answer": answer,
@@ -3031,7 +4167,9 @@ func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer s
 		return fmt.Errorf("opencode: answer request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.applyAuthHeaders(req.Header)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -3049,9 +4187,9 @@ func (c *Client) answerNormalQuestion(ctx context.Context, q *Question, answer s
 	return nil
 }
 
-// resolveAnswerOption 灏嗙敤鎴疯緭鍏ョ殑绛旀锛堝彲鑳芥槸鏁板瓧绱㈠紩锛夎В鏋愪负瀹為檯閫夐」鏍囩
-// questionIndex: 绗嚑涓瓙闂 (0-based)
-// input: 鐢ㄦ埛杈撳叆锛屽彲鑳芥槸 "1" 鎴?"绾疕TML椤甸潰" 绛?
+// resolveAnswerOption 将用户输入的答案（可能是数字索引）解析为实际选项标签
+// questionIndex: 第几个子问题 (0-based)
+// input: 用户输入，可能是 "1" 或 "纯HTML页面" 等
 func (c *Client) resolveAnswerOption(q *Question, questionIndex int, input string) string {
 	input = strings.TrimSpace(input)
 	if input == "" {
@@ -3061,7 +4199,7 @@ func (c *Client) resolveAnswerOption(q *Question, questionIndex int, input strin
 	log.Printf("opencode: resolveAnswerOption - qID: %s, questionIndex: %d, input: '%s', hasQuestions: %d, hasSimpleOptions: %d",
 		q.ID, questionIndex, input, len(q.Questions), len(q.Options))
 
-	// 浼樺厛浣跨敤鏂扮増 Questions 鏁扮粍
+	// 优先使用新版 Questions 数组
 	if len(q.Questions) > 0 {
 		if questionIndex >= len(q.Questions) {
 			log.Printf("opencode: questionIndex %d out of range (has %d questions), returning original input", questionIndex, len(q.Questions))
@@ -3070,9 +4208,9 @@ func (c *Client) resolveAnswerOption(q *Question, questionIndex int, input strin
 
 		qi := q.Questions[questionIndex]
 
-		// 灏濊瘯灏嗚緭鍏ヨВ鏋愪负鏁板瓧
+		// 尝试将输入解析为数字
 		if idx, err := strconv.Atoi(input); err == nil {
-			// 鏁板瓧绱㈠紩鏄?1-based
+			// 数字索引是 1-based
 			if idx >= 1 && idx <= len(qi.Options) {
 				result := qi.Options[idx-1].Label
 				log.Printf("opencode: converted number %d -> '%s'", idx, result)
@@ -3082,7 +4220,7 @@ func (c *Client) resolveAnswerOption(q *Question, questionIndex int, input strin
 			}
 		}
 
-		// 濡傛灉涓嶆槸鏈夋晥鐨勬暟瀛楋紝妫€鏌ユ槸鍚︽槸鏈夋晥鐨勯€夐」鏍囩
+		// 如果不是有效的数字，检查是否是有效的选项标签
 		for _, opt := range qi.Options {
 			if strings.EqualFold(opt.Label, input) {
 				log.Printf("opencode: matched option label '%s'", opt.Label)
@@ -3091,9 +4229,9 @@ func (c *Client) resolveAnswerOption(q *Question, questionIndex int, input strin
 		}
 	}
 
-	// 鍥為€€鍒扮畝鍖?Options 鏁扮粍锛堟棫鏍煎紡鍏煎锛?
+	// 回退到简化 Options 数组（旧格式兼容）
 	if len(q.Options) > 0 {
-		// 濡傛灉 questionIndex 涓?0锛屽皾璇曚娇鐢ㄧ畝鍖栭€夐」
+		// 如果 questionIndex 为 0，尝试使用简化选项
 		if questionIndex == 0 {
 			if idx, err := strconv.Atoi(input); err == nil {
 				if idx >= 1 && idx <= len(q.Options) {
@@ -3111,12 +4249,12 @@ func (c *Client) resolveAnswerOption(q *Question, questionIndex int, input strin
 		}
 	}
 
-	// 鏃犳硶瑙ｆ瀽锛岃繑鍥炲師濮嬭緭鍏?
+	// 无法解析，返回原始输入
 	log.Printf("opencode: could not resolve input '%s', returning original", input)
 	return input
 }
 
-// cleanupRequestCache 瀹氭湡娓呯悊杩囨湡鐨勮姹傜紦瀛?
+// cleanupRequestCache 定期清理过期的请求缓存
 func (c *Client) cleanupRequestCache() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -3133,9 +4271,9 @@ func (c *Client) cleanupRequestCache() {
 	}
 }
 
-// ========== Skill鎻愮ず ==========
+// ========== Skill提示 ==========
 
-// refreshSkillCache 鍒锋柊鍙敤skill缂撳瓨
+// refreshSkillCache 刷新可用skill缓存
 func (c *Client) refreshSkillCache(ctx context.Context) {
 	agents, err := c.ListAgents(ctx)
 	if err != nil {
@@ -3158,7 +4296,7 @@ func (c *Client) refreshSkillCache(ctx context.Context) {
 	log.Printf("opencode: refreshed skill cache with %d skills", len(c.skillHintCache))
 }
 
-// getSkillHint 鑾峰彇skill鎻愮ず鏂囨湰
+// getSkillHint 获取skill提示文本
 func (c *Client) getSkillHint() string {
 	c.skillCacheMu.RLock()
 	defer c.skillCacheMu.RUnlock()
@@ -3168,23 +4306,23 @@ func (c *Client) getSkillHint() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("\n\n[鍙敤鎶€鑳芥彁绀篯 濡傛灉闇€瑕侊紝浣犲彲浠ヤ娇鐢ㄤ互涓嬫妧鑳斤細")
+	sb.WriteString("\n\n[可用技能提示] 如果需要，你可以使用以下技能：")
 	for _, skill := range c.skillHintCache {
 		sb.WriteString("\n- ")
 		sb.WriteString(skill)
 	}
-	sb.WriteString("\\n璇峰湪闇€瑕佹椂涓诲姩璋冪敤杩欎簺鎶€鑳姐€?")
+	sb.WriteString("\n请在需要时主动调用这些技能。")
 
 	return sb.String()
 }
 
-// enhanceContentWithSkillHint 鍦ㄦ秷鎭唴瀹逛腑娣诲姞skill鎻愮ず
+// enhanceContentWithSkillHint 在消息内容中添加skill提示
 func (c *Client) enhanceContentWithSkillHint(content string, sessionID string) string {
 	if !c.enableSkillHint {
 		return content
 	}
 
-	// 妫€鏌ユ槸鍚﹂渶瑕佸埛鏂扮紦瀛?
+	// 检查是否需要刷新缓存
 	c.skillCacheMu.RLock()
 	needRefresh := len(c.skillHintCache) == 0
 	c.skillCacheMu.RUnlock()
@@ -3200,7 +4338,7 @@ func (c *Client) enhanceContentWithSkillHint(content string, sessionID string) s
 		return content
 	}
 
-	// 鍙湪session鐨勫墠鍑犳潯娑堟伅娣诲姞鎻愮ず锛岄伩鍏嶅啑浣?
+	// 只在session的前几条消息添加提示，避免冗余
 	msgCount := c.GetMessageCount(sessionID)
 	if msgCount > 3 {
 		return content
@@ -3209,7 +4347,7 @@ func (c *Client) enhanceContentWithSkillHint(content string, sessionID string) s
 	return content + hint
 }
 
-// RefreshSkills 鎵嬪姩鍒锋柊skill缂撳瓨
+// RefreshSkills 手动刷新skill缓存
 func (c *Client) RefreshSkills(ctx context.Context) error {
 	c.refreshSkillCache(ctx)
 	return nil
@@ -3218,32 +4356,4 @@ func (c *Client) RefreshSkills(ctx context.Context) error {
 // SetSkillHintEnabled 设置是否启用skill提示
 func (c *Client) SetSkillHintEnabled(enabled bool) {
 	c.enableSkillHint = enabled
-}
-
-// FindVideoSkill 查找视频处理的 skill
-// 返回 skill 名称，如果没有找到返回空字符串
-func (c *Client) FindVideoSkill(ctx context.Context) string {
-	agents, err := c.ListAgents(ctx)
-	if err != nil {
-		log.Printf("opencode: failed to list agents for video skill: %v", err)
-		return ""
-	}
-
-	// 查找视频相关的 skill
-	videoKeywords := []string{"video", "视频", "analyze", "分析"}
-	for _, agent := range agents {
-		name := strings.ToLower(agent.Name)
-		desc := strings.ToLower(agent.Description)
-
-		// 检查名称或描述中是否包含视频相关关键词
-		for _, kw := range videoKeywords {
-			if strings.Contains(name, kw) || strings.Contains(desc, kw) {
-				log.Printf("opencode: found video skill: %s (%s)", agent.Name, agent.Description)
-				return agent.Name
-			}
-		}
-	}
-
-	log.Printf("opencode: no video skill found, will use model directly")
-	return ""
 }

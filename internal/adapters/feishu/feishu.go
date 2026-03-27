@@ -62,6 +62,26 @@ type Handler struct {
 	accessToken     string
 	tokenExpiry     time.Time
 	debugMode       bool // Enable detailed event logging
+	overflowPolicy  sync.Map
+	overflowPending sync.Map
+}
+
+const (
+	feishuOverflowPolicyAsk     = "ask"
+	feishuOverflowPolicySummary = "summary"
+	feishuOverflowPolicyNew     = "new"
+)
+
+type feishuTokenOverflowPendingState struct {
+	UserID      string
+	SessionID   string
+	ThreadID    string
+	Content     string
+	Agent       string
+	Attachments []opencode.Attachment
+	Metadata    map[string]string
+	Target      chatTarget
+	CreatedAt   time.Time
 }
 
 func NewHandler(client *opencode.Client, cfg Config) *Handler {
@@ -218,6 +238,12 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 	// ========== 检查是否是快速回复（权限或问题回答）==========
 	content := strings.TrimSpace(msg.Content)
+	if handled, err := h.handleTokenOverflowQuickReply(ctx, target, msg, content); handled || err != nil {
+		if handled {
+			return "handled", nil
+		}
+		return "", err
+	}
 	sessionID, hasSession := h.adapter.GetSessionForUser(msg.UserID)
 
 	if hasSession {
@@ -464,9 +490,49 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return "思考过程：\n" + trimmed + "\n思考结束"
 	}
 
+	threadID := msg.ChatID
+	if threadID == "" {
+		threadID = msg.MessageID
+	}
+	retryContent := content
+	retryMetadata := map[string]string{}
+
 	callback := func(chunk string) error {
 		raw := chunk
 		trimmed := strings.TrimSpace(chunk)
+		if h.isTokenOverflowErrorText(trimmed) {
+			state := &feishuTokenOverflowPendingState{
+				UserID:      msg.UserID,
+				SessionID:   sessionID,
+				ThreadID:    threadID,
+				Content:     retryContent,
+				Agent:       agentName,
+				Attachments: append([]opencode.Attachment(nil), msg.Attachments...),
+				Metadata:    cloneStringMap(retryMetadata),
+				Target:      target,
+				CreatedAt:   time.Now(),
+			}
+			if state.SessionID == "" {
+				if sid, ok := h.adapter.GetSessionForUser(msg.UserID); ok {
+					state.SessionID = sid
+				}
+			}
+
+			switch h.getTokenOverflowPolicy(msg.UserID) {
+			case feishuOverflowPolicySummary:
+				h.storeTokenOverflowPending(msg.UserID, state)
+				_ = h.sendTextChunks(sendCtx, target, "⚠️ 检测到上下文超限，已按偏好自动执行“压缩并继续”，请稍候...")
+				go h.executeTokenOverflowDecision(context.Background(), msg.UserID, "summary")
+			case feishuOverflowPolicyNew:
+				h.storeTokenOverflowPending(msg.UserID, state)
+				_ = h.sendTextChunks(sendCtx, target, "⚠️ 检测到上下文超限，已按偏好自动执行“新会话并继续”，请稍候...")
+				go h.executeTokenOverflowDecision(context.Background(), msg.UserID, "new")
+			default:
+				h.storeTokenOverflowPending(msg.UserID, state)
+				_ = h.sendTextChunks(sendCtx, target, h.buildTokenOverflowPrompt())
+			}
+			return nil
+		}
 
 		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
 			thinkingDelta := strings.TrimPrefix(chunk, opencode.ThinkingSignalPrefix)
@@ -612,11 +678,6 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return nil
 	}
 
-	threadID := msg.ChatID
-	if threadID == "" {
-		threadID = msg.MessageID
-	}
-
 	sendContent := msg.Content
 	metadata := map[string]string{
 		"message_id":      msg.MessageID,
@@ -648,6 +709,8 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			sendContent = base.BuildMediaPromptPrefix(mediaCtx) + sendContent
 		}
 	}
+	retryContent = sendContent
+	retryMetadata = cloneStringMap(metadata)
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
 		Channel:     "feishu",
@@ -2609,7 +2672,7 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, target chatTarget, u
 	log.Printf("feishu: executing command in session %s: %s", sessionID, command)
 
 	// Execute command
-	result, err := h.client.ExecuteShell(ctx, sessionID, command)
+	output, err := h.client.ExecuteShellOutput(ctx, sessionID, command)
 	if err != nil {
 		log.Printf("feishu: command execution failed: %v", err)
 		errMsg := fmt.Sprintf("❌ 命令执行失败: %v", err)
@@ -2619,10 +2682,10 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, target chatTarget, u
 
 	// Build response message
 	var reply string
-	if result != nil {
-		reply = fmt.Sprintf("🖥️ 命令执行结果:\n\n```\n%s\n```", result.ID)
+	if strings.TrimSpace(output) != "" {
+		reply = fmt.Sprintf("🖥️ 命令执行结果:\n\n```\n%s\n```", output)
 	} else {
-		reply = "🖥️ 命令执行完成"
+		reply = "🖥️ 命令已执行，但没有可显示的输出"
 	}
 
 	_ = h.sendTextChunks(ctx, target, reply)
@@ -2756,6 +2819,269 @@ func parsePermissionReply(content string) string {
 		}
 	}
 	return ""
+}
+
+func (h *Handler) isTokenOverflowErrorText(text string) bool {
+	msg := strings.ToLower(strings.TrimSpace(text))
+	if msg == "" {
+		return false
+	}
+	if !strings.Contains(msg, "opencode 会话出错") && !strings.Contains(msg, "session error") {
+		return false
+	}
+	return strings.Contains(msg, "parameter=input_tokens") ||
+		strings.Contains(msg, "maximum input length") ||
+		strings.Contains(msg, "context length") ||
+		strings.Contains(msg, "input tokens")
+}
+
+func (h *Handler) buildTokenOverflowPrompt() string {
+	return "⚠️ 当前会话上下文已超出模型上限，导致本次请求失败。\n\n" +
+		"请选择后续操作（直接回复数字或文字即可）：\n" +
+		"1. 压缩并继续（调用 summary 后重试本条消息）\n" +
+		"2. 新会话并继续（重置会话后重试本条消息）\n" +
+		"3. 取消\n" +
+		"4. 总是压缩并继续\n" +
+		"5. 总是新会话并继续"
+}
+
+func (h *Handler) getTokenOverflowPolicy(userID string) string {
+	if value, ok := h.overflowPolicy.Load(strings.TrimSpace(userID)); ok {
+		if policy, ok := value.(string); ok {
+			policy = strings.TrimSpace(policy)
+			if policy == feishuOverflowPolicySummary || policy == feishuOverflowPolicyNew {
+				return policy
+			}
+		}
+	}
+	return feishuOverflowPolicyAsk
+}
+
+func (h *Handler) setTokenOverflowPolicy(userID, policy string) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	if policy != feishuOverflowPolicySummary && policy != feishuOverflowPolicyNew {
+		h.overflowPolicy.Delete(userID)
+		return
+	}
+	h.overflowPolicy.Store(userID, policy)
+}
+
+func (h *Handler) storeTokenOverflowPending(userID string, state *feishuTokenOverflowPendingState) {
+	if state == nil {
+		return
+	}
+	h.overflowPending.Store(strings.TrimSpace(userID), state)
+}
+
+func (h *Handler) getTokenOverflowPending(userID string) (*feishuTokenOverflowPendingState, bool) {
+	value, ok := h.overflowPending.Load(strings.TrimSpace(userID))
+	if !ok {
+		return nil, false
+	}
+	state, ok := value.(*feishuTokenOverflowPendingState)
+	if !ok || state == nil {
+		return nil, false
+	}
+	if time.Since(state.CreatedAt) > 30*time.Minute {
+		h.overflowPending.Delete(strings.TrimSpace(userID))
+		return nil, false
+	}
+	return state, true
+}
+
+func (h *Handler) clearTokenOverflowPending(userID string) {
+	h.overflowPending.Delete(strings.TrimSpace(userID))
+}
+
+func (h *Handler) handleTokenOverflowQuickReply(ctx context.Context, target chatTarget, msg incomingMessage, content string) (bool, error) {
+	state, ok := h.getTokenOverflowPending(msg.UserID)
+	if !ok {
+		return false, nil
+	}
+
+	decision, setAlways, recognized := parseTokenOverflowDecision(content)
+	if !recognized {
+		_ = h.sendTextChunks(ctx, target, "请回复 1/2/3/4/5（或对应中文选项）来处理上下文超限问题。")
+		return true, nil
+	}
+
+	if decision == "cancel" {
+		h.clearTokenOverflowPending(msg.UserID)
+		_ = h.sendTextChunks(ctx, target, "✅ 已取消本次继续处理。你可以手动发送 /summary、/new 或重发消息。")
+		return true, nil
+	}
+
+	if setAlways {
+		if decision == "summary" {
+			h.setTokenOverflowPolicy(msg.UserID, feishuOverflowPolicySummary)
+			_ = h.sendTextChunks(ctx, target, "✅ 已设置为：总是压缩并继续。正在处理本条消息...")
+		} else if decision == "new" {
+			h.setTokenOverflowPolicy(msg.UserID, feishuOverflowPolicyNew)
+			_ = h.sendTextChunks(ctx, target, "✅ 已设置为：总是新会话并继续。正在处理本条消息...")
+		}
+	}
+
+	h.storeTokenOverflowPending(msg.UserID, state)
+	go h.executeTokenOverflowDecision(context.Background(), msg.UserID, decision)
+	return true, nil
+}
+
+func parseTokenOverflowDecision(content string) (decision string, setAlways bool, recognized bool) {
+	normalized := normalizeDecisionText(content)
+	if normalized == "" {
+		return "", false, false
+	}
+
+	if normalized == "3" || strings.Contains(normalized, "取消") || normalized == "no" {
+		return "cancel", false, true
+	}
+
+	alwaysSummaryTokens := []string{"4", "总是压缩", "总是总结", "总是这样压缩", "alwayssummary"}
+	alwaysNewTokens := []string{"5", "总是新会话", "总是重开", "总是这样新会话", "alwaysnew"}
+	summaryTokens := []string{"1", "压缩", "总结", "summary", "压缩继续", "继续压缩", "继续"}
+	newTokens := []string{"2", "新会话", "重开", "new", "reset", "新会话继续", "继续新会话"}
+
+	if containsDecisionToken(normalized, alwaysSummaryTokens) {
+		return "summary", true, true
+	}
+	if containsDecisionToken(normalized, alwaysNewTokens) {
+		return "new", true, true
+	}
+	if containsDecisionToken(normalized, summaryTokens) {
+		return "summary", false, true
+	}
+	if containsDecisionToken(normalized, newTokens) {
+		return "new", false, true
+	}
+
+	return "", false, false
+}
+
+func normalizeDecisionText(content string) string {
+	raw := strings.TrimSpace(strings.ToLower(content))
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '，', ',', '。', '.', '！', '!', '？', '?', '：', ':', ';', '；', '（', '）', '(', ')', '“', '”', '"', '\'', '、', '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		default:
+			return r
+		}
+	}, raw)
+}
+
+func containsDecisionToken(text string, tokens []string) bool {
+	for _, token := range tokens {
+		t := normalizeDecisionText(token)
+		if t != "" && strings.Contains(text, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, decision string) {
+	state, ok := h.getTokenOverflowPending(userID)
+	if !ok {
+		return
+	}
+
+	decision = strings.TrimSpace(decision)
+	if decision == "" {
+		decision = "summary"
+	}
+
+	timeout := 20 * time.Minute
+	if strings.TrimSpace(state.Agent) != "" {
+		timeout = 30 * time.Minute
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if decision == "summary" {
+		sessionID := strings.TrimSpace(state.SessionID)
+		if sessionID == "" {
+			if sid, exists := h.adapter.GetSessionForUser(state.UserID); exists {
+				sessionID = sid
+			}
+		}
+		if sessionID == "" {
+			_ = h.sendTextChunks(runCtx, state.Target, "❌ 无法定位当前会话，已改为新会话继续。")
+			decision = "new"
+		} else {
+			if err := h.client.SummarizeSession(runCtx, sessionID); err != nil {
+				_ = h.sendTextChunks(runCtx, state.Target, fmt.Sprintf("❌ 自动压缩失败：%v", err))
+				h.clearTokenOverflowPending(userID)
+				return
+			}
+			state.SessionID = sessionID
+		}
+	}
+
+	if decision == "new" {
+		if strings.TrimSpace(state.ThreadID) != "" {
+			h.client.ResetSession(state.ThreadID)
+		}
+		h.adapter.ClearSessionForUser(state.UserID)
+		state.SessionID = ""
+	}
+
+	response, err := h.client.SendMessage(runCtx, opencode.MessagePayload{
+		Channel:     "feishu",
+		UserID:      state.UserID,
+		ThreadID:    state.ThreadID,
+		SessionID:   state.SessionID,
+		Content:     state.Content,
+		Agent:       state.Agent,
+		Streaming:   false,
+		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:    cloneStringMap(state.Metadata),
+	})
+	if err != nil {
+		_ = h.sendTextChunks(runCtx, state.Target, fmt.Sprintf("❌ 已尝试%s后重试，但仍失败：%v", tokenOverflowDecisionLabel(decision), err))
+		h.clearTokenOverflowPending(userID)
+		return
+	}
+
+	if response.SessionID != "" {
+		h.adapter.MapUserToSession(state.UserID, response.SessionID)
+		h.adapter.MapSessionData(response.SessionID, "receive_id", state.Target.receiveID)
+		h.adapter.MapSessionData(response.SessionID, "receive_id_type", state.Target.receiveIDType)
+	}
+
+	finalReply := strings.TrimSpace(response.Reply)
+	if finalReply == "" {
+		finalReply = "✅ 已完成重试，本次没有可直接返回的文本内容。"
+	}
+	if err := h.sendTextChunks(runCtx, state.Target, finalReply); err != nil {
+		log.Printf("feishu: failed to send token-overflow retry reply: %v", err)
+	}
+
+	h.clearTokenOverflowPending(userID)
+}
+
+func tokenOverflowDecisionLabel(decision string) string {
+	switch decision {
+	case "summary":
+		return "压缩"
+	case "new":
+		return "新会话"
+	default:
+		return "处理"
+	}
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 func (h *Handler) buildPendingRequirementHint(userID string) string {

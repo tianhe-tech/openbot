@@ -35,13 +35,31 @@ type Config struct {
 
 // Handler processes WeCom callbacks and forwards them to OpenCode.
 type Handler struct {
-	client      *opencode.Client
-	cfg         Config
-	adapter     *base.BidirectionalAdapter
-	httpClient  *http.Client
-	tokenMu     sync.Mutex
-	accessToken string
-	tokenExpiry time.Time
+	client          *opencode.Client
+	cfg             Config
+	adapter         *base.BidirectionalAdapter
+	httpClient      *http.Client
+	tokenMu         sync.Mutex
+	accessToken     string
+	tokenExpiry     time.Time
+	overflowPolicy  sync.Map
+	overflowPending sync.Map
+}
+
+const (
+	wecomOverflowPolicyAsk     = "ask"
+	wecomOverflowPolicySummary = "summary"
+	wecomOverflowPolicyNew     = "new"
+)
+
+type wecomTokenOverflowPendingState struct {
+	UserID      string
+	SessionID   string
+	ThreadID    string
+	Content     string
+	Attachments []opencode.Attachment
+	Metadata    map[string]string
+	CreatedAt   time.Time
 }
 
 // NewHandler wires the adapter with an OpenCode client instance.
@@ -146,6 +164,16 @@ func (h *Handler) handleEvent(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomIncomingMessage) (string, error) {
 	userID := env.FromUserID
 	content := msg.Content
+	threadID := strings.TrimSpace(env.RoomID)
+	if threadID == "" {
+		threadID = userID
+	}
+
+	if msg.MsgType == "text" {
+		if handled, reply, err := h.handleTokenOverflowQuickReply(ctx, userID, content); handled || err != nil {
+			return reply, err
+		}
+	}
 
 	// command routing
 	if msg.MsgType == "text" && (content == "/help" || content == "帮助") {
@@ -182,11 +210,6 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 
 	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
-
-	threadID := strings.TrimSpace(env.RoomID)
-	if threadID == "" {
-		threadID = userID
-	}
 
 	metadata := map[string]string{
 		"msg_type": env.MsgType,
@@ -225,6 +248,25 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 		Attachments: msg.Attachments,
 		Metadata:    metadata,
 	}, func(chunk string) error {
+		if h.isTokenOverflowErrorText(chunk) {
+			state := &wecomTokenOverflowPendingState{
+				UserID:      userID,
+				SessionID:   sessionID,
+				ThreadID:    threadID,
+				Content:     sendContent,
+				Attachments: append([]opencode.Attachment(nil), msg.Attachments...),
+				Metadata:    cloneStringMap(metadata),
+				CreatedAt:   time.Now(),
+			}
+			if state.SessionID == "" {
+				if sid, ok := h.adapter.GetSessionForUser(userID); ok {
+					state.SessionID = sid
+				}
+			}
+			h.storeTokenOverflowPending(userID, state)
+			return nil
+		}
+
 		// First callback with a session-ID-like value is a mapping signal.
 		if !sessionMapped && strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
 			h.adapter.MapUserToSession(userID, chunk)
@@ -283,6 +325,19 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 	if err != nil {
 		log.Printf("wecom: streaming error for user %s: %v", userID, err)
 		return "", fmt.Errorf("streaming: %w", err)
+	}
+
+	if pending, ok := h.getTokenOverflowPending(userID); ok {
+		if pending.ThreadID == threadID && pending.Content == sendContent {
+			switch h.getTokenOverflowPolicy(userID) {
+			case wecomOverflowPolicySummary:
+				return h.executeTokenOverflowDecision(ctx, userID, "summary")
+			case wecomOverflowPolicyNew:
+				return h.executeTokenOverflowDecision(ctx, userID, "new")
+			default:
+				return h.buildTokenOverflowPrompt(), nil
+			}
+		}
 	}
 
 	mu.Lock()
@@ -879,6 +934,261 @@ func (h *Handler) handleSummary(userID string) (string, error) {
 	}
 
 	return fmt.Sprintf("✅ 上下文压缩完成\n\n会话 %s 的历史消息已被总结压缩。", sessionID[:min(8, len(sessionID))]), nil
+}
+
+func (h *Handler) isTokenOverflowErrorText(text string) bool {
+	msg := strings.ToLower(strings.TrimSpace(text))
+	if msg == "" {
+		return false
+	}
+	if !strings.Contains(msg, "opencode 会话出错") && !strings.Contains(msg, "session error") {
+		return false
+	}
+	return strings.Contains(msg, "parameter=input_tokens") ||
+		strings.Contains(msg, "maximum input length") ||
+		strings.Contains(msg, "context length") ||
+		strings.Contains(msg, "input tokens")
+}
+
+func (h *Handler) buildTokenOverflowPrompt() string {
+	return "⚠️ 当前会话上下文已超出模型上限，导致本次请求失败。\n\n" +
+		"请选择后续操作（直接回复数字或文字即可）：\n" +
+		"1. 压缩并继续（调用 summary 后重试本条消息）\n" +
+		"2. 新会话并继续（重置会话后重试本条消息）\n" +
+		"3. 取消\n" +
+		"4. 总是压缩并继续\n" +
+		"5. 总是新会话并继续"
+}
+
+func (h *Handler) getTokenOverflowPolicy(userID string) string {
+	if value, ok := h.overflowPolicy.Load(strings.TrimSpace(userID)); ok {
+		if policy, ok := value.(string); ok {
+			policy = strings.TrimSpace(policy)
+			if policy == wecomOverflowPolicySummary || policy == wecomOverflowPolicyNew {
+				return policy
+			}
+		}
+	}
+	return wecomOverflowPolicyAsk
+}
+
+func (h *Handler) setTokenOverflowPolicy(userID, policy string) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	if policy != wecomOverflowPolicySummary && policy != wecomOverflowPolicyNew {
+		h.overflowPolicy.Delete(userID)
+		return
+	}
+	h.overflowPolicy.Store(userID, policy)
+}
+
+func (h *Handler) storeTokenOverflowPending(userID string, state *wecomTokenOverflowPendingState) {
+	if state == nil {
+		return
+	}
+	h.overflowPending.Store(strings.TrimSpace(userID), state)
+}
+
+func (h *Handler) getTokenOverflowPending(userID string) (*wecomTokenOverflowPendingState, bool) {
+	value, ok := h.overflowPending.Load(strings.TrimSpace(userID))
+	if !ok {
+		return nil, false
+	}
+	state, ok := value.(*wecomTokenOverflowPendingState)
+	if !ok || state == nil {
+		return nil, false
+	}
+	if time.Since(state.CreatedAt) > 30*time.Minute {
+		h.overflowPending.Delete(strings.TrimSpace(userID))
+		return nil, false
+	}
+	return state, true
+}
+
+func (h *Handler) clearTokenOverflowPending(userID string) {
+	h.overflowPending.Delete(strings.TrimSpace(userID))
+}
+
+func (h *Handler) handleTokenOverflowQuickReply(ctx context.Context, userID, content string) (bool, string, error) {
+	_, ok := h.getTokenOverflowPending(userID)
+	if !ok {
+		return false, "", nil
+	}
+
+	decision, setAlways, recognized := parseTokenOverflowDecision(content)
+	if !recognized {
+		return true, "请回复 1/2/3/4/5（或对应中文选项）来处理上下文超限问题。", nil
+	}
+
+	if decision == "cancel" {
+		h.clearTokenOverflowPending(userID)
+		return true, "✅ 已取消本次继续处理。你可以手动发送 /summary、/new 或重发消息。", nil
+	}
+
+	if setAlways {
+		if decision == "summary" {
+			h.setTokenOverflowPolicy(userID, wecomOverflowPolicySummary)
+		} else if decision == "new" {
+			h.setTokenOverflowPolicy(userID, wecomOverflowPolicyNew)
+		}
+	}
+
+	reply, err := h.executeTokenOverflowDecision(ctx, userID, decision)
+	if err != nil {
+		return true, "", err
+	}
+	if setAlways {
+		if decision == "summary" {
+			reply = "✅ 已设置为：总是压缩并继续。\n\n" + reply
+		} else if decision == "new" {
+			reply = "✅ 已设置为：总是新会话并继续。\n\n" + reply
+		}
+	}
+	return true, reply, nil
+}
+
+func parseTokenOverflowDecision(content string) (decision string, setAlways bool, recognized bool) {
+	normalized := normalizeDecisionText(content)
+	if normalized == "" {
+		return "", false, false
+	}
+
+	if normalized == "3" || strings.Contains(normalized, "取消") || normalized == "no" {
+		return "cancel", false, true
+	}
+
+	alwaysSummaryTokens := []string{"4", "总是压缩", "总是总结", "总是这样压缩", "alwayssummary"}
+	alwaysNewTokens := []string{"5", "总是新会话", "总是重开", "总是这样新会话", "alwaysnew"}
+	summaryTokens := []string{"1", "压缩", "总结", "summary", "压缩继续", "继续压缩", "继续"}
+	newTokens := []string{"2", "新会话", "重开", "new", "reset", "新会话继续", "继续新会话"}
+
+	if containsDecisionToken(normalized, alwaysSummaryTokens) {
+		return "summary", true, true
+	}
+	if containsDecisionToken(normalized, alwaysNewTokens) {
+		return "new", true, true
+	}
+	if containsDecisionToken(normalized, summaryTokens) {
+		return "summary", false, true
+	}
+	if containsDecisionToken(normalized, newTokens) {
+		return "new", false, true
+	}
+
+	return "", false, false
+}
+
+func normalizeDecisionText(content string) string {
+	raw := strings.TrimSpace(strings.ToLower(content))
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '，', ',', '。', '.', '！', '!', '？', '?', '：', ':', ';', '；', '（', '）', '(', ')', '“', '”', '"', '\'', '、', '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		default:
+			return r
+		}
+	}, raw)
+}
+
+func containsDecisionToken(text string, tokens []string) bool {
+	for _, token := range tokens {
+		t := normalizeDecisionText(token)
+		if t != "" && strings.Contains(text, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, decision string) (string, error) {
+	state, ok := h.getTokenOverflowPending(userID)
+	if !ok {
+		return "❌ 未找到待处理的超限请求，请重发原消息。", nil
+	}
+
+	decision = strings.TrimSpace(decision)
+	if decision == "" {
+		decision = "summary"
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer cancel()
+
+	if decision == "summary" {
+		sessionID := strings.TrimSpace(state.SessionID)
+		if sessionID == "" {
+			if sid, exists := h.adapter.GetSessionForUser(state.UserID); exists {
+				sessionID = sid
+			}
+		}
+		if sessionID == "" {
+			decision = "new"
+		} else {
+			if err := h.client.SummarizeSession(runCtx, sessionID); err != nil {
+				h.clearTokenOverflowPending(userID)
+				return "", fmt.Errorf("自动压缩失败: %w", err)
+			}
+			state.SessionID = sessionID
+		}
+	}
+
+	if decision == "new" {
+		if strings.TrimSpace(state.ThreadID) != "" {
+			h.client.ResetSession(state.ThreadID)
+		}
+		h.adapter.ClearSessionForUser(state.UserID)
+		state.SessionID = ""
+	}
+
+	response, err := h.client.SendMessage(runCtx, opencode.MessagePayload{
+		Channel:     "wecom",
+		UserID:      state.UserID,
+		ThreadID:    state.ThreadID,
+		SessionID:   state.SessionID,
+		Content:     state.Content,
+		Streaming:   false,
+		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:    cloneStringMap(state.Metadata),
+	})
+	if err != nil {
+		h.clearTokenOverflowPending(userID)
+		return "", fmt.Errorf("已尝试%s后重试，但仍失败: %w", tokenOverflowDecisionLabel(decision), err)
+	}
+
+	if response.SessionID != "" {
+		h.adapter.MapUserToSession(state.UserID, response.SessionID)
+	}
+
+	h.clearTokenOverflowPending(userID)
+	finalReply := strings.TrimSpace(response.Reply)
+	if finalReply == "" {
+		finalReply = "✅ 已完成重试，本次没有可直接返回的文本内容。"
+	}
+	return finalReply, nil
+}
+
+func tokenOverflowDecisionLabel(decision string) string {
+	switch decision {
+	case "summary":
+		return "压缩"
+	case "new":
+		return "新会话"
+	default:
+		return "处理"
+	}
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 //  envelope types

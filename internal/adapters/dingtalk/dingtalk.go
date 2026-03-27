@@ -124,12 +124,33 @@ type Handler struct {
 	cronScheduler   *scheduler.CronScheduler // 定时任务调度器
 	processedMsgIDs sync.Map                 // map[string]time.Time - 已处理的消息ID及其时间戳
 	cleanupOnce     sync.Once                // 确保清理goroutine只启动一次
+	overflowPolicy  sync.Map                 // map[userID]string, token超限恢复策略
+	overflowPending sync.Map                 // map[userID]*tokenOverflowPendingState, 待处理的token超限恢复
 	// access token 缓存（避免每次都获取）
 	accessToken       string
 	accessTokenExpiry time.Time
 	accessTokenMu     sync.Mutex
 	allowedUserSet    map[string]struct{}
 	whitelistMu       sync.RWMutex
+}
+
+const (
+	tokenOverflowPolicyAsk     = "ask"
+	tokenOverflowPolicySummary = "summary"
+	tokenOverflowPolicyNew     = "new"
+)
+
+type tokenOverflowPendingState struct {
+	SessionID        string
+	ThreadID         string
+	UserID           string
+	Agent            string
+	Content          string
+	Attachments      []opencode.Attachment
+	Metadata         map[string]string
+	SessionWebhook   string
+	ConversationType string
+	CreatedAt        time.Time
 }
 
 // NewHandler wires the adapter with an OpenCode client.
@@ -1152,6 +1173,49 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 		sessionMappingMu.Unlock()
 
+		if h.isTokenOverflowErrorChunk(chunk) {
+			log.Printf("dingtalk stream: token overflow detected for user %s", userID)
+			state := &tokenOverflowPendingState{
+				SessionID:        sessionID,
+				ThreadID:         conversationID,
+				UserID:           userID,
+				Agent:            agentName,
+				Content:          sendContent,
+				Attachments:      append([]opencode.Attachment(nil), attachments...),
+				Metadata:         cloneStringMap(metadata),
+				SessionWebhook:   data.SessionWebhook,
+				ConversationType: data.ConversationType,
+				CreatedAt:        time.Now(),
+			}
+			if state.SessionID == "" {
+				if mappedSessionID, ok := h.adapter.GetSessionForUser(userID); ok {
+					state.SessionID = mappedSessionID
+				}
+			}
+
+			policy := h.getTokenOverflowPolicy(userID)
+			switch policy {
+			case tokenOverflowPolicySummary:
+				h.storeTokenOverflowPending(userID, state)
+				if err := sendReply("⚠️ 检测到上下文已超限，已按偏好自动执行“压缩并继续”，请稍候..."); err != nil {
+					log.Printf("dingtalk stream: failed to send token overflow auto-summary hint: %v", err)
+				}
+				go h.executeTokenOverflowDecision(context.Background(), userID, "summary")
+			case tokenOverflowPolicyNew:
+				h.storeTokenOverflowPending(userID, state)
+				if err := sendReply("⚠️ 检测到上下文已超限，已按偏好自动执行“新会话并继续”，请稍候..."); err != nil {
+					log.Printf("dingtalk stream: failed to send token overflow auto-new hint: %v", err)
+				}
+				go h.executeTokenOverflowDecision(context.Background(), userID, "new")
+			default:
+				h.storeTokenOverflowPending(userID, state)
+				if err := sendReply(h.buildTokenOverflowPrompt()); err != nil {
+					log.Printf("dingtalk stream: failed to send token overflow prompt: %v", err)
+				}
+			}
+			return nil
+		}
+
 		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
 			thinkingDelta := strings.TrimPrefix(chunk, opencode.ThinkingSignalPrefix)
 			if strings.TrimSpace(thinkingDelta) == "" {
@@ -1824,7 +1888,7 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, data *chatbot.BotCal
 	log.Printf("dingtalk: executing command in session %s: %s", sessionID, command)
 
 	// Execute command
-	result, err := h.client.ExecuteShell(ctx, sessionID, command)
+	output, err := h.client.ExecuteShellOutput(ctx, sessionID, command)
 	if err != nil {
 		log.Printf("dingtalk: command execution failed: %v", err)
 		errMsg := fmt.Sprintf("❌ 命令执行失败: %v", err)
@@ -1835,10 +1899,10 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, data *chatbot.BotCal
 
 	// Build response message
 	var reply string
-	if result != nil {
-		reply = fmt.Sprintf("🖥️ 命令执行结果:\n\n```\n%s\n```", result.ID)
+	if strings.TrimSpace(output) != "" {
+		reply = fmt.Sprintf("🖥️ 命令执行结果:\n\n```\n%s\n```", output)
 	} else {
-		reply = "🖥️ 命令执行完成"
+		reply = "🖥️ 命令已执行，但没有可显示的输出"
 	}
 
 	// Send reply
@@ -2401,6 +2465,13 @@ func containsAnyPermissionToken(text string, tokens []string) bool {
 func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
 
+	if handled, err := h.handleTokenOverflowQuickReply(ctx, data, userID, content); handled || err != nil {
+		if handled {
+			return []byte("handled"), nil
+		}
+		return nil, err
+	}
+
 	// 获取用户的 session
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
@@ -2542,6 +2613,250 @@ func (h *Handler) handleAbort(ctx context.Context, data *chatbot.BotCallbackData
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 任务已中止"))
 	return nil, nil
+}
+
+func (h *Handler) isTokenOverflowErrorChunk(chunk string) bool {
+	msg := strings.ToLower(strings.TrimSpace(chunk))
+	if msg == "" {
+		return false
+	}
+	if !strings.Contains(msg, "opencode 会话出错") && !strings.Contains(msg, "session error") {
+		return false
+	}
+	return strings.Contains(msg, "parameter=input_tokens") ||
+		strings.Contains(msg, "maximum input length") ||
+		strings.Contains(msg, "context length") ||
+		strings.Contains(msg, "input tokens")
+}
+
+func (h *Handler) buildTokenOverflowPrompt() string {
+	return "⚠️ 当前会话上下文已超出模型上限，导致本次请求失败。\n\n" +
+		"请选择后续操作（直接回复数字或文字即可）：\n" +
+		"1. 压缩并继续（调用 summary 后重试本条消息）\n" +
+		"2. 新会话并继续（重置会话后重试本条消息）\n" +
+		"3. 取消\n" +
+		"4. 总是压缩并继续\n" +
+		"5. 总是新会话并继续\n\n" +
+		"也可用命令：\n" +
+		"/summary 或 /new"
+}
+
+func (h *Handler) getTokenOverflowPolicy(userID string) string {
+	if value, ok := h.overflowPolicy.Load(strings.TrimSpace(userID)); ok {
+		if policy, ok := value.(string); ok {
+			policy = strings.TrimSpace(policy)
+			if policy == tokenOverflowPolicySummary || policy == tokenOverflowPolicyNew {
+				return policy
+			}
+		}
+	}
+	return tokenOverflowPolicyAsk
+}
+
+func (h *Handler) setTokenOverflowPolicy(userID, policy string) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	if policy != tokenOverflowPolicySummary && policy != tokenOverflowPolicyNew {
+		h.overflowPolicy.Delete(userID)
+		return
+	}
+	h.overflowPolicy.Store(userID, policy)
+}
+
+func (h *Handler) storeTokenOverflowPending(userID string, state *tokenOverflowPendingState) {
+	if state == nil {
+		return
+	}
+	h.overflowPending.Store(strings.TrimSpace(userID), state)
+}
+
+func (h *Handler) getTokenOverflowPending(userID string) (*tokenOverflowPendingState, bool) {
+	value, ok := h.overflowPending.Load(strings.TrimSpace(userID))
+	if !ok {
+		return nil, false
+	}
+	state, ok := value.(*tokenOverflowPendingState)
+	if !ok || state == nil {
+		return nil, false
+	}
+	if time.Since(state.CreatedAt) > 30*time.Minute {
+		h.overflowPending.Delete(strings.TrimSpace(userID))
+		return nil, false
+	}
+	return state, true
+}
+
+func (h *Handler) clearTokenOverflowPending(userID string) {
+	h.overflowPending.Delete(strings.TrimSpace(userID))
+}
+
+func (h *Handler) handleTokenOverflowQuickReply(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, content string) (bool, error) {
+	state, ok := h.getTokenOverflowPending(userID)
+	if !ok {
+		return false, nil
+	}
+
+	replier := chatbot.NewChatbotReplier()
+	decision, setAlways, recognized := parseTokenOverflowDecision(content)
+	if !recognized {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("请回复 1/2/3/4/5（或对应中文选项）来处理上下文超限问题。"))
+		return true, nil
+	}
+
+	if decision == "cancel" {
+		h.clearTokenOverflowPending(userID)
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已取消本次继续处理。你可以手动发送 /summary、/new 或重发消息。"))
+		return true, nil
+	}
+
+	if setAlways {
+		if decision == "summary" {
+			h.setTokenOverflowPolicy(userID, tokenOverflowPolicySummary)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已设置为：总是压缩并继续。正在处理本条消息..."))
+		} else if decision == "new" {
+			h.setTokenOverflowPolicy(userID, tokenOverflowPolicyNew)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("✅ 已设置为：总是新会话并继续。正在处理本条消息..."))
+		}
+	}
+
+	h.storeTokenOverflowPending(userID, state)
+	go h.executeTokenOverflowDecision(context.Background(), userID, decision)
+	return true, nil
+}
+
+func parseTokenOverflowDecision(content string) (decision string, setAlways bool, recognized bool) {
+	normalized := normalizePermissionReplyText(content)
+	if normalized == "" {
+		return "", false, false
+	}
+
+	if normalized == "3" || strings.Contains(normalized, "取消") || normalized == "no" {
+		return "cancel", false, true
+	}
+
+	alwaysSummaryTokens := []string{"4", "总是压缩", "总是总结", "总是这样压缩", "alwayssummary"}
+	alwaysNewTokens := []string{"5", "总是新会话", "总是重开", "总是这样新会话", "alwaysnew"}
+	summaryTokens := []string{"1", "压缩", "总结", "summary", "压缩继续", "继续压缩", "继续"}
+	newTokens := []string{"2", "新会话", "重开", "new", "reset", "新会话继续", "继续新会话"}
+
+	if containsAnyPermissionToken(normalized, alwaysSummaryTokens) {
+		return "summary", true, true
+	}
+	if containsAnyPermissionToken(normalized, alwaysNewTokens) {
+		return "new", true, true
+	}
+	if containsAnyPermissionToken(normalized, summaryTokens) {
+		return "summary", false, true
+	}
+	if containsAnyPermissionToken(normalized, newTokens) {
+		return "new", false, true
+	}
+
+	return "", false, false
+}
+
+func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, decision string) {
+	state, ok := h.getTokenOverflowPending(userID)
+	if !ok {
+		return
+	}
+
+	decision = strings.TrimSpace(decision)
+	if decision == "" {
+		decision = "summary"
+	}
+
+	timeout := 20 * time.Minute
+	if strings.TrimSpace(state.Agent) != "" {
+		timeout = 30 * time.Minute
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if decision == "summary" {
+		sessionID := strings.TrimSpace(state.SessionID)
+		if sessionID == "" {
+			if sid, exists := h.adapter.GetSessionForUser(state.UserID); exists {
+				sessionID = sid
+			}
+		}
+		if sessionID == "" {
+			_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, "❌ 无法定位当前会话，已改为新会话继续。")
+			decision = "new"
+		} else {
+			if err := h.client.SummarizeSession(runCtx, sessionID); err != nil {
+				_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, fmt.Sprintf("❌ 自动压缩失败：%v", err))
+				h.clearTokenOverflowPending(userID)
+				return
+			}
+			state.SessionID = sessionID
+		}
+	}
+
+	if decision == "new" {
+		if strings.TrimSpace(state.ThreadID) != "" {
+			h.client.ResetSession(state.ThreadID)
+		}
+		h.adapter.ClearSessionForUser(state.UserID)
+		state.SessionID = ""
+	}
+
+	response, err := h.client.SendMessage(runCtx, opencode.MessagePayload{
+		Channel:     "dingtalk",
+		UserID:      state.UserID,
+		ThreadID:    state.ThreadID,
+		SessionID:   state.SessionID,
+		Content:     state.Content,
+		Agent:       state.Agent,
+		Streaming:   false,
+		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:    cloneStringMap(state.Metadata),
+	})
+	if err != nil {
+		_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID,
+			fmt.Sprintf("❌ 已尝试%s后重试，但仍失败：%v", tokenOverflowDecisionLabel(decision), err))
+		h.clearTokenOverflowPending(userID)
+		return
+	}
+
+	if response.SessionID != "" {
+		h.adapter.MapUserToSession(state.UserID, response.SessionID)
+		h.adapter.MapSessionData(response.SessionID, "channel", state.SessionWebhook)
+	}
+
+	finalReply := strings.TrimSpace(response.Reply)
+	if finalReply == "" {
+		finalReply = "✅ 已完成重试，本次没有可直接返回的文本内容。"
+	}
+	if err := h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, finalReply); err != nil {
+		log.Printf("dingtalk: failed to send token-overflow retry reply: %v", err)
+	}
+
+	h.clearTokenOverflowPending(userID)
+}
+
+func tokenOverflowDecisionLabel(decision string) string {
+	switch decision {
+	case "summary":
+		return "压缩"
+	case "new":
+		return "新会话"
+	default:
+		return "处理"
+	}
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // handleCronTask 处理定时任务命令
