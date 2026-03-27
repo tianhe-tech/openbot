@@ -82,6 +82,7 @@ func Load() (Config, error) {
 			SigningSecret:     os.Getenv("DINGTALK_SIGNING_SECRET"),
 			UserWhitelist:     nil,
 			OwnerUserID:       strings.TrimSpace(os.Getenv("DINGTALK_OWNER_USERID")),
+			NonOwnerPlanMode:  getBool("DINGTALK_NON_OWNER_PLAN_MODE", false),
 			// 阿里云 NLS 语音识别（可选）
 			AliyunNLSAkID:   os.Getenv("ALIYUN_NLS_AKID"),
 			AliyunNLSAkKey:  os.Getenv("ALIYUN_NLS_AKKEY"),
