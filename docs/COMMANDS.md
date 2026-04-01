@@ -114,11 +114,13 @@
 ## 🛠️ 高级命令
 
 ### `/cmd <command>`
-直接执行技能脚本命令。
+在当前会话中执行 shell 命令，并返回命令输出结果。
 
 **示例：**
 ```
-/cmd websearch.py "OpenCode SDK"
+/cmd ls -la
+/cmd cat README.md
+/cmd git status
 ```
 
 ### `/answer <question_id> <answer>`
@@ -140,6 +142,29 @@
 - `/crontask enable` - 启用任务
 - `/crontask disable` - 禁用任务
 - `/crontask info` - 查看任务详情
+
+### 自然语言定时任务（推荐）
+除 `/crontask` 外，也可直接发送自然语言让网关识别定时任务意图（DingTalk/Feishu/WeCom）：
+
+```
+每天早上9点提醒我检查日志
+列出定时任务
+禁用任务 cron-1746000000
+试运行任务 cron-1746000000
+```
+
+写操作（创建/启用/禁用/删除/试运行）默认采用“草稿确认”机制：
+
+```
+确认 / yes / 1   # 执行
+取消 / no / 0    # 放弃
+```
+
+也支持 `/crontask <自然语言>` 兜底写法：
+
+```
+/crontask 每天早上9点提醒我发日报
+```
 
 ---
 

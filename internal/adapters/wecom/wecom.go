@@ -18,6 +18,7 @@ import (
 
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/scheduler"
 )
 
 const (
@@ -38,6 +39,8 @@ type Handler struct {
 	client          *opencode.Client
 	cfg             Config
 	adapter         *base.BidirectionalAdapter
+	cronScheduler   *scheduler.CronScheduler
+	nlScheduleSvc   *scheduler.NLScheduleService
 	httpClient      *http.Client
 	tokenMu         sync.Mutex
 	accessToken     string
@@ -80,6 +83,16 @@ func (h *Handler) GetAdapter() *base.BidirectionalAdapter {
 	return h.adapter
 }
 
+// SetCronScheduler sets cron scheduler for scheduled task management.
+func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
+	h.cronScheduler = cronScheduler
+}
+
+// SetNLScheduleService sets natural-language scheduling service.
+func (h *Handler) SetNLScheduleService(svc *scheduler.NLScheduleService) {
+	h.nlScheduleSvc = svc
+}
+
 // RegisterCronSession registers a cron session into the adapter.
 // Implements scheduler.SessionRegistrar interface.
 func (h *Handler) RegisterCronSession(sessionID string, metadata map[string]interface{}) {
@@ -91,8 +104,32 @@ func (h *Handler) RegisterCronSession(sessionID string, metadata map[string]inte
 // SendMessage implements the MessageSender interface used by the base adapter
 // for routing unsolicited events (e.g. permission requests) back to a user.
 func (h *Handler) SendMessage(ctx context.Context, channel, userID, content string) error {
-	// TODO: send proactive message via WeCom active message API
-	log.Printf("wecom[send] -> user=%s channel=%s content=%s", userID, channel, content)
+	text := strings.TrimSpace(content)
+	if text == "" {
+		return nil
+	}
+	log.Printf("wecom: proactive send start channel=%q user=%q len=%d", strings.TrimSpace(channel), strings.TrimSpace(userID), len(text))
+
+	// Prefer group chat when channel carries room/chat id; fallback to direct user.
+	if ch := strings.TrimSpace(channel); ch != "" && ch != "wecom" {
+		if err := h.sendAppChatText(ctx, ch, text); err == nil {
+			log.Printf("wecom: proactive send succeeded via appchat channel=%q", ch)
+			return nil
+		} else {
+			log.Printf("wecom: proactive send via appchat failed channel=%q err=%v", ch, err)
+		}
+		log.Printf("wecom: proactive send fallback to direct user channel=%q user=%q", ch, strings.TrimSpace(userID))
+	}
+
+	uid := strings.TrimSpace(userID)
+	if uid == "" || strings.HasPrefix(uid, "cron:") {
+		return fmt.Errorf("wecom proactive send requires a concrete user id when chat channel is unavailable")
+	}
+	if err := h.sendTextToUser(ctx, uid, text); err != nil {
+		log.Printf("wecom: proactive send direct user failed user=%q err=%v", uid, err)
+		return err
+	}
+	log.Printf("wecom: proactive send succeeded via direct user user=%q", uid)
 	return nil
 }
 
@@ -196,6 +233,17 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 	}
 	if msg.MsgType == "text" && (content == "/summary" || content == "压缩" || content == "总结") {
 		return h.handleSummary(userID)
+	}
+	if msg.MsgType == "text" && strings.HasPrefix(content, "/crontask") {
+		if handled, reply, err := h.handleCronTask(ctx, env, msg, content); handled || err != nil {
+			return reply, err
+		}
+	}
+
+	if msg.MsgType == "text" {
+		if handled, reply, err := h.tryHandleNLSchedule(ctx, env, msg, content); handled || err != nil {
+			return reply, err
+		}
 	}
 
 	// normal message  streaming session
@@ -717,6 +765,84 @@ func (h *Handler) downloadURLAsDataURI(ctx context.Context, rawURL, defaultMime 
 	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(body), mimeType, nil
 }
 
+func (h *Handler) sendTextToUser(ctx context.Context, userID, content string) error {
+	token, err := h.getAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	body := map[string]interface{}{
+		"touser":  userID,
+		"msgtype": "text",
+		"agentid": h.cfg.AgentID,
+		"text": map[string]string{
+			"content": content,
+		},
+		"safe": 0,
+	}
+	return h.postWeComJSON(ctx, fmt.Sprintf("%s/message/send?access_token=%s", wecomAPIEndpoint, url.QueryEscape(token)), body)
+}
+
+func (h *Handler) sendAppChatText(ctx context.Context, chatID, content string) error {
+	token, err := h.getAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	body := map[string]interface{}{
+		"chatid":  chatID,
+		"msgtype": "text",
+		"text": map[string]string{
+			"content": content,
+		},
+		"safe": 0,
+	}
+	return h.postWeComJSON(ctx, fmt.Sprintf("%s/appchat/send?access_token=%s", wecomAPIEndpoint, url.QueryEscape(token)), body)
+}
+
+func (h *Handler) postWeComJSON(ctx context.Context, rawURL string, payload interface{}) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response failed: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		preview := string(bodyBytes)
+		if len(preview) > 300 {
+			preview = preview[:300]
+		}
+		return fmt.Errorf("http status=%d body=%s", resp.StatusCode, strings.TrimSpace(preview))
+	}
+
+	var result struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		preview := string(bodyBytes)
+		if len(preview) > 300 {
+			preview = preview[:300]
+		}
+		return fmt.Errorf("decode response failed: %w, body=%s", err, strings.TrimSpace(preview))
+	}
+	if result.ErrCode != 0 {
+		return fmt.Errorf("wecom api failed: errcode=%d errmsg=%s", result.ErrCode, result.ErrMsg)
+	}
+	return nil
+}
+
 func readRawString(raw map[string]json.RawMessage, key string) string {
 	val, ok := raw[key]
 	if !ok {
@@ -810,6 +936,50 @@ func detectMimeByFilename(name string) string {
 	default:
 		return ""
 	}
+}
+
+func (h *Handler) handleCronTask(ctx context.Context, env callbackEnvelope, msg wecomIncomingMessage, content string) (bool, string, error) {
+	if h.cronScheduler == nil {
+		return true, "❌ 定时任务功能未启用", nil
+	}
+	nlText := strings.TrimSpace(strings.TrimPrefix(content, "/crontask"))
+	if handled, reply, err := h.tryHandleNLScheduleOpt(ctx, env, msg, nlText, true); handled || err != nil {
+		return handled, reply, err
+	}
+	return true, "❌ 未知的子命令，使用 /crontask 后接自然语言或标准命令。", nil
+}
+
+func (h *Handler) tryHandleNLSchedule(ctx context.Context, env callbackEnvelope, msg wecomIncomingMessage, text string) (bool, string, error) {
+	return h.tryHandleNLScheduleOpt(ctx, env, msg, text, false)
+}
+
+func (h *Handler) tryHandleNLScheduleOpt(ctx context.Context, env callbackEnvelope, msg wecomIncomingMessage, text string, forceCreate bool) (bool, string, error) {
+	if h.nlScheduleSvc == nil || strings.TrimSpace(text) == "" {
+		return false, "", nil
+	}
+	if !forceCreate && !scheduler.ShouldTryNLScheduleText(text) {
+		return false, "", nil
+	}
+
+	channel := strings.TrimSpace(env.RoomID)
+	resp, err := h.nlScheduleSvc.HandleText(ctx, scheduler.NLScheduleRequest{
+		AdapterType: "wecom",
+		UserID:      strings.TrimSpace(env.FromUserID),
+		Channel:     channel,
+		Text:        text,
+		ForceCreate: forceCreate,
+		Metadata: map[string]interface{}{
+			"room_id":      env.RoomID,
+			"from_user_id": env.FromUserID,
+		},
+	})
+	if err != nil {
+		return true, "❌ 定时任务处理失败: " + err.Error(), err
+	}
+	if resp == nil || !resp.Handled {
+		return false, "", nil
+	}
+	return true, resp.Message, nil
 }
 
 //  command handlers

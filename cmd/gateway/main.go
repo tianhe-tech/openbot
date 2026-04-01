@@ -166,8 +166,11 @@ func main() {
 	// Set cronScheduler to adapters so they can manage scheduled tasks
 	dingtalkHandler.SetCronScheduler(cronScheduler)
 	feishuHandler.SetCronScheduler(cronScheduler)
-	// TODO: Add SetCronScheduler to other adapters if needed
-	// wecomHandler.SetCronScheduler(cronScheduler)
+	wecomHandler.SetCronScheduler(cronScheduler)
+	nlScheduleSvc := scheduler.NewNLScheduleService(cronScheduler, taskScheduler, nil, nil)
+	dingtalkHandler.SetNLScheduleService(nlScheduleSvc)
+	feishuHandler.SetNLScheduleService(nlScheduleSvc)
+	wecomHandler.SetNLScheduleService(nlScheduleSvc)
 
 	// Register adapters in registry
 	adapterRegistry.Register(wecomHandler.GetAdapter())

@@ -34,6 +34,8 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
 
 - **Cron Scheduler & `/crontask` Command** ⏰
   - Create scheduled tasks directly from chat
+  - Natural-language scheduling and management in chat (DingTalk/Feishu/WeCom)
+  - Draft-confirm flow for write operations (confirm/cancel)
   - Full cron expression support (5-6 fields)
   - Task management: add, list, enable, disable, delete
   - Perfect for monitoring, reports, and reminders
@@ -219,6 +221,26 @@ Available agents:
 | `/crontask info <id>` | Show task details |
 | `/crontask help` | Show help |
 
+### Natural-Language Scheduling
+
+You can also submit and manage scheduled tasks in plain language (in DingTalk/Feishu/WeCom):
+
+```text
+每天早上9点提醒我生成日报
+列出我的定时任务
+禁用任务 cron-1746000000
+把这个任务试运行一次
+```
+
+For write operations (create/enable/disable/delete/run-once), the gateway replies with a draft first.
+Reply with `确认` / `yes` to execute, or `取消` / `no` to abort.
+
+`/crontask` also supports natural-language fallback:
+
+```text
+/crontask 每天早上9点提醒我检查系统
+```
+
 **Examples:**
 ```bash
 # Daily report at 9 AM
@@ -233,15 +255,63 @@ Available agents:
 
 ### Other Commands
 
+**Basic**
+
 | Command | Description |
 |---------|-------------|
-| `/skills` | List available agents |
+| `/help` 或 `帮助` | Show help information |
+| `/skills` 或 `/agents` | List available agents/skills |
+| `/abort` 或 `/stop` | Abort current task |
+| `/refresh` | Refresh skill cache |
+
+**Session Management**
+
+| Command | Description |
+|---------|-------------|
+| `/status` 或 `状态` | Show current session status (ID, title, token usage) |
+| `/new` 或 `/reset` | Reset session mapping (next message creates new session) |
+| `/clear` 或 `清除` | Delete current session and all its data |
+| `/fork` | Fork current session (keep history, new branch) |
+| `/undo` 或 `撤销` | Undo last message |
+| `/redo` 或 `重做` | Redo last undone message |
+| `/sessions` 或 `/list` | List all sessions (up to 10 recent) |
+| `/summary` 或 `压缩` | Summarize session context (free token space) |
+
+**Task Tracking**
+
+| Command | Description |
+|---------|-------------|
+| `/todo` 或 `任务` | Show AI's current task progress (maps to TUI todo board) |
+| `/diff` 或 `变更` | Show file change summary for this session |
+
+**Model & Output Config**
+
+| Command | Description |
+|---------|-------------|
+| `/model` | List available models (with current session info) |
+| `/model <provider>/<model>` | Set model for current session |
+| `/thinking` | Show thinking output toggle status |
+| `/thinking on\|off` | Toggle thinking output |
+| `/final` | Show final-only return mode status |
+| `/final on\|off` | Toggle return only final result |
+| `/steps` | Show step display status |
+| `/steps on\|off` | Toggle step display |
+| `/config` 或 `配置` | Show full configuration |
+
+**Advanced**
+
+| Command | Description |
+|---------|-------------|
+| `/cmd <command>` | Execute a shell command in the current session |
+| `/answer <answer>` | Answer the latest pending question (or `/answer <question_id> <answer>`) |
+
+**Whitelist (DingTalk only)**
+
+| Command | Description |
+|---------|-------------|
 | `/whitelist list` | List whitelist users |
 | `/whitelist add <userID...>` | Add whitelist users at runtime |
 | `/whitelist del <userID...>` | Remove whitelist users at runtime |
-| `/help` | Show help information |
-| `/abort` | Abort current task |
-| `/cmd <command>` | Execute shell command |
 
 ---
 
