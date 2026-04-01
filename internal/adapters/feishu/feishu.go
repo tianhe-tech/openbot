@@ -54,6 +54,7 @@ type Handler struct {
 	adapter         *base.BidirectionalAdapter
 	wsClient        *larkws.Client
 	cronScheduler   *scheduler.CronScheduler
+	nlScheduleSvc   *scheduler.NLScheduleService
 	processedMsgIDs sync.Map
 	cleanupOnce     sync.Once
 	httpClient      *http.Client
@@ -99,6 +100,11 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 
 func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
 	h.cronScheduler = cronScheduler
+}
+
+// SetNLScheduleService sets natural-language scheduling service.
+func (h *Handler) SetNLScheduleService(svc *scheduler.NLScheduleService) {
+	h.nlScheduleSvc = svc
 }
 
 // RegisterCronSession 注册定时任务session到adapter，使SSE事件能正确路由
@@ -445,6 +451,16 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// Handle /answer command to answer pending questions
 	if strings.HasPrefix(content, "/answer ") {
 		return h.handleAnswer(ctx, target, msg.UserID, content)
+	}
+
+	// Handle natural-language scheduling for plain text.
+	if msg.MessageType == "text" {
+		if handled, err := h.tryHandleNLSchedule(ctx, target, msg.UserID, content); handled || err != nil {
+			if err != nil {
+				return "", err
+			}
+			return "handled", nil
+		}
 	}
 	// ========== 特殊命令处理结束 ==========
 
@@ -3159,9 +3175,54 @@ func (h *Handler) handleCronTask(ctx context.Context, target chatTarget, userID,
 	case "help", "帮助":
 		return h.sendCronTaskHelp(ctx, target)
 	default:
+		// 支持 /crontask <自然语言描述> 的兜底解析。
+		nlText := strings.TrimSpace(strings.TrimPrefix(content, "/crontask"))
+		if handled, err := h.tryHandleNLScheduleOpt(ctx, target, userID, nlText, true); handled || err != nil {
+			if err != nil {
+				return "", err
+			}
+			return "handled", nil
+		}
 		_ = h.sendTextChunks(ctx, target, "❌ 未知的子命令，使用 /crontask help 查看帮助")
 		return "handled", nil
 	}
+}
+
+func (h *Handler) tryHandleNLSchedule(ctx context.Context, target chatTarget, userID, text string) (bool, error) {
+	return h.tryHandleNLScheduleOpt(ctx, target, userID, text, false)
+}
+
+func (h *Handler) tryHandleNLScheduleOpt(ctx context.Context, target chatTarget, userID, text string, forceCreate bool) (bool, error) {
+	if h.nlScheduleSvc == nil || strings.TrimSpace(text) == "" {
+		return false, nil
+	}
+	if !forceCreate && !scheduler.ShouldTryNLScheduleText(text) {
+		return false, nil
+	}
+
+	resp, err := h.nlScheduleSvc.HandleText(ctx, scheduler.NLScheduleRequest{
+		AdapterType: "feishu",
+		UserID:      userID,
+		Channel:     target.receiveID,
+		Text:        text,
+		ForceCreate: forceCreate,
+		Metadata: map[string]interface{}{
+			"receive_id":      target.receiveID,
+			"receive_id_type": target.receiveIDType,
+		},
+	})
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, "❌ 定时任务处理失败: "+err.Error())
+		return true, err
+	}
+	if resp == nil || !resp.Handled {
+		return false, nil
+	}
+
+	if strings.TrimSpace(resp.Message) != "" {
+		_ = h.sendTextChunks(ctx, target, resp.Message)
+	}
+	return true, nil
 }
 
 // handleCronTaskAdd adds a cron task

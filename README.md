@@ -34,6 +34,8 @@ Enterprise messaging platform gateway for OpenCode AI assistant integration.
 
 - **Cron Scheduler & `/crontask` Command** ⏰
   - Create scheduled tasks directly from chat
+  - Natural-language scheduling and management in chat (DingTalk/Feishu/WeCom)
+  - Draft-confirm flow for write operations (confirm/cancel)
   - Full cron expression support (5-6 fields)
   - Task management: add, list, enable, disable, delete
   - Perfect for monitoring, reports, and reminders
@@ -218,6 +220,26 @@ Available agents:
 | `/crontask delete <id>` | Delete a task |
 | `/crontask info <id>` | Show task details |
 | `/crontask help` | Show help |
+
+### Natural-Language Scheduling
+
+You can also submit and manage scheduled tasks in plain language (in DingTalk/Feishu/WeCom):
+
+```text
+每天早上9点提醒我生成日报
+列出我的定时任务
+禁用任务 cron-1746000000
+把这个任务试运行一次
+```
+
+For write operations (create/enable/disable/delete/run-once), the gateway replies with a draft first.
+Reply with `确认` / `yes` to execute, or `取消` / `no` to abort.
+
+`/crontask` also supports natural-language fallback:
+
+```text
+/crontask 每天早上9点提醒我检查系统
+```
 
 **Examples:**
 ```bash

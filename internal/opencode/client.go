@@ -1103,6 +1103,7 @@ func extractTextFromAssistantMessageJSON(raw []byte) string {
 	}
 
 	textParts := make([]string, 0, len(partsValue))
+	seen := make(map[string]struct{}, len(partsValue))
 	for _, part := range partsValue {
 		partMap, ok := part.(map[string]interface{})
 		if !ok {
@@ -1122,7 +1123,10 @@ func extractTextFromAssistantMessageJSON(raw []byte) string {
 
 		for _, c := range candidates {
 			if c != "" {
-				textParts = append(textParts, c)
+				if _, exists := seen[c]; !exists {
+					seen[c] = struct{}{}
+					textParts = append(textParts, c)
+				}
 				break
 			}
 		}
@@ -3261,27 +3265,29 @@ func extractTextFromSessionParts(parts []opencode.Part) string {
 	}
 
 	textParts := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts)*2)
+	appendUnique := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		if _, exists := seen[text]; exists {
+			return
+		}
+		seen[text] = struct{}{}
+		textParts = append(textParts, text)
+	}
 	for _, part := range parts {
-		if strings.TrimSpace(part.Text) != "" {
-			textParts = append(textParts, strings.TrimSpace(part.Text))
-		}
+		appendUnique(part.Text)
 
-		if extracted := extractTextFromPartState(part.State); extracted != "" {
-			textParts = append(textParts, extracted)
-		}
+		appendUnique(extractTextFromPartState(part.State))
 
 		switch p := part.AsUnion().(type) {
 		case opencode.TextPart:
-			if strings.TrimSpace(p.Text) != "" {
-				textParts = append(textParts, p.Text)
-			}
+			appendUnique(p.Text)
 		case opencode.ToolPart:
-			if strings.TrimSpace(p.State.Output) != "" {
-				textParts = append(textParts, strings.TrimSpace(p.State.Output))
-			}
-			if strings.TrimSpace(p.State.Error) != "" {
-				textParts = append(textParts, strings.TrimSpace(p.State.Error))
-			}
+			appendUnique(p.State.Output)
+			appendUnique(p.State.Error)
 		}
 	}
 

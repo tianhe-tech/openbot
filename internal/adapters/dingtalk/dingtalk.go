@@ -122,10 +122,11 @@ type Handler struct {
 	adapter         *base.BidirectionalAdapter
 	streamClient    *dtclient.StreamClient
 	cronScheduler   *scheduler.CronScheduler // 定时任务调度器
-	processedMsgIDs sync.Map                 // map[string]time.Time - 已处理的消息ID及其时间戳
-	cleanupOnce     sync.Once                // 确保清理goroutine只启动一次
-	overflowPolicy  sync.Map                 // map[userID]string, token超限恢复策略
-	overflowPending sync.Map                 // map[userID]*tokenOverflowPendingState, 待处理的token超限恢复
+	nlScheduleSvc   *scheduler.NLScheduleService
+	processedMsgIDs sync.Map  // map[string]time.Time - 已处理的消息ID及其时间戳
+	cleanupOnce     sync.Once // 确保清理goroutine只启动一次
+	overflowPolicy  sync.Map  // map[userID]string, token超限恢复策略
+	overflowPending sync.Map  // map[userID]*tokenOverflowPendingState, 待处理的token超限恢复
 	// access token 缓存（避免每次都获取）
 	accessToken       string
 	accessTokenExpiry time.Time
@@ -185,6 +186,11 @@ func NewHandler(ocClient *opencode.Client, cfg Config) *Handler {
 // SetCronScheduler 设置定时任务调度器
 func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
 	h.cronScheduler = cronScheduler
+}
+
+// SetNLScheduleService 设置自然语言定时任务服务
+func (h *Handler) SetNLScheduleService(svc *scheduler.NLScheduleService) {
+	h.nlScheduleSvc = svc
 }
 
 // RegisterCronSession 注册定时任务session到adapter，使SSE事件能正确路由
@@ -1019,6 +1025,13 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	// Handle /answer command to answer pending questions
 	if strings.HasPrefix(content, "/answer ") {
 		return h.handleAnswer(ctx, data, userID, content)
+	}
+
+	// Handle natural-language scheduling for plain text.
+	if isPlainTextMessage {
+		if handled, err := h.tryHandleNLSchedule(ctx, data, userID, content); handled || err != nil {
+			return nil, err
+		}
 	}
 
 	// 如果是命令形式的回复，走 /answer 命令处理。
@@ -2893,9 +2906,53 @@ func (h *Handler) handleCronTask(ctx context.Context, data *chatbot.BotCallbackD
 	case "help", "帮助":
 		return h.sendCronTaskHelp(ctx, data)
 	default:
+		// 支持 /crontask <自然语言描述> 的兜底解析。
+		nlText := strings.TrimSpace(strings.TrimPrefix(content, "/crontask"))
+		if handled, err := h.tryHandleNLScheduleOpt(ctx, data, userID, nlText, true); handled || err != nil {
+			return nil, err
+		}
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 未知的子命令，使用 /crontask help 查看帮助"))
 		return nil, nil
 	}
+}
+
+func (h *Handler) tryHandleNLSchedule(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, text string) (bool, error) {
+	return h.tryHandleNLScheduleOpt(ctx, data, userID, text, false)
+}
+
+func (h *Handler) tryHandleNLScheduleOpt(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, text string, forceCreate bool) (bool, error) {
+	if h.nlScheduleSvc == nil || strings.TrimSpace(text) == "" {
+		return false, nil
+	}
+	if !forceCreate && !scheduler.ShouldTryNLScheduleText(text) {
+		return false, nil
+	}
+
+	resp, err := h.nlScheduleSvc.HandleText(ctx, scheduler.NLScheduleRequest{
+		AdapterType: "dingtalk",
+		UserID:      userID,
+		Channel:     data.ConversationId,
+		Text:        text,
+		ForceCreate: forceCreate,
+		Metadata: map[string]interface{}{
+			"conversation_id": data.ConversationId,
+			"session_webhook": data.SessionWebhook,
+		},
+	})
+	if err != nil {
+		replier := chatbot.NewChatbotReplier()
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 定时任务处理失败: "+err.Error()))
+		return true, err
+	}
+	if resp == nil || !resp.Handled {
+		return false, nil
+	}
+
+	replier := chatbot.NewChatbotReplier()
+	if strings.TrimSpace(resp.Message) != "" {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(resp.Message))
+	}
+	return true, nil
 }
 
 // handleCronTaskAdd 添加定时任务
