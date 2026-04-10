@@ -255,37 +255,49 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	if hasSession {
 		log.Printf("feishu: checking quick reply '%s' for user %s (session: %s)", content, userLabel, sessionID[:min(8, len(sessionID))])
 
-		// 先尝试查找待处理的权限请求
-		permission, ok := h.client.GetLatestPendingPermission(sessionID)
-		if ok {
+		// 同时读取待处理权限和问题，避免旧权限误拦截新问题回复
+		permission, hasPermission := h.client.GetLatestPendingPermission(sessionID)
+		question, hasQuestion := h.client.GetLatestPendingQuestion(sessionID)
+		preferQuestion := false
+		if hasPermission && hasQuestion && question.CreatedAt.After(permission.CreatedAt) {
+			preferQuestion = true
+			log.Printf("feishu: both pending permission(%s) and question(%s) exist, prefer newer question", permission.ID, question.ID)
+		}
+
+		if hasPermission && !preferQuestion {
 			log.Printf("feishu: user %s replied '%s' (bytes=% X) to permission %s (session: %s)",
 				userLabel, content, []byte(content), permission.ID, sessionID[:min(8, len(sessionID))])
 
 			englishResponse := parsePermissionReply(content)
 			if englishResponse == "" {
 				log.Printf("feishu: unrecognized permission reply from %s: raw=%q bytes=% X", userLabel, content, []byte(content))
-				_ = h.sendTextChunks(ctx, target, "❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许")
+				if hasQuestion {
+					log.Printf("feishu: fallback to pending question %s after permission parse miss", question.ID)
+				} else {
+					_ = h.sendTextChunks(ctx, target, "❌ 未能识别权限回复，请回复：允许 / 拒绝 / 始终允许")
+					return "handled", nil
+				}
+			}
+
+			if englishResponse != "" {
+				log.Printf("feishu: resolved permission reply '%s' -> %s for %s", content, englishResponse, permission.ID)
+
+				if err := h.client.RespondToPermission(ctx, permission.ID, englishResponse); err != nil {
+					log.Printf("feishu: RespondToPermission failed for %s: %v", permission.ID, err)
+					_ = h.sendTextChunks(ctx, target, "❌ 权限回复失败，请重试")
+					return "", err
+				}
+
+				displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+				msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
+				_ = h.sendTextChunks(ctx, target, msg)
+				log.Printf("feishu: successfully answered permission %s (%s)", permission.ID, englishResponse)
 				return "handled", nil
 			}
-
-			log.Printf("feishu: resolved permission reply '%s' -> %s for %s", content, englishResponse, permission.ID)
-
-			if err := h.client.RespondToPermission(ctx, permission.ID, englishResponse); err != nil {
-				log.Printf("feishu: RespondToPermission failed for %s: %v", permission.ID, err)
-				_ = h.sendTextChunks(ctx, target, "❌ 权限回复失败，请重试")
-				return "", err
-			}
-
-			displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
-			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
-			_ = h.sendTextChunks(ctx, target, msg)
-			log.Printf("feishu: successfully answered permission %s (%s)", permission.ID, englishResponse)
-			return "handled", nil
 		}
 
 		// 再尝试查找待处理的普通问题
-		question, ok := h.client.GetLatestPendingQuestion(sessionID)
-		if ok {
+		if hasQuestion {
 			log.Printf("feishu: user %s replied '%s' to question %s", userLabel, content, question.ID)
 			log.Printf("feishu: question details - ID: %s, Options count: %d, Questions count: %d",
 				question.ID, len(question.Options), len(question.Questions))
@@ -395,6 +407,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// Handle /steps command to toggle step visibility
 	if strings.HasPrefix(content, "/steps") || strings.HasPrefix(content, "/step") {
 		return h.handleSteps(ctx, target, content)
+	}
+
+	// Handle /devcore command to configure dev core profile injection
+	if strings.HasPrefix(content, "/devcore") {
+		return h.handleDevCore(ctx, target, content)
 	}
 
 	// Handle /config command to view configuration
@@ -2151,6 +2168,10 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 🤖 模型配置：
 /model - 查看可用模型（含当前会话信息）
 /model <provider>/<model> - 设置模型
+/devcore - 查看 Dev Core 状态
+/devcore <自然语言偏好> - 直接设置并开启 Dev Core
+/devcore on|off - 开关 Dev Core 注入
+/devcore reset - 清空偏好并关闭（默认状态）
 /thinking - 查看 thinking 开关状态
 /thinking on|off - 开关 thinking 返回
 /final - 查看最终返回模式
@@ -2174,7 +2195,7 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 💡 使用技巧：
 • @build / @plan / @chat 消息 - 调用特定 agent（Build/Plan/Chat 模式）
 • 任务进行中可发 /todo 查看进度
-• 完成后自动显示文件变更摘要
+• 文件变更可通过 /diff 手动查看摘要
 • /fork 创建当前上下文的副本继续探索
 
 🛠️ 高级命令：
@@ -2275,6 +2296,73 @@ func (h *Handler) handleSteps(ctx context.Context, target chatTarget, content st
 	default:
 		msg := "❌ 命令格式错误\n\n使用方法:\n/steps - 查看状态\n/steps on - 开启\n/steps off - 关闭"
 		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+}
+
+// handleDevCore 处理 Dev Core 提示词设置命令（全局）
+func (h *Handler) handleDevCore(ctx context.Context, target chatTarget, content string) (string, error) {
+	raw := strings.TrimSpace(content)
+	parts := strings.Fields(raw)
+
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "status")) {
+		status := "off"
+		if h.client.IsDevCoreEnabled() {
+			status = "on"
+		}
+		prompt := strings.TrimSpace(h.client.GetDevCorePrompt())
+		if prompt == "" {
+			prompt = "（未设置）"
+		}
+		msg := fmt.Sprintf("🧩 Dev Core 状态: %s（仅会话首条消息注入）\n\n当前提示词:\n%s\n\n使用方法:\n/devcore <自然语言偏好>\n/devcore on\n/devcore off\n/devcore set <提示词>\n/devcore reset", status, prompt)
+		_ = h.sendTextChunks(ctx, target, msg)
+		return "handled", nil
+	}
+
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		if strings.TrimSpace(h.client.GetDevCorePrompt()) == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 当前未设置 Dev Core 提示词\n\n请先使用:\n/devcore <自然语言偏好>\n或 /devcore set <提示词>")
+			return "handled", nil
+		}
+		h.client.SetDevCoreEnabled(true)
+		_ = h.sendTextChunks(ctx, target, "✅ 已开启 Dev Core（仅会话首条消息注入）")
+		return "handled", nil
+	case "off", "false", "0":
+		h.client.SetDevCoreEnabled(false)
+		_ = h.sendTextChunks(ctx, target, "✅ 已关闭 Dev Core 注入")
+		return "handled", nil
+	case "reset":
+		h.client.ResetDevCorePrompt()
+		h.client.SetDevCoreEnabled(false)
+		_ = h.sendTextChunks(ctx, target, "✅ 已清空 Dev Core 提示词，并关闭注入（默认状态）")
+		return "handled", nil
+	case "set":
+		if len(parts) < 3 {
+			_ = h.sendTextChunks(ctx, target, "❌ 命令格式错误\n\n使用方法:\n/devcore set <提示词>")
+			return "handled", nil
+		}
+		prompt := strings.TrimSpace(strings.TrimPrefix(content, parts[0]+" "+parts[1]))
+		if prompt == "" {
+			_ = h.sendTextChunks(ctx, target, "❌ 提示词不能为空")
+			return "handled", nil
+		}
+		h.client.SetDevCorePrompt(prompt)
+		h.client.SetDevCoreEnabled(true)
+		_ = h.sendTextChunks(ctx, target, "✅ Dev Core 提示词已更新（从新会话首条消息生效）")
+		return "handled", nil
+	default:
+		// 支持自然语言直接设置：/devcore 我希望回答更简洁...
+		prompt := strings.TrimSpace(strings.TrimPrefix(raw, parts[0]))
+		if prompt == "" {
+			msg := "❌ 命令格式错误\n\n使用方法:\n/devcore\n/devcore <自然语言偏好>\n/devcore status\n/devcore on\n/devcore off\n/devcore set <提示词>\n/devcore reset"
+			_ = h.sendTextChunks(ctx, target, msg)
+			return "handled", nil
+		}
+		h.client.SetDevCorePrompt(prompt)
+		h.client.SetDevCoreEnabled(true)
+		_ = h.sendTextChunks(ctx, target, "✅ Dev Core 偏好已通过自然语言设置（从新会话首条消息生效）")
 		return "handled", nil
 	}
 }
@@ -2650,6 +2738,7 @@ func (h *Handler) handleConfig(ctx context.Context, target chatTarget, userID st
 	msgBuilder.WriteString("  /thinking - 查看/设置 thinking 返回\n")
 	msgBuilder.WriteString("  /final - 查看/设置 final-only 输出\n")
 	msgBuilder.WriteString("  /steps - 查看/设置步骤显示\n")
+	msgBuilder.WriteString("  /devcore - 查看/设置 Dev Core 提示词\n")
 	msgBuilder.WriteString("  /status - 查看会话状态\n")
 	msgBuilder.WriteString("  /new - 创建新会话\n")
 	msgBuilder.WriteString("  /clear - 清除当前会话\n")
