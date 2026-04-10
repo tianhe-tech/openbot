@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	opencodesdk "github.com/sst/opencode-sdk-go"
 	"github.com/user/opencode-gateway/internal/adapters/base"
@@ -24,6 +25,7 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
 	"github.com/user/opencode-gateway/internal/config"
 	"github.com/user/opencode-gateway/internal/logging"
+	"github.com/user/opencode-gateway/internal/memstore"
 	"github.com/user/opencode-gateway/internal/opencode"
 	"github.com/user/opencode-gateway/internal/opencodesvc"
 	"github.com/user/opencode-gateway/internal/proxy"
@@ -120,6 +122,7 @@ func main() {
 	// Create OpenCode client with event handling support
 	ocOptions := []opencode.Option{
 		opencode.WithDirectory(cfg.OpenCodeDirectory),
+		opencode.WithDevCoreProfile(cfg.OpenCodeDevCoreEnabled, cfg.OpenCodeDevCorePrompt),
 	}
 	if serveManager != nil {
 		ocOptions = append(ocOptions, opencode.WithServerUnavailableHandler(func(restartCtx context.Context, reason string) (string, error) {
@@ -134,6 +137,41 @@ func main() {
 			return msg, nil
 		}))
 	}
+
+	// ========== Memory Store (optional) ==========
+	memStorePath := cfg.MemStorePath
+	if memStorePath == "" {
+		// Default: <OPENCODE_DIRECTORY>/tmp/memory.db
+		memStorePath = filepath.Join(cfg.OpenCodeDirectory, "tmp", "memory.db")
+	}
+	memDB, memErr := memstore.Open(memStorePath)
+	if memErr != nil {
+		log.Printf("main: memory store unavailable (%s), continuing without memory: %v", memStorePath, memErr)
+	} else {
+		log.Printf("main: memory store opened at %s", memStorePath)
+		ocOptions = append(ocOptions, opencode.WithMemStore(memstore.NewGatewayAdapter(memDB)))
+		// Periodic forgetting curve decay (every hour)
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := memDB.DecayAll(); err != nil {
+						log.Printf("memstore: decay error: %v", err)
+					}
+				}
+			}
+		}()
+		defer func() {
+			if err := memDB.Close(); err != nil {
+				log.Printf("memstore: close error: %v", err)
+			}
+		}()
+	}
+
 	ocClient := opencode.NewClient(opencodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
 	if cfg.ProxyHubWSURL != "" {
 		restartFn := func(restartCtx context.Context, reason string) (string, error) {

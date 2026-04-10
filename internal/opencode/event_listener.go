@@ -1289,15 +1289,6 @@ const TodoAutoPushInterval = 5 * time.Second
 func (s *StreamingSessionHandler) notifyCompletion() {
 	s.stopWaitingTimer()
 
-	// 如果有文件变更，在完成时追加摘要
-	if len(s.sessionDiff) > 0 {
-		diffMsg := s.FormatDiffSummary()
-		if diffMsg != "" {
-			_ = s.callback(diffMsg)
-			s.emitEvent(StreamEventDiffSummary, diffMsg, nil, nil, s.sessionDiff, "session.diff.summary")
-		}
-	}
-
 	// 发送 flush 信号：让 adapter 立即把 fullReply 中尚未发送的内容全部发出去。
 	// 这发生在 SSE goroutine 持有 s.mu 期间，确保在 SendMessageStreaming 返回之前
 	// 最终内容已经发送完毕，避免任何竞态条件。

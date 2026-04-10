@@ -234,6 +234,9 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 	if msg.MsgType == "text" && (content == "/summary" || content == "压缩" || content == "总结") {
 		return h.handleSummary(userID)
 	}
+	if msg.MsgType == "text" && strings.HasPrefix(content, "/devcore") {
+		return h.handleDevCore(content)
+	}
 	if msg.MsgType == "text" && strings.HasPrefix(content, "/crontask") {
 		if handled, reply, err := h.handleCronTask(ctx, env, msg, content); handled || err != nil {
 			return reply, err
@@ -995,9 +998,66 @@ func (h *Handler) handleHelp() (string, error) {
 /abort 或 停止     - 中止正在运行的任务
 /status 或 状态    - 查看当前会话状态
 /summary 或 压缩   - 压缩会话上下文（释放token空间）
+/devcore           - 查看 Dev Core 状态
+/devcore <自然语言偏好> - 直接设置并开启 Dev Core
+/devcore on|off    - 开关 Dev Core 注入
+/devcore reset     - 清空偏好并关闭（默认状态）
 
 💬 直接发送消息即可与 AI 对话`
 	return helpText, nil
+}
+
+func (h *Handler) handleDevCore(content string) (string, error) {
+	raw := strings.TrimSpace(content)
+	parts := strings.Fields(raw)
+
+	if len(parts) == 1 || (len(parts) >= 2 && strings.EqualFold(parts[1], "status")) {
+		status := "off"
+		if h.client.IsDevCoreEnabled() {
+			status = "on"
+		}
+		prompt := strings.TrimSpace(h.client.GetDevCorePrompt())
+		if prompt == "" {
+			prompt = "（未设置）"
+		}
+		return fmt.Sprintf(" Dev Core 状态: %s（仅会话首条消息注入）\n\n当前提示词:\n%s\n\n使用方法:\n/devcore <自然语言偏好>\n/devcore on\n/devcore off\n/devcore set <提示词>\n/devcore reset", status, prompt), nil
+	}
+
+	arg := strings.ToLower(parts[1])
+	switch arg {
+	case "on", "true", "1":
+		if strings.TrimSpace(h.client.GetDevCorePrompt()) == "" {
+			return " 当前未设置 Dev Core 提示词\n\n请先使用:\n/devcore <自然语言偏好>\n或 /devcore set <提示词>", nil
+		}
+		h.client.SetDevCoreEnabled(true)
+		return " 已开启 Dev Core（仅会话首条消息注入）", nil
+	case "off", "false", "0":
+		h.client.SetDevCoreEnabled(false)
+		return " 已关闭 Dev Core 注入", nil
+	case "reset":
+		h.client.ResetDevCorePrompt()
+		h.client.SetDevCoreEnabled(false)
+		return " 已清空 Dev Core 提示词，并关闭注入（默认状态）", nil
+	case "set":
+		if len(parts) < 3 {
+			return " 命令格式错误\n\n使用方法:\n/devcore set <提示词>", nil
+		}
+		prompt := strings.TrimSpace(strings.TrimPrefix(raw, parts[0]+" "+parts[1]))
+		if prompt == "" {
+			return " 提示词不能为空", nil
+		}
+		h.client.SetDevCorePrompt(prompt)
+		h.client.SetDevCoreEnabled(true)
+		return " Dev Core 提示词已更新（从新会话首条消息生效）", nil
+	default:
+		prompt := strings.TrimSpace(strings.TrimPrefix(raw, parts[0]))
+		if prompt == "" {
+			return " 命令格式错误\n\n使用方法:\n/devcore\n/devcore <自然语言偏好>\n/devcore status\n/devcore on\n/devcore off\n/devcore set <提示词>\n/devcore reset", nil
+		}
+		h.client.SetDevCorePrompt(prompt)
+		h.client.SetDevCoreEnabled(true)
+		return " Dev Core 偏好已通过自然语言设置（从新会话首条消息生效）", nil
+	}
 }
 
 func (h *Handler) handleFork(ctx context.Context, userID string) (string, error) {

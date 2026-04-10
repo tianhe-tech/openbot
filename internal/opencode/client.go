@@ -212,6 +212,8 @@ type Client struct {
 	directory        string
 	timeout          time.Duration // 默认超时时间
 	retryConfig      RetryConfig   // 重试配置
+	devCoreEnabled   bool          // 是否启用开发助手内核提示词注入
+	devCorePrompt    string        // 开发助手内核提示词
 	enableSkillHint  bool          // 是否在消息中添加skill提示
 	skillHintCache   []string      // 缓存的可用skill列表
 	skillCacheMu     sync.RWMutex
@@ -228,10 +230,13 @@ type Client struct {
 	providerCache    []Provider
 	capabilityCache  map[string]modelCapability // key: lower(provider/model)
 	defaultModelHint *opencode.SessionPromptParamsModel
+	memStore         MemStoreRecorder // optional memory store (set via WithMemStore)
 }
 
 // Option mutates a client during construction.
 type Option func(*Client)
+
+const defaultDevCorePrompt = "你是 Dev Core。请按用户偏好输出，回答清晰、可执行、可验证。"
 
 // UserMemoryFact is the adapter-facing memory record format.
 type UserMemoryFact struct {
@@ -268,10 +273,37 @@ func WithRetryConfig(cfg RetryConfig) Option {
 	}
 }
 
+// MemStoreRecorder is the minimal interface the Client calls to record and recall conversations.
+// Implemented by *memstore.Store via an adapter wrapper in main.go.
+type MemStoreRecorder interface {
+	// RecordConversation persists one completed request/response turn.
+	RecordConversation(adapter, userID, request, response string)
+	// InjectRecallContext returns a context preamble to prepend to the user message when a
+	// recall intent is detected; returns "" when no injection is needed.
+	InjectRecallContext(request, adapter, userID string) string
+}
+
+// WithMemStore attaches an optional memory store that records every successful
+// conversation turn (request → response) for later recall.
+func WithMemStore(ms MemStoreRecorder) Option {
+	return func(c *Client) {
+		c.memStore = ms
+	}
+}
+
 // WithSkillHint enables automatic skill hint injection.
 func WithSkillHint(enable bool) Option {
 	return func(c *Client) {
 		c.enableSkillHint = enable
+	}
+}
+
+// WithDevCoreProfile configures the always-on developer profile prompt that is
+// injected before each user message.
+func WithDevCoreProfile(enabled bool, prompt string) Option {
+	return func(c *Client) {
+		c.devCoreEnabled = enabled
+		c.devCorePrompt = strings.TrimSpace(prompt)
 	}
 }
 
@@ -317,6 +349,7 @@ func NewClient(endpoint, apiKey string, opts ...Option) *Client {
 				"500",
 			},
 		},
+		devCoreEnabled:  false,
 		enableSkillHint: false,       // 默认禁用skill提示
 		isHealthy:       false,       // 初始状态未知
 		lastHealthCheck: time.Time{}, // 未检查过
@@ -434,6 +467,15 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
+	}
+
+	// ========== 记忆召回注入（如果用户在询问历史工作）==========
+	// Save original content BEFORE injection so recording always stores the clean user message.
+	originalContent := payload.Content
+	if c.memStore != nil {
+		if injected := c.memStore.InjectRecallContext(payload.Content, payload.Channel, payload.UserID); injected != "" {
+			payload.Content = injected + payload.Content
+		}
 	}
 
 	// ========== 健康检查：确保OpenCode server已启动 ==========
@@ -786,6 +828,13 @@ sendMessage:
 
 	// ========== 缓存成功响应用于去重 ==========
 	c.completeRequest(requestHash, response)
+
+	// ========== 记忆存储（异步，不阻塞主流程）==========
+	if c.memStore != nil && strings.TrimSpace(reply) != "" {
+		ms := c.memStore
+		ch, uid, req, rep := payload.Channel, payload.UserID, originalContent, reply
+		go ms.RecordConversation(ch, uid, req, rep)
+	}
 
 	return response, nil
 }
@@ -2788,6 +2837,36 @@ func (c *Client) SetStepEnabled(enabled bool) {
 	c.modeMu.Unlock()
 }
 
+func (c *Client) IsDevCoreEnabled() bool {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return c.devCoreEnabled
+}
+
+func (c *Client) SetDevCoreEnabled(enabled bool) {
+	c.modeMu.Lock()
+	c.devCoreEnabled = enabled
+	c.modeMu.Unlock()
+}
+
+func (c *Client) GetDevCorePrompt() string {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return c.devCorePrompt
+}
+
+func (c *Client) SetDevCorePrompt(prompt string) {
+	c.modeMu.Lock()
+	c.devCorePrompt = strings.TrimSpace(prompt)
+	c.modeMu.Unlock()
+}
+
+func (c *Client) ResetDevCorePrompt() {
+	c.modeMu.Lock()
+	c.devCorePrompt = ""
+	c.modeMu.Unlock()
+}
+
 // GetSessionInfo retrieves detailed information about a session.
 type SessionInfo struct {
 	SessionID     string
@@ -3130,6 +3209,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 					}
 				}
 			}
+			c.recordMemAsync(payload, response.Reply)
 			return response, nil
 
 		case <-ticker.C:
@@ -3137,6 +3217,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			if isAsyncMode && handler.IsCompleted() {
 				log.Printf("opencode: ✅ async streaming completed via SSE for session %s (contentSent=%t, lastContentLen=%d)",
 					sessionID[:8], handler.HasSentContent(), len(handler.GetLastContent()))
+				c.recordMemAsync(payload, handler.GetLastContent())
 				return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 			}
 
@@ -3158,6 +3239,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 				if timeSinceStepFinish > 5*time.Second {
 					log.Printf("opencode: 🏁 received step-finish %v ago (has sent content), treating as completed for session %s",
 						timeSinceStepFinish, sessionID[:8])
+					c.recordMemAsync(payload, handler.GetLastContent())
 					return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 				}
 			}
@@ -3167,6 +3249,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			if isAsyncMode && hasSentContent && timeSinceLastEvent > 30*time.Second {
 				log.Printf("opencode: ⏱️ streaming idle for %v (has sent content), treating as completed for session %s",
 					timeSinceLastEvent, sessionID[:8])
+				c.recordMemAsync(payload, handler.GetLastContent())
 				return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 			}
 
@@ -3175,12 +3258,24 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			if isAsyncMode && timeSinceLastEvent > 1*time.Minute {
 				log.Printf("opencode: ⏱️ streaming timeout (no events for %v, hasSent=%t), treating as completed for session %s",
 					timeSinceLastEvent, hasSentContent, sessionID[:8])
+				c.recordMemAsync(payload, handler.GetLastContent())
 				return c.finalizeAsyncStreamingResponse(sessionID, handler, callback, asyncResponse), nil
 			}
 
 			idleCheckCount++
 		}
 	}
+}
+
+// recordMemAsync fires a goroutine to record a conversation turn in the memory store.
+// It is a no-op when no store is configured.
+func (c *Client) recordMemAsync(payload MessagePayload, reply string) {
+	if c.memStore == nil || strings.TrimSpace(reply) == "" {
+		return
+	}
+	ms := c.memStore
+	ch, uid, req, rep := payload.Channel, payload.UserID, payload.Content, reply
+	go ms.RecordConversation(ch, uid, req, rep)
 }
 
 func (c *Client) finalizeAsyncStreamingResponse(sessionID string, handler *StreamingSessionHandler, callback StreamCallback, response Response) Response {
@@ -4324,8 +4419,19 @@ func (c *Client) getSkillHint() string {
 
 // enhanceContentWithSkillHint 在消息内容中添加skill提示
 func (c *Client) enhanceContentWithSkillHint(content string, sessionID string) string {
+	enhanced := content
+
+	if c.devCoreEnabled {
+		msgCount := c.GetMessageCount(sessionID)
+		if msgCount == 0 {
+			if profile := strings.TrimSpace(c.GetDevCorePrompt()); profile != "" {
+				enhanced = "[DEV_CORE_PROFILE]\n" + profile + "\n[/DEV_CORE_PROFILE]\n\n[USER_INPUT]\n" + content
+			}
+		}
+	}
+
 	if !c.enableSkillHint {
-		return content
+		return enhanced
 	}
 
 	// 检查是否需要刷新缓存
@@ -4341,16 +4447,16 @@ func (c *Client) enhanceContentWithSkillHint(content string, sessionID string) s
 
 	hint := c.getSkillHint()
 	if hint == "" {
-		return content
+		return enhanced
 	}
 
 	// 只在session的前几条消息添加提示，避免冗余
 	msgCount := c.GetMessageCount(sessionID)
 	if msgCount > 3 {
-		return content
+		return enhanced
 	}
 
-	return content + hint
+	return enhanced + hint
 }
 
 // RefreshSkills 手动刷新skill缓存

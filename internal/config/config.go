@@ -14,44 +14,50 @@ import (
 
 // Config captures all runtime configuration knobs for the gateway.
 type Config struct {
-	HTTPEnabled          bool
-	ServerAddr           string
-	ReadTimeout          time.Duration
-	WriteTimeout         time.Duration
-	ShutdownGrace        time.Duration
-	OpenCodeEndpoint     string
-	OpenCodeAPIKey       string
-	OpenCodeDirectory    string
-	OpenCodeManageServe  bool
-	OpenCodeServeCommand string
-	OpenCodeServeArgs    []string
-	ProxyHubWSURL        string
-	ProxyKeyFile         string
-	ProxyLocalAddr       string
-	ProxyReconnect       time.Duration
-	WeCom                wecom.Config
-	FeiShu               feishu.Config
-	DingTalk             dingtalk.Config
+	HTTPEnabled            bool
+	ServerAddr             string
+	ReadTimeout            time.Duration
+	WriteTimeout           time.Duration
+	ShutdownGrace          time.Duration
+	OpenCodeEndpoint       string
+	OpenCodeAPIKey         string
+	OpenCodeDirectory      string
+	OpenCodeDevCoreEnabled bool
+	OpenCodeDevCorePrompt  string
+	OpenCodeManageServe    bool
+	OpenCodeServeCommand   string
+	OpenCodeServeArgs      []string
+	ProxyHubWSURL          string
+	ProxyKeyFile           string
+	ProxyLocalAddr         string
+	ProxyReconnect         time.Duration
+	MemStorePath           string // path to the SQLite memory database; "" disables memory
+	WeCom                  wecom.Config
+	FeiShu                 feishu.Config
+	DingTalk               dingtalk.Config
 }
 
 // Load reads configuration from environment variables with sensible defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPEnabled:          getBool("HTTP_ENABLED", false),
-		ServerAddr:           getEnv("SERVER_ADDR", ":8080"),
-		ReadTimeout:          getDuration("SERVER_READ_TIMEOUT", 30*time.Second),   // 增加读取超时
-		WriteTimeout:         getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
-		ShutdownGrace:        getDuration("SERVER_SHUTDOWN_GRACE", 30*time.Second),
-		OpenCodeEndpoint:     getEnv("OPENCODE_ENDPOINT", "http://localhost:4096"),
-		OpenCodeAPIKey:       getOpenCodeAPIKey(),
-		OpenCodeDirectory:    getEnv("OPENCODE_DIRECTORY", "."),
-		OpenCodeManageServe:  getBool("OPENCODE_MANAGE_SERVE", true),
-		OpenCodeServeCommand: strings.TrimSpace(getEnv("OPENCODE_SERVE_COMMAND", "opencode")),
-		OpenCodeServeArgs:    splitServeArgs(getEnv("OPENCODE_SERVE_ARGS", "serve")),
-		ProxyHubWSURL:        strings.TrimSpace(os.Getenv("PROXY_HUB_WS_URL")),
-		ProxyKeyFile:         getEnv("PROXY_KEY_FILE", ".opencode-gateway-proxy.json"),
-		ProxyLocalAddr:       getEnv("PROXY_LOCAL_OPENCODE_ADDR", "127.0.0.1:4096"),
-		ProxyReconnect:       getDuration("PROXY_RECONNECT_DELAY", 5*time.Second),
+		HTTPEnabled:            getBool("HTTP_ENABLED", false),
+		ServerAddr:             getEnv("SERVER_ADDR", ":8080"),
+		ReadTimeout:            getDuration("SERVER_READ_TIMEOUT", 30*time.Second),   // 增加读取超时
+		WriteTimeout:           getDuration("SERVER_WRITE_TIMEOUT", 300*time.Second), // 增加到5分钟，AI响应可能很慢
+		ShutdownGrace:          getDuration("SERVER_SHUTDOWN_GRACE", 30*time.Second),
+		OpenCodeEndpoint:       getEnv("OPENCODE_ENDPOINT", "http://localhost:4096"),
+		OpenCodeAPIKey:         getOpenCodeAPIKey(),
+		OpenCodeDirectory:      getEnv("OPENCODE_DIRECTORY", "."),
+		OpenCodeDevCoreEnabled: getBool("OPENCODE_DEV_CORE_ENABLED", false),
+		OpenCodeDevCorePrompt:  strings.TrimSpace(os.Getenv("OPENCODE_DEV_CORE_PROMPT")),
+		OpenCodeManageServe:    getBool("OPENCODE_MANAGE_SERVE", true),
+		OpenCodeServeCommand:   strings.TrimSpace(getEnv("OPENCODE_SERVE_COMMAND", "opencode")),
+		OpenCodeServeArgs:      splitServeArgs(getEnv("OPENCODE_SERVE_ARGS", "serve")),
+		ProxyHubWSURL:          strings.TrimSpace(os.Getenv("PROXY_HUB_WS_URL")),
+		ProxyKeyFile:           getEnv("PROXY_KEY_FILE", ".opencode-gateway-proxy.json"),
+		ProxyLocalAddr:         getEnv("PROXY_LOCAL_OPENCODE_ADDR", "127.0.0.1:4096"),
+		ProxyReconnect:         getDuration("PROXY_RECONNECT_DELAY", 5*time.Second),
+		MemStorePath:           getEnv("MEMORY_STORE_PATH", ""),
 		WeCom: wecom.Config{
 			Token:          os.Getenv("WECOM_TOKEN"),
 			EncodingAESKey: os.Getenv("WECOM_AES_KEY"),
