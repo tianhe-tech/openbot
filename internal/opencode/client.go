@@ -637,6 +637,10 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, creating new session",
 				sessionID[:8], contextUsage*100, ContextUsageThreshold*100)
 
+			// 保存旧session的model override，以便迁移到新session
+			oldSessionID := sessionID
+			oldModelOverride, hasModelOverride := c.getSessionModelOverride(oldSessionID)
+
 			// 总结旧session
 			if err := c.SummarizeSession(ctx, sessionID); err != nil {
 				log.Printf("opencode: failed to summarize session %s: %v", sessionID, err)
@@ -666,6 +670,14 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 				}
 				c.messageCount.Store(sessionID, 0)
 				c.tokenCount.Store(sessionID, 0)
+
+				// 迁移旧session的model override到新session，避免切换过model的用户压缩后回退到默认模型
+				if hasModelOverride {
+					c.modelOverride.Store(sessionID, oldModelOverride)
+					log.Printf("opencode: carried model override %s/%s from old session %s to new session %s",
+						oldModelOverride.ProviderID.Value, oldModelOverride.ModelID.Value,
+						oldSessionID[:min(8, len(oldSessionID))], sessionID[:min(8, len(sessionID))])
+				}
 
 				// 获取新session的模型配置
 				go c.fetchAndCacheModelConfig(context.Background(), sessionID)
@@ -2725,8 +2737,28 @@ func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
 
 	log.Printf("opencode: summarizing session %s", sessionID)
 
+	// 解析当前session使用的 providerID / modelID（session override 优先，次选默认模型）
+	var summarizeProviderID, summarizeModelID string
+	if override, ok := c.getSessionModelOverride(sessionID); ok {
+		summarizeProviderID = strings.TrimSpace(override.ProviderID.Value)
+		summarizeModelID = strings.TrimSpace(override.ModelID.Value)
+	}
+	if summarizeProviderID == "" || summarizeModelID == "" {
+		_, _, defaultModel, _ := c.loadProviderCatalog(ctx, false)
+		if defaultModel != nil {
+			summarizeProviderID = strings.TrimSpace(defaultModel.ProviderID.Value)
+			summarizeModelID = strings.TrimSpace(defaultModel.ModelID.Value)
+		}
+	}
+	if summarizeProviderID == "" || summarizeModelID == "" {
+		return fmt.Errorf("opencode: summarize session: no model configured for session %s", sessionID)
+	}
+
 	// 调用OpenCode的summarize API
-	_, err := c.sdk.Session.Summarize(ctx, sessionID, opencode.SessionSummarizeParams{})
+	_, err := c.sdk.Session.Summarize(ctx, sessionID, opencode.SessionSummarizeParams{
+		ProviderID: opencode.F(summarizeProviderID),
+		ModelID:    opencode.F(summarizeModelID),
+	})
 	if err != nil {
 		return fmt.Errorf("opencode: summarize session: %w", err)
 	}
