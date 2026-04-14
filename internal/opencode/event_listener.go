@@ -223,29 +223,45 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			// 🔍 输出原始 JSON 用于诊断
 			log.Printf("opencode: 🔍 message.part.updated RAW JSON (first 800 chars): %.800s", jsonData)
 
-			var partMeta struct {
+			var partMeta2 struct {
 				Properties struct {
 					Part struct {
-						ID   string `json:"id"`
-						Type string `json:"type"`
+						ID     string `json:"id"`
+						Type   string `json:"type"`
+						Tokens struct {
+							Input  int `json:"input"`
+							Output int `json:"output"`
+							Total  int `json:"total"`
+						} `json:"tokens"`
 					} `json:"part"`
 					Message struct {
 						Role string `json:"role"`
 					} `json:"message"`
 				} `json:"properties"`
 			}
-			if err := json.Unmarshal([]byte(jsonData), &partMeta); err == nil {
-				partID := partMeta.Properties.Part.ID
-				role := partMeta.Properties.Message.Role
+			if err := json.Unmarshal([]byte(jsonData), &partMeta2); err == nil {
+				partID := partMeta2.Properties.Part.ID
+				role := partMeta2.Properties.Message.Role
 				log.Printf("opencode: 🔍 message.part.updated parsed - partID=%s, role=%s, partType=%s",
-					partID[:min(8, len(partID))], role, partMeta.Properties.Part.Type)
+					partID[:min(8, len(partID))], role, partMeta2.Properties.Part.Type)
 				if partID != "" && role != "" {
 					s.partRoles.Store(partID, role)
 				}
-				if partMeta.Properties.Part.Type == "step-finish" {
+				if partMeta2.Properties.Part.Type == "step-finish" {
 					s.receivedStepFinish = true
 					s.stepFinishTime = time.Now()
 					log.Printf("opencode: 🏁 received step-finish for session %s", s.sessionID[:8])
+					// 用 API 返回的真实 input token 数覆盖估算值
+					if inputTokens := partMeta2.Properties.Part.Tokens.Input; inputTokens > 0 {
+						if s.client != nil {
+							s.client.UpdateTokenCount(s.sessionID, inputTokens)
+						}
+					} else if total := partMeta2.Properties.Part.Tokens.Total; total > 0 {
+						// 部分模型只返回 total，用 total 作为保守估计
+						if s.client != nil {
+							s.client.UpdateTokenCount(s.sessionID, total)
+						}
+					}
 				}
 			}
 		}
@@ -337,8 +353,27 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: file edited for session %s", s.sessionID[:8])
 
 	case "message.updated":
-		// 消息更新事件，通常由 message.part.updated 处理，这里静默忽略
-		// log.Printf("opencode: message updated for session %s (ignored, handled by part.updated)", s.sessionID[:8])
+		// 从 message.updated 中提取 messageID→role 映射，存入 client.messageRoles，
+		// 供 extractContentFromEvent 过滤用户自身消息（避免把用户输入当 AI 回复回传）。
+		if s.client != nil {
+			if raw := event.JSON.RawJSON(); raw != "" {
+				var msgUpdate struct {
+					Properties struct {
+						Info struct {
+							ID   string `json:"id"`
+							Role string `json:"role"`
+						} `json:"info"`
+					} `json:"properties"`
+				}
+				if err := json.Unmarshal([]byte(raw), &msgUpdate); err == nil {
+					msgID := msgUpdate.Properties.Info.ID
+					role := msgUpdate.Properties.Info.Role
+					if msgID != "" && role != "" {
+						s.client.messageRoles.Store(msgID, role)
+					}
+				}
+			}
+		}
 
 	case "session.updated":
 		// Session 更新事件，静默处理
@@ -518,6 +553,14 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 
 	case "message.removed":
 		log.Printf("opencode: message removed for session %s", s.sessionID[:8])
+
+	case "session.compacted":
+		// opencode 服务端自主压缩完成通知（可能是我们调用 SummarizeSession 触发，也可能是服务端自动触发）
+		// 压缩后重置 token 计数器，等待下次 step-finish 携带真实值
+		if s.client != nil {
+			s.client.tokenCount.Store(s.sessionID, 0)
+		}
+		log.Printf("opencode: ✅ session.compacted received for session %s, token counter reset", s.sessionID[:8])
 
 	case "server.instance.disposed":
 		// 服务器重启，事件监听器主循环负责重连

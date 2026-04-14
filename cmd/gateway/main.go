@@ -18,6 +18,9 @@ import (
 	"syscall"
 	"time"
 
+	"runtime"
+
+	"github.com/fsnotify/fsnotify"
 	opencodesdk "github.com/sst/opencode-sdk-go"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
@@ -173,6 +176,50 @@ func main() {
 	}
 
 	ocClient := opencode.NewClient(opencodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
+
+	// Watch opencode.json for changes and trigger a graceful restart.
+	// Started here (after ocClient is created) so the drain check can inspect
+	// active streaming sessions before restarting the opencode process.
+	if serveManager != nil {
+		// Collect the config paths that are currently in effect:
+		// global (~/.config/opencode/opencode.json) and/or project-local.
+		var watchPaths []string
+		globalCfgPath := filepath.Join(os.Getenv("HOME"), ".config", "opencode", "opencode.json")
+		if runtime.GOOS == "windows" {
+			if appData := os.Getenv("APPDATA"); appData != "" {
+				globalCfgPath = filepath.Join(appData, "opencode", "opencode.json")
+			}
+		}
+		projectCfgPath := filepath.Join(cfg.OpenCodeDirectory, "opencode.json")
+		for _, p := range []string{globalCfgPath, projectCfgPath} {
+			abs, _ := filepath.Abs(p)
+			if _, err := os.Stat(abs); err == nil {
+				watchPaths = append(watchPaths, abs)
+			}
+		}
+		// If neither exists yet, still watch the project dir so creation is caught.
+		if len(watchPaths) == 0 {
+			abs, _ := filepath.Abs(projectCfgPath)
+			watchPaths = append(watchPaths, abs)
+		}
+		restartOnChange := func() {
+			log.Println("opencode: config file changed, draining active sessions before restart...")
+			// Wait up to 30 s for any in-progress streaming to finish.
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) {
+				if !ocClient.HasActiveStreamingSessions() {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			log.Println("opencode: restarting opencode serve (config-change)...")
+			if _, err := serveManager.Restart(ctx, "config-change"); err != nil {
+				log.Printf("opencode: config-change restart error: %v", err)
+			}
+		}
+		go watchOpencodeConfig(ctx, watchPaths, restartOnChange)
+	}
+
 	if cfg.ProxyHubWSURL != "" {
 		restartFn := func(restartCtx context.Context, reason string) (string, error) {
 			if serveManager == nil {
@@ -594,6 +641,68 @@ func pickFreeTCPPort() (int, error) {
 		return 0, fmt.Errorf("failed to allocate free tcp port")
 	}
 	return addr.Port, nil
+}
+
+// watchOpencodeConfig monitors one or more opencode.json config files and calls
+// onChange after a 2-second quiet period following any Write/Create/Rename event.
+// It watches the parent directories so editor atomic-write renames are also caught.
+func watchOpencodeConfig(ctx context.Context, configPaths []string, onChange func()) {
+	if len(configPaths) == 0 {
+		return
+	}
+
+	// Build absolute path set and collect unique parent directories to watch.
+	absSet := make(map[string]struct{}, len(configPaths))
+	dirSet := make(map[string]struct{}, len(configPaths))
+	for _, p := range configPaths {
+		abs, _ := filepath.Abs(p)
+		absSet[abs] = struct{}{}
+		dirSet[filepath.Dir(abs)] = struct{}{}
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("opencode: config watcher unavailable: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	for dir := range dirSet {
+		if err := watcher.Add(dir); err != nil {
+			log.Printf("opencode: config watcher add %s: %v", dir, err)
+		}
+	}
+	log.Printf("opencode: watching config files: %v", configPaths)
+
+	const debounceDuration = 2 * time.Second
+	var debounce *time.Timer
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			abs, _ := filepath.Abs(event.Name)
+			if _, matched := absSet[abs]; !matched {
+				continue
+			}
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
+				log.Printf("opencode: config change detected: %s", abs)
+				if debounce != nil {
+					debounce.Stop()
+				}
+				debounce = time.AfterFunc(debounceDuration, onChange)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("opencode: config watcher error: %v", err)
+		}
+	}
 }
 
 // extractSessionIDFromEvent 从OpenCode事件中提取sessionID
