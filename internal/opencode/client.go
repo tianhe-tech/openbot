@@ -615,92 +615,36 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			goto sendMessage
 		}
 
-		// 检查是否需要总结或创建新session
+		// 检查是否需要原地压缩
 		count, _ := c.messageCount.Load(sessionID)
 		msgCount := count.(int)
 		tokens, _ := c.tokenCount.Load(sessionID)
 		currentTokens := tokens.(int)
 
-		// 估算当前消息的token数
+		// 估算当前消息的token数（仅用于日志和保守预判，真实计数由 step-finish 更新）
 		estimatedMsgTokens := estimateTokens(payload.Content)
 		projectedTokens := currentTokens + estimatedMsgTokens
 
-		// 获取模型上下文长度
+		// 获取模型上下文长度（从 capabilityCache 查表，比硬编码准确）
 		maxContextTokens := c.getMaxContextLength(sessionID)
 		contextUsage := float64(projectedTokens) / float64(maxContextTokens)
 
 		log.Printf("opencode: session %s - messages: %d, tokens: %d/%d (%.1f%%), estimated msg tokens: %d",
 			sessionID[:8], msgCount, currentTokens, maxContextTokens, contextUsage*100, estimatedMsgTokens)
 
-		// 如果上下文使用率超过阈值，创建新session
+		// 上下文使用率超过阈值：在同一 session 内原地压缩（不建新 session）
 		if contextUsage >= ContextUsageThreshold {
-			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, creating new session",
+			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, triggering in-place summarize",
 				sessionID[:8], contextUsage*100, ContextUsageThreshold*100)
-
-			// 保存旧session的model override，以便迁移到新session
-			oldSessionID := sessionID
-			oldModelOverride, hasModelOverride := c.getSessionModelOverride(oldSessionID)
-
-			// 总结旧session
-			if err := c.SummarizeSession(ctx, sessionID); err != nil {
-				log.Printf("opencode: failed to summarize session %s: %v", sessionID, err)
-			}
-
-			// 获取总结内容
-			summary := ""
-			if sum, ok := c.sessionSummary.Load(sessionID); ok {
-				summary = sum.(string)
-			}
-
-			// 创建新session，标题包含历史信息
-			title := fmt.Sprintf("%s-%s-续", payload.Channel, payload.UserID)
-			if summary != "" {
-				title = fmt.Sprintf("%s-%s (之前讨论: %s)", payload.Channel, payload.UserID, truncateString(summary, 50))
-			}
-
-			newSession, err := c.sdk.Session.New(ctx, opencode.SessionNewParams{
-				Title: opencode.F(title),
-			})
-			if err != nil {
-				log.Printf("opencode: failed to create new session: %v, continuing with current", err)
-			} else {
-				sessionID = newSession.ID
-				if payload.ThreadID != "" {
-					c.sessions.Store(payload.ThreadID, sessionID)
-				}
-				c.messageCount.Store(sessionID, 0)
-				c.tokenCount.Store(sessionID, 0)
-
-				// 迁移旧session的model override到新session，避免切换过model的用户压缩后回退到默认模型
-				if hasModelOverride {
-					c.modelOverride.Store(sessionID, oldModelOverride)
-					log.Printf("opencode: carried model override %s/%s from old session %s to new session %s",
-						oldModelOverride.ProviderID.Value, oldModelOverride.ModelID.Value,
-						oldSessionID[:min(8, len(oldSessionID))], sessionID[:min(8, len(sessionID))])
-				}
-
-				// 获取新session的模型配置
-				go c.fetchAndCacheModelConfig(context.Background(), sessionID)
-
-				// 如果有总结，将总结作为系统消息添加到新session的上下文
-				if summary != "" {
-					contextMsg := fmt.Sprintf("[上一轮对话总结]: %s\n\n[用户新消息]: %s", summary, payload.Content)
-					payload.Content = contextMsg
-					estimatedMsgTokens = estimateTokens(contextMsg) // 重新估算
-					log.Printf("opencode: created new session %s with context from previous session", sessionID)
-				} else {
-					log.Printf("opencode: created new session %s for thread %s", sessionID, payload.ThreadID)
-				}
-			}
-		} else if contextUsage >= SummaryThreshold && msgCount%5 == 0 {
-			// 在达到总结阈值后，每5条消息尝试总结一次（后台异步）
-			log.Printf("opencode: session %s context usage %.1f%% >= summary threshold %.1f%%, scheduling background summary",
-				sessionID[:8], contextUsage*100, SummaryThreshold*100)
 			go func(sid string) {
-				sumCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				sumCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
 				if err := c.SummarizeSession(sumCtx, sid); err != nil {
-					log.Printf("opencode: background summarization failed for session %s: %v", sid, err)
+					log.Printf("opencode: in-place summarize failed for session %s: %v", sid, err)
+				} else {
+					// 压缩完成后重置 token 计数器，等待下次 step-finish 携带真实值
+					c.tokenCount.Store(sid, 0)
+					log.Printf("opencode: in-place summarize done for session %s, token counter reset", sid[:min(8, len(sid))])
 				}
 			}(sessionID)
 		}
@@ -771,9 +715,12 @@ sendMessage:
 		log.Printf("opencode: selected model %s/%s for session %s (%s)", modelOverride.ProviderID.Value, modelOverride.ModelID.Value, sessionID[:8], modelReason)
 	}
 
-	// 流式模式下默认使用异步 prompt_async；但当已选定模型覆盖时，改走同步 prompt
-	// 以确保 provider/model 绑定在服务端稳定生效。
-	if payload.Streaming && modelOverride == nil {
+	// 流式模式统一使用异步 prompt_async，model override 直接放进 POST body 即可生效
+	if payload.Streaming {
+		if modelOverride != nil {
+			log.Printf("opencode: streaming request for session %s using async prompt with model override %s/%s",
+				sessionID[:min(8, len(sessionID))], modelOverride.ProviderID.Value, modelOverride.ModelID.Value)
+		}
 		c.runningSessions.Store(sessionID, true)
 		if err := c.sendPromptAsync(ctx, sessionID, parts, modelOverride); err != nil {
 			c.runningSessions.Delete(sessionID)
@@ -797,11 +744,6 @@ sendMessage:
 
 		c.completeRequest(requestHash, response)
 		return response, nil
-	}
-
-	if payload.Streaming && modelOverride != nil {
-		log.Printf("opencode: streaming request for session %s will use sync prompt to enforce model override %s/%s",
-			sessionID[:min(8, len(sessionID))], modelOverride.ProviderID.Value, modelOverride.ModelID.Value)
 	}
 
 	// ========== 使用重试机制发送消息 ==========
@@ -1348,6 +1290,7 @@ type Model struct {
 	Attachment       bool     `json:"attachment,omitempty"`
 	InputModalities  []string `json:"input_modalities,omitempty"`
 	OutputModalities []string `json:"output_modalities,omitempty"`
+	ContextLength    int      `json:"context_length,omitempty"` // 模型上下文窗口大小（token数）
 }
 
 type modelCapability struct {
@@ -1356,6 +1299,7 @@ type modelCapability struct {
 	Attachment       bool
 	InputModalities  map[string]struct{}
 	OutputModalities map[string]struct{}
+	ContextLength    int // 模型上下文窗口大小（token数），0 表示未知
 }
 
 // GetCurrentProvider retrieves the current provider and model for a session.
@@ -2111,6 +2055,10 @@ func (c *Client) loadProviderCatalogFromHTTP(ctx context.Context) ([]Provider, m
 					Input      map[string]bool `json:"input"`
 					Output     map[string]bool `json:"output"`
 				} `json:"capabilities"`
+				Limit struct {
+					Context float64 `json:"context"`
+					Output  float64 `json:"output"`
+				} `json:"limit"`
 			} `json:"models"`
 		} `json:"providers"`
 	}
@@ -2207,6 +2155,7 @@ func (c *Client) loadProviderCatalogFromHTTP(ctx context.Context) ([]Provider, m
 			sort.Strings(outputModalities)
 
 			attachmentCap := modelCfg.Attachment || modelCfg.Capabilities.Attachment
+			contextLen := int(modelCfg.Limit.Context)
 
 			provider.Models = append(provider.Models, Model{
 				ID:               normalizedModelID,
@@ -2214,6 +2163,7 @@ func (c *Client) loadProviderCatalogFromHTTP(ctx context.Context) ([]Provider, m
 				Attachment:       attachmentCap,
 				InputModalities:  inputModalities,
 				OutputModalities: outputModalities,
+				ContextLength:    contextLen,
 			})
 
 			capabilityMap[normalizeModelKey(provider.ID, normalizedModelID)] = modelCapability{
@@ -2222,6 +2172,7 @@ func (c *Client) loadProviderCatalogFromHTTP(ctx context.Context) ([]Provider, m
 				Attachment:       attachmentCap,
 				InputModalities:  inputSet,
 				OutputModalities: outputSet,
+				ContextLength:    contextLen,
 			}
 		}
 
@@ -2623,6 +2574,14 @@ func (c *Client) invalidateStaleSessions(ctx context.Context) {
 	if len(staleThreads) > 0 {
 		log.Printf("opencode: invalidated %d stale session mappings", len(staleThreads))
 	}
+
+	// Clear provider catalog cache so the next request fetches fresh provider/model
+	// list from the (possibly restarted) opencode server immediately.
+	c.providerCacheMu.Lock()
+	c.providerCache = nil
+	c.providerCacheAt = time.Time{}
+	c.providerCacheMu.Unlock()
+	log.Printf("opencode: provider catalog cache invalidated after reconnect")
 }
 
 func (c *Client) syncRegisteredSessionSnapshots(ctx context.Context) {
@@ -2667,6 +2626,17 @@ func (c *Client) RegisterSessionHandler(sessionID string, handler EventHandler) 
 // UnregisterSessionHandler removes an event handler for a specific session.
 func (c *Client) UnregisterSessionHandler(sessionID string) {
 	c.sessionHandlers.Delete(sessionID)
+}
+
+// HasActiveStreamingSessions reports whether any streaming session handler is
+// currently registered. Use this to drain before a graceful restart.
+func (c *Client) HasActiveStreamingSessions() bool {
+	found := false
+	c.sessionHandlers.Range(func(_, _ interface{}) bool {
+		found = true
+		return false // stop early
+	})
+	return found
 }
 
 var _ MessageSender = (*Client)(nil)
@@ -3511,7 +3481,7 @@ func estimateTokens(text string) int {
 
 // getMaxContextLength 获取session的最大上下文长度
 func (c *Client) getMaxContextLength(sessionID string) int {
-	// 尝试从缓存获取模型配置
+	// 1. 尝试从已缓存的模型配置中获取
 	if cfg, ok := c.modelConfig.Load(sessionID); ok {
 		modelCfg := cfg.(*ModelConfig)
 		if modelCfg.ContextLength > 0 {
@@ -3519,7 +3489,36 @@ func (c *Client) getMaxContextLength(sessionID string) int {
 		}
 	}
 
-	// 返回默认值
+	// 2. 从 capabilityMap 查找 session 对应模型的上下文长度
+	c.providerCacheMu.RLock()
+	capMap := c.capabilityCache
+	defaultModel := c.defaultModelHint
+	c.providerCacheMu.RUnlock()
+
+	if len(capMap) > 0 {
+		// 优先使用 session 的 model override
+		if override, ok := c.getSessionModelOverride(sessionID); ok {
+			pid := strings.ToLower(strings.TrimSpace(override.ProviderID.Value))
+			mid := strings.ToLower(strings.TrimSpace(override.ModelID.Value))
+			if pid != "" && mid != "" {
+				if cap, ok := capMap[pid+"/"+mid]; ok && cap.ContextLength > 0 {
+					return cap.ContextLength
+				}
+			}
+		}
+		// 回落到默认模型
+		if defaultModel != nil {
+			pid := strings.ToLower(strings.TrimSpace(defaultModel.ProviderID.Value))
+			mid := strings.ToLower(strings.TrimSpace(defaultModel.ModelID.Value))
+			if pid != "" && mid != "" {
+				if cap, ok := capMap[pid+"/"+mid]; ok && cap.ContextLength > 0 {
+					return cap.ContextLength
+				}
+			}
+		}
+	}
+
+	// 3. 返回保守默认值
 	return DefaultMaxTokens
 }
 
@@ -3569,6 +3568,17 @@ func (c *Client) GetTokenCount(sessionID string) int {
 		return 0
 	}
 	return tokens.(int)
+}
+
+// UpdateTokenCount 以 step-finish 事件的真实 inputTokens 覆盖当前session的token计数。
+// inputTokens 是本轮请求实际使用的输入上下文大小，由 API 返回，比字符估算准确得多。
+func (c *Client) UpdateTokenCount(sessionID string, inputTokens int) {
+	if sessionID == "" || inputTokens <= 0 {
+		return
+	}
+	c.tokenCount.Store(sessionID, inputTokens)
+	log.Printf("opencode: 📊 token count updated from step-finish: session=%s, inputTokens=%d",
+		sessionID[:min(8, len(sessionID))], inputTokens)
 }
 
 // GetContextUsage 获取session的上下文使用率

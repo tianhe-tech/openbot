@@ -22,8 +22,19 @@ var recallTriggers = []string{
 	"最近开发", "近期开发", "近来开发",
 }
 
+// recallMaxRunes is the maximum message length (in runes) for recall routing.
+// Pure recall queries are inherently short. Long messages are regular chat
+// that may incidentally contain temporal words — they must NOT be intercepted.
+const recallMaxRunes = 60
+
 // DetectRecallIntent returns true if the text is likely asking about past work.
+// Long messages (> recallMaxRunes runes) always return false: keyword scanning
+// of arbitrary-length text produces too many false positives.
 func DetectRecallIntent(text string) bool {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) > recallMaxRunes {
+		return false
+	}
 	lower := strings.ToLower(text)
 	for _, kw := range recallTriggers {
 		if strings.Contains(lower, kw) {
