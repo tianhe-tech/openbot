@@ -1,0 +1,448 @@
+// Package skillgen implements Hermes-style automatic skill generation: after a
+// completed conversation (long session or post-handoff), it mines the
+// exchange for a reusable procedure and drafts a SKILL.md — always off the
+// hot path, idle-gated so it never interferes with active user Q&A.
+//
+// High level:
+//
+//	opencode.Client fires SkillCandidateEvent
+//	                        │
+//	     ┌──────────────────┴──────────────────┐
+//	     │ skillgen.Service.OnSkillCandidate() │   (non-blocking, enqueue)
+//	     └──────────────────┬──────────────────┘
+//	                        │
+//	         asyncwork.Queue job (single goroutine)
+//	                        │
+//	     ┌──────────────────┴──────────────────┐
+//	     │ 1. waitUntilIdle (poll IsBusy)      │
+//	     │ 2. dedup + daily cap                │
+//	     │ 3. pick model (epsilon-greedy)      │
+//	     │ 4. drafter.Draft → SKILL.md text    │
+//	     │ 5. persist as pending_review        │
+//	     │ 6. installer.WriteDraft → file      │
+//	     │ 7. notifier.Notify → adapter        │
+//	     └─────────────────────────────────────┘
+//
+// Review happens via slash commands intercepted in opencode.Client.SendMessage
+// (see commands.go): /skill-list /skill-view /skill-approve /skill-reject.
+package skillgen
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/user/opencode-gateway/internal/asyncwork"
+	"github.com/user/opencode-gateway/internal/memstore"
+	"github.com/user/opencode-gateway/internal/opencode"
+)
+
+// Config controls skill-autogen behavior. Zero values mean "disabled" / safe default.
+type Config struct {
+	Enabled bool
+	// DraftModel is the preferred model id (e.g. "anthropic/claude-sonnet-4-5"),
+	// ignored when AlternateModels list is non-empty and ModelSelfSelect is true.
+	DraftModel string
+	// AlternateModels is a pool from which the Service may explore via
+	// epsilon-greedy when ModelSelfSelect is on.
+	AlternateModels []string
+	// Epsilon in [0, 1]: random-explore probability for model selection.
+	Epsilon float64
+	// ModelSelfSelect: if false, always use DraftModel.
+	ModelSelfSelect bool
+	// MaxPerDay caps total candidates created in any rolling 24h window. 0 = disabled.
+	MaxPerDay int
+	// OnHandoff enables mining from stuck-session handoffs.
+	OnHandoff bool
+	// OnLongSession enables mining from long successful sessions.
+	OnLongSession bool
+	// LongSessionMinTurns gates the long-session trigger.
+	LongSessionMinTurns int
+	// MinToolCalls gates the long-session trigger: the session must have
+	// completed at least this many tool calls before it is worth mining.
+	// This is more reliable than LongSessionMinTurns because a single-turn
+	// PDF→Excel task with 5 tool calls is valuable, while a 10-message
+	// pure-chat thread is not. 0 disables; default 3.
+	MinToolCalls int
+	// CandidateDir is where SKILL.md drafts are written for review.
+	// Defaults to "skills-candidates" under CWD.
+	CandidateDir string
+	// InstallDir is where approved skills are moved to.
+	// Defaults to "skills" under CWD.
+	InstallDir string
+	// ApprovalRequired: if false, drafts are auto-approved and installed directly.
+	ApprovalRequired bool
+	// MinConfidence gates drafts below this heuristic score (0..1). 0 accepts all.
+	MinConfidence float64
+}
+
+// DefaultConfig returns a conservative, disabled-by-default config.
+func DefaultConfig() Config {
+	return Config{
+		Enabled:             false,
+		DraftModel:          "",
+		Epsilon:             0.15,
+		ModelSelfSelect:     true,
+		MaxPerDay:           5,
+		OnHandoff:           true,
+		OnLongSession:       true,
+		LongSessionMinTurns: 0, // disabled in favour of MinToolCalls
+		MinToolCalls:        3, // >=3 completed tool calls required
+		CandidateDir:        "skills-candidates",
+		InstallDir:          "skills",
+		ApprovalRequired:    true,
+		MinConfidence:       0.4,
+	}
+}
+
+// Drafter generates a SKILL.md draft from a captured conversation.
+type Drafter interface {
+	Draft(ctx context.Context, in DraftInput) (DraftOutput, error)
+}
+
+// DraftInput is the evidence a Drafter works with.
+type DraftInput struct {
+	Trigger  string
+	Adapter  string
+	UserID   string
+	ThreadID string
+	// Conversation is a chronological list of {role, text} turns.
+	Conversation []Turn
+	// ModelID selected by the Service (may be "" when Drafter decides).
+	ModelID string
+	// ExistingSkillTitles is the list of already-installed skill directory names
+	// (read from InstallDir before calling Draft). The drafter uses this to
+	// decide whether to PATCH an existing skill rather than create a duplicate.
+	ExistingSkillTitles []string
+}
+
+// Turn is one role-tagged utterance.
+type Turn struct {
+	Role string // "user" or "assistant"
+	Text string
+}
+
+// DraftOutput is what a Drafter produces.
+type DraftOutput struct {
+	Title       string  // short slug, used for directory name (kebab-case)
+	SkillMD     string  // full SKILL.md content including frontmatter
+	Score       float64 // self-confidence [0, 1]
+	ModelID     string  // model actually used
+	Action      string  // "create" or "patch"
+	PatchTarget string  // slug of the existing skill to update (when Action=="patch")
+}
+
+// Notifier pushes a notification back to the originating adapter that a
+// skill candidate is awaiting review.
+type Notifier interface {
+	NotifyCandidate(adapter, userID, candidateID, title string, approvalRequired bool) error
+}
+
+// Service orchestrates candidate mining on a background queue.
+type Service struct {
+	cfg      Config
+	store    *memstore.Store
+	client   *opencode.Client
+	queue    *asyncwork.Queue
+	drafter  Drafter
+	notifier Notifier
+	// dedup: best-effort per-thread recent-fire cache to avoid mining the same
+	// thread repeatedly on successive long-session ticks.
+	recent sync.Map // map[threadID]time.Time
+}
+
+// NewService wires dependencies. queue and drafter MUST be non-nil when cfg.Enabled is true.
+func NewService(cfg Config, store *memstore.Store, client *opencode.Client, queue *asyncwork.Queue, drafter Drafter, notifier Notifier) *Service {
+	if cfg.CandidateDir == "" {
+		cfg.CandidateDir = "skills-candidates"
+	}
+	if cfg.InstallDir == "" {
+		cfg.InstallDir = "skills"
+	}
+	return &Service{cfg: cfg, store: store, client: client, queue: queue, drafter: drafter, notifier: notifier}
+}
+
+// Config returns the effective config (used by command handlers to branch on settings).
+func (s *Service) Config() Config {
+	if s == nil {
+		return Config{}
+	}
+	return s.cfg
+}
+
+// OnSkillCandidate is the opencode.SkillCandidateHook entry point.
+// Never blocks: it validates, dedups, and enqueues the mining job.
+func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
+	if s == nil || !s.cfg.Enabled || s.queue == nil || s.drafter == nil {
+		return
+	}
+	// Per-trigger gating.
+	switch event.Trigger {
+	case opencode.SkillTriggerHandoff:
+		if !s.cfg.OnHandoff {
+			return
+		}
+	case opencode.SkillTriggerLongSession:
+		if !s.cfg.OnLongSession {
+			return
+		}
+		// MinToolCalls gate (primary): session must have completed enough tool calls
+		// to represent a real procedural task, not just Q&A or file browsing.
+		if s.cfg.MinToolCalls > 0 && event.ToolCallCount < s.cfg.MinToolCalls {
+			return
+		}
+		// LongSessionMinTurns gate (secondary, backward-compat): only applied when
+		// MinToolCalls is disabled (0) and caller still relies on turn count.
+		if s.cfg.MinToolCalls == 0 && s.cfg.LongSessionMinTurns > 0 && event.TurnCount < s.cfg.LongSessionMinTurns {
+			return
+		}
+	default:
+		return
+	}
+	// Dedup: same thread, same tool-call decile (every 10 completions creates a
+	// new segment) within 30 min → skip. This avoids re-mining the same task on
+	// each tick while still allowing re-trigger when the session moves into a
+	// meaningfully different phase (10+ more tool calls completed).
+	dedupKey := fmt.Sprintf("%s:%d", event.ThreadID, event.ToolCallCount/10)
+	if prev, ok := s.recent.Load(dedupKey); ok {
+		if t, ok2 := prev.(time.Time); ok2 && time.Since(t) < 30*time.Minute {
+			return
+		}
+	}
+	s.recent.Store(dedupKey, time.Now())
+
+	// Daily cap: check cheaply before we enqueue.
+	if s.cfg.MaxPerDay > 0 && s.store != nil {
+		if n, err := s.store.CountSkillCandidatesSince(time.Now().Add(-24 * time.Hour)); err == nil && n >= s.cfg.MaxPerDay {
+			log.Printf("skillgen: daily cap reached (%d), skipping %s for thread %s", n, event.Trigger, event.ThreadID)
+			return
+		}
+	}
+
+	ev := event // capture
+	s.queue.Enqueue(asyncwork.JobFunc{
+		Label: fmt.Sprintf("skillgen:%s:%s", ev.Trigger, ev.ThreadID),
+		Fn: func(ctx context.Context) error {
+			return s.run(ctx, ev)
+		},
+	})
+}
+
+// run is the full mining pipeline: idle-wait → fetch turns → draft → persist → install → notify.
+func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) error {
+	// 1. Idle gate — yield to any active user Q&A.
+	if err := s.waitUntilIdle(ctx, 5*time.Minute); err != nil {
+		log.Printf("skillgen: idle-wait gave up for thread %s: %v", ev.ThreadID, err)
+		return err
+	}
+
+	// 2. Fetch conversation turns.
+	turns, err := s.fetchTurns(ctx, ev.SessionID)
+	if err != nil || len(turns) == 0 {
+		if err != nil {
+			log.Printf("skillgen: fetch turns failed for %s: %v", ev.SessionID, err)
+		}
+		return err
+	}
+
+	// 3. Pick model.
+	model := s.pickModel()
+	if s.store != nil && model != "" {
+		_ = s.store.RecordModelAttempt(model)
+	}
+
+	// 4. Read existing installed skills from disk (zero LLM cost) so the drafter
+	// can decide to PATCH an existing skill instead of creating a duplicate.
+	var existingSkills []string
+	if s.cfg.InstallDir != "" {
+		if entries, err := os.ReadDir(s.cfg.InstallDir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					existingSkills = append(existingSkills, e.Name())
+				}
+			}
+		}
+	}
+
+	// 5. Draft.
+	draftCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	out, err := s.drafter.Draft(draftCtx, DraftInput{
+		Trigger:             string(ev.Trigger),
+		Adapter:             ev.Adapter,
+		UserID:              ev.UserID,
+		ThreadID:            ev.ThreadID,
+		Conversation:        turns,
+		ModelID:             model,
+		ExistingSkillTitles: existingSkills,
+	})
+	if err != nil {
+		log.Printf("skillgen: draft failed (model=%s thread=%s): %v", model, ev.ThreadID, err)
+		return err
+	}
+	if strings.TrimSpace(out.SkillMD) == "" || strings.TrimSpace(out.Title) == "" {
+		log.Printf("skillgen: drafter returned empty output for thread %s", ev.ThreadID)
+		return nil
+	}
+	if s.cfg.MinConfidence > 0 && out.Score < s.cfg.MinConfidence {
+		log.Printf("skillgen: draft score %.2f < minConfidence %.2f, dropping (title=%s)", out.Score, s.cfg.MinConfidence, out.Title)
+		return nil
+	}
+
+	// 6. Persist candidate row.
+	status := memstore.SkillStatusPendingReview
+	if !s.cfg.ApprovalRequired {
+		status = memstore.SkillStatusApproved
+	}
+	c := memstore.SkillCandidate{
+		ID:        memstore.NewSkillCandidateID(),
+		Trigger:   string(ev.Trigger),
+		Adapter:   ev.Adapter,
+		UserID:    ev.UserID,
+		ThreadID:  ev.ThreadID,
+		SessionID: ev.SessionID,
+		Status:    status,
+		Score:     out.Score,
+		ModelID:   out.ModelID,
+		Title:     out.Title,
+		SkillMD:   out.SkillMD,
+	}
+
+	// 7. Write to disk (patch existing skill, draft dir, or install dir when auto-approving).
+	targetDir := s.cfg.CandidateDir
+	if !s.cfg.ApprovalRequired {
+		targetDir = s.cfg.InstallDir
+	}
+	// When the drafter signals action=patch, write directly to the existing
+	// installed skill so the update lands immediately without a review step.
+	if out.Action == "patch" && out.PatchTarget != "" {
+		targetDir = s.cfg.InstallDir
+	}
+	path, werr := writeSkillFile(targetDir, out.Title, out.SkillMD)
+	if werr != nil {
+		log.Printf("skillgen: write skill file failed: %v", werr)
+		// Still persist the candidate so user can retrieve via /skill-view.
+	} else {
+		c.DraftPath = path
+	}
+
+	if s.store != nil {
+		if err := s.store.SaveSkillCandidate(c); err != nil {
+			log.Printf("skillgen: save candidate failed: %v", err)
+			return err
+		}
+	}
+
+	// When auto-approving, record a positive outcome so model stats accumulate.
+	if !s.cfg.ApprovalRequired && s.store != nil && out.ModelID != "" {
+		_ = s.store.RecordModelOutcome(out.ModelID, true, out.Score)
+	}
+
+	// 8. Notify.
+	if s.notifier != nil && ev.Adapter != "" && ev.UserID != "" {
+		if err := s.notifier.NotifyCandidate(ev.Adapter, ev.UserID, c.ID, c.Title, s.cfg.ApprovalRequired); err != nil {
+			log.Printf("skillgen: notifier failed (adapter=%s user=%s): %v", ev.Adapter, ev.UserID, err)
+		}
+	}
+
+	log.Printf("skillgen: candidate %s created (title=%q status=%s score=%.2f model=%s path=%s)",
+		c.ID, c.Title, c.Status, c.Score, c.ModelID, c.DraftPath)
+	return nil
+}
+
+// waitUntilIdle polls the client's busy flag with backoff; gives up after maxWait.
+func (s *Service) waitUntilIdle(ctx context.Context, maxWait time.Duration) error {
+	if s.client == nil {
+		return nil
+	}
+	deadline := time.Now().Add(maxWait)
+	backoff := 2 * time.Second
+	for {
+		if !s.client.IsBusy() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("opencode still busy after %s", maxWait)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// fetchTurns retrieves the session message history via the opencode client.
+// Uses the already-exposed client helper (added below via export).
+func (s *Service) fetchTurns(ctx context.Context, sessionID string) ([]Turn, error) {
+	if s.client == nil || sessionID == "" {
+		return nil, nil
+	}
+	raw, err := s.client.FetchSessionTurns(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	turns := make([]Turn, 0, len(raw))
+	for _, t := range raw {
+		turns = append(turns, Turn{Role: t.Role, Text: t.Text})
+	}
+	return turns, nil
+}
+
+// pickModel selects a model using memstore's epsilon-greedy helper when
+// ModelSelfSelect is on and stats are available; falls back to DraftModel.
+func (s *Service) pickModel() string {
+	if !s.cfg.ModelSelfSelect || s.store == nil {
+		return s.cfg.DraftModel
+	}
+	return s.store.PickSkillGenModel(s.cfg.AlternateModels, s.cfg.DraftModel, s.cfg.Epsilon)
+}
+
+// writeSkillFile writes SKILL.md under <root>/<slug>/SKILL.md and returns the path.
+func writeSkillFile(root, title, content string) (string, error) {
+	slug := slugify(title)
+	if slug == "" {
+		return "", fmt.Errorf("skillgen: empty title")
+	}
+	dir := filepath.Join(root, slug)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// slugify converts a title to a kebab-case directory name.
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		case r == ' ', r == '-', r == '_':
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 60 {
+		out = out[:60]
+	}
+	return out
+}

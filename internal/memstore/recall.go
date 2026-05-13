@@ -2,10 +2,70 @@ package memstore
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
 )
+
+// ---- Directory Extraction ----
+
+// dirContextPhrases are Chinese phrases that typically precede or follow a directory path
+// in a conversation about development work (e.g. "在 /root/myapp 目录下").
+var dirContextPhrases = []string{
+	"目录下", "目录里", "目录中", "目录",
+	"路径", "项目路径", "工作目录",
+	"下面", "里面", "下开发", "下写",
+}
+
+// dirPathRe matches Unix-style absolute paths (/foo/bar) and Windows-style absolute paths
+// (C:\foo\bar or D:/foo/bar) that appear in text.  We require at least one path separator
+// after the root so bare "/" or "C:\" alone are ignored.
+var dirPathRe = regexp.MustCompile(
+	`(?:^|[\s\(\["'\x{300C}\x{300D}\x{3010}\x{3011}])(` + // leading boundary
+		`(?:[A-Za-z]:[/\\][^\s\x{300C}\x{300D}\x{3010}\x{3011}"'\)\]\x{3002}\x{FF01}\x{FF0C}]+)` + // Windows: C:\...
+		`|(?:/[^\s\x{300C}\x{300D}\x{3010}\x{3011}"'\)\]\x{3002}\x{FF01}\x{FF0C}]{2,})` + // Unix: /...
+		`)`,
+)
+
+// ExtractDirFromText attempts to find a filesystem path mentioned in the request text.
+// It combines two strategies:
+//  1. Regex scan for Unix/Windows absolute paths.
+//  2. Context-phrase gating: the path must appear near a directory-context phrase OR
+//     stand alone as a likely path (starts with / or drive letter).
+//
+// Returns "" when nothing convincing is found.
+func ExtractDirFromText(text string) string {
+	matches := dirPathRe.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+
+	// If a directory-context phrase is nearby, return the first path match.
+	lower := strings.ToLower(text)
+	for _, phrase := range dirContextPhrases {
+		if strings.Contains(lower, phrase) {
+			// Return the first captured path from regex.
+			for _, m := range matches {
+				if len(m) >= 2 {
+					return strings.TrimRight(m[1], "/\\")
+				}
+			}
+		}
+	}
+
+	// Even without a context phrase, if the text is a short imperative (≤120 runes)
+	// and contains an absolute path, capture it — e.g. "帮我在 /data/proj 开发爬虫".
+	if len([]rune(text)) <= 120 {
+		for _, m := range matches {
+			if len(m) >= 2 {
+				return strings.TrimRight(m[1], "/\\")
+			}
+		}
+	}
+
+	return ""
+}
 
 // ---- Intent Detection ----
 
@@ -313,9 +373,13 @@ func BuildRecallContext(records []MemRecord, projectSummaries []ProjectSummary) 
 		if len(deduped) > 0 {
 			sb.WriteString("## 相关记录\n")
 			for _, r := range deduped {
-				sb.WriteString(fmt.Sprintf("- [%s][%s] %s：%s\n",
+				dirPart := ""
+				if r.WorkDir != "" && r.WorkDir != "." {
+					dirPart = fmt.Sprintf(" (%s)", r.WorkDir)
+				}
+				sb.WriteString(fmt.Sprintf("- [%s][%s] %s：%s%s\n",
 					r.Ts.Format("2006-01-02"), r.Adapter,
-					r.Action, r.Summary,
+					r.Action, r.Summary, dirPart,
 				))
 			}
 			sb.WriteString("\n")

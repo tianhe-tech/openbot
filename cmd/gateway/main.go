@@ -26,14 +26,17 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
+	"github.com/user/opencode-gateway/internal/asyncwork"
 	"github.com/user/opencode-gateway/internal/config"
 	"github.com/user/opencode-gateway/internal/logging"
 	"github.com/user/opencode-gateway/internal/memstore"
 	"github.com/user/opencode-gateway/internal/opencode"
 	"github.com/user/opencode-gateway/internal/opencodesvc"
 	"github.com/user/opencode-gateway/internal/proxy"
+	"github.com/user/opencode-gateway/internal/retryworker"
 	"github.com/user/opencode-gateway/internal/scheduler"
 	"github.com/user/opencode-gateway/internal/server"
+	"github.com/user/opencode-gateway/internal/skillgen"
 	"github.com/user/opencode-gateway/internal/uibrpc"
 )
 
@@ -177,6 +180,44 @@ func main() {
 
 	ocClient := opencode.NewClient(opencodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
 
+	// ========== Async work queue (handoff save, skill mining) ==========
+	asyncQueue := asyncwork.New(cfg.SkillAutogen.QueueCapacity)
+	asyncQueue.Start(ctx)
+	ocClient.SetAsyncQueue(asyncQueue)
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		asyncQueue.Stop(stopCtx)
+	}()
+
+	// ========== Skill autogen (optional) ==========
+	if cfg.SkillAutogen.Enabled && memDB != nil {
+		skillCfg := skillgen.Config{
+			Enabled:             true,
+			DraftModel:          cfg.SkillAutogen.DraftModel,
+			AlternateModels:     cfg.SkillAutogen.AlternateModels,
+			Epsilon:             cfg.SkillAutogen.Epsilon,
+			ModelSelfSelect:     cfg.SkillAutogen.ModelSelfSelect,
+			MaxPerDay:           cfg.SkillAutogen.MaxPerDay,
+			OnHandoff:           cfg.SkillAutogen.OnHandoff,
+			OnLongSession:       cfg.SkillAutogen.OnLongSession,
+			LongSessionMinTurns: cfg.SkillAutogen.LongSessionMinTurns,
+			CandidateDir:        cfg.SkillAutogen.CandidateDir,
+			InstallDir:          cfg.SkillAutogen.InstallDir,
+			ApprovalRequired:    cfg.SkillAutogen.ApprovalRequired,
+			MinConfidence:       cfg.SkillAutogen.MinConfidence,
+		}
+		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath)
+		notifier := skillgen.NewRegistryNotifier(adapterRegistry)
+		skillSvc := skillgen.NewService(skillCfg, memDB, ocClient, asyncQueue, drafter, notifier)
+		ocClient.SetSkillCandidateHook(skillSvc)
+		ocClient.AddCommandInterceptor(skillSvc)
+		log.Printf("main: skill autogen enabled (model=%s approvalRequired=%t maxPerDay=%d)",
+			skillCfg.DraftModel, skillCfg.ApprovalRequired, skillCfg.MaxPerDay)
+	} else if cfg.SkillAutogen.Enabled && memDB == nil {
+		log.Printf("main: skill autogen disabled: memory store unavailable")
+	}
+
 	// Watch opencode.json for changes and trigger a graceful restart.
 	// Started here (after ocClient is created) so the drain check can inspect
 	// active streaming sessions before restarting the opencode process.
@@ -256,6 +297,65 @@ func main() {
 	dingtalkHandler.SetNLScheduleService(nlScheduleSvc)
 	feishuHandler.SetNLScheduleService(nlScheduleSvc)
 	wecomHandler.SetNLScheduleService(nlScheduleSvc)
+
+	// ========== Offline retry queue (optional) ==========
+	if cfg.RetryQueue.Enabled && memDB != nil {
+		rwCfg := retryworker.Config{
+			Enabled:        true,
+			CronExpr:       cfg.RetryQueue.CronExpr,
+			MaxRetries:     cfg.RetryQueue.MaxRetries,
+			BatchSize:      cfg.RetryQueue.BatchSize,
+			MessageTimeout: 25 * time.Minute,
+		}
+		rwRegistry := retryworker.NewRegistry()
+		rw := retryworker.New(rwCfg, memDB, rwRegistry)
+
+		// Wire adapters as retry senders.
+		rwRegistry.Register(feishuHandler)
+		rwRegistry.Register(dingtalkHandler)
+
+		// Give adapters access to the retry store + worker (for /retry command
+		// and for enqueuing on timeout).
+		feishuHandler.SetRetryWorker(memDB, rw)
+		dingtalkHandler.SetRetryWorker(memDB, rw)
+
+		// Schedule cron-driven off-peak processing.
+		if cfg.RetryQueue.CronExpr != "" {
+			if sysErr := cronScheduler.AddSystemJob(cfg.RetryQueue.CronExpr, func() {
+				runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+				defer cancel()
+				succ, total, err := rw.RunOnce(runCtx)
+				if err != nil {
+					log.Printf("retry-cron: error: %v", err)
+					return
+				}
+				log.Printf("retry-cron: succeeded=%d total=%d", succ, total)
+			}); sysErr != nil {
+				log.Printf("main: retry queue cron registration error: %v", sysErr)
+			} else {
+				log.Printf("main: retry queue cron registered (expr=%q)", cfg.RetryQueue.CronExpr)
+			}
+		}
+		// Periodic purge of expired records (every 6 hours).
+		go func() {
+			ticker := time.NewTicker(6 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := memDB.PurgeExpiredRetries(); err != nil {
+						log.Printf("retry-queue: purge error: %v", err)
+					}
+				}
+			}
+		}()
+		log.Printf("main: retry queue enabled (cron=%q maxRetries=%d batchSize=%d)",
+			cfg.RetryQueue.CronExpr, cfg.RetryQueue.MaxRetries, cfg.RetryQueue.BatchSize)
+	} else if cfg.RetryQueue.Enabled && memDB == nil {
+		log.Printf("main: retry queue disabled: memory store unavailable")
+	}
 
 	// Register adapters in registry
 	adapterRegistry.Register(wecomHandler.GetAdapter())

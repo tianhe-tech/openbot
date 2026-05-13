@@ -764,6 +764,10 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 			return ToolSignalPrefix + msg, "", ""
 
 		case "completed":
+			// 每次工具完成递增计数器，供 skillgen 评估任务复杂度
+			if s.client != nil {
+				s.client.IncrementToolCall(s.sessionID)
+			}
 			output := strings.TrimSpace(state.Output)
 			if output != "" {
 				if len([]rune(output)) > 160 {

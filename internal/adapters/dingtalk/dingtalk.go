@@ -21,7 +21,9 @@ import (
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
 	dtclient "github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
 	"github.com/user/opencode-gateway/internal/adapters/base"
+	"github.com/user/opencode-gateway/internal/memstore"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/retryworker"
 	"github.com/user/opencode-gateway/internal/scheduler"
 )
 
@@ -133,6 +135,9 @@ type Handler struct {
 	accessTokenMu     sync.Mutex
 	allowedUserSet    map[string]struct{}
 	whitelistMu       sync.RWMutex
+	// retryStore and retryWorker support the /retry command and off-peak retry queue.
+	retryStore  *memstore.Store
+	retryWorker *retryworker.Worker
 }
 
 const (
@@ -186,6 +191,32 @@ func NewHandler(ocClient *opencode.Client, cfg Config) *Handler {
 // SetCronScheduler 设置定时任务调度器
 func (h *Handler) SetCronScheduler(cronScheduler *scheduler.CronScheduler) {
 	h.cronScheduler = cronScheduler
+}
+
+// SetRetryWorker wires up the retry store and worker for /retry command and
+// off-peak automatic re-processing.
+func (h *Handler) SetRetryWorker(store *memstore.Store, worker *retryworker.Worker) {
+	h.retryStore = store
+	h.retryWorker = worker
+}
+
+// AdapterName implements retryworker.RetrySender.
+func (h *Handler) AdapterName() string { return "dingtalk" }
+
+// SendRetryMessage implements retryworker.RetrySender.
+func (h *Handler) SendRetryMessage(ctx context.Context, r memstore.PendingRetry) (string, error) {
+	payload := retryworker.BuildOpenCodePayload(r)
+	payload.Streaming = false
+	resp, err := h.client.SendMessage(ctx, payload)
+	if err != nil {
+		return "", err
+	}
+	return resp.Reply, nil
+}
+
+// NotifyUser implements retryworker.RetrySender.
+func (h *Handler) NotifyUser(ctx context.Context, r memstore.PendingRetry, reply string) error {
+	return h.adapter.SendToUserInChannel(ctx, r.Channel, r.UserID, reply)
 }
 
 // SetNLScheduleService 设置自然语言定时任务服务
@@ -915,6 +946,11 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleAbort(ctx, data, userID)
 	}
 
+	// Handle /retry command
+	if content == "/retry" || strings.HasPrefix(content, "/retry ") {
+		return h.handleRetry(ctx, data, userID, strings.TrimPrefix(strings.TrimPrefix(content, "/retry"), " "))
+	}
+
 	// Handle /new or /reset command to create new session
 	if content == "/new" || content == "/reset" || content == "新会话" {
 		return h.handleNewSession(ctx, data, userID)
@@ -1156,6 +1192,9 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			sendContent = base.BuildMediaPromptPrefix(mediaCtx) + sendContent
 		}
 	}
+	// Snapshot content/metadata for potential off-peak retry enqueue.
+	retryContent := sendContent
+	retryMetadata := cloneStringMap(metadata)
 
 	response, err := h.client.SendMessageStreamingWithEvents(sendCtx, opencode.MessagePayload{
 		Channel:     "dingtalk",
@@ -1393,6 +1432,33 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	accumulatedContent := fullReply.String()
 	log.Printf("dingtalk stream: 🔍 SendMessageStreaming returned - userID=%s, err=%v, reply_len=%d, accumulated_len=%d",
 		userID, err, len(response.Reply), len(accumulatedContent))
+
+	// Enqueue for off-peak retry when deadline exceeded with zero content.
+	if retryworker.IsDeadlineErr(err) && len(accumulatedContent) == 0 && len(response.Reply) == 0 {
+		if h.retryStore != nil {
+			attJSON := ""
+			if len(attachments) > 0 {
+				if b, jerr := json.Marshal(attachments); jerr == nil {
+					attJSON = string(b)
+				}
+			}
+			_, inserted, qErr := h.retryStore.SavePendingRetry(memstore.PendingRetry{
+				Adapter:         "dingtalk",
+				UserID:          userID,
+				ThreadID:        conversationID,
+				Channel:         data.SessionWebhook,
+				Content:         retryContent,
+				AttachmentsJSON: attJSON,
+				Metadata:        retryMetadata,
+				FailReason:      err.Error(),
+			})
+			if qErr != nil {
+				log.Printf("dingtalk: enqueue retry failed for user %s: %v", userID, qErr)
+			} else if inserted {
+				log.Printf("dingtalk: enqueued retry for user %s (thread=%s)", userID, conversationID)
+			}
+		}
+	}
 
 	if err != nil {
 		var errMsg string
@@ -2889,6 +2955,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 			_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, "❌ 无法定位当前会话，已改为新会话继续。")
 			decision = "new"
 		} else {
+			// 清除已总结标记，允许再次压缩（会话可能已再次溢出）
+			h.client.ClearSessionSummary(sessionID)
+			// 重置 gateway 侧 token 计数，避免下一条消息的预判因残留计数误判
+			h.client.ResetSessionTokenCount(sessionID)
 			if err := h.client.SummarizeSession(runCtx, sessionID); err != nil {
 				_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, fmt.Sprintf("❌ 自动压缩失败：%v", err))
 				h.clearTokenOverflowPending(userID)
@@ -3715,7 +3785,9 @@ func jsonStringEscape(s string) string {
 
 // ========== New Command Handlers ==========
 
-// handleNewSession 处理创建新会话命令
+// handleNewSession 处理创建新会话命令.
+// 如果当前有活跃 session，会先将其消息历史压缩保存为 pending handoff，
+// 这样下一条消息会自动携带上下文摘要进入新 session。
 func (h *Handler) handleNewSession(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
 
@@ -3725,24 +3797,85 @@ func (h *Handler) handleNewSession(ctx context.Context, data *chatbot.BotCallbac
 		oldSessionID = sid
 	}
 
-	// 重置session映射
 	threadID := data.ConversationId
-	if threadID != "" {
+	var contextSaved bool
+	if oldSessionID != "" && threadID != "" {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 正在保存当前会话上下文..."))
+		saveCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		var err error
+		contextSaved, err = h.client.SaveHandoffAndReset(saveCtx, threadID, "dingtalk", userID, oldSessionID)
+		cancel()
+		if err != nil {
+			log.Printf("dingtalk: handleNewSession: SaveHandoffAndReset failed: %v", err)
+		}
+	} else if threadID != "" {
 		h.client.ResetSession(threadID)
 	}
 	h.adapter.ClearSessionForUser(userID)
 
-	msg := "✅ 已重置会话\n\n"
-	if oldSessionID != "" {
-		msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:8])
+	var msg string
+	if contextSaved {
+		msg = "✅ 已重置会话，上下文已保存\n\n"
+		if oldSessionID != "" {
+			msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:min(8, len(oldSessionID))])
+		}
+		msg += "下一条消息将自动开启新会话并携带上下文摘要，直接发送你想继续的任务即可。"
+	} else {
+		msg = "✅ 已重置会话\n\n"
+		if oldSessionID != "" {
+			msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:min(8, len(oldSessionID))])
+		}
+		msg += "下次发送消息将创建新会话"
 	}
-	msg += "下次发送消息将创建新会话"
 
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
 		log.Printf("dingtalk: failed to send new session response: %v", err)
 		return nil, err
 	}
 
+	return nil, nil
+}
+
+// handleRetry 处理 /retry 命令
+func (h *Handler) handleRetry(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, subCmd string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+	send := func(msg string) {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+	}
+	if h.retryStore == nil || h.retryWorker == nil {
+		send("ℹ️ 离线重试队列未启用（RETRY_QUEUE_ENABLED=true 可开启）")
+		return nil, nil
+	}
+	switch strings.TrimSpace(subCmd) {
+	case "now":
+		send("⏳ 正在处理离线重试队列...")
+		go func() {
+			runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			succ, total, err := h.retryWorker.RunOnce(runCtx)
+			var result string
+			if err != nil {
+				result = fmt.Sprintf("❌ 重试执行出错: %v", err)
+			} else if total == 0 {
+				result = "✅ 队列为空，没有需要重试的请求"
+			} else {
+				result = fmt.Sprintf("✅ 重试完成：成功 %d / 总计 %d", succ, total)
+			}
+			notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer notifyCancel()
+			_ = h.adapter.SendToUserInChannel(notifyCtx, data.SessionWebhook, userID, result)
+		}()
+	case "clear":
+		n, err := h.retryStore.ClearRetryQueue("pending")
+		if err != nil {
+			send(fmt.Sprintf("❌ 清空队列失败: %v", err))
+			return nil, err
+		}
+		send(fmt.Sprintf("✅ 已清空 %d 条待重试请求", n))
+	default:
+		send(h.retryWorker.StatusSummary(ctx) +
+			"\n\n命令：\n/retry now - 立即处理队列\n/retry clear - 清空等待中的请求")
+	}
 	return nil, nil
 }
 
@@ -4023,9 +4156,15 @@ func (h *Handler) handleModelSet(ctx context.Context, data *chatbot.BotCallbackD
 	// 获取当前session
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
-		msg := "❌ 当前没有活跃的会话\n\n请先发送消息创建会话，然后再设置模型"
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
-		return nil, nil
+		// gateway 重启后本地映射丢失，尝试从 opencode server 恢复
+		if recovered, found := h.client.FindLatestSessionForUser(ctx, "dingtalk", userID); found {
+			sessionID = recovered
+			h.adapter.MapUserToSession(userID, sessionID)
+		} else {
+			msg := "❌ 当前没有活跃的会话\n\n请先发送消息创建会话，然后再设置模型"
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
+			return nil, nil
+		}
 	}
 
 	var providerID, modelID string

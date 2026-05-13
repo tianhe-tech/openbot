@@ -26,7 +26,9 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/user/opencode-gateway/internal/adapters/base"
+	"github.com/user/opencode-gateway/internal/memstore"
 	"github.com/user/opencode-gateway/internal/opencode"
+	"github.com/user/opencode-gateway/internal/retryworker"
 	"github.com/user/opencode-gateway/internal/scheduler"
 )
 
@@ -65,6 +67,9 @@ type Handler struct {
 	debugMode       bool // Enable detailed event logging
 	overflowPolicy  sync.Map
 	overflowPending sync.Map
+	// retryStore and retryWorker support the /retry command and off-peak retry queue.
+	retryStore  *memstore.Store
+	retryWorker *retryworker.Worker
 }
 
 const (
@@ -83,6 +88,34 @@ type feishuTokenOverflowPendingState struct {
 	Metadata    map[string]string
 	Target      chatTarget
 	CreatedAt   time.Time
+}
+
+// SetRetryWorker wires up the retry store and worker for /retry command and
+// off-peak automatic re-processing.
+func (h *Handler) SetRetryWorker(store *memstore.Store, worker *retryworker.Worker) {
+	h.retryStore = store
+	h.retryWorker = worker
+}
+
+// AdapterName implements retryworker.RetrySender.
+func (h *Handler) AdapterName() string { return "feishu" }
+
+// SendRetryMessage implements retryworker.RetrySender: replays a failed message
+// through opencode and returns the reply text.
+func (h *Handler) SendRetryMessage(ctx context.Context, r memstore.PendingRetry) (string, error) {
+	payload := retryworker.BuildOpenCodePayload(r)
+	payload.Streaming = false // sync mode for simplicity in background retries
+	resp, err := h.client.SendMessage(ctx, payload)
+	if err != nil {
+		return "", err
+	}
+	return resp.Reply, nil
+}
+
+// NotifyUser implements retryworker.RetrySender: sends text back to the
+// originating feishu user/channel.
+func (h *Handler) NotifyUser(ctx context.Context, r memstore.PendingRetry, reply string) error {
+	return h.adapter.SendToUserInChannel(ctx, r.Channel, r.UserID, reply)
 }
 
 func NewHandler(client *opencode.Client, cfg Config) *Handler {
@@ -362,6 +395,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// Handle /abort command to abort running session
 	if content == "/abort" || content == "/stop" || content == "停止" {
 		return h.handleAbort(ctx, target, msg.UserID)
+	}
+
+	// Handle /retry command
+	if content == "/retry" || strings.HasPrefix(content, "/retry ") {
+		return h.handleRetry(ctx, target, msg.UserID, strings.TrimPrefix(strings.TrimPrefix(content, "/retry"), " "))
 	}
 
 	// Handle /new or /reset command to create new session
@@ -759,6 +797,34 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 	log.Printf("feishu: 🔍 SendMessageStreaming returned - user=%s, err=%v, reply_len=%d, accumulated_len=%d",
 		userLabel, err, len(response.Reply), fullReply.Len())
+
+	// Enqueue for off-peak retry when the request timed out before any content
+	// was received (pure upstream model overload, not a partial-stream timeout).
+	if retryworker.IsDeadlineErr(err) && fullReply.Len() == 0 && len(response.Reply) == 0 {
+		if h.retryStore != nil {
+			attJSON := ""
+			if len(msg.Attachments) > 0 {
+				if b, jerr := json.Marshal(msg.Attachments); jerr == nil {
+					attJSON = string(b)
+				}
+			}
+			_, inserted, qErr := h.retryStore.SavePendingRetry(memstore.PendingRetry{
+				Adapter:         "feishu",
+				UserID:          msg.UserID,
+				ThreadID:        threadID,
+				Channel:         target.receiveID,
+				Content:         retryContent,
+				AttachmentsJSON: attJSON,
+				Metadata:        retryMetadata,
+				FailReason:      err.Error(),
+			})
+			if qErr != nil {
+				log.Printf("feishu: enqueue retry failed for user %s: %v", userLabel, qErr)
+			} else if inserted {
+				log.Printf("feishu: enqueued retry for user %s (thread=%s)", userLabel, threadID)
+			}
+		}
+	}
 
 	if err != nil {
 		errMsg := fmt.Sprintf("❌ 处理失败: %v", err)
@@ -2395,25 +2461,86 @@ func (h *Handler) handleAbort(ctx context.Context, target chatTarget, userID str
 	return "handled", nil
 }
 
-// handleNewSession 处理创建新会话命令
+// handleNewSession 处理创建新会话命令.
+// 如果当前有活跃 session，会先将其消息历史压缩保存为 pending handoff，
+// 这样下一条消息会自动携带上下文摘要进入新 session。
 func (h *Handler) handleNewSession(ctx context.Context, target chatTarget, userID, threadID string) (string, error) {
 	var oldSessionID string
 	if sid, ok := h.adapter.GetSessionForUser(userID); ok {
 		oldSessionID = sid
 	}
 
-	if threadID != "" {
+	var contextSaved bool
+	if oldSessionID != "" && threadID != "" {
+		_ = h.sendTextChunks(ctx, target, "⏳ 正在保存当前会话上下文...")
+		saveCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		var err error
+		contextSaved, err = h.client.SaveHandoffAndReset(saveCtx, threadID, "feishu", userID, oldSessionID)
+		cancel()
+		if err != nil {
+			log.Printf("feishu: handleNewSession: SaveHandoffAndReset failed: %v", err)
+		}
+	} else if threadID != "" {
 		h.client.ResetSession(threadID)
 	}
 	h.adapter.ClearSessionForUser(userID)
 
-	msg := "✅ 已重置会话\n\n"
-	if oldSessionID != "" {
-		msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:min(8, len(oldSessionID))])
+	var msg string
+	if contextSaved {
+		msg = "✅ 已重置会话，上下文已保存\n\n"
+		if oldSessionID != "" {
+			msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:min(8, len(oldSessionID))])
+		}
+		msg += "下一条消息将自动开启新会话并携带上下文摘要，直接发送你想继续的任务即可。"
+	} else {
+		msg = "✅ 已重置会话\n\n"
+		if oldSessionID != "" {
+			msg += fmt.Sprintf("旧会话: %s\n", oldSessionID[:min(8, len(oldSessionID))])
+		}
+		msg += "下次发送消息将创建新会话"
 	}
-	msg += "下次发送消息将创建新会话"
 
 	_ = h.sendTextChunks(ctx, target, msg)
+	return "handled", nil
+}
+
+// handleRetry 处理 /retry 命令：查看队列状态或立即触发重试。
+// subCmd: "" 或 "status" → 查看状态; "now" → 立即处理; "clear" → 清空队列
+func (h *Handler) handleRetry(ctx context.Context, target chatTarget, userID, subCmd string) (string, error) {
+	if h.retryStore == nil || h.retryWorker == nil {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 离线重试队列未启用（RETRY_QUEUE_ENABLED=true 可开启）")
+		return "handled", nil
+	}
+	switch strings.TrimSpace(subCmd) {
+	case "now":
+		_ = h.sendTextChunks(ctx, target, "⏳ 正在处理离线重试队列...")
+		go func() {
+			runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			succ, total, err := h.retryWorker.RunOnce(runCtx)
+			var result string
+			if err != nil {
+				result = fmt.Sprintf("❌ 重试执行出错: %v", err)
+			} else if total == 0 {
+				result = "✅ 队列为空，没有需要重试的请求"
+			} else {
+				result = fmt.Sprintf("✅ 重试完成：成功 %d / 总计 %d", succ, total)
+			}
+			notifyCtx, notifyCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer notifyCancel()
+			_ = h.adapter.SendToUserInChannel(notifyCtx, target.receiveID, userID, result)
+		}()
+	case "clear":
+		n, err := h.retryStore.ClearRetryQueue("pending")
+		if err != nil {
+			_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 清空队列失败: %v", err))
+			return "", err
+		}
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("✅ 已清空 %d 条待重试请求", n))
+	default:
+		_ = h.sendTextChunks(ctx, target, h.retryWorker.StatusSummary(ctx)+
+			"\n\n命令：\n/retry now - 立即处理队列\n/retry clear - 清空等待中的请求")
+	}
 	return "handled", nil
 }
 
@@ -2639,8 +2766,14 @@ func (h *Handler) handleModelQuery(ctx context.Context, target chatTarget, userI
 func (h *Handler) handleModelSet(ctx context.Context, target chatTarget, userID string, args []string) (string, error) {
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
-		_ = h.sendTextChunks(ctx, target, "❌ 当前没有活跃的会话\n\n请先发送消息创建会话，然后再设置模型")
-		return "handled", nil
+		// gateway 重启后本地映射丢失，尝试从 opencode server 恢复
+		if recovered, found := h.client.FindLatestSessionForUser(ctx, "feishu", userID); found {
+			sessionID = recovered
+			h.adapter.MapUserToSession(userID, sessionID)
+		} else {
+			_ = h.sendTextChunks(ctx, target, "❌ 当前没有活跃的会话\n\n请先发送消息创建会话，然后再设置模型")
+			return "handled", nil
+		}
 	}
 
 	var providerID, modelID string
@@ -3116,6 +3249,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 			_ = h.sendTextChunks(runCtx, state.Target, "❌ 无法定位当前会话，已改为新会话继续。")
 			decision = "new"
 		} else {
+			// 清除已总结标记，允许再次压缩（会话可能已再次溢出）
+			h.client.ClearSessionSummary(sessionID)
+			// 重置 gateway 侧 token 计数，避免下一条消息的预判因残留计数误判
+			h.client.ResetSessionTokenCount(sessionID)
 			if err := h.client.SummarizeSession(runCtx, sessionID); err != nil {
 				_ = h.sendTextChunks(runCtx, state.Target, fmt.Sprintf("❌ 自动压缩失败：%v", err))
 				h.clearTokenOverflowPending(userID)
