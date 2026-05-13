@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"time"
 	"unicode"
 )
 
@@ -65,67 +64,6 @@ func ExtractDirFromText(text string) string {
 	}
 
 	return ""
-}
-
-// ---- Intent Detection ----
-
-// recallTriggers are Chinese phrases that indicate the user wants to recall past conversations.
-var recallTriggers = []string{
-	"之前", "以前", "上次", "上一次", "曾经", "历史",
-	"回忆", "回顾", "记得", "还记得",
-	"开发了", "做过", "写过", "建过", "实现过",
-	"之前做的", "以前做的", "我做过", "我开发过",
-	"哪天", "什么时候做的", "什么时候开发的",
-	// Question-form indicators: always a recall/meta query, never real work
-	"是啊", "啥项目", "啥程序", "啥软件",
-	"什么项目", "什么程序", "哪些项目", "哪个项目",
-	"最近开发", "近期开发", "近来开发",
-}
-
-// recallMaxRunes is the maximum message length (in runes) for recall routing.
-// Pure recall queries are inherently short. Long messages are regular chat
-// that may incidentally contain temporal words — they must NOT be intercepted.
-const recallMaxRunes = 60
-
-// DetectRecallIntent returns true if the text is likely asking about past work.
-// Long messages (> recallMaxRunes runes) always return false: keyword scanning
-// of arbitrary-length text produces too many false positives.
-func DetectRecallIntent(text string) bool {
-	runes := []rune(strings.TrimSpace(text))
-	if len(runes) > recallMaxRunes {
-		return false
-	}
-	lower := strings.ToLower(text)
-	for _, kw := range recallTriggers {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-// DetectTimeWindow returns how many days back the query is asking about.
-// Defaults to 30 days for generic recall queries.
-func DetectTimeWindow(text string) int {
-	lower := strings.ToLower(text)
-	switch {
-	case strings.Contains(lower, "今天") || strings.Contains(lower, "今日"):
-		return 1
-	case strings.Contains(lower, "昨天") || strings.Contains(lower, "昨日"):
-		return 2
-	case strings.Contains(lower, "这周") || strings.Contains(lower, "本周") ||
-		strings.Contains(lower, "这星期") || strings.Contains(lower, "这个星期"):
-		return 7
-	case strings.Contains(lower, "上周") || strings.Contains(lower, "上个星期"):
-		return 14
-	case strings.Contains(lower, "这个月") || strings.Contains(lower, "本月"):
-		return 30
-	case strings.Contains(lower, "最近") || strings.Contains(lower, "近期") ||
-		strings.Contains(lower, "近来") || strings.Contains(lower, "近几天"):
-		return 30
-	default:
-		return 30
-	}
 }
 
 // ---- Keyword Extraction ----
@@ -323,72 +261,6 @@ func BuildSummary(request, response, action, project string) string {
 	return req
 }
 
-// BuildRecallContext formats a list of records into a prompt context string.
-// Project summaries are capped at 5; detail records are deduplicated by (project,date) and capped at 5.
-func BuildRecallContext(records []MemRecord, projectSummaries []ProjectSummary) string {
-	if len(records) == 0 && len(projectSummaries) == 0 {
-		return ""
-	}
-
-	var sb strings.Builder
-	sb.WriteString("【历史工作记忆】以下是用户过去的工作记录，供参考：\n\n")
-
-	// Cap project overview at 5
-	shown := projectSummaries
-	if len(shown) > 5 {
-		shown = shown[:5]
-	}
-	if len(shown) > 0 {
-		sb.WriteString("## 项目概览\n")
-		for _, ps := range shown {
-			daysSince := int(time.Since(ps.Last).Hours() / 24)
-			actions := strings.Join(unique(ps.Actions), "、")
-			sb.WriteString(fmt.Sprintf("- **%s**（%s）：共 %d 次操作（%s），最近一次在 %d 天前（%s）\n",
-				ps.Project, ps.Adapter,
-				ps.Count, actions,
-				daysSince, ps.Last.Format("2006-01-02"),
-			))
-		}
-		sb.WriteString("\n")
-	}
-
-	// Deduplicate detail records by (project, date), cap at 5
-	if len(records) > 0 {
-		seen := make(map[string]struct{})
-		var deduped []MemRecord
-		for _, r := range records {
-			key := r.Project + "|" + r.Ts.Format("2006-01-02")
-			if r.Project == "" {
-				key = r.Summary + "|" + r.Ts.Format("2006-01-02")
-			}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			deduped = append(deduped, r)
-			if len(deduped) >= 5 {
-				break
-			}
-		}
-		if len(deduped) > 0 {
-			sb.WriteString("## 相关记录\n")
-			for _, r := range deduped {
-				dirPart := ""
-				if r.WorkDir != "" && r.WorkDir != "." {
-					dirPart = fmt.Sprintf(" (%s)", r.WorkDir)
-				}
-				sb.WriteString(fmt.Sprintf("- [%s][%s] %s：%s%s\n",
-					r.Ts.Format("2006-01-02"), r.Adapter,
-					r.Action, r.Summary, dirPart,
-				))
-			}
-			sb.WriteString("\n")
-		}
-	}
-
-	return sb.String()
-}
-
 // ---- helpers ----
 
 func truncateRunes(s string, maxRunes int) string {
@@ -397,21 +269,4 @@ func truncateRunes(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "…"
-}
-
-func unique(ss []string) []string {
-	seen := make(map[string]struct{})
-	var out []string
-	for _, s := range ss {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	return out
 }

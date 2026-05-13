@@ -61,6 +61,7 @@ type SkillAutogenConfig struct {
 	InstallDir          string
 	ApprovalRequired    bool
 	MinConfidence       float64
+	MinToolCalls        int
 	QueueCapacity       int
 	ReferenceSkillPath  string
 }
@@ -144,6 +145,7 @@ func Load() (Config, error) {
 			OnHandoff:           getBool("SKILLGEN_ON_HANDOFF", true),
 			OnLongSession:       getBool("SKILLGEN_ON_LONG_SESSION", true),
 			LongSessionMinTurns: getInt("SKILLGEN_LONG_SESSION_MIN_TURNS", 8),
+			MinToolCalls:        getInt("SKILLGEN_MIN_TOOL_CALLS", 3),
 			CandidateDir:        getEnv("SKILLGEN_CANDIDATE_DIR", "skills-candidates"),
 			InstallDir:          getEnv("SKILLGEN_INSTALL_DIR", "skills"),
 			ApprovalRequired:    getBool("SKILLGEN_APPROVAL_REQUIRED", true),

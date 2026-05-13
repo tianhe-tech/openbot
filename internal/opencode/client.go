@@ -363,9 +363,6 @@ type MemStoreRecorder interface {
 	// RecordConversation persists one completed request/response turn.
 	// workDir is the opencode working directory (e.g. "/root/openbot"); pass empty string if unknown.
 	RecordConversation(adapter, userID, request, response, workDir string)
-	// InjectRecallContext returns a context preamble to prepend to the user message when a
-	// recall intent is detected; returns "" when no injection is needed.
-	InjectRecallContext(request, adapter, userID string) string
 }
 
 // HandoffStore is an optional extension the memstore adapter may implement to
@@ -631,15 +628,6 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
-	}
-
-	// ========== 记忆召回注入（如果用户在询问历史工作）==========
-	// Save original content BEFORE injection so recording always stores the clean user message.
-	originalContent := payload.Content
-	if c.memStore != nil {
-		if injected := c.memStore.InjectRecallContext(payload.Content, payload.Channel, payload.UserID); injected != "" {
-			payload.Content = injected + payload.Content
-		}
 	}
 
 	// ========== 会话接续注入（上一会话因 opencode 服务端死锁中断时自动恢复）==========
@@ -964,7 +952,7 @@ sendMessage:
 	// ========== 记忆存储（异步，不阻塞主流程）==========
 	if c.memStore != nil && strings.TrimSpace(reply) != "" {
 		ms := c.memStore
-		ch, uid, req, rep, sid := payload.Channel, payload.UserID, originalContent, reply, sessionID
+		ch, uid, req, rep, sid := payload.Channel, payload.UserID, payload.Content, reply, sessionID
 		go func() { ms.RecordConversation(ch, uid, req, rep, c.sessionDirectory(sid)) }()
 	}
 
@@ -4009,14 +3997,21 @@ func (c *Client) triggerSessionHandoff(payload MessagePayload, sessionID string)
 		// Fire skill-candidate hook so skillgen can mine the stuck session for a
 		// reusable procedure. Hook implementation must be quick or internally async.
 		if hook := c.skillCandidateHook; hook != nil {
+			toolCalls := 0
+			if v, ok := c.toolCallCount.Load(sessionID); ok {
+				if n, ok2 := v.(int); ok2 {
+					toolCalls = n
+				}
+			}
 			hook.OnSkillCandidate(SkillCandidateEvent{
-				Trigger:     SkillTriggerHandoff,
-				ThreadID:    payload.ThreadID,
-				SessionID:   sessionID,
-				Adapter:     payload.Channel,
-				UserID:      payload.UserID,
-				LastUserMsg: lastUserMsg,
-				TurnCount:   len(roles),
+				Trigger:       SkillTriggerHandoff,
+				ThreadID:      payload.ThreadID,
+				SessionID:     sessionID,
+				Adapter:       payload.Channel,
+				UserID:        payload.UserID,
+				LastUserMsg:   lastUserMsg,
+				TurnCount:     len(roles),
+				ToolCallCount: toolCalls,
 			})
 		}
 		return nil

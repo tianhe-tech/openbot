@@ -148,7 +148,7 @@ func main() {
 	memStorePath := cfg.MemStorePath
 	if memStorePath == "" {
 		// Default: <OPENCODE_DIRECTORY>/tmp/memory.db
-		memStorePath = filepath.Join(cfg.OpenCodeDirectory, "tmp", "memory.db")
+		memStorePath = filepath.Join(cfg.OpenCodeDirectory, "mem", "memory.db")
 	}
 	memDB, memErr := memstore.Open(memStorePath)
 	if memErr != nil {
@@ -156,6 +156,8 @@ func main() {
 	} else {
 		log.Printf("main: memory store opened at %s", memStorePath)
 		ocOptions = append(ocOptions, opencode.WithMemStore(memstore.NewGatewayAdapter(memDB)))
+		// Auto-register the MCP memory tool so the LLM can search memory proactively.
+		ensureMCPMemoryTool(cfg.OpenCodeDirectory, memStorePath)
 		// Periodic forgetting curve decay (every hour)
 		go func() {
 			ticker := time.NewTicker(time.Hour)
@@ -206,6 +208,7 @@ func main() {
 			InstallDir:          cfg.SkillAutogen.InstallDir,
 			ApprovalRequired:    cfg.SkillAutogen.ApprovalRequired,
 			MinConfidence:       cfg.SkillAutogen.MinConfidence,
+			MinToolCalls:        cfg.SkillAutogen.MinToolCalls,
 		}
 		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath)
 		notifier := skillgen.NewRegistryNotifier(adapterRegistry)
@@ -278,7 +281,7 @@ func main() {
 	cronScheduler := scheduler.NewCronScheduler(taskScheduler)
 
 	// Set cron task storage path for persistence
-	cronStoragePath := filepath.Join(cfg.OpenCodeDirectory, "tmp", "cron_tasks.json")
+	cronStoragePath := filepath.Join(cfg.OpenCodeDirectory, "cron", "cron_tasks.json")
 	cronScheduler.SetStoragePath(cronStoragePath)
 	log.Printf("main: cron tasks will be persisted to %s", cronStoragePath)
 
@@ -1119,4 +1122,99 @@ func handleCronPermission(ctx context.Context, ocClient *opencode.Client, event 
 
 	log.Printf("opencode cron: successfully auto-answered %s for cron session %s", eventType, sessionID[:min(8, len(sessionID))])
 	return nil
+}
+
+// ========== MCP memory tool auto-registration ==========
+
+// ensureMCPMemoryTool ensures the project-level opencode.json contains a
+// "gateway-memory" MCP entry so the LLM can call memory tools without manual
+// configuration.  If the entry already exists it is left untouched.
+func ensureMCPMemoryTool(opencodeDir, memDBPath string) {
+	mcpBin := findMCPBinary()
+	if mcpBin == "" {
+		log.Printf("mcp: openbot-mcp binary not found next to gateway, skipping auto-registration")
+		return
+	}
+
+	// Resolve memDBPath to absolute so the MCP process can find it regardless of cwd.
+	if abs, err := filepath.Abs(memDBPath); err == nil {
+		memDBPath = abs
+	}
+
+	cfgPath := filepath.Join(opencodeDir, "opencode.json")
+
+	// Read existing config or start fresh.
+	var root map[string]interface{}
+	data, err := os.ReadFile(cfgPath)
+	if err == nil {
+		if err := json.Unmarshal(data, &root); err != nil {
+			log.Printf("mcp: cannot parse %s, skipping auto-registration: %v", cfgPath, err)
+			return
+		}
+	} else {
+		root = make(map[string]interface{})
+	}
+
+	// Navigate into "mcp" section.
+	mcpSection, _ := root["mcp"].(map[string]interface{})
+	if mcpSection == nil {
+		mcpSection = make(map[string]interface{})
+	}
+	if _, exists := mcpSection["gateway-memory"]; exists {
+		return // already registered
+	}
+
+	mcpSection["gateway-memory"] = map[string]interface{}{
+		"type":    "local",
+		"command": []string{mcpBin, "--db", memDBPath},
+		"enabled": true,
+	}
+	root["mcp"] = mcpSection
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		log.Printf("mcp: marshal error: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		log.Printf("mcp: mkdir error: %v", err)
+		return
+	}
+	if err := os.WriteFile(cfgPath, out, 0o644); err != nil {
+		log.Printf("mcp: write %s error: %v", cfgPath, err)
+		return
+	}
+	log.Printf("mcp: auto-registered gateway-memory tool in %s (binary=%s)", cfgPath, mcpBin)
+}
+
+// findMCPBinary locates the openbot-mcp binary next to the current executable,
+// in the working directory, or in ./bin/.
+func findMCPBinary() string {
+	suffix := ""
+	if runtime.GOOS == "windows" {
+		suffix = ".exe"
+	}
+	name := "openbot-mcp" + suffix
+
+	// 1. Next to the current executable.
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(candidate); err == nil {
+			abs, _ := filepath.Abs(candidate)
+			return abs
+		}
+	}
+	// 2. Current working directory.
+	if abs, err := filepath.Abs(name); err == nil {
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	// 3. ./bin/ directory.
+	if abs, err := filepath.Abs(filepath.Join("bin", name)); err == nil {
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	return ""
 }

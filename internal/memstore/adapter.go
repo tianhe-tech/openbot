@@ -28,12 +28,6 @@ func (g *GatewayAdapter) RecordConversation(adapter, userID, request, response, 
 	if request == "" || response == "" {
 		return
 	}
-	// Skip storing pure recall/history queries — they are meta-questions, not real work.
-	// Storing them creates noise: "我最近开发了什么" → project="项目" → pollutes memory.
-	if DetectRecallIntent(request) {
-		return
-	}
-
 	action := ExtractAction(request)
 
 	// Resolve the effective working directory:
@@ -73,38 +67,6 @@ func (g *GatewayAdapter) RecordConversation(adapter, userID, request, response, 
 	if err := g.store.Record(rec); err != nil {
 		log.Printf("memstore: record error (adapter=%s user=%s): %v", adapter, userID, err)
 	}
-}
-
-// InjectRecallContext checks if request looks like a recall query; if so, searches the store
-// and returns a formatted preamble to prepend to the user message.  Returns "" otherwise.
-func (g *GatewayAdapter) InjectRecallContext(request, adapter, userID string) string {
-	if !DetectRecallIntent(request) {
-		return ""
-	}
-
-	window := DetectTimeWindow(request)
-	since := time.Now().AddDate(0, 0, -window)
-	keywords := ExtractKeywords(request)
-
-	// Cross-platform recall: this is a single-user personal gateway, so all records
-	// belong to the same person regardless of adapter/platform. No userID isolation needed.
-	records, err := g.store.Recall(keywords, "", "", since, 8)
-	if err != nil {
-		log.Printf("memstore: recall error: %v", err)
-		return ""
-	}
-
-	// Project summaries: all adapters, same time window, minCount=1
-	projectSums, err := g.store.ProjectSummaries("", "", since, 1)
-	if err != nil {
-		log.Printf("memstore: project summaries error: %v", err)
-	}
-
-	ctx := BuildRecallContext(records, projectSums)
-	if ctx == "" {
-		return ""
-	}
-	return ctx + "\n\n---\n\n【用户消息】"
 }
 
 // ---- Session handoff (opencode scheduler-deadlock recovery) ----
