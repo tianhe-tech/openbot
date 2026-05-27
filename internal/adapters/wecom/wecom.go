@@ -63,6 +63,7 @@ type wecomTokenOverflowPendingState struct {
 	Attachments []opencode.Attachment
 	Metadata    map[string]string
 	CreatedAt   time.Time
+	Executing   bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // NewHandler wires the adapter with an OpenCode client instance.
@@ -1242,9 +1243,14 @@ func (h *Handler) clearTokenOverflowPending(userID string) {
 }
 
 func (h *Handler) handleTokenOverflowQuickReply(ctx context.Context, userID, content string) (bool, string, error) {
-	_, ok := h.getTokenOverflowPending(userID)
+	state, ok := h.getTokenOverflowPending(userID)
 	if !ok {
 		return false, "", nil
+	}
+
+	// 如果已经在执行重试，阻止新消息并提示用户等待
+	if state.Executing {
+		return true, "⏳ 上下文压缩/重试正在进行中，请稍候...", nil
 	}
 
 	decision, setAlways, recognized := parseTokenOverflowDecision(content)
@@ -1338,6 +1344,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		return "❌ 未找到待处理的超限请求，请重发原消息。", nil
 	}
 
+	// 标记为执行中，防止用户新消息创建并发请求
+	state.Executing = true
+	h.storeTokenOverflowPending(userID, state)
+
 	decision = strings.TrimSpace(decision)
 	if decision == "" {
 		decision = "summary"
@@ -1372,16 +1382,37 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		state.SessionID = ""
 	}
 
-	response, err := h.client.SendMessage(runCtx, opencode.MessagePayload{
+	// 使用流式模式重试，避免长时间阻塞无反馈
+	var retryReply strings.Builder
+	retryCallback := func(chunk string) error {
+		trimmed := strings.TrimSpace(chunk)
+		if trimmed == "" {
+			return nil
+		}
+		if strings.HasPrefix(trimmed, "ses_") && len(trimmed) < 100 {
+			h.adapter.MapUserToSession(state.UserID, trimmed)
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+			return nil
+		}
+		if chunk == opencode.FlushSignal {
+			return nil
+		}
+		retryReply.WriteString(chunk)
+		return nil
+	}
+
+	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
 		Channel:     "wecom",
 		UserID:      state.UserID,
 		ThreadID:    state.ThreadID,
 		SessionID:   state.SessionID,
 		Content:     state.Content,
-		Streaming:   false,
+		Streaming:   true,
 		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
 		Metadata:    cloneStringMap(state.Metadata),
-	})
+	}, retryCallback)
 	if err != nil {
 		h.clearTokenOverflowPending(userID)
 		return "", fmt.Errorf("已尝试%s后重试，但仍失败: %w", tokenOverflowDecisionLabel(decision), err)
@@ -1392,7 +1423,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 	}
 
 	h.clearTokenOverflowPending(userID)
-	finalReply := strings.TrimSpace(response.Reply)
+	finalReply := strings.TrimSpace(retryReply.String())
+	if finalReply == "" {
+		finalReply = strings.TrimSpace(response.Reply)
+	}
 	if finalReply == "" {
 		finalReply = "✅ 已完成重试，本次没有可直接返回的文本内容。"
 	}

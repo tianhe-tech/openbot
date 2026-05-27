@@ -40,6 +40,7 @@ type StreamingSessionHandler struct {
 	stepFinishTime     time.Time   // 收到 step-finish 的时间
 	waitingTimer       *time.Timer // 等待提示定时器
 	onComplete         func()
+	onCompleteOnce     sync.Once     // 确保 onComplete 只执行一次（session.idle 和 finalizeAsync 都可能触发）
 	client             *Client       // 用于存储问题
 	messageSender      MessageSender // 用于主动推送消息到用户
 	showThinking       bool          // 是否输出 reasoning/thinking 内容
@@ -47,25 +48,27 @@ type StreamingSessionHandler struct {
 	lastTodoSummary    string        // 最近一次自动推送的 todo 文本（用于去重）
 	lastTodoPushTime   time.Time     // 最近一次自动推送 todo 的时间
 	// 增量内容追踪（对照 TUI sync.tsx 中 message.part.delta / message.part.updated 机制）
-	partTextCache   sync.Map   // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
-	toolSignalCache sync.Map   // partID -> string: 最近一次已发送的工具状态签名，避免重复推送
-	partRoles       sync.Map   // partID -> string: 每个 part 所属 message 的 role（"user"/"assistant"），用于过滤用户消息
-	sessionTodos    []TodoItem // 当前 todo 列表（来自 todo.updated 事件）
-	sessionDiff     []FileDiff // 本次会话的文件变更（来自 session.diff 事件）
+	partTextCache   sync.Map        // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
+	toolSignalCache sync.Map        // partID -> string: 最近一次已发送的工具状态签名，避免重复推送
+	partRoles       sync.Map        // partID -> string: 每个 part 所属 message 的 role（"user"/"assistant"），用于过滤用户消息
+	sessionTodos    []TodoItem      // 当前 todo 列表（来自 todo.updated 事件）
+	sessionDiff     []FileDiff      // 本次会话的文件变更（来自 session.diff 事件）
+	activeToolParts map[string]bool // partID -> true：当前处于 pending/running 状态的 tool part，用于判断是否仍有活跃 tool
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
 func NewStreamingSessionHandler(sessionID string, callback StreamCallback, eventCallback StreamEventCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool) *StreamingSessionHandler {
 	h := &StreamingSessionHandler{
-		sessionID:      sessionID,
-		callback:       callback,
-		eventCallback:  eventCallback,
-		lastUpdateTime: time.Now(),
-		onComplete:     onComplete,
-		client:         client,
-		messageSender:  messageSender,
-		showThinking:   showThinking,
-		showSteps:      showSteps,
+		sessionID:       sessionID,
+		callback:        callback,
+		eventCallback:   eventCallback,
+		lastUpdateTime:  time.Now(),
+		onComplete:      onComplete,
+		client:          client,
+		messageSender:   messageSender,
+		showThinking:    showThinking,
+		showSteps:       showSteps,
+		activeToolParts: make(map[string]bool),
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
@@ -251,15 +254,18 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					s.receivedStepFinish = true
 					s.stepFinishTime = time.Now()
 					log.Printf("opencode: 🏁 received step-finish for session %s", s.sessionID[:8])
-					// 用 API 返回的真实 input token 数覆盖估算值
-					if inputTokens := partMeta2.Properties.Part.Tokens.Input; inputTokens > 0 {
-						if s.client != nil {
-							s.client.UpdateTokenCount(s.sessionID, inputTokens)
-						}
-					} else if total := partMeta2.Properties.Part.Tokens.Total; total > 0 {
-						// 部分模型只返回 total，用 total 作为保守估计
+					// 用 API 返回的真实 token 数覆盖估算值。
+					// 注意：必须使用 total（完整上下文窗口占用），而不是 input（仅 cache-miss 的新 token）。
+					// 在支持 KV cache 的模型上，input 可能只有几百而 total 已达十几万，
+					// 用 input 会导致自动压缩阈值永远不触发。
+					if total := partMeta2.Properties.Part.Tokens.Total; total > 0 {
 						if s.client != nil {
 							s.client.UpdateTokenCount(s.sessionID, total)
+						}
+					} else if inputTokens := partMeta2.Properties.Part.Tokens.Input; inputTokens > 0 {
+						// fallback: 部分模型只返回 input，没有 total
+						if s.client != nil {
+							s.client.UpdateTokenCount(s.sessionID, inputTokens)
 						}
 					}
 				}
@@ -404,14 +410,6 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		s.completed = true
 		s.notifyCompletion()
 		log.Printf("opencode: session error handled for session %s", s.sessionID[:8])
-
-		// 通知用户下一条消息会自动建立新会话（session 映射由 main.go 的全局事件处理器清除）
-		newSessionMsg := "\n\n💡 会话已重置，发送新消息即可自动开始新的对话。"
-		if err := s.callback(newSessionMsg); err != nil {
-			log.Printf("opencode: session.error new-session hint error: %v", err)
-		} else {
-			s.emitEvent(StreamEventInfo, newSessionMsg, nil, nil, nil, eventType)
-		}
 
 	case "message.part.delta":
 		// 来自 TUI sync.tsx: message.part.delta 是增量文本的主要来源
@@ -726,6 +724,16 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 		state := props.Part.State
 		partID := props.Part.ID
 		log.Printf("opencode: 🔍 extractContent - tool event: name=%s, status=%s", toolName, state.Status)
+
+		// 追踪活跃 tool parts（pending/running 视为活跃，completed/error 视为结束）
+		if partID != "" {
+			switch state.Status {
+			case "pending", "running":
+				s.activeToolParts[partID] = true
+			case "completed", "error":
+				delete(s.activeToolParts, partID)
+			}
+		}
 
 		switch state.Status {
 		case "running":
@@ -1282,6 +1290,20 @@ func (s *StreamingSessionHandler) GetStepFinishTime() time.Time {
 	return s.stepFinishTime
 }
 
+// HasActiveTools 检查是否仍有 pending/running 状态的 tool part
+func (s *StreamingSessionHandler) HasActiveTools() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.activeToolParts) > 0
+}
+
+// ActiveToolCount 返回当前活跃（pending/running）tool part 数量
+func (s *StreamingSessionHandler) ActiveToolCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.activeToolParts)
+}
+
 // GetLastEventInfo 获取最后一次事件的时间和类型
 func (s *StreamingSessionHandler) GetLastEventInfo() (time.Time, string) {
 	s.mu.Lock()
@@ -1342,8 +1364,17 @@ func (s *StreamingSessionHandler) notifyCompletion() {
 	_ = s.callback(FlushSignal)
 	s.emitEventFromChunk(FlushSignal)
 
+	s.fireOnComplete()
+}
+
+// fireOnComplete 通过 sync.Once 保证 onComplete 回调只执行一次。
+// session.idle(notifyCompletion) 和 finalizeAsyncStreamingResponse 都可能触发，
+// 幂等化避免重复注销 handler / 重复清理。
+func (s *StreamingSessionHandler) fireOnComplete() {
 	if s.onComplete != nil {
-		go s.onComplete()
+		s.onCompleteOnce.Do(func() {
+			go s.onComplete()
+		})
 	}
 }
 

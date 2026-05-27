@@ -14,13 +14,13 @@
 //	         asyncwork.Queue job (single goroutine)
 //	                        │
 //	     ┌──────────────────┴──────────────────┐
-//	     │ 1. waitUntilIdle (poll IsBusy)      │
-//	     │ 2. dedup + daily cap                │
-//	     │ 3. pick model (epsilon-greedy)      │
-//	     │ 4. drafter.Draft → SKILL.md text    │
-//	     │ 5. persist as pending_review        │
-//	     │ 6. installer.WriteDraft → file      │
-//	     │ 7. notifier.Notify → adapter        │
+//	     │ 1. dedup + daily cap                │
+//	     │ 2. pick model (epsilon-greedy)      │
+//	     │ 3. drafter.Draft → SKILL.md text    │
+//	     │    (dedicated session, no idle-wait) │
+//	     │ 4. persist as pending_review        │
+//	     │ 5. installer.WriteDraft → file      │
+//	     │ 6. notifier.Notify → adapter        │
 //	     └─────────────────────────────────────┘
 //
 // Review happens via slash commands intercepted in opencode.Client.SendMessage
@@ -230,18 +230,16 @@ func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
 		Fn: func(ctx context.Context) error {
 			return s.run(ctx, ev)
 		},
+		Dur: 10 * time.Minute, // drafter uses a dedicated session; give it more headroom
 	})
 }
 
-// run is the full mining pipeline: idle-wait → fetch turns → draft → persist → install → notify.
+// run is the full mining pipeline: fetch turns → draft → persist → install → notify.
 func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) error {
-	// 1. Idle gate — yield to any active user Q&A.
-	if err := s.waitUntilIdle(ctx, 5*time.Minute); err != nil {
-		log.Printf("skillgen: idle-wait gave up for thread %s: %v", ev.ThreadID, err)
-		return err
-	}
+	// Drafter uses a dedicated session (thread "skillgen-draft-<threadID>"),
+	// so it does not interfere with the user's active Q&A. No idle-wait needed.
 
-	// 2. Fetch conversation turns.
+	// 1. Fetch conversation turns.
 	turns, err := s.fetchTurns(ctx, ev.SessionID)
 	if err != nil || len(turns) == 0 {
 		if err != nil {
@@ -250,13 +248,13 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		return err
 	}
 
-	// 3. Pick model.
+	// 2. Pick model.
 	model := s.pickModel()
 	if s.store != nil && model != "" {
 		_ = s.store.RecordModelAttempt(model)
 	}
 
-	// 4. Read existing installed skills from disk (zero LLM cost) so the drafter
+	// 3. Read existing installed skills from disk (zero LLM cost) so the drafter
 	// can decide to PATCH an existing skill instead of creating a duplicate.
 	var existingSkills []string
 	if s.cfg.InstallDir != "" {
@@ -269,8 +267,8 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		}
 	}
 
-	// 5. Draft.
-	draftCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	// 4. Draft.
+	draftCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
 	out, err := s.drafter.Draft(draftCtx, DraftInput{
 		Trigger:             string(ev.Trigger),
@@ -294,7 +292,7 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		return nil
 	}
 
-	// 6. Persist candidate row.
+	// 5. Persist candidate row.
 	status := memstore.SkillStatusPendingReview
 	if !s.cfg.ApprovalRequired {
 		status = memstore.SkillStatusApproved
@@ -313,7 +311,7 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		SkillMD:   out.SkillMD,
 	}
 
-	// 7. Write to disk (patch existing skill, draft dir, or install dir when auto-approving).
+	// 6. Write to disk (patch existing skill, draft dir, or install dir when auto-approving).
 	targetDir := s.cfg.CandidateDir
 	if !s.cfg.ApprovalRequired {
 		targetDir = s.cfg.InstallDir
@@ -343,7 +341,7 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		_ = s.store.RecordModelOutcome(out.ModelID, true, out.Score)
 	}
 
-	// 8. Notify.
+	// 7. Notify.
 	if s.notifier != nil && ev.Adapter != "" && ev.UserID != "" {
 		if err := s.notifier.NotifyCandidate(ev.Adapter, ev.UserID, c.ID, c.Title, s.cfg.ApprovalRequired); err != nil {
 			log.Printf("skillgen: notifier failed (adapter=%s user=%s): %v", ev.Adapter, ev.UserID, err)
@@ -353,31 +351,6 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 	log.Printf("skillgen: candidate %s created (title=%q status=%s score=%.2f model=%s path=%s)",
 		c.ID, c.Title, c.Status, c.Score, c.ModelID, c.DraftPath)
 	return nil
-}
-
-// waitUntilIdle polls the client's busy flag with backoff; gives up after maxWait.
-func (s *Service) waitUntilIdle(ctx context.Context, maxWait time.Duration) error {
-	if s.client == nil {
-		return nil
-	}
-	deadline := time.Now().Add(maxWait)
-	backoff := 2 * time.Second
-	for {
-		if !s.client.IsBusy() {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("opencode still busy after %s", maxWait)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-	}
 }
 
 // fetchTurns retrieves the session message history via the opencode client.

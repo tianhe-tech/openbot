@@ -29,6 +29,14 @@ type Job interface {
 	Run(ctx context.Context) error
 }
 
+// TimedJob is an optional extension of Job that allows individual jobs to
+// override the queue's default 5-minute timeout.
+type TimedJob interface {
+	Job
+	// Timeout returns the per-job timeout. Zero or negative means use default.
+	Timeout() time.Duration
+}
+
 // Queue is a single-goroutine dispatcher over a buffered channel.
 type Queue struct {
 	jobs    chan Job
@@ -85,7 +93,13 @@ func (q *Queue) runOne(parent context.Context, job Job) {
 			log.Printf("asyncwork: job %q panicked: %v", job.Name(), r)
 		}
 	}()
-	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	timeout := 5 * time.Minute
+	if tj, ok := job.(TimedJob); ok {
+		if d := tj.Timeout(); d > 0 {
+			timeout = d
+		}
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	start := time.Now()
 	if err := job.Run(ctx); err != nil {
@@ -96,6 +110,18 @@ func (q *Queue) runOne(parent context.Context, job Job) {
 	q.ran.Add(1)
 	log.Printf("asyncwork: job %q done in %s", job.Name(), time.Since(start))
 }
+
+// JobFunc is a convenience adapter that turns a closure into a Job.
+// When Dur > 0, it also implements TimedJob to override the default timeout.
+type JobFunc struct {
+	Label string
+	Fn    func(ctx context.Context) error
+	Dur   time.Duration // optional per-job timeout; 0 = use queue default
+}
+
+func (j JobFunc) Name() string                  { return j.Label }
+func (j JobFunc) Run(ctx context.Context) error { return j.Fn(ctx) }
+func (j JobFunc) Timeout() time.Duration        { return j.Dur }
 
 // Enqueue adds a job. Returns false when the queue is full or stopped; the
 // caller can treat the job as lost. Never blocks.
@@ -141,21 +167,4 @@ func (q *Queue) Stop(ctx context.Context) {
 // Stats returns a snapshot of counters.
 func (q *Queue) Stats() (enqueued, ran, failed, dropped uint64) {
 	return q.enqueued.Load(), q.ran.Load(), q.failed.Load(), q.dropped.Load()
-}
-
-// JobFunc adapts a function literal to the Job interface.
-type JobFunc struct {
-	Label string
-	Fn    func(ctx context.Context) error
-}
-
-// Name implements Job.
-func (j JobFunc) Name() string { return j.Label }
-
-// Run implements Job.
-func (j JobFunc) Run(ctx context.Context) error {
-	if j.Fn == nil {
-		return nil
-	}
-	return j.Fn(ctx)
 }

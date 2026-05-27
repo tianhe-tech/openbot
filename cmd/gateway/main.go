@@ -25,6 +25,7 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
+	"github.com/user/opencode-gateway/internal/adapters/wechat"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
 	"github.com/user/opencode-gateway/internal/asyncwork"
 	"github.com/user/opencode-gateway/internal/config"
@@ -291,15 +292,18 @@ func main() {
 	wecomHandler := wecom.NewHandler(ocClient, cfg.WeCom)
 	feishuHandler := feishu.NewHandler(ocClient, cfg.FeiShu)
 	dingtalkHandler := dingtalk.NewHandler(ocClient, cfg.DingTalk)
+	wechatHandler := wechat.NewHandler(ocClient, cfg.WeChat)
 
 	// Set cronScheduler to adapters so they can manage scheduled tasks
 	dingtalkHandler.SetCronScheduler(cronScheduler)
 	feishuHandler.SetCronScheduler(cronScheduler)
 	wecomHandler.SetCronScheduler(cronScheduler)
+	wechatHandler.SetCronScheduler(cronScheduler)
 	nlScheduleSvc := scheduler.NewNLScheduleService(cronScheduler, taskScheduler, nil, nil)
 	dingtalkHandler.SetNLScheduleService(nlScheduleSvc)
 	feishuHandler.SetNLScheduleService(nlScheduleSvc)
 	wecomHandler.SetNLScheduleService(nlScheduleSvc)
+	wechatHandler.SetNLScheduleService(nlScheduleSvc)
 
 	// ========== Offline retry queue (optional) ==========
 	if cfg.RetryQueue.Enabled && memDB != nil {
@@ -364,6 +368,7 @@ func main() {
 	adapterRegistry.Register(wecomHandler.GetAdapter())
 	adapterRegistry.Register(feishuHandler.GetAdapter())
 	adapterRegistry.Register(dingtalkHandler.GetAdapter())
+	adapterRegistry.Register(wechatHandler.GetAdapter())
 
 	// erroredSessions tracks sessions that were deliberately cleared after session.error.
 	// The title-recovery logic must not re-map these, otherwise the user gets stuck on
@@ -398,6 +403,7 @@ func main() {
 			{"dingtalk", dingtalkHandler},
 			{"feishu", feishuHandler},
 			{"wecom", wecomHandler},
+			{"wechat", wechatHandler},
 		} {
 			adapter := adapter.handler.GetAdapter()
 			if userID, ok := adapter.GetUserForSession(sessionID); ok {
@@ -426,6 +432,8 @@ func main() {
 					foundAdapter = feishuHandler.GetAdapter()
 				case "wecom":
 					foundAdapter = wecomHandler.GetAdapter()
+				case "wechat":
+					foundAdapter = wechatHandler.GetAdapter()
 				}
 
 				if foundAdapter != nil {
@@ -467,6 +475,8 @@ func main() {
 								foundAdapter = feishuHandler.GetAdapter()
 							case "wecom":
 								foundAdapter = wecomHandler.GetAdapter()
+							case "wechat":
+								foundAdapter = wechatHandler.GetAdapter()
 							}
 
 							if foundAdapter != nil {
@@ -505,6 +515,16 @@ func main() {
 			return err
 		}
 
+		// 会话出错后清除 session 映射，使下一条消息自动建立新会话
+		// 同时将该 sessionID 加入黑名单，防止 title 恢复逻辑把坏 session 重新绑定
+		// 注意：必须在 content == "" 判断之前执行，否则清理逻辑会被跳过
+		if eventType == "session.error" && !isCronSession {
+			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
+				sessionID[:min(8, len(sessionID))], foundUserID)
+			foundAdapter.ClearSessionForUser(foundUserID)
+			erroredSessions.Store(sessionID, struct{}{})
+		}
+
 		if content == "" {
 			log.Printf("opencode event: no content extracted from event type %s for session %s",
 				eventType, sessionID[:min(8, len(sessionID))])
@@ -516,15 +536,6 @@ func main() {
 
 		// Route to adapter
 		routeErr := adapterRegistry.RouteEventToAdapter(ctx, foundChannel, sessionID, content)
-
-		// 会话出错后清除 session 映射，使下一条消息自动建立新会话
-		// 同时将该 sessionID 加入黑名单，防止 title 恢复逻辑把坏 session 重新绑定
-		if eventType == "session.error" && !isCronSession {
-			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
-				sessionID[:min(8, len(sessionID))], foundUserID)
-			foundAdapter.ClearSessionForUser(foundUserID)
-			erroredSessions.Store(sessionID, struct{}{})
-		}
 
 		return routeErr
 	})
@@ -565,6 +576,12 @@ func main() {
 		log.Printf("warning: could not start feishu websocket client: %v", err)
 	}
 	defer feishuHandler.Stop()
+
+	// Start WeChat long-poll client if enabled
+	if err := wechatHandler.Start(ctx); err != nil {
+		log.Printf("warning: could not start wechat poll client: %v", err)
+	}
+	defer wechatHandler.Stop()
 
 	// Setup HTTP server
 	srv := server.New(server.Config{
@@ -898,25 +915,9 @@ func extractContentFromEvent(event *opencodesdk.EventListResponse) (string, erro
 		return "", nil
 
 	case "session.error":
-		var wrapper struct {
-			Properties struct {
-				Message string `json:"message"`
-				Detail  string `json:"detail"`
-			} `json:"properties"`
-		}
-		if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &wrapper); err == nil {
-			var parts []string
-			if wrapper.Properties.Message != "" {
-				parts = append(parts, wrapper.Properties.Message)
-			}
-			if wrapper.Properties.Detail != "" {
-				parts = append(parts, wrapper.Properties.Detail)
-			}
-			if len(parts) > 0 {
-				return "⚠️ OpenCode 会话出错：" + strings.Join(parts, "; "), nil
-			}
-		}
-		return "⚠️ OpenCode 会话发生错误，请稍后重试。", nil
+		// session.error 已由 StreamingSessionHandler 处理（包括 overflow 检测和用户通知），
+		// 全局处理器只负责清理 session 映射（在调用方完成），不再重复发送错误消息。
+		return "", nil
 
 	case "session.status", "session.updated", "session.created", "session.diff",
 		"file.edited", "file.watcher.updated", "lsp.updated", "server.heartbeat", "message.updated":

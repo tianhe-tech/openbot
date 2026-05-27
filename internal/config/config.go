@@ -9,6 +9,7 @@ import (
 
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
+	"github.com/user/opencode-gateway/internal/adapters/wechat"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
 )
 
@@ -33,6 +34,7 @@ type Config struct {
 	ProxyReconnect         time.Duration
 	MemStorePath           string // path to the SQLite memory database; "" disables memory
 	WeCom                  wecom.Config
+	WeChat                 wechat.Config
 	FeiShu                 feishu.Config
 	DingTalk               dingtalk.Config
 
@@ -105,6 +107,13 @@ func Load() (Config, error) {
 			CorpID:         os.Getenv("WECOM_CORP_ID"),
 			CorpSecret:     os.Getenv("WECOM_CORP_SECRET"),
 			AgentID:        os.Getenv("WECOM_AGENT_ID"),
+		},
+		WeChat: wechat.Config{
+			BotToken:   os.Getenv("WECHAT_BOT_TOKEN"),
+			BaseURL:    getEnv("WECHAT_BASE_URL", "https://ilinkai.weixin.qq.com"),
+			AccountID:  os.Getenv("WECHAT_ACCOUNT_ID"),
+			StateDir:   os.Getenv("WECHAT_STATE_DIR"),
+			CDNBaseURL: getEnv("WECHAT_CDN_BASE_URL", "https://ilinkai.weixin.qq.com"),
 		},
 		FeiShu: feishu.Config{
 			AppID:             os.Getenv("FEISHU_APP_ID"),

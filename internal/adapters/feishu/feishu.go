@@ -88,6 +88,7 @@ type feishuTokenOverflowPendingState struct {
 	Metadata    map[string]string
 	Target      chatTarget
 	CreatedAt   time.Time
+	Executing   bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // SetRetryWorker wires up the retry store and worker for /retry command and
@@ -3140,6 +3141,12 @@ func (h *Handler) handleTokenOverflowQuickReply(ctx context.Context, target chat
 		return false, nil
 	}
 
+	// 如果已经在执行重试，阻止新消息并提示用户等待
+	if state.Executing {
+		_ = h.sendTextChunks(ctx, target, "⏳ 上下文压缩/重试正在进行中，请稍候...")
+		return true, nil
+	}
+
 	decision, setAlways, recognized := parseTokenOverflowDecision(content)
 	if !recognized {
 		_ = h.sendTextChunks(ctx, target, "请回复 1/2/3/4/5（或对应中文选项）来处理上下文超限问题。")
@@ -3226,6 +3233,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		return
 	}
 
+	// 标记为执行中，防止用户新消息创建并发请求
+	state.Executing = true
+	h.storeTokenOverflowPending(userID, state)
+
 	decision = strings.TrimSpace(decision)
 	if decision == "" {
 		decision = "summary"
@@ -3258,6 +3269,7 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 				h.clearTokenOverflowPending(userID)
 				return
 			}
+			_ = h.sendTextChunks(runCtx, state.Target, "✅ 压缩完成，正在重试消息...")
 			state.SessionID = sessionID
 		}
 	}
@@ -3270,35 +3282,105 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		state.SessionID = ""
 	}
 
-	response, err := h.client.SendMessage(runCtx, opencode.MessagePayload{
+	// 使用流式模式重试，避免长时间阻塞无反馈（同步模式曾导致 11 分钟无响应）
+	// 与正常流一致的批量发送逻辑：累积内容，按间隔批量发送，避免按字发消息
+	var retryBuf strings.Builder
+	var retryLastSent int
+	retryLastUpdate := time.Now()
+	const retryMinInterval = 5 * time.Second
+	const retryMinChars = 300
+	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled()
+
+	retryCallback := func(chunk string) error {
+		trimmed := strings.TrimSpace(chunk)
+		if trimmed == "" {
+			return nil
+		}
+		// 映射 session ID
+		if strings.HasPrefix(trimmed, "ses_") && len(trimmed) < 100 {
+			h.adapter.MapUserToSession(state.UserID, trimmed)
+			h.adapter.MapSessionData(trimmed, "receive_id", state.Target.receiveID)
+			h.adapter.MapSessionData(trimmed, "receive_id_type", state.Target.receiveIDType)
+			return nil
+		}
+		// 跳过思考信号
+		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+			return nil
+		}
+		// FlushSignal: 发送所有剩余未发送的内容
+		if chunk == opencode.FlushSignal {
+			unsent := retryBuf.String()[retryLastSent:]
+			if len(unsent) > 0 {
+				if err := h.sendTextChunks(runCtx, state.Target, unsent); err != nil {
+					log.Printf("feishu: retry flush send failed: %v", err)
+				} else {
+					retryLastSent = retryBuf.Len()
+				}
+			}
+			return nil
+		}
+		// 工具/步骤等立即发送的特殊消息
+		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.StepSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
+			sigMsg := chunk
+			for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix} {
+				sigMsg = strings.TrimPrefix(sigMsg, p)
+			}
+			if strings.TrimSpace(sigMsg) != "" {
+				_ = h.sendTextChunks(runCtx, state.Target, strings.TrimSpace(sigMsg))
+			}
+			return nil
+		}
+		// 立即发送的交互式提示消息
+		if isImmediateChunk(trimmed) {
+			return h.sendTextChunks(runCtx, state.Target, chunk)
+		}
+
+		// 累积内容，按间隔批量发送（与正常流一致：300字符 + 5秒间隔）
+		retryBuf.WriteString(chunk)
+		newLen := retryBuf.Len() - retryLastSent
+		now := time.Now()
+		if !bufferFinalUntilFlush && newLen >= retryMinChars && now.Sub(retryLastUpdate) >= retryMinInterval {
+			toSend := retryBuf.String()[retryLastSent:]
+			if err := h.sendTextChunks(runCtx, state.Target, toSend); err != nil {
+				log.Printf("feishu: retry intermediate send failed: %v", err)
+			} else {
+				retryLastSent = retryBuf.Len()
+				retryLastUpdate = now
+			}
+		}
+		return nil
+	}
+
+	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
 		Channel:     "feishu",
 		UserID:      state.UserID,
 		ThreadID:    state.ThreadID,
 		SessionID:   state.SessionID,
 		Content:     state.Content,
 		Agent:       state.Agent,
-		Streaming:   false,
+		Streaming:   true,
 		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
 		Metadata:    cloneStringMap(state.Metadata),
-	})
+	}, retryCallback)
 	if err != nil {
 		_ = h.sendTextChunks(runCtx, state.Target, fmt.Sprintf("❌ 已尝试%s后重试，但仍失败：%v", tokenOverflowDecisionLabel(decision), err))
 		h.clearTokenOverflowPending(userID)
 		return
 	}
 
+	// 发送剩余未发送的缓冲内容
+	if unsent := retryBuf.String()[retryLastSent:]; len(unsent) > 0 {
+		if err := h.sendTextChunks(runCtx, state.Target, unsent); err != nil {
+			log.Printf("feishu: retry final send failed: %v", err)
+		}
+	}
+
 	if response.SessionID != "" {
 		h.adapter.MapUserToSession(state.UserID, response.SessionID)
 		h.adapter.MapSessionData(response.SessionID, "receive_id", state.Target.receiveID)
 		h.adapter.MapSessionData(response.SessionID, "receive_id_type", state.Target.receiveIDType)
-	}
-
-	finalReply := strings.TrimSpace(response.Reply)
-	if finalReply == "" {
-		finalReply = "✅ 已完成重试，本次没有可直接返回的文本内容。"
-	}
-	if err := h.sendTextChunks(runCtx, state.Target, finalReply); err != nil {
-		log.Printf("feishu: failed to send token-overflow retry reply: %v", err)
 	}
 
 	h.clearTokenOverflowPending(userID)

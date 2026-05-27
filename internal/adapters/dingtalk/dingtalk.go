@@ -157,6 +157,7 @@ type tokenOverflowPendingState struct {
 	SessionWebhook   string
 	ConversationType string
 	CreatedAt        time.Time
+	Executing        bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // NewHandler wires the adapter with an OpenCode client.
@@ -2867,6 +2868,13 @@ func (h *Handler) handleTokenOverflowQuickReply(ctx context.Context, data *chatb
 		return false, nil
 	}
 
+	// 如果已经在执行重试，阻止新消息并提示用户等待
+	if state.Executing {
+		replier := chatbot.NewChatbotReplier()
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("⏳ 上下文压缩/重试正在进行中，请稍候..."))
+		return true, nil
+	}
+
 	replier := chatbot.NewChatbotReplier()
 	decision, setAlways, recognized := parseTokenOverflowDecision(content)
 	if !recognized {
@@ -2932,6 +2940,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		return
 	}
 
+	// 标记为执行中，防止用户新消息创建并发请求
+	state.Executing = true
+	h.storeTokenOverflowPending(userID, state)
+
 	decision = strings.TrimSpace(decision)
 	if decision == "" {
 		decision = "summary"
@@ -2964,6 +2976,7 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 				h.clearTokenOverflowPending(userID)
 				return
 			}
+			_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, "✅ 压缩完成，正在重试消息...")
 			state.SessionID = sessionID
 		}
 	}
@@ -2976,17 +2989,95 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		state.SessionID = ""
 	}
 
-	response, err := h.client.SendMessage(runCtx, opencode.MessagePayload{
+	// 使用流式模式重试，复用 AI Card 路径避免每个 delta 变成独立消息
+	preferAICard := h.shouldPreferAICardForOpenCodeReply()
+	sendRetryReply := func(msg string) error {
+		if preferAICard {
+			return h.sendReplyWithAICardFallback(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, msg)
+		}
+		return h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, msg)
+	}
+
+	var retryBuf strings.Builder
+	var retryLastSent int
+	retryLastUpdate := time.Now()
+	const retryMinInterval = 5 * time.Second
+	const retryMinChars = 300
+
+	retryCallback := func(chunk string) error {
+		trimmed := strings.TrimSpace(chunk)
+		if trimmed == "" {
+			return nil
+		}
+		if strings.HasPrefix(trimmed, "ses_") && len(trimmed) < 100 {
+			h.adapter.MapUserToSession(state.UserID, trimmed)
+			h.adapter.MapSessionData(trimmed, "channel", state.SessionWebhook)
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+			return nil
+		}
+		// FlushSignal: 发送所有剩余未发送的内容
+		if chunk == opencode.FlushSignal {
+			unsent := retryBuf.String()[retryLastSent:]
+			if len(unsent) > 0 {
+				if preferAICard {
+					// AI Card 路径会完整更新，跳过此处；由 streaming end 发送
+					log.Printf("dingtalk stream: retry flush: deferring %d bytes to AI Card final path", len(unsent))
+				} else {
+					if err := sendRetryReply(unsent); err != nil {
+						log.Printf("dingtalk stream: retry flush send failed: %v", err)
+					} else {
+						retryLastSent = retryBuf.Len()
+					}
+				}
+			}
+			return nil
+		}
+		// 工具/步骤等立即发送的特殊消息
+		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.StepSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
+			sigMsg := chunk
+			for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix} {
+				sigMsg = strings.TrimPrefix(sigMsg, p)
+			}
+			if strings.TrimSpace(sigMsg) != "" {
+				_ = sendRetryReply(strings.TrimSpace(sigMsg))
+			}
+			return nil
+		}
+		// 立即发送的交互式提示消息
+		if strings.HasPrefix(chunk, "⏳") || strings.HasPrefix(chunk, "⏱️") ||
+			strings.HasPrefix(chunk, "🔐") || strings.HasPrefix(chunk, "❓") ||
+			strings.HasPrefix(chunk, "🤔💭") {
+			return sendRetryReply(chunk)
+		}
+
+		// 累积内容，按间隔批量发送
+		retryBuf.WriteString(chunk)
+		newLen := retryBuf.Len() - retryLastSent
+		now := time.Now()
+		if !preferAICard && newLen >= retryMinChars && now.Sub(retryLastUpdate) >= retryMinInterval {
+			if err := sendRetryReply(retryBuf.String()); err == nil {
+				retryLastSent = retryBuf.Len()
+				retryLastUpdate = now
+			}
+		}
+		return nil
+	}
+
+	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
 		Channel:     "dingtalk",
 		UserID:      state.UserID,
 		ThreadID:    state.ThreadID,
 		SessionID:   state.SessionID,
 		Content:     state.Content,
 		Agent:       state.Agent,
-		Streaming:   false,
+		Streaming:   true,
 		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
 		Metadata:    cloneStringMap(state.Metadata),
-	})
+	}, retryCallback)
 	if err != nil {
 		_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID,
 			fmt.Sprintf("❌ 已尝试%s后重试，但仍失败：%v", tokenOverflowDecisionLabel(decision), err))
@@ -2994,17 +3085,16 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		return
 	}
 
+	// 发送剩余未发送的缓冲内容
+	if unsent := retryBuf.String()[retryLastSent:]; len(unsent) > 0 {
+		if err := sendRetryReply(unsent); err != nil {
+			log.Printf("dingtalk stream: retry final send failed: %v", err)
+		}
+	}
+
 	if response.SessionID != "" {
 		h.adapter.MapUserToSession(state.UserID, response.SessionID)
 		h.adapter.MapSessionData(response.SessionID, "channel", state.SessionWebhook)
-	}
-
-	finalReply := strings.TrimSpace(response.Reply)
-	if finalReply == "" {
-		finalReply = "✅ 已完成重试，本次没有可直接返回的文本内容。"
-	}
-	if err := h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID, finalReply); err != nil {
-		log.Printf("dingtalk: failed to send token-overflow retry reply: %v", err)
 	}
 
 	h.clearTokenOverflowPending(userID)

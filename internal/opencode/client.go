@@ -1752,6 +1752,30 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 				log.Printf("opencode: processing event type=%s (no sessionID)", eventType)
 			}
 
+			// Pre-dispatch: unconditionally extract messageID→role from message.updated
+			// events. The user's message.updated often has NO sessionID in JSON, so the
+			// handler dispatch below would skip it and messageRoles would never be stored,
+			// causing user text to be echoed back as AI response.
+			if eventType == "message.updated" {
+				if raw := event.JSON.RawJSON(); raw != "" {
+					var mu struct {
+						Properties struct {
+							Info struct {
+								ID   string `json:"id"`
+								Role string `json:"role"`
+							} `json:"info"`
+						} `json:"properties"`
+					}
+					if err := json.Unmarshal([]byte(raw), &mu); err == nil {
+						if mu.Properties.Info.ID != "" && mu.Properties.Info.Role != "" {
+							c.messageRoles.Store(mu.Properties.Info.ID, mu.Properties.Info.Role)
+							log.Printf("opencode: pre-dispatch messageRoles stored msgID=%s role=%s",
+								mu.Properties.Info.ID[:min(8, len(mu.Properties.Info.ID))], mu.Properties.Info.Role)
+						}
+					}
+				}
+			}
+
 			// Fast path: if session ID found, call the specific session handler
 			if sessionID != "" {
 				if handler, ok := c.sessionHandlers.Load(sessionID); ok {
@@ -3578,6 +3602,43 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("opencode: ⚠️ context deadline exceeded for session %s, performing cleanup", sessionID[:8])
+
+			// 1. 清理 handler（防止泄漏：删除 runningSessions / probeSnapshots / handler 注册）
+			if handler != nil && handler.onComplete != nil {
+				handler.onComplete()
+			}
+
+			// 2. 尝试 abort 卡住的 session，让 opencode 服务端取消正在运行的 tool。
+			//    这等价于 TUI 中用户 Ctrl+C 的行为：
+			//    - opencode 服务端会 interrupt prompt loop
+			//    - onInterrupt handler 将 tool status 设为 "error"
+			//    - session 回到 idle 状态，保持完整可用
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			abortErr := c.AbortSession(abortCtx, sessionID)
+			abortCancel()
+
+			if abortErr == nil {
+				// Abort 成功：session 将很快恢复 idle，保留 thread→session 映射。
+				// 下次用户发消息时复用同一 session（完整上下文），模型会看到 tool error 并正常继续。
+				log.Printf("opencode: ✅ abort session %s succeeded on ctx.Done, session preserved for reuse", sessionID[:8])
+				notice := "⚠️ 任务执行超时，已取消当前工具执行。会话上下文已保留，请发送消息继续对话。"
+				if callback != nil {
+					_ = callback(notice)
+				}
+			} else {
+				// Abort 失败：session 可能彻底卡死，降级到 handoff（清除映射 + 新 session）
+				log.Printf("opencode: ⚠️ abort session %s failed on ctx.Done: %v, falling back to handoff", sessionID[:8], abortErr)
+				if payload.ThreadID != "" {
+					notice := c.triggerSessionHandoff(payload, sessionID)
+					log.Printf("opencode: handoff triggered on ctx.Done for session %s (thread=%s)",
+						sessionID[:8], payload.ThreadID)
+					if notice != "" && callback != nil {
+						_ = callback(notice)
+					}
+				}
+			}
+
 			return Response{}, ctx.Err()
 
 		case err := <-errorChan:
@@ -3645,22 +3706,21 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			log.Printf("opencode: 🔍 ticker check - session=%s, isAsync=%t, isCompleted=%t, hasSent=%t, hasStepFinish=%t, lastEvent=%v ago (type=%s), idleCount=%d",
 				sessionID[:8], isAsyncMode, isCompleted, hasSentContent, hasStepFinish, timeSinceLastEvent, lastEventType, idleCheckCount)
 
-			// 如果收到了 step-finish 事件且已发送内容，5秒后没有新事件就认为完成
-			// (step-finish 通常标志着模型输出完成，后续应该很快有 session.idle)
-			if isAsyncMode && hasStepFinish && hasSentContent && !stepFinishTime.IsZero() {
+			// step-finish 仅用于日志/token 计数，不再作为完成信号。
+			// 正常完成由 session.idle 事件驱动（handler.IsCompleted()），
+			// ticker 仅作为超时安全网。这与官方 TUI 的行为一致。
+			hasActiveTools := handler.HasActiveTools()
+			if isAsyncMode && hasStepFinish && !stepFinishTime.IsZero() {
 				timeSinceStepFinish := time.Since(stepFinishTime)
-				if timeSinceStepFinish > 5*time.Second {
-					log.Printf("opencode: 🏁 received step-finish %v ago (has sent content), treating as completed for session %s",
-						timeSinceStepFinish, sessionID[:8])
-					c.recordMemAsync(payload, handler.GetLastContent())
-					return c.finalizeAsyncStreamingResponse(payload, sessionID, handler, callback, asyncResponse), nil
-				}
+				log.Printf("opencode: 📊 step-finish %v ago (activeTools=%d, hasSent=%t) for session %s — waiting for session.idle",
+					timeSinceStepFinish, handler.ActiveToolCount(), hasSentContent, sessionID[:8])
 			}
 
 			// 如果已发送内容且超过阈值无新事件，认为可能完成
 			// 阈值可通过 OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS 调整（默认30s）
-			if isAsyncMode && hasSentContent && timeSinceLastEvent > streamIdleTimeoutHasContent {
-				log.Printf("opencode: ⏱️ streaming idle for %v (has sent content, threshold=%v), treating as completed for session %s",
+			// ⚠️ 同样需要检查活跃 tool：有 tool 运行时不应因 idle 超时退出
+			if isAsyncMode && hasSentContent && !hasActiveTools && timeSinceLastEvent > streamIdleTimeoutHasContent {
+				log.Printf("opencode: ⏱️ streaming idle for %v (has sent content, no active tools, threshold=%v), treating as completed for session %s",
 					timeSinceLastEvent, streamIdleTimeoutHasContent, sessionID[:8])
 				c.recordMemAsync(payload, handler.GetLastContent())
 				return c.finalizeAsyncStreamingResponse(payload, sessionID, handler, callback, asyncResponse), nil
@@ -4039,6 +4099,22 @@ func (c *Client) triggerSessionHandoff(payload MessagePayload, sessionID string)
 }
 
 func (c *Client) finalizeAsyncStreamingResponse(payload MessagePayload, sessionID string, handler *StreamingSessionHandler, callback StreamCallback, response Response) Response {
+	// Ensure handler is properly cleaned up on all exit paths.
+	// Without this, the handler stays registered after the ticker returns,
+	// keeps processing SSE events, and its callback closure references an
+	// expired ctxToken — causing dozens of "send reply failed" errors.
+	if handler != nil {
+		handler.mu.Lock()
+		if !handler.completed {
+			handler.completed = true
+			handler.stopWaitingTimer()
+		}
+		handler.mu.Unlock()
+		// 通过 sync.Once 保证幂等：即使 session.idle 已经触发过 onComplete，
+		// 这里再调一次也是安全的 no-op。
+		handler.fireOnComplete()
+	}
+
 	if strings.TrimSpace(response.Reply) != "" {
 		return response
 	}
