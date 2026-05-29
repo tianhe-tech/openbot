@@ -3602,44 +3602,58 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("opencode: ⚠️ context deadline exceeded for session %s, performing cleanup", sessionID[:8])
+			log.Printf("opencode: ⚠️ context deadline for session %s, flushing accumulated content (no abort)", sessionID[:8])
 
-			// 1. 清理 handler（防止泄漏：删除 runningSessions / probeSnapshots / handler 注册）
-			if handler != nil && handler.onComplete != nil {
-				handler.onComplete()
-			}
+			// 清理 handler，flush 积累内容。不 abort session —— 让任务在后台
+			// 继续运行，session 保持可用。下次用户发消息时可复用同一 session。
+			if handler != nil {
+				handler.mu.Lock()
+				if !handler.completed {
+					handler.completed = true
+					handler.stopWaitingTimer()
+				}
+				handler.mu.Unlock()
 
-			// 2. 尝试 abort 卡住的 session，让 opencode 服务端取消正在运行的 tool。
-			//    这等价于 TUI 中用户 Ctrl+C 的行为：
-			//    - opencode 服务端会 interrupt prompt loop
-			//    - onInterrupt handler 将 tool status 设为 "error"
-			//    - session 回到 idle 状态，保持完整可用
-			abortCtx, abortCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			abortErr := c.AbortSession(abortCtx, sessionID)
-			abortCancel()
-
-			if abortErr == nil {
-				// Abort 成功：session 将很快恢复 idle，保留 thread→session 映射。
-				// 下次用户发消息时复用同一 session（完整上下文），模型会看到 tool error 并正常继续。
-				log.Printf("opencode: ✅ abort session %s succeeded on ctx.Done, session preserved for reuse", sessionID[:8])
-				notice := "⚠️ 任务执行超时，已取消当前工具执行。会话上下文已保留，请发送消息继续对话。"
+				// 发送 FlushSignal，确保 adapter 把所有积累的内容发出去
 				if callback != nil {
-					_ = callback(notice)
+					_ = callback(FlushSignal)
 				}
-			} else {
-				// Abort 失败：session 可能彻底卡死，降级到 handoff（清除映射 + 新 session）
-				log.Printf("opencode: ⚠️ abort session %s failed on ctx.Done: %v, falling back to handoff", sessionID[:8], abortErr)
-				if payload.ThreadID != "" {
-					notice := c.triggerSessionHandoff(payload, sessionID)
-					log.Printf("opencode: handoff triggered on ctx.Done for session %s (thread=%s)",
-						sessionID[:8], payload.ThreadID)
-					if notice != "" && callback != nil {
-						_ = callback(notice)
-					}
-				}
+
+				handler.fireOnComplete()
 			}
 
-			return Response{}, ctx.Err()
+			// 返回已积累的内容（而非错误），保证最终结果送达
+			content := ""
+			if handler != nil {
+				content = handler.GetLastContent()
+			}
+
+			if strings.TrimSpace(content) != "" {
+				log.Printf("opencode: 📤 returning accumulated content (%d chars) on context deadline for session %s", len(content), sessionID[:8])
+				c.recordMemAsync(payload, content)
+				return Response{Reply: content, Trace: sessionID}, nil
+			}
+
+			// 没有积累的内容，尝试从 API 获取最新回复
+			fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 8*time.Second)
+			reply, messageID, fresh, fetchErr := c.fetchFreshAssistantReply(fallbackCtx, sessionID)
+			fallbackCancel()
+			if fetchErr == nil && fresh && strings.TrimSpace(reply) != "" {
+				log.Printf("opencode: 📤 fetched fresh reply (%d chars) on context deadline for session %s", len(reply), sessionID[:8])
+				if callback != nil {
+					_ = callback(reply)
+				}
+				c.recordMemAsync(payload, reply)
+				return Response{Reply: reply, MessageID: messageID, Trace: sessionID}, nil
+			}
+
+			// 仍无内容，返回通知（不返回 error，避免 adapter 只发错误信息）
+			notice := "⏳ 任务仍在执行中，请稍后发送消息查看结果。会话上下文已保留。"
+			log.Printf("opencode: ⚠️ no content accumulated on context deadline for session %s, sending notice", sessionID[:8])
+			if callback != nil {
+				_ = callback(notice)
+			}
+			return Response{Reply: notice, Trace: sessionID}, nil
 
 		case err := <-errorChan:
 			return Response{}, err

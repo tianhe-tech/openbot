@@ -76,7 +76,7 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, event
 		defer h.mu.Unlock()
 		if !h.contentSent && !h.completed && !h.waitingHintSent {
 			h.waitingHintSent = true
-			_ = h.callback("⏳ 正在努力处理中...\n")
+			_ = h.callback(QuestionSignalPrefix + "⏳ 正在努力处理中...")
 		}
 	})
 	return h
@@ -127,6 +127,11 @@ func (s *StreamingSessionHandler) emitEventFromChunk(chunk string) {
 
 	if strings.HasPrefix(chunk, TodoSignalPrefix) {
 		s.emitEvent(StreamEventTodo, strings.TrimPrefix(chunk, TodoSignalPrefix), nil, nil, nil, "todo")
+		return
+	}
+
+	if strings.HasPrefix(chunk, QuestionSignalPrefix) {
+		s.emitEvent(StreamEventInfo, strings.TrimPrefix(chunk, QuestionSignalPrefix), nil, nil, nil, "question")
 		return
 	}
 
@@ -331,8 +336,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: sending %s message (len=%d, prefix=%s) for session %s",
 			event.Type, len(questionMsg), questionMsg[:min(10, len(questionMsg))], s.sessionID[:8])
 
-		// 只发送一次！通过streaming callback发送（将权限请求内联到输出流中）
-		if err := s.callback(questionMsg); err != nil {
+		// 只发送一次！通过streaming callback发送，使用 QuestionSignalPrefix
+		// 让 adapter 立即发送（不进入内容积累缓冲区）
+		if err := s.callback(QuestionSignalPrefix + questionMsg); err != nil {
 			log.Printf("opencode: question/permission callback error: %v", err)
 		} else {
 			if question != nil {
@@ -400,7 +406,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			errorMsg = fmt.Sprintf("⚠️ OpenCode 会话出错：%s", errorMsg)
 		}
 
-		if err := s.callback(errorMsg); err != nil {
+		if err := s.callback(QuestionSignalPrefix + errorMsg); err != nil {
 			log.Printf("opencode: session.error callback error: %v", err)
 		} else {
 			s.emitEvent(StreamEventError, errorMsg, nil, nil, nil, eventType)
@@ -1351,6 +1357,10 @@ const StepSignalPrefix = "\x00step:"
 
 // TodoSignalPrefix marks auto-pushed todo progress updates.
 const TodoSignalPrefix = "\x00todo:"
+
+// QuestionSignalPrefix marks permission/question messages that need immediate
+// delivery to the user (not buffered in content accumulation).
+const QuestionSignalPrefix = "\x00question:"
 
 // TodoAutoPushInterval controls minimum interval between auto todo updates.
 const TodoAutoPushInterval = 5 * time.Second

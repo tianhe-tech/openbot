@@ -1319,6 +1319,17 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			}
 			return nil
 		}
+		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
+			qMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
+			if qMsg == "" {
+				return nil
+			}
+			if err := sendReply(qMsg); err != nil {
+				log.Printf("dingtalk stream: ⚠️ failed to send question/permission message: %v", err)
+				return err
+			}
+			return nil
+		}
 
 		// FlushSignal: session 结束，立即发送所有尚未发送的内容
 		if chunk == opencode.FlushSignal {
@@ -3037,9 +3048,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		// 工具/步骤等立即发送的特殊消息
 		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) ||
 			strings.HasPrefix(chunk, opencode.StepSignalPrefix) ||
-			strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
+			strings.HasPrefix(chunk, opencode.TodoSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
 			sigMsg := chunk
-			for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix} {
+			for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix, opencode.QuestionSignalPrefix} {
 				sigMsg = strings.TrimPrefix(sigMsg, p)
 			}
 			if strings.TrimSpace(sigMsg) != "" {

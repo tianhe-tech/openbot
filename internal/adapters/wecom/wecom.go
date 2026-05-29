@@ -366,6 +366,15 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 			}
 			return nil
 		}
+		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
+			if msg != "" {
+				mu.Lock()
+				meta = append(meta, msg)
+				mu.Unlock()
+			}
+			return nil
+		}
 		if chunk == "" {
 			return nil
 		}
@@ -1398,6 +1407,13 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		}
 		if chunk == opencode.FlushSignal {
 			return nil
+		}
+		// Strip signal prefixes so they don't leak into the reply
+		for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix, opencode.QuestionSignalPrefix} {
+			if strings.HasPrefix(chunk, p) {
+				chunk = strings.TrimPrefix(chunk, p)
+				break
+			}
 		}
 		retryReply.WriteString(chunk)
 		return nil

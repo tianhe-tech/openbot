@@ -495,17 +495,6 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	sessionID, _ := h.adapter.GetSessionForUser(userID)
 	threadID := chatID
 
-	sendReply := func(text string) {
-		text = strings.TrimSpace(text)
-		if text == "" {
-			return
-		}
-		h.trackSentText(userID, text)
-		if err := h.weClient.SendText(userID, text, ctxToken); err != nil {
-			log.Printf("wechat: send reply failed user=%s: %v", userID, err)
-		}
-	}
-
 	// Accumulated content state (mutex-protected)
 	var fullReplyMu sync.Mutex
 	var fullReply strings.Builder
@@ -517,6 +506,7 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 
 	const minUpdateChars = 300
 	const minUpdateInterval = 5 * time.Second
+	bufferFinalUntilFlush := h.client.IsFinalOnlyEnabled() || h.client.IsThinkingEnabled()
 
 	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
@@ -543,10 +533,15 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		if chunk == opencode.FlushSignal {
 			fullReplyMu.Lock()
 			unsent := fullReply.String()[lastSentLength:]
-			lastSentLength = fullReply.Len()
 			fullReplyMu.Unlock()
 			if strings.TrimSpace(unsent) != "" {
-				sendReply(unsent)
+				if err := h.sendTextChunks(userID, unsent, ctxToken); err != nil {
+					log.Printf("wechat: ⚠️ flush send failed user=%s: %v (will retry at final)", userID, err)
+				} else {
+					fullReplyMu.Lock()
+					lastSentLength = fullReply.Len()
+					fullReplyMu.Unlock()
+				}
 			}
 			return nil
 		}
@@ -562,25 +557,40 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 			return nil
 		}
 
-		// Tool/step/todo signals → send immediately
+		// Tool/step/todo/question signals → send immediately (with chunking protection)
 		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.ToolSignalPrefix))
 			if msg != "" {
-				sendReply("🔧 " + msg)
+				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
+					log.Printf("wechat: ⚠️ tool send failed user=%s: %v", userID, err)
+				}
 			}
 			return nil
 		}
 		if strings.HasPrefix(chunk, opencode.StepSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.StepSignalPrefix))
 			if msg != "" {
-				sendReply("📌 " + msg)
+				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
+					log.Printf("wechat: ⚠️ step send failed user=%s: %v", userID, err)
+				}
 			}
 			return nil
 		}
 		if strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.TodoSignalPrefix))
 			if msg != "" {
-				sendReply("📋 " + msg)
+				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
+					log.Printf("wechat: ⚠️ todo send failed user=%s: %v", userID, err)
+				}
+			}
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
+			if msg != "" {
+				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
+					log.Printf("wechat: ⚠️ question send failed user=%s: %v", userID, err)
+				}
 			}
 			return nil
 		}
@@ -595,24 +605,37 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		currentLen := fullReply.Len()
 		newContentLen := currentLen - lastSentLength
 		timeSinceUpdate := time.Since(lastUpdateTime)
-		shouldSend := newContentLen >= minUpdateChars && timeSinceUpdate >= minUpdateInterval
+		shouldSend := !bufferFinalUntilFlush && newContentLen >= minUpdateChars && timeSinceUpdate >= minUpdateInterval
 		var toSend string
 		if shouldSend {
 			toSend = fullReply.String()[lastSentLength:]
-			lastSentLength = currentLen
-			lastUpdateTime = time.Now()
 		}
 		fullReplyMu.Unlock()
 
 		if shouldSend && strings.TrimSpace(toSend) != "" {
-			sendReply(toSend)
+			if err := h.sendTextChunks(userID, toSend, ctxToken); err != nil {
+				log.Printf("wechat: ⚠️ intermediate send failed user=%s: %v (will retry at final)", userID, err)
+			} else {
+				fullReplyMu.Lock()
+				lastSentLength = fullReply.Len()
+				lastUpdateTime = time.Now()
+				fullReplyMu.Unlock()
+			}
 		}
 		return nil
 	})
 
 	if err != nil {
 		log.Printf("wechat: streaming error user=%s: %v", userID, err)
-		sendReply("⚠️ 处理出错：" + truncate(err.Error(), 300))
+		// 即使出错，也要把已积累的未发送内容发给用户，保证最终结果送达
+		fullReplyMu.Lock()
+		errUnsent := fullReply.String()[lastSentLength:]
+		fullReplyMu.Unlock()
+		if strings.TrimSpace(errUnsent) != "" {
+			log.Printf("wechat: 📤 sending accumulated content on error (%d unsent) user=%s", len(errUnsent), userID)
+			_ = h.sendTextChunks(userID, errUnsent, ctxToken)
+		}
+		_ = h.sendTextChunks(userID, "⚠️ 处理出错："+truncate(err.Error(), 300), ctxToken)
 		return
 	}
 
@@ -630,18 +653,18 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	fullReplyMu.Unlock()
 
 	if thinkingText != "" {
-		sendReply("💭 思考过程:\n" + thinkingText)
+		_ = h.sendTextChunks(userID, "💭 思考过程:\n"+thinkingText, ctxToken)
 	}
 
 	if strings.TrimSpace(unsent) != "" {
 		log.Printf("wechat: 📤 sending final message (%d total, %d unsent)", len(accumulatedContent), len(unsent))
-		sendReply(unsent)
+		_ = h.sendTextChunks(userID, unsent, ctxToken)
 	} else if len(accumulatedContent) == 0 {
 		// No content was streamed; use the synchronous reply if available.
 		if strings.TrimSpace(response.Reply) != "" {
-			sendReply(response.Reply)
+			_ = h.sendTextChunks(userID, response.Reply, ctxToken)
 		} else {
-			sendReply("✅ 处理完成")
+			_ = h.sendTextChunks(userID, "✅ 处理完成", ctxToken)
 		}
 	} else {
 		log.Printf("wechat: all content already sent (%d bytes)", len(accumulatedContent))
@@ -1831,6 +1854,36 @@ func replyToPermissionResponse(input string) string {
 		return "always"
 	}
 	return ""
+}
+
+const maxWechatTextLength = 1800
+
+func chunkText(content string, limit int) []string {
+	runes := []rune(content)
+	if limit <= 0 || len(runes) <= limit {
+		return []string{content}
+	}
+	var chunks []string
+	for start := 0; start < len(runes); start += limit {
+		end := start + limit
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[start:end]))
+	}
+	return chunks
+}
+
+func (h *Handler) sendTextChunks(userID, text, ctxToken string) error {
+	chunks := chunkText(text, maxWechatTextLength)
+	for _, chunk := range chunks {
+		h.trackSentText(userID, chunk)
+		if err := h.weClient.SendText(userID, chunk, ctxToken); err != nil {
+			return err
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return nil
 }
 
 func truncate(s string, maxLen int) string {
