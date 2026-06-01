@@ -242,10 +242,19 @@ func (c *Client) SendWeixinMessage(msg *WeixinMessage) error {
 		return err
 	}
 	if resp.Ret != 0 || resp.Errcode != 0 {
-		return fmt.Errorf("sendmessage ret=%d errcode=%d errmsg=%s", resp.Ret, resp.Errcode, resp.Errmsg)
+		base := fmt.Errorf("sendmessage ret=%d errcode=%d errmsg=%s", resp.Ret, resp.Errcode, resp.Errmsg)
+		// ret=-2 with empty errmsg is iLink bot rate-limit / anti-spam rejection.
+		if resp.Ret == -2 && resp.Errcode == 0 {
+			return fmt.Errorf("%w: %s", ErrRateLimited, base.Error())
+		}
+		return base
 	}
 	return nil
 }
+
+// ErrRateLimited is returned (wrapped) when the iLink bot API rejects a send
+// due to anti-spam / frequency limiting (ret=-2, empty errmsg).
+var ErrRateLimited = errors.New("wechat rate limited")
 
 type configEnvelope struct {
 	IlinkUserID  string   `json:"ilink_user_id"`
@@ -346,4 +355,82 @@ func (c *Client) SendText(toUserID, text, contextToken string) error {
 // SendTypingIndicator sends a typing-start indicator.
 func (c *Client) SendTypingIndicator(ilinkUserID, typingTicket string) error {
 	return c.SendTyping(ilinkUserID, typingTicket, TypingStatusTyping)
+}
+
+// --- Media upload ---
+
+type getUploadURLEnvelope struct {
+	FileKey     string   `json:"filekey"`
+	MediaType   int      `json:"media_type"`
+	ToUserID    string   `json:"to_user_id"`
+	RawSize     int      `json:"rawsize"`
+	RawFileMD5  string   `json:"rawfilemd5"`
+	FileSize    int      `json:"filesize"`
+	NoNeedThumb bool     `json:"no_need_thumb"`
+	AESKey      string   `json:"aeskey"`
+	BaseInfo    BaseInfo `json:"base_info"`
+}
+
+// GetUploadURL gets a CDN upload URL for sending media files.
+func (c *Client) GetUploadURL(toUserID string, mediaType int, filekey, aesKeyHex string, rawSize int, rawFileMD5 string, fileSize int) (*GetUploadURLResponse, error) {
+	body := &getUploadURLEnvelope{
+		FileKey:     filekey,
+		MediaType:   mediaType,
+		ToUserID:    toUserID,
+		RawSize:     rawSize,
+		RawFileMD5:  rawFileMD5,
+		FileSize:    fileSize,
+		NoNeedThumb: true,
+		AESKey:      aesKeyHex,
+		BaseInfo:    buildBaseInfo(),
+	}
+	var resp GetUploadURLResponse
+	if err := c.post("ilink/bot/getuploadurl", body, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Ret != 0 || resp.Errcode != 0 {
+		return nil, fmt.Errorf("getuploadurl ret=%d errcode=%d errmsg=%s", resp.Ret, resp.Errcode, resp.Errmsg)
+	}
+	return &resp, nil
+}
+
+// UploadCiphertext posts encrypted bytes to the CDN and returns the encrypted query param.
+func (c *Client) UploadCiphertext(uploadURL string, ciphertext []byte) (string, error) {
+	bodyReader := strings.NewReader(string(ciphertext))
+	req, err := http.NewRequest("POST", uploadURL, bodyReader)
+	if err != nil {
+		return "", err
+	}
+
+	// Set headers: start with standard headers, override Content-Type
+	h := c.headers()
+	h.Set("Content-Type", "application/octet-stream")
+	req.Header = h
+	req.ContentLength = int64(len(ciphertext))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("CDN upload: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		limit := len(raw)
+		if limit > 200 {
+			limit = 200
+		}
+		return "", fmt.Errorf("CDN upload HTTP %d: %s", resp.StatusCode, string(raw[:limit]))
+	}
+
+	encryptedParam := resp.Header.Get("x-encrypted-param")
+	if encryptedParam == "" {
+		raw, _ := io.ReadAll(resp.Body)
+		limit := len(raw)
+		if limit > 200 {
+			limit = 200
+		}
+		return "", fmt.Errorf("CDN upload missing x-encrypted-param header: %s", string(raw[:limit]))
+	}
+	return encryptedParam, nil
 }

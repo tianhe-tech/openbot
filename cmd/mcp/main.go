@@ -168,7 +168,7 @@ func (s *mcpServer) toolDefinitions() []mcpToolDef {
 	return []mcpToolDef{
 		{
 			Name:        "memory_search",
-			Description: "搜索用户的历史工作记忆。当用户询问过去做过什么项目、之前的工作内容、历史记录时调用此工具。支持关键词搜索，返回匹配的工作记录和项目概览。使用场景：用户问'我最近做了什么'、'之前那个爬虫项目'、'上次部署的项目'等。",
+			Description: "按具体关键词搜索历史工作记忆。仅当用户问题中包含明确的项目名、技术词或主题词时使用（如 '之前那个 aicfs 项目'、'爬虫部署'、'docker 配置'）。如果用户只是泛泛地问'最近做了什么/有哪些项目/开发了什么'这类没有具体关键词的问题，请改用 memory_list_projects 或 memory_recent。",
 			InputSchema: mcpToolSchema{
 				Type: "object",
 				Properties: map[string]mcpPropertyDef{
@@ -186,7 +186,7 @@ func (s *mcpServer) toolDefinitions() []mcpToolDef {
 		},
 		{
 			Name:        "memory_list_projects",
-			Description: "列出用户的所有项目及其活动概览。当用户问'我有哪些项目'、'最近在做什么'、'开发了哪些东西'时调用。不需要关键词，直接返回项目列表。",
+			Description: "列出用户所有项目及其活动概览。当用户泛泛地问'我有哪些项目'、'最近做了什么程序'、'开发了哪些东西'、'最近开发了哪些项目'时优先调用此工具，而不是 memory_search。不需要关键词，直接返回项目列表。",
 			InputSchema: mcpToolSchema{
 				Type: "object",
 				Properties: map[string]mcpPropertyDef{
@@ -282,7 +282,58 @@ func (s *mcpServer) toolMemorySearch(args map[string]interface{}) (string, error
 
 	projects, _ := s.store.ProjectSummaries("", "", since, 1)
 
+	// Fallback: if keyword recall hit nothing OR the query is broad (no concrete
+	// non-vague keyword), surface the most recent records so that questions like
+	// "最近开发了哪些项目" still produce useful results even when project labels
+	// were never extracted at write time.
+	if len(records) == 0 || isBroadQuery(query) {
+		if recent, rerr := s.store.Recent("", "", days, 15); rerr == nil && len(recent) > 0 {
+			// Merge: prefer keyword hits first, then append recents not already present.
+			seen := make(map[string]struct{}, len(records))
+			for _, r := range records {
+				seen[r.ID] = struct{}{}
+			}
+			for _, r := range recent {
+				if _, dup := seen[r.ID]; dup {
+					continue
+				}
+				records = append(records, r)
+				if len(records) >= 20 {
+					break
+				}
+			}
+		}
+	}
+
 	return formatSearchResult(records, projects), nil
+}
+
+// broadQueryHints are vague Chinese/English words that, when they are the only
+// content of the query, indicate the user wants a general overview rather than
+// a specific keyword match.
+var broadQueryHints = map[string]struct{}{
+	"最近": {}, "以前": {}, "之前": {}, "过去": {}, "近期": {},
+	"什么": {}, "哪些": {}, "哪个": {}, "什么样": {},
+	"开发": {}, "做了": {}, "做过": {}, "做的": {}, "在做": {},
+	"项目": {}, "程序": {}, "东西": {}, "工作": {}, "事情": {},
+	"recent": {}, "what": {}, "projects": {}, "work": {}, "done": {},
+}
+
+// isBroadQuery returns true when the query contains no concrete keyword beyond
+// the vague "最近做了什么项目" vocabulary — in that case keyword-based Recall is
+// expected to under-perform and we should also surface Recent records.
+func isBroadQuery(query string) bool {
+	kws := memstore.ExtractKeywords(query)
+	for _, kw := range kws {
+		if _, vague := broadQueryHints[strings.ToLower(kw)]; vague {
+			continue
+		}
+		// Any non-vague keyword of meaningful length disqualifies broad mode.
+		if len([]rune(kw)) >= 2 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *mcpServer) toolListProjects(args map[string]interface{}) (string, error) {

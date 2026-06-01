@@ -150,6 +150,29 @@ type Credentials struct {
 	IlinkUserID string `json:"ilink_user_id,omitempty"`
 }
 
+// --- Upload Types ---
+
+type GetUploadURLRequest struct {
+	FileKey     string   `json:"filekey"`
+	MediaType   int      `json:"media_type"`
+	ToUserID    string   `json:"to_user_id"`
+	RawSize     int      `json:"rawsize"`
+	RawFileMD5  string   `json:"rawfilemd5"`
+	FileSize    int      `json:"filesize"`
+	NoNeedThumb bool     `json:"no_need_thumb"`
+	AESKey      string   `json:"aeskey"`
+	BaseInfo    BaseInfo `json:"base_info,omitempty"`
+}
+
+type GetUploadURLResponse struct {
+	UploadParam      string `json:"upload_param"`
+	ThumbUploadParam string `json:"thumb_upload_param"`
+	UploadFullURL    string `json:"upload_full_url"`
+	Ret              int    `json:"ret"`
+	Errcode          int    `json:"errcode"`
+	Errmsg           string `json:"errmsg"`
+}
+
 // --- Constants ---
 
 const (
@@ -163,6 +186,11 @@ const (
 	ItemTypeVoice = 3
 	ItemTypeFile  = 4
 	ItemTypeVideo = 5
+
+	UploadMediaTypeImage = 1
+	UploadMediaTypeVideo = 2
+	UploadMediaTypeFile  = 3
+	UploadMediaTypeVoice = 4
 
 	TypingStatusTyping = 1
 	TypingStatusCancel = 2

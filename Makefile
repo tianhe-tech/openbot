@@ -36,6 +36,9 @@ endif
 GATEWAY_BIN := $(BIN_DIR)/openbot$(EXE)
 MCP_BIN     := $(BIN_DIR)/openbot-mcp$(EXE)
 ATTACH_BIN  := $(BIN_DIR)/openbot-attach$(EXE)
+WECHAT_BIN  := $(BIN_DIR)/openbot-wechat$(EXE)
+
+# ── Build targets ────
 
 # ── Go helpers (cross-platform, no shell deps) ───────────────
 MKDIRP := go run tools/mkdirp/main.go
@@ -47,8 +50,8 @@ ENV_FILE    ?= .env
 #  Targets
 # ══════════════════════════════════════════════════════════════
 
-.PHONY: all build install uninstall clean run run-env test vet lint \
-        build-gateway build-mcp build-attach \
+.PHONY: all build install uninstall clean run run-wechat run-env test vet lint \
+        build-gateway build-mcp build-attach build-wechat \
         build-linux build-darwin build-darwin-arm64 build-windows build-all \
         init-env init-dirs help
 
@@ -56,13 +59,13 @@ ENV_FILE    ?= .env
 all: build
 
 ## Build all binaries for the current OS
-build: init-dirs build-gateway build-mcp build-attach
+build: init-dirs build-gateway build-mcp build-attach build-wechat
 	@echo ""
 	@echo "===== Build complete ====="
 	@echo "  $(GATEWAY_BIN)"
 	@echo "  $(MCP_BIN)"
 	@echo "  $(ATTACH_BIN)"
-
+	@echo "  $(WECHAT_BIN)"
 build-gateway: init-dirs
 	@echo "[BUILD] openbot (gateway)..."
 	go build -ldflags "$(LDFLAGS)" -o $(GATEWAY_BIN) ./cmd/gateway
@@ -75,6 +78,10 @@ build-attach: init-dirs
 	@echo "[BUILD] openbot-attach..."
 	go build -ldflags "$(LDFLAGS)" -o $(ATTACH_BIN) ./cmd/attach
 
+build-wechat: init-dirs
+	@echo "[BUILD] openbot-wechat..."
+	go build -ldflags "$(LDFLAGS)" -o $(WECHAT_BIN) ./cmd/wechat-login
+
 # ── Install to GOPATH/bin (add to PATH for CLI access) ────────
 ## Install binaries to GOPATH/bin
 install: build
@@ -82,6 +89,7 @@ install: build
 	go run tools/install/main.go $(GATEWAY_BIN) $(INSTALL_DIR)/openbot$(EXE)
 	go run tools/install/main.go $(MCP_BIN)     $(INSTALL_DIR)/openbot-mcp$(EXE)
 	go run tools/install/main.go $(ATTACH_BIN)  $(INSTALL_DIR)/openbot-attach$(EXE)
+	go run tools/install/main.go $(WECHAT_BIN)  $(INSTALL_DIR)/openbot-wechat$(EXE)
 	@echo "Installed to $(INSTALL_DIR) — make sure it is in your PATH."
 
 ## Uninstall: remove installed binaries
@@ -89,13 +97,18 @@ uninstall:
 	go run tools/remove/main.go \
 		$(INSTALL_DIR)/openbot$(EXE) \
 		$(INSTALL_DIR)/openbot-mcp$(EXE) \
-		$(INSTALL_DIR)/openbot-attach$(EXE)
+		$(INSTALL_DIR)/openbot-attach$(EXE) \
+		$(INSTALL_DIR)/openbot-wechat$(EXE)
 	@echo "Uninstalled."
 
 # ── Run ───────────────────────────────────────────────────────
 ## Run directly (uses current shell env vars)
 run: build
 	$(GATEWAY_BIN)
+
+## Run wechat binary directly
+run-wechat: build-wechat
+	$(WECHAT_BIN)
 
 ## Load .env and run (one-click start)
 run-env: build
@@ -151,6 +164,7 @@ build-linux:
 	GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux_amd64/openbot        ./cmd/gateway
 	GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux_amd64/openbot-mcp    ./cmd/mcp
 	GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux_amd64/openbot-attach ./cmd/attach
+	GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux_amd64/openbot-wechat ./cmd/wechat-login
 	@echo "linux/amd64 -> $(BIN_DIR)/linux_amd64/"
 
 ## darwin/amd64 binary
@@ -160,6 +174,7 @@ build-darwin:
 	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_amd64/openbot        ./cmd/gateway
 	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_amd64/openbot-mcp    ./cmd/mcp
 	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_amd64/openbot-attach ./cmd/attach
+	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_amd64/openbot-wechat ./cmd/wechat-login
 	@echo "darwin/amd64 -> $(BIN_DIR)/darwin_amd64/"
 
 ## darwin/arm64 binary (Apple Silicon)
@@ -169,6 +184,7 @@ build-darwin-arm64:
 	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_arm64/openbot        ./cmd/gateway
 	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_arm64/openbot-mcp    ./cmd/mcp
 	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_arm64/openbot-attach ./cmd/attach
+	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin_arm64/openbot-wechat ./cmd/wechat-login
 	@echo "darwin/arm64 -> $(BIN_DIR)/darwin_arm64/"
 
 ## windows/amd64 binary
@@ -178,6 +194,7 @@ build-windows:
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/windows_amd64/openbot.exe        ./cmd/gateway
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/windows_amd64/openbot-mcp.exe    ./cmd/mcp
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/windows_amd64/openbot-attach.exe ./cmd/attach
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/windows_amd64/openbot-wechat.exe ./cmd/wechat-login
 	@echo "windows/amd64 -> $(BIN_DIR)/windows_amd64/"
 
 ## Build all platforms at once
@@ -198,7 +215,8 @@ help:
 	@echo "============================================================"
 	@echo ""
 	@echo " Build (native OS):"
-	@echo "   make / make build        Build for current OS to bin/"
+	@echo "   make / make build        Build all including wechat to bin/"
+	@echo "   make build-wechat        Build only openbot-wechat"
 	@echo ""
 	@echo " Cross-compile:"
 	@echo "   make build-linux          linux/amd64"
@@ -212,8 +230,9 @@ help:
 	@echo "   make uninstall    Remove installed binaries"
 	@echo ""
 	@echo " Run:"
-	@echo "   make run          Build and run (current env vars)"
-	@echo "   make run-env      Load .env then run (one-click)"
+	@echo "   make run           Build and run gateway (current env vars)"
+	@echo "   make run-wechat    Build and run openbot-wechat only"
+	@echo "   make run-env       Load .env then run gateway (one-click)"
 	@echo ""
 	@echo " Init:"
 	@echo "   make init-env     Generate .env from .env.example"

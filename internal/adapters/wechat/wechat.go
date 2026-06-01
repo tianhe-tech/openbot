@@ -2,15 +2,18 @@ package wechat
 
 import (
 	"context"
-	"crypto/aes"
+	"crypto/md5"
+	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +56,10 @@ type Handler struct {
 	sentTextsMu     sync.Mutex
 	recentSentTexts map[string]time.Time // hash(userID+text) -> sentTime
 
+	// sender serializes outbound messages per user with pacing and
+	// rate-limit-aware backoff (iLink bot ret=-2).
+	sender *senderRegistry
+
 	cancel context.CancelFunc
 }
 
@@ -71,6 +78,7 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		store:             NewStore(stateDir),
 		lastContextTokens: make(map[string]string),
 		recentSentTexts:   make(map[string]time.Time),
+		sender:            newSenderRegistry(),
 	}
 	h.adapter = base.NewBidirectionalAdapter("wechat", h)
 	return h
@@ -99,6 +107,7 @@ func (h *Handler) RegisterCronSession(sessionID string, metadata map[string]inte
 }
 
 // SendMessage implements base.MessageSender for proactive event delivery.
+// Supports MEDIA: path tags for inline media delivery.
 func (h *Handler) SendMessage(ctx context.Context, channel, userID, content string) error {
 	text := strings.TrimSpace(content)
 	if text == "" {
@@ -114,13 +123,31 @@ func (h *Handler) SendMessage(ctx context.Context, channel, userID, content stri
 	ctxToken := h.lastContextTokens[uid]
 	h.mu.Unlock()
 
-	log.Printf("wechat: proactive send user=%q len=%d", uid, len(text))
-	h.trackSentText(uid, text)
-	if err := h.weClient.SendText(uid, text, ctxToken); err != nil {
-		log.Printf("wechat: proactive send failed user=%q err=%v", uid, err)
-		return err
+	// Extract MEDIA: tags before text delivery.
+	mediaFiles, cleanedContent := extractMediaDirective(text)
+	finalText := strings.TrimSpace(cleanedContent)
+
+	log.Printf("wechat: proactive send user=%q len=%d media=%d", uid, len(text), len(mediaFiles))
+
+	// Deliver media files first.
+	var lastErr error
+	for _, mediaPath := range mediaFiles {
+		if err := h.sendMediaFile(uid, mediaPath, "", ctxToken); err != nil {
+			log.Printf("wechat: media send failed user=%q path=%s err=%v", uid, mediaPath, err)
+			lastErr = err
+		}
 	}
-	return nil
+
+	// Deliver text content.
+	if finalText != "" {
+		h.trackSentText(uid, finalText)
+		if err := h.sendTextChunks(uid, finalText, ctxToken); err != nil {
+			log.Printf("wechat: proactive send failed user=%q err=%v", uid, err)
+			return err
+		}
+	}
+
+	return lastErr
 }
 
 // Start begins the long-poll message loop in a background goroutine.
@@ -329,8 +356,7 @@ func (h *Handler) handleMessage(ctx context.Context, msg *WeixinMessage) error {
 	// Command routing
 	if cmd, handled := h.tryCommand(ctx, userID, chatID, userText, msg); handled {
 		if cmd != "" {
-			h.trackSentText(userID, cmd)
-			_ = h.weClient.SendText(userID, cmd, msg.ContextToken)
+			_ = h.sendTextChunks(userID, cmd, msg.ContextToken)
 		}
 		return nil
 	}
@@ -340,8 +366,7 @@ func (h *Handler) handleMessage(ctx context.Context, msg *WeixinMessage) error {
 	if !strings.HasPrefix(strings.TrimSpace(userText), "/") {
 		if reply, handled := h.handleQuickReply(ctx, userID, userText, msg.ContextToken); handled {
 			if reply != "" {
-				h.trackSentText(userID, reply)
-				_ = h.weClient.SendText(userID, reply, msg.ContextToken)
+				_ = h.sendTextChunks(userID, reply, msg.ContextToken)
 			}
 			return nil
 		}
@@ -557,37 +582,34 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 			return nil
 		}
 
-		// Tool/step/todo/question signals → send immediately (with chunking protection)
+		// Tool/step/todo/question signals → best-effort (drop if rate-limited)
+		// so they cannot starve the final answer of retry budget.
 		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.ToolSignalPrefix))
 			if msg != "" {
-				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
-					log.Printf("wechat: ⚠️ tool send failed user=%s: %v", userID, err)
-				}
+				_ = h.sendTextChunksSkippable(userID, msg, ctxToken)
 			}
 			return nil
 		}
 		if strings.HasPrefix(chunk, opencode.StepSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.StepSignalPrefix))
 			if msg != "" {
-				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
-					log.Printf("wechat: ⚠️ step send failed user=%s: %v", userID, err)
-				}
+				_ = h.sendTextChunksSkippable(userID, msg, ctxToken)
 			}
 			return nil
 		}
 		if strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.TodoSignalPrefix))
 			if msg != "" {
-				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
-					log.Printf("wechat: ⚠️ todo send failed user=%s: %v", userID, err)
-				}
+				_ = h.sendTextChunksSkippable(userID, msg, ctxToken)
 			}
 			return nil
 		}
 		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
 			if msg != "" {
+				// Questions are user-actionable so try harder, but still don't
+				// block the final answer — use critical path.
 				if err := h.sendTextChunks(userID, msg, ctxToken); err != nil {
 					log.Printf("wechat: ⚠️ question send failed user=%s: %v", userID, err)
 				}
@@ -613,8 +635,13 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		fullReplyMu.Unlock()
 
 		if shouldSend && strings.TrimSpace(toSend) != "" {
-			if err := h.sendTextChunks(userID, toSend, ctxToken); err != nil {
-				log.Printf("wechat: ⚠️ intermediate send failed user=%s: %v (will retry at final)", userID, err)
+			// Intermediate progressive previews are best-effort; if dropped,
+			// the final-send block at the end will deliver everything from
+			// lastSentLength onward.
+			if err := h.sendTextChunksSkippable(userID, toSend, ctxToken); err != nil {
+				if !errors.Is(err, ErrSkipped) {
+					log.Printf("wechat: ⚠️ intermediate send failed user=%s: %v (will retry at final)", userID, err)
+				}
 			} else {
 				fullReplyMu.Lock()
 				lastSentLength = fullReply.Len()
@@ -656,6 +683,10 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		_ = h.sendTextChunks(userID, "💭 思考过程:\n"+thinkingText, ctxToken)
 	}
 
+	// Detect MEDIA: directives in accumulated content for media dispatch.
+	// Only the unsent portion needs text delivery.
+	mediaPaths, _ := extractMediaDirective(accumulatedContent)
+
 	if strings.TrimSpace(unsent) != "" {
 		log.Printf("wechat: 📤 sending final message (%d total, %d unsent)", len(accumulatedContent), len(unsent))
 		_ = h.sendTextChunks(userID, unsent, ctxToken)
@@ -663,11 +694,19 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		// No content was streamed; use the synchronous reply if available.
 		if strings.TrimSpace(response.Reply) != "" {
 			_ = h.sendTextChunks(userID, response.Reply, ctxToken)
-		} else {
+		} else if len(mediaPaths) == 0 {
 			_ = h.sendTextChunks(userID, "✅ 处理完成", ctxToken)
 		}
 	} else {
 		log.Printf("wechat: all content already sent (%d bytes)", len(accumulatedContent))
+	}
+
+	// Send media files detected via MEDIA: directives
+	for _, mediaPath := range mediaPaths {
+		log.Printf("wechat: 📤 sending media from MEDIA: directive: %s", mediaPath)
+		if err := h.sendMediaFile(userID, mediaPath, "", ctxToken); err != nil {
+			log.Printf("wechat: ⚠️ media send failed user=%s path=%s err=%v", userID, mediaPath, err)
+		}
 	}
 }
 
@@ -1697,83 +1736,6 @@ func (h *Handler) fetchCDNBytes(media *CDNMedia) ([]byte, error) {
 	return data, nil
 }
 
-// parseAesKey parses a base64-encoded AES key.
-// Two formats are used by WeChat CDN:
-//   - base64(16 raw bytes) → images (aes_key from media field)
-//   - base64(32-char hex string) → file/voice/video
-func parseAesKey(aesKeyBase64 string) ([]byte, error) {
-	decoded, err := base64.StdEncoding.DecodeString(aesKeyBase64)
-	if err != nil {
-		// Try RawStdEncoding (no padding)
-		decoded, err = base64.RawStdEncoding.DecodeString(aesKeyBase64)
-		if err != nil {
-			return nil, fmt.Errorf("base64 decode aes_key: %w", err)
-		}
-	}
-	if len(decoded) == 16 {
-		return decoded, nil
-	}
-	if len(decoded) == 32 {
-		// Check if it's a hex-encoded key: base64 → hex string → raw bytes
-		hexStr := string(decoded)
-		raw, err := hex.DecodeString(hexStr)
-		if err == nil && len(raw) == 16 {
-			return raw, nil
-		}
-	}
-	return nil, fmt.Errorf("aes_key must decode to 16 raw bytes or 32-char hex, got %d bytes", len(decoded))
-}
-
-// hexToBase64 converts a hex string to base64 encoding.
-func hexToBase64(hexStr string) string {
-	raw, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return ""
-	}
-	return base64.StdEncoding.EncodeToString(raw)
-}
-
-// decryptAesEcb decrypts data using AES-128-ECB with PKCS7 padding.
-func decryptAesEcb(ciphertext, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	bs := block.BlockSize()
-	if len(ciphertext) == 0 || len(ciphertext)%bs != 0 {
-		return nil, fmt.Errorf("ciphertext length %d not multiple of block size %d", len(ciphertext), bs)
-	}
-
-	plaintext := make([]byte, len(ciphertext))
-	for i := 0; i < len(ciphertext); i += bs {
-		block.Decrypt(plaintext[i:i+bs], ciphertext[i:i+bs])
-	}
-
-	// Remove PKCS7 padding
-	plaintext, err = pkcs7Unpad(plaintext, bs)
-	if err != nil {
-		return nil, err
-	}
-	return plaintext, nil
-}
-
-// pkcs7Unpad removes PKCS7 padding.
-func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
-	if len(data) == 0 {
-		return nil, fmt.Errorf("empty data")
-	}
-	padding := int(data[len(data)-1])
-	if padding < 1 || padding > blockSize || padding > len(data) {
-		return nil, fmt.Errorf("invalid PKCS7 padding %d", padding)
-	}
-	for i := len(data) - padding; i < len(data); i++ {
-		if data[i] != byte(padding) {
-			return nil, fmt.Errorf("invalid PKCS7 padding at byte %d", i)
-		}
-	}
-	return data[:len(data)-padding], nil
-}
-
 // handleQuickReply tries to interpret non-command text as an answer to a
 // pending permission or question (mirrors dingtalk's handleQuickReply).
 func (h *Handler) handleQuickReply(ctx context.Context, userID, content, ctxToken string) (string, bool) {
@@ -1858,32 +1820,302 @@ func replyToPermissionResponse(input string) string {
 
 const maxWechatTextLength = 1800
 
-func chunkText(content string, limit int) []string {
-	runes := []rune(content)
-	if limit <= 0 || len(runes) <= limit {
-		return []string{content}
+// sendTextChunks sends text using Hermes-style message chunking via the
+// per-user serialized sender. Pacing and rate-limit backoff are handled
+// inside the sender so callers may invoke this concurrently from different
+// signal paths (content / tool / step / todo / question / proactive).
+//
+// On partial delivery (some chunks succeeded, then a chunk failed) the caller
+// MUST treat the whole call as failed and not advance its cursor; otherwise
+// the un-delivered tail would be lost. The sender stops at the first failure
+// to make this contract simple.
+func (h *Handler) sendTextChunks(userID, text, ctxToken string) error {
+	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
+	if len(chunks) == 0 {
+		return nil
 	}
-	var chunks []string
-	for start := 0; start < len(runes); start += limit {
-		end := start + limit
-		if end > len(runes) {
-			end = len(runes)
-		}
-		chunks = append(chunks, string(runes[start:end]))
+	delivered, err := h.sender.sendChunks(userID, chunks, func(chunk string) error {
+		h.trackSentText(userID, chunk)
+		return h.weClient.SendText(userID, chunk, ctxToken)
+	})
+	if err != nil {
+		log.Printf("wechat: chunk send failed user=%s delivered=%d/%d: %v", userID, delivered, len(chunks), err)
 	}
-	return chunks
+	return err
 }
 
-func (h *Handler) sendTextChunks(userID, text, ctxToken string) error {
-	chunks := chunkText(text, maxWechatTextLength)
-	for _, chunk := range chunks {
-		h.trackSentText(userID, chunk)
-		if err := h.weClient.SendText(userID, chunk, ctxToken); err != nil {
-			return err
-		}
-		time.Sleep(150 * time.Millisecond)
+// sendTextChunksSkippable is the best-effort variant used for non-critical
+// progress notifications (tool/step/todo/question/intermediate streaming
+// previews). If the per-user sender is currently rate-limited or paced, the
+// batch is dropped silently rather than queueing behind retries that would
+// starve the final answer. Returns ErrSkipped if dropped.
+func (h *Handler) sendTextChunksSkippable(userID, text, ctxToken string) error {
+	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
+	if len(chunks) == 0 {
+		return nil
 	}
-	return nil
+	delivered, err := h.sender.sendChunksSkippable(userID, chunks, func(chunk string) error {
+		h.trackSentText(userID, chunk)
+		return h.weClient.SendText(userID, chunk, ctxToken)
+	})
+	if err != nil && !errors.Is(err, ErrSkipped) {
+		log.Printf("wechat: skippable chunk send failed user=%s delivered=%d/%d: %v", userID, delivered, len(chunks), err)
+	}
+	return err
+}
+
+// --- Outbound Media Sending ---
+
+// mediaDirectivePattern matches MEDIA: path tags in text.
+// Go's regexp (RE2) does not support (?=...) lookahead, so we match conservatively
+// and validate/clean paths in Go code.
+var mediaDirectivePattern = regexp.MustCompile(`MEDIA:\s*(\S+\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa))`)
+
+// extractMediaDirective extracts MEDIA: path tags from text content.
+func extractMediaDirective(content string) (paths []string, cleaned string) {
+	cleaned = content
+	if !strings.Contains(content, "MEDIA:") {
+		return nil, content
+	}
+
+	// Remove [[audio_as_voice]] and [[as_document]] directives
+	cleaned = strings.ReplaceAll(cleaned, "[[audio_as_voice]]", "")
+	cleaned = strings.ReplaceAll(cleaned, "[[as_document]]", "")
+
+	for _, match := range mediaDirectivePattern.FindAllStringSubmatch(content, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		path := strings.TrimSpace(match[1])
+		if path == "" {
+			continue
+		}
+		// Strip surrounding quote/backtick/' wrappers
+		if len(path) >= 2 && (path[0] == path[len(path)-1]) && (path[0] == '`' || path[0] == '"' || path[0] == '\'') {
+			path = path[1 : len(path)-1]
+		}
+		// Clean trailing punctuation/delimiters that the simpler regex may have captured
+		path = strings.TrimRight(path, "`\"',.;:)}] ")
+		path = strings.TrimLeft(path, "`\"'")
+		if path == "" || !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "~/") {
+			continue
+		}
+		// Expand ~/ to home directory
+		if strings.HasPrefix(path, "~/") {
+			home, _ := os.UserHomeDir()
+			path = filepath.Join(home, path[2:])
+		}
+		paths = append(paths, path)
+	}
+
+	if len(paths) > 0 {
+		cleaned = mediaDirectivePattern.ReplaceAllString(cleaned, "")
+		// Collapse multiple newlines
+		cleaned = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleaned, "\n\n")
+		cleaned = strings.TrimSpace(cleaned)
+	}
+	return
+}
+
+// sendMediaFile uploads a local file to WeChat CDN and sends it as a media message.
+func (h *Handler) sendMediaFile(userID, filePath, caption, ctxToken string) error {
+	if h.weClient == nil {
+		return fmt.Errorf("wechat client not initialized")
+	}
+
+	plaintext, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	mediaType, itemBuilder := outboundMediaBuilder(filePath, false)
+
+	filekeyBytes := make([]byte, 16)
+	if _, err := rand.Read(filekeyBytes); err != nil {
+		return fmt.Errorf("generate filekey: %w", err)
+	}
+	filekey := fmt.Sprintf("%x", filekeyBytes)
+
+	aesKey := make([]byte, 16)
+	if _, err := rand.Read(aesKey); err != nil {
+		return fmt.Errorf("generate aes key: %w", err)
+	}
+
+	rawSize := len(plaintext)
+	rawFileMD5 := fmt.Sprintf("%x", md5.Sum(plaintext))
+	fileSize := aesPaddedSize(rawSize)
+	aesKeyHex := fmt.Sprintf("%x", aesKey)
+
+	uploadResp, err := h.weClient.GetUploadURL(userID, mediaType, filekey, aesKeyHex, rawSize, rawFileMD5, fileSize)
+	if err != nil {
+		return fmt.Errorf("get upload url: %w", err)
+	}
+
+	ciphertext, err := encryptAesEcb(plaintext, aesKey)
+	if err != nil {
+		return fmt.Errorf("aes encrypt: %w", err)
+	}
+
+	uploadURL := uploadResp.UploadFullURL
+	if uploadURL == "" && uploadResp.UploadParam != "" {
+		cdnBase := h.cfg.CDNBaseURL
+		if cdnBase == "" {
+			cdnBase = "https://novac2c.cdn.weixin.qq.com/c2c"
+		}
+		uploadURL = fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
+			cdnBase, uploadResp.UploadParam, filekey)
+	}
+	if uploadURL == "" {
+		return fmt.Errorf("getUploadUrl returned neither upload_full_url nor upload_param")
+	}
+
+	encryptedQueryParam, err := h.weClient.UploadCiphertext(uploadURL, ciphertext)
+	if err != nil {
+		return fmt.Errorf("cdn upload: %w", err)
+	}
+
+	// The iLink API expects aes_key as base64(hex_string), not base64(raw_bytes).
+	aesKeyForAPI := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%x", aesKey)))
+
+	itemKwargs := mediaItemArgs{
+		encryptQueryParam: encryptedQueryParam,
+		aesKeyForAPI:      aesKeyForAPI,
+		ciphertextSize:    len(ciphertext),
+		plaintextSize:     rawSize,
+		filename:          filepath.Base(filePath),
+		rawFileMD5:        rawFileMD5,
+	}
+	if mediaType == UploadMediaTypeVoice && strings.HasSuffix(filePath, ".silk") {
+		itemKwargs.encodeType = 6
+		itemKwargs.sampleRate = 24000
+		itemKwargs.bitsPerSample = 16
+	}
+	mediaItem := itemBuilder(itemKwargs)
+
+	// Send caption text first (if any)
+	if caption != "" {
+		if err := h.sendTextChunks(userID, caption, ctxToken); err != nil {
+			log.Printf("wechat: caption send before media failed: %v", err)
+		}
+	}
+
+	// Send media message
+	msg := &WeixinMessage{
+		Seq:          int(nextSeq()),
+		ToUserID:     userID,
+		ClientID:     generateClientID(),
+		ContextToken: ctxToken,
+		MessageType:  MessageTypeBot,
+		MessageState: MessageStateFinish,
+		ItemList:     []MessageItem{mediaItem},
+	}
+	return h.weClient.SendWeixinMessage(msg)
+}
+
+type mediaItemArgs struct {
+	encryptQueryParam string
+	aesKeyForAPI      string
+	ciphertextSize    int
+	plaintextSize     int
+	filename          string
+	rawFileMD5        string
+	encodeType        int
+	sampleRate        int
+	bitsPerSample     int
+}
+
+// outboundMediaBuilder returns upload media type and item builder function based on file extension.
+func outboundMediaBuilder(path string, forceFileAttachment bool) (int, func(mediaItemArgs) MessageItem) {
+	ext := strings.ToLower(filepath.Ext(path))
+	mt := mime.TypeByExtension(ext)
+	if mt == "" {
+		mt = "application/octet-stream"
+	}
+
+	if strings.HasPrefix(mt, "image/") && !forceFileAttachment {
+		return UploadMediaTypeImage, func(kw mediaItemArgs) MessageItem {
+			return MessageItem{
+				Type: ItemTypeImage,
+				ImageItem: &ImageItem{
+					Media: &CDNMedia{
+						EncryptQueryParam: kw.encryptQueryParam,
+						AESKey:            kw.aesKeyForAPI,
+						EncryptType:       1,
+					},
+					MidSize: kw.ciphertextSize,
+				},
+			}
+		}
+	}
+
+	if strings.HasPrefix(mt, "video/") {
+		return UploadMediaTypeVideo, func(kw mediaItemArgs) MessageItem {
+			return MessageItem{
+				Type: ItemTypeVideo,
+				VideoItem: &VideoItem{
+					Media: &CDNMedia{
+						EncryptQueryParam: kw.encryptQueryParam,
+						AESKey:            kw.aesKeyForAPI,
+						EncryptType:       1,
+					},
+					VideoSize:  kw.ciphertextSize,
+					PlayLength: 0,
+					VideoMD5:   kw.rawFileMD5,
+				},
+			}
+		}
+	}
+
+	if ext == ".silk" && !forceFileAttachment {
+		return UploadMediaTypeVoice, func(kw mediaItemArgs) MessageItem {
+			return MessageItem{
+				Type: ItemTypeVoice,
+				VoiceItem: &VoiceItem{
+					Media: &CDNMedia{
+						EncryptQueryParam: kw.encryptQueryParam,
+						AESKey:            kw.aesKeyForAPI,
+						EncryptType:       1,
+					},
+					EncodeType:   kw.encodeType,
+					BitsPerSampl: kw.bitsPerSample,
+					SampleRate:   kw.sampleRate,
+				},
+			}
+		}
+	}
+
+	if strings.HasPrefix(mt, "audio/") {
+		return UploadMediaTypeFile, func(kw mediaItemArgs) MessageItem {
+			return MessageItem{
+				Type: ItemTypeFile,
+				FileItem: &FileItem{
+					Media: &CDNMedia{
+						EncryptQueryParam: kw.encryptQueryParam,
+						AESKey:            kw.aesKeyForAPI,
+						EncryptType:       1,
+					},
+					FileName: kw.filename,
+					Len:      strconv.Itoa(kw.plaintextSize),
+				},
+			}
+		}
+	}
+
+	// Default: send as file attachment
+	return UploadMediaTypeFile, func(kw mediaItemArgs) MessageItem {
+		return MessageItem{
+			Type: ItemTypeFile,
+			FileItem: &FileItem{
+				Media: &CDNMedia{
+					EncryptQueryParam: kw.encryptQueryParam,
+					AESKey:            kw.aesKeyForAPI,
+					EncryptType:       1,
+				},
+				FileName: kw.filename,
+				Len:      strconv.Itoa(kw.plaintextSize),
+			},
+		}
+	}
 }
 
 func truncate(s string, maxLen int) string {

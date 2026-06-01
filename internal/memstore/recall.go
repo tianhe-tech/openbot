@@ -244,7 +244,39 @@ func ExtractProject(text string) string {
 		return truncateRunes(project, 10)
 	}
 
+	// Fallback: capture a standalone ASCII identifier (≥3 chars, contains a letter)
+	// that follows an action verb. Catches phrases like "做了 aicfs"、"开发 aicfs 的 xxx".
+	if id := extractIdentAfterVerb(text); id != "" {
+		return truncateRunes(id, 16)
+	}
+
 	return ""
+}
+
+// identAfterVerbRe matches an action verb followed (within a few spaces/punct chars)
+// by an ASCII identifier of 3+ chars containing at least one letter.
+var identAfterVerbRe = regexp.MustCompile(
+	`(?:开发|做|搞|写|搭建|实现|编写|新建|创建|部署|帮我做|帮我写|帮我开发)[了过\s:：,，的个]{0,4}([A-Za-z][A-Za-z0-9_\-]{2,})`,
+)
+
+// genericIdents are common English words that look like identifiers but are not
+// real project names.
+var genericIdents = map[string]struct{}{
+	"app": {}, "api": {}, "bot": {}, "demo": {}, "test": {}, "tests": {},
+	"the": {}, "and": {}, "for": {}, "with": {}, "new": {}, "old": {},
+	"docker": {}, "k8s": {}, "项目": {},
+}
+
+func extractIdentAfterVerb(text string) string {
+	m := identAfterVerbRe.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	ident := m[1]
+	if _, generic := genericIdents[strings.ToLower(ident)]; generic {
+		return ""
+	}
+	return ident
 }
 
 // ---- Summary Construction ----

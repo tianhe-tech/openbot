@@ -73,13 +73,13 @@ const (
 // for the no-content branch is therefore intentionally generous. Override via
 // env:
 //   - OPENCODE_STREAM_IDLE_TIMEOUT_SECONDS        : no-content timeout (default 600)
-//   - OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS: has-content timeout (default 30)
+//   - OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS: has-content timeout (default 120)
 //   - OPENCODE_STREAM_BUSY_PROBE_EXTEND           : set to "0"/"false" to disable
 //     the "still busy" probe that extends the no-content timeout when the
 //     session still shows activity.
 var (
 	streamIdleTimeoutNoContent  = parseDurationEnvSeconds("OPENCODE_STREAM_IDLE_TIMEOUT_SECONDS", 600*time.Second)
-	streamIdleTimeoutHasContent = parseDurationEnvSeconds("OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS", 30*time.Second)
+	streamIdleTimeoutHasContent = parseDurationEnvSeconds("OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS", 120*time.Second)
 	streamBusyProbeEnabled      = parseBoolEnv("OPENCODE_STREAM_BUSY_PROBE_EXTEND", true)
 )
 
@@ -3733,7 +3733,42 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			// 如果已发送内容且超过阈值无新事件，认为可能完成
 			// 阈值可通过 OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS 调整（默认30s）
 			// ⚠️ 同样需要检查活跃 tool：有 tool 运行时不应因 idle 超时退出
+			// ⚠️ 在宣告完成前必须先做 busy probe：模型在 prefill / extended-thinking
+			// 阶段会安静 1-2 分钟但 hasActiveTools=false，如果直接退出会导致后续
+			// message.part.delta 在没有 session handler 时被全局兜底丢弃，用户只看到
+			// 部分输出（wechat 这条路径尤其明显，因为发送速度受限频影响更慢）。
 			if isAsyncMode && hasSentContent && !hasActiveTools && timeSinceLastEvent > streamIdleTimeoutHasContent {
+				if streamBusyProbeEnabled && time.Since(lastBusyProbeAt) > 30*time.Second {
+					lastBusyProbeAt = time.Now()
+					probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					busy, probeErr := c.probeSessionStillBusy(probeCtx, sessionID)
+					probeCancel()
+					if probeErr != nil {
+						log.Printf("opencode: ⚠️ has-content busy probe failed for session %s: %v (extending one round)", sessionID[:8], probeErr)
+						consecutiveNotBusy = 0
+						busyProbeExtendAt = time.Now()
+						idleCheckCount++
+						continue
+					}
+					if busy {
+						consecutiveNotBusy = 0
+						busyProbeExtendAt = time.Now()
+						log.Printf("opencode: ⏳ has-content idle %v (threshold=%v) but session %s still busy, extending wait",
+							timeSinceLastEvent, streamIdleTimeoutHasContent, sessionID[:8])
+						idleCheckCount++
+						continue
+					}
+					consecutiveNotBusy++
+					if consecutiveNotBusy < 2 {
+						log.Printf("opencode: ⏳ has-content idle %v, probe %d not-busy (need 2), extending wait for session %s",
+							timeSinceLastEvent, consecutiveNotBusy, sessionID[:8])
+						busyProbeExtendAt = time.Now()
+						idleCheckCount++
+						continue
+					}
+					log.Printf("opencode: ⏱️ has-content timeout confirmed (idle=%v, %d consecutive not-busy probes) for session %s",
+						timeSinceLastEvent, consecutiveNotBusy, sessionID[:8])
+				}
 				log.Printf("opencode: ⏱️ streaming idle for %v (has sent content, no active tools, threshold=%v), treating as completed for session %s",
 					timeSinceLastEvent, streamIdleTimeoutHasContent, sessionID[:8])
 				c.recordMemAsync(payload, handler.GetLastContent())
