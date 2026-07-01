@@ -18,19 +18,26 @@ import (
 	"syscall"
 	"time"
 
+	"runtime"
+
+	"github.com/fsnotify/fsnotify"
 	opencodesdk "github.com/sst/opencode-sdk-go"
 	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/adapters/dingtalk"
 	"github.com/user/opencode-gateway/internal/adapters/feishu"
+	"github.com/user/opencode-gateway/internal/adapters/wechat"
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
+	"github.com/user/opencode-gateway/internal/asyncwork"
 	"github.com/user/opencode-gateway/internal/config"
 	"github.com/user/opencode-gateway/internal/logging"
 	"github.com/user/opencode-gateway/internal/memstore"
 	"github.com/user/opencode-gateway/internal/opencode"
 	"github.com/user/opencode-gateway/internal/opencodesvc"
 	"github.com/user/opencode-gateway/internal/proxy"
+	"github.com/user/opencode-gateway/internal/retryworker"
 	"github.com/user/opencode-gateway/internal/scheduler"
 	"github.com/user/opencode-gateway/internal/server"
+	"github.com/user/opencode-gateway/internal/skillgen"
 	"github.com/user/opencode-gateway/internal/uibrpc"
 )
 
@@ -142,7 +149,7 @@ func main() {
 	memStorePath := cfg.MemStorePath
 	if memStorePath == "" {
 		// Default: <OPENCODE_DIRECTORY>/tmp/memory.db
-		memStorePath = filepath.Join(cfg.OpenCodeDirectory, "tmp", "memory.db")
+		memStorePath = filepath.Join(cfg.OpenCodeDirectory, "mem", "memory.db")
 	}
 	memDB, memErr := memstore.Open(memStorePath)
 	if memErr != nil {
@@ -150,6 +157,8 @@ func main() {
 	} else {
 		log.Printf("main: memory store opened at %s", memStorePath)
 		ocOptions = append(ocOptions, opencode.WithMemStore(memstore.NewGatewayAdapter(memDB)))
+		// Auto-register the MCP memory tool so the LLM can search memory proactively.
+		ensureMCPMemoryTool(cfg.OpenCodeDirectory, memStorePath)
 		// Periodic forgetting curve decay (every hour)
 		go func() {
 			ticker := time.NewTicker(time.Hour)
@@ -173,6 +182,89 @@ func main() {
 	}
 
 	ocClient := opencode.NewClient(opencodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
+
+	// ========== Async work queue (handoff save, skill mining) ==========
+	asyncQueue := asyncwork.New(cfg.SkillAutogen.QueueCapacity)
+	asyncQueue.Start(ctx)
+	ocClient.SetAsyncQueue(asyncQueue)
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		asyncQueue.Stop(stopCtx)
+	}()
+
+	// ========== Skill autogen (optional) ==========
+	if cfg.SkillAutogen.Enabled && memDB != nil {
+		skillCfg := skillgen.Config{
+			Enabled:             true,
+			DraftModel:          cfg.SkillAutogen.DraftModel,
+			AlternateModels:     cfg.SkillAutogen.AlternateModels,
+			Epsilon:             cfg.SkillAutogen.Epsilon,
+			ModelSelfSelect:     cfg.SkillAutogen.ModelSelfSelect,
+			MaxPerDay:           cfg.SkillAutogen.MaxPerDay,
+			OnHandoff:           cfg.SkillAutogen.OnHandoff,
+			OnLongSession:       cfg.SkillAutogen.OnLongSession,
+			LongSessionMinTurns: cfg.SkillAutogen.LongSessionMinTurns,
+			CandidateDir:        cfg.SkillAutogen.CandidateDir,
+			InstallDir:          cfg.SkillAutogen.InstallDir,
+			ApprovalRequired:    cfg.SkillAutogen.ApprovalRequired,
+			MinConfidence:       cfg.SkillAutogen.MinConfidence,
+			MinToolCalls:        cfg.SkillAutogen.MinToolCalls,
+		}
+		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath)
+		notifier := skillgen.NewRegistryNotifier(adapterRegistry)
+		skillSvc := skillgen.NewService(skillCfg, memDB, ocClient, asyncQueue, drafter, notifier)
+		ocClient.SetSkillCandidateHook(skillSvc)
+		ocClient.AddCommandInterceptor(skillSvc)
+		log.Printf("main: skill autogen enabled (model=%s approvalRequired=%t maxPerDay=%d)",
+			skillCfg.DraftModel, skillCfg.ApprovalRequired, skillCfg.MaxPerDay)
+	} else if cfg.SkillAutogen.Enabled && memDB == nil {
+		log.Printf("main: skill autogen disabled: memory store unavailable")
+	}
+
+	// Watch opencode.json for changes and trigger a graceful restart.
+	// Started here (after ocClient is created) so the drain check can inspect
+	// active streaming sessions before restarting the opencode process.
+	if serveManager != nil {
+		// Collect the config paths that are currently in effect:
+		// global (~/.config/opencode/opencode.json) and/or project-local.
+		var watchPaths []string
+		globalCfgPath := filepath.Join(os.Getenv("HOME"), ".config", "opencode", "opencode.json")
+		if runtime.GOOS == "windows" {
+			if appData := os.Getenv("APPDATA"); appData != "" {
+				globalCfgPath = filepath.Join(appData, "opencode", "opencode.json")
+			}
+		}
+		projectCfgPath := filepath.Join(cfg.OpenCodeDirectory, "opencode.json")
+		for _, p := range []string{globalCfgPath, projectCfgPath} {
+			abs, _ := filepath.Abs(p)
+			if _, err := os.Stat(abs); err == nil {
+				watchPaths = append(watchPaths, abs)
+			}
+		}
+		// If neither exists yet, still watch the project dir so creation is caught.
+		if len(watchPaths) == 0 {
+			abs, _ := filepath.Abs(projectCfgPath)
+			watchPaths = append(watchPaths, abs)
+		}
+		restartOnChange := func() {
+			log.Println("opencode: config file changed, draining active sessions before restart...")
+			// Wait up to 30 s for any in-progress streaming to finish.
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) {
+				if !ocClient.HasActiveStreamingSessions() {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			log.Println("opencode: restarting opencode serve (config-change)...")
+			if _, err := serveManager.Restart(ctx, "config-change"); err != nil {
+				log.Printf("opencode: config-change restart error: %v", err)
+			}
+		}
+		go watchOpencodeConfig(ctx, watchPaths, restartOnChange)
+	}
+
 	if cfg.ProxyHubWSURL != "" {
 		restartFn := func(restartCtx context.Context, reason string) (string, error) {
 			if serveManager == nil {
@@ -190,7 +282,7 @@ func main() {
 	cronScheduler := scheduler.NewCronScheduler(taskScheduler)
 
 	// Set cron task storage path for persistence
-	cronStoragePath := filepath.Join(cfg.OpenCodeDirectory, "tmp", "cron_tasks.json")
+	cronStoragePath := filepath.Join(cfg.OpenCodeDirectory, "cron", "cron_tasks.json")
 	cronScheduler.SetStoragePath(cronStoragePath)
 	log.Printf("main: cron tasks will be persisted to %s", cronStoragePath)
 
@@ -200,20 +292,83 @@ func main() {
 	wecomHandler := wecom.NewHandler(ocClient, cfg.WeCom)
 	feishuHandler := feishu.NewHandler(ocClient, cfg.FeiShu)
 	dingtalkHandler := dingtalk.NewHandler(ocClient, cfg.DingTalk)
+	wechatHandler := wechat.NewHandler(ocClient, cfg.WeChat)
 
 	// Set cronScheduler to adapters so they can manage scheduled tasks
 	dingtalkHandler.SetCronScheduler(cronScheduler)
 	feishuHandler.SetCronScheduler(cronScheduler)
 	wecomHandler.SetCronScheduler(cronScheduler)
+	wechatHandler.SetCronScheduler(cronScheduler)
 	nlScheduleSvc := scheduler.NewNLScheduleService(cronScheduler, taskScheduler, nil, nil)
 	dingtalkHandler.SetNLScheduleService(nlScheduleSvc)
 	feishuHandler.SetNLScheduleService(nlScheduleSvc)
 	wecomHandler.SetNLScheduleService(nlScheduleSvc)
+	wechatHandler.SetNLScheduleService(nlScheduleSvc)
+
+	// ========== Offline retry queue (optional) ==========
+	if cfg.RetryQueue.Enabled && memDB != nil {
+		rwCfg := retryworker.Config{
+			Enabled:        true,
+			CronExpr:       cfg.RetryQueue.CronExpr,
+			MaxRetries:     cfg.RetryQueue.MaxRetries,
+			BatchSize:      cfg.RetryQueue.BatchSize,
+			MessageTimeout: 25 * time.Minute,
+		}
+		rwRegistry := retryworker.NewRegistry()
+		rw := retryworker.New(rwCfg, memDB, rwRegistry)
+
+		// Wire adapters as retry senders.
+		rwRegistry.Register(feishuHandler)
+		rwRegistry.Register(dingtalkHandler)
+
+		// Give adapters access to the retry store + worker (for /retry command
+		// and for enqueuing on timeout).
+		feishuHandler.SetRetryWorker(memDB, rw)
+		dingtalkHandler.SetRetryWorker(memDB, rw)
+
+		// Schedule cron-driven off-peak processing.
+		if cfg.RetryQueue.CronExpr != "" {
+			if sysErr := cronScheduler.AddSystemJob(cfg.RetryQueue.CronExpr, func() {
+				runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+				defer cancel()
+				succ, total, err := rw.RunOnce(runCtx)
+				if err != nil {
+					log.Printf("retry-cron: error: %v", err)
+					return
+				}
+				log.Printf("retry-cron: succeeded=%d total=%d", succ, total)
+			}); sysErr != nil {
+				log.Printf("main: retry queue cron registration error: %v", sysErr)
+			} else {
+				log.Printf("main: retry queue cron registered (expr=%q)", cfg.RetryQueue.CronExpr)
+			}
+		}
+		// Periodic purge of expired records (every 6 hours).
+		go func() {
+			ticker := time.NewTicker(6 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := memDB.PurgeExpiredRetries(); err != nil {
+						log.Printf("retry-queue: purge error: %v", err)
+					}
+				}
+			}
+		}()
+		log.Printf("main: retry queue enabled (cron=%q maxRetries=%d batchSize=%d)",
+			cfg.RetryQueue.CronExpr, cfg.RetryQueue.MaxRetries, cfg.RetryQueue.BatchSize)
+	} else if cfg.RetryQueue.Enabled && memDB == nil {
+		log.Printf("main: retry queue disabled: memory store unavailable")
+	}
 
 	// Register adapters in registry
 	adapterRegistry.Register(wecomHandler.GetAdapter())
 	adapterRegistry.Register(feishuHandler.GetAdapter())
 	adapterRegistry.Register(dingtalkHandler.GetAdapter())
+	adapterRegistry.Register(wechatHandler.GetAdapter())
 
 	// erroredSessions tracks sessions that were deliberately cleared after session.error.
 	// The title-recovery logic must not re-map these, otherwise the user gets stuck on
@@ -248,6 +403,7 @@ func main() {
 			{"dingtalk", dingtalkHandler},
 			{"feishu", feishuHandler},
 			{"wecom", wecomHandler},
+			{"wechat", wechatHandler},
 		} {
 			adapter := adapter.handler.GetAdapter()
 			if userID, ok := adapter.GetUserForSession(sessionID); ok {
@@ -276,6 +432,8 @@ func main() {
 					foundAdapter = feishuHandler.GetAdapter()
 				case "wecom":
 					foundAdapter = wecomHandler.GetAdapter()
+				case "wechat":
+					foundAdapter = wechatHandler.GetAdapter()
 				}
 
 				if foundAdapter != nil {
@@ -306,6 +464,12 @@ func main() {
 							adapterName := parts[0]
 							userID := parts[1]
 
+							// skillgen uses internal drafting sessions; they are not adapter-routable
+							// and should not go through title recovery.
+							if adapterName == "skillgen" {
+								return nil
+							}
+
 							log.Printf("opencode event: recovering mapping from session title - adapter=%s, userID=%s, sessionID=%s",
 								adapterName, userID, sessionID[:min(8, len(sessionID))])
 
@@ -317,6 +481,8 @@ func main() {
 								foundAdapter = feishuHandler.GetAdapter()
 							case "wecom":
 								foundAdapter = wecomHandler.GetAdapter()
+							case "wechat":
+								foundAdapter = wechatHandler.GetAdapter()
 							}
 
 							if foundAdapter != nil {
@@ -355,6 +521,16 @@ func main() {
 			return err
 		}
 
+		// 会话出错后清除 session 映射，使下一条消息自动建立新会话
+		// 同时将该 sessionID 加入黑名单，防止 title 恢复逻辑把坏 session 重新绑定
+		// 注意：必须在 content == "" 判断之前执行，否则清理逻辑会被跳过
+		if eventType == "session.error" && !isCronSession {
+			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
+				sessionID[:min(8, len(sessionID))], foundUserID)
+			foundAdapter.ClearSessionForUser(foundUserID)
+			erroredSessions.Store(sessionID, struct{}{})
+		}
+
 		if content == "" {
 			log.Printf("opencode event: no content extracted from event type %s for session %s",
 				eventType, sessionID[:min(8, len(sessionID))])
@@ -366,15 +542,6 @@ func main() {
 
 		// Route to adapter
 		routeErr := adapterRegistry.RouteEventToAdapter(ctx, foundChannel, sessionID, content)
-
-		// 会话出错后清除 session 映射，使下一条消息自动建立新会话
-		// 同时将该 sessionID 加入黑名单，防止 title 恢复逻辑把坏 session 重新绑定
-		if eventType == "session.error" && !isCronSession {
-			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
-				sessionID[:min(8, len(sessionID))], foundUserID)
-			foundAdapter.ClearSessionForUser(foundUserID)
-			erroredSessions.Store(sessionID, struct{}{})
-		}
 
 		return routeErr
 	})
@@ -415,6 +582,12 @@ func main() {
 		log.Printf("warning: could not start feishu websocket client: %v", err)
 	}
 	defer feishuHandler.Stop()
+
+	// Start WeChat long-poll client if enabled
+	if err := wechatHandler.Start(ctx); err != nil {
+		log.Printf("warning: could not start wechat poll client: %v", err)
+	}
+	defer wechatHandler.Stop()
 
 	// Setup HTTP server
 	srv := server.New(server.Config{
@@ -596,6 +769,68 @@ func pickFreeTCPPort() (int, error) {
 	return addr.Port, nil
 }
 
+// watchOpencodeConfig monitors one or more opencode.json config files and calls
+// onChange after a 2-second quiet period following any Write/Create/Rename event.
+// It watches the parent directories so editor atomic-write renames are also caught.
+func watchOpencodeConfig(ctx context.Context, configPaths []string, onChange func()) {
+	if len(configPaths) == 0 {
+		return
+	}
+
+	// Build absolute path set and collect unique parent directories to watch.
+	absSet := make(map[string]struct{}, len(configPaths))
+	dirSet := make(map[string]struct{}, len(configPaths))
+	for _, p := range configPaths {
+		abs, _ := filepath.Abs(p)
+		absSet[abs] = struct{}{}
+		dirSet[filepath.Dir(abs)] = struct{}{}
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("opencode: config watcher unavailable: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	for dir := range dirSet {
+		if err := watcher.Add(dir); err != nil {
+			log.Printf("opencode: config watcher add %s: %v", dir, err)
+		}
+	}
+	log.Printf("opencode: watching config files: %v", configPaths)
+
+	const debounceDuration = 2 * time.Second
+	var debounce *time.Timer
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			abs, _ := filepath.Abs(event.Name)
+			if _, matched := absSet[abs]; !matched {
+				continue
+			}
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
+				log.Printf("opencode: config change detected: %s", abs)
+				if debounce != nil {
+					debounce.Stop()
+				}
+				debounce = time.AfterFunc(debounceDuration, onChange)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("opencode: config watcher error: %v", err)
+		}
+	}
+}
+
 // extractSessionIDFromEvent 从OpenCode事件中提取sessionID
 func extractSessionIDFromEvent(event *opencodesdk.EventListResponse) string {
 	if event == nil || event.JSON.RawJSON() == "" {
@@ -686,25 +921,9 @@ func extractContentFromEvent(event *opencodesdk.EventListResponse) (string, erro
 		return "", nil
 
 	case "session.error":
-		var wrapper struct {
-			Properties struct {
-				Message string `json:"message"`
-				Detail  string `json:"detail"`
-			} `json:"properties"`
-		}
-		if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &wrapper); err == nil {
-			var parts []string
-			if wrapper.Properties.Message != "" {
-				parts = append(parts, wrapper.Properties.Message)
-			}
-			if wrapper.Properties.Detail != "" {
-				parts = append(parts, wrapper.Properties.Detail)
-			}
-			if len(parts) > 0 {
-				return "⚠️ OpenCode 会话出错：" + strings.Join(parts, "; "), nil
-			}
-		}
-		return "⚠️ OpenCode 会话发生错误，请稍后重试。", nil
+		// session.error 已由 StreamingSessionHandler 处理（包括 overflow 检测和用户通知），
+		// 全局处理器只负责清理 session 映射（在调用方完成），不再重复发送错误消息。
+		return "", nil
 
 	case "session.status", "session.updated", "session.created", "session.diff",
 		"file.edited", "file.watcher.updated", "lsp.updated", "server.heartbeat", "message.updated":
@@ -910,4 +1129,99 @@ func handleCronPermission(ctx context.Context, ocClient *opencode.Client, event 
 
 	log.Printf("opencode cron: successfully auto-answered %s for cron session %s", eventType, sessionID[:min(8, len(sessionID))])
 	return nil
+}
+
+// ========== MCP memory tool auto-registration ==========
+
+// ensureMCPMemoryTool ensures the project-level opencode.json contains a
+// "gateway-memory" MCP entry so the LLM can call memory tools without manual
+// configuration.  If the entry already exists it is left untouched.
+func ensureMCPMemoryTool(opencodeDir, memDBPath string) {
+	mcpBin := findMCPBinary()
+	if mcpBin == "" {
+		log.Printf("mcp: openbot-mcp binary not found next to gateway, skipping auto-registration")
+		return
+	}
+
+	// Resolve memDBPath to absolute so the MCP process can find it regardless of cwd.
+	if abs, err := filepath.Abs(memDBPath); err == nil {
+		memDBPath = abs
+	}
+
+	cfgPath := filepath.Join(opencodeDir, "opencode.json")
+
+	// Read existing config or start fresh.
+	var root map[string]interface{}
+	data, err := os.ReadFile(cfgPath)
+	if err == nil {
+		if err := json.Unmarshal(data, &root); err != nil {
+			log.Printf("mcp: cannot parse %s, skipping auto-registration: %v", cfgPath, err)
+			return
+		}
+	} else {
+		root = make(map[string]interface{})
+	}
+
+	// Navigate into "mcp" section.
+	mcpSection, _ := root["mcp"].(map[string]interface{})
+	if mcpSection == nil {
+		mcpSection = make(map[string]interface{})
+	}
+	if _, exists := mcpSection["gateway-memory"]; exists {
+		return // already registered
+	}
+
+	mcpSection["gateway-memory"] = map[string]interface{}{
+		"type":    "local",
+		"command": []string{mcpBin, "--db", memDBPath},
+		"enabled": true,
+	}
+	root["mcp"] = mcpSection
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		log.Printf("mcp: marshal error: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		log.Printf("mcp: mkdir error: %v", err)
+		return
+	}
+	if err := os.WriteFile(cfgPath, out, 0o644); err != nil {
+		log.Printf("mcp: write %s error: %v", cfgPath, err)
+		return
+	}
+	log.Printf("mcp: auto-registered gateway-memory tool in %s (binary=%s)", cfgPath, mcpBin)
+}
+
+// findMCPBinary locates the openbot-mcp binary next to the current executable,
+// in the working directory, or in ./bin/.
+func findMCPBinary() string {
+	suffix := ""
+	if runtime.GOOS == "windows" {
+		suffix = ".exe"
+	}
+	name := "openbot-mcp" + suffix
+
+	// 1. Next to the current executable.
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(candidate); err == nil {
+			abs, _ := filepath.Abs(candidate)
+			return abs
+		}
+	}
+	// 2. Current working directory.
+	if abs, err := filepath.Abs(name); err == nil {
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	// 3. ./bin/ directory.
+	if abs, err := filepath.Abs(filepath.Join("bin", name)); err == nil {
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	return ""
 }

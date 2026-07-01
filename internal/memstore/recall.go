@@ -2,59 +2,68 @@ package memstore
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
-	"time"
 	"unicode"
 )
 
-// ---- Intent Detection ----
+// ---- Directory Extraction ----
 
-// recallTriggers are Chinese phrases that indicate the user wants to recall past conversations.
-var recallTriggers = []string{
-	"之前", "以前", "上次", "上一次", "曾经", "历史",
-	"回忆", "回顾", "记得", "还记得",
-	"开发了", "做过", "写过", "建过", "实现过",
-	"之前做的", "以前做的", "我做过", "我开发过",
-	"哪天", "什么时候做的", "什么时候开发的",
-	// Question-form indicators: always a recall/meta query, never real work
-	"是啊", "啥项目", "啥程序", "啥软件",
-	"什么项目", "什么程序", "哪些项目", "哪个项目",
-	"最近开发", "近期开发", "近来开发",
+// dirContextPhrases are Chinese phrases that typically precede or follow a directory path
+// in a conversation about development work (e.g. "在 /root/myapp 目录下").
+var dirContextPhrases = []string{
+	"目录下", "目录里", "目录中", "目录",
+	"路径", "项目路径", "工作目录",
+	"下面", "里面", "下开发", "下写",
 }
 
-// DetectRecallIntent returns true if the text is likely asking about past work.
-func DetectRecallIntent(text string) bool {
+// dirPathRe matches Unix-style absolute paths (/foo/bar) and Windows-style absolute paths
+// (C:\foo\bar or D:/foo/bar) that appear in text.  We require at least one path separator
+// after the root so bare "/" or "C:\" alone are ignored.
+var dirPathRe = regexp.MustCompile(
+	`(?:^|[\s\(\["'\x{300C}\x{300D}\x{3010}\x{3011}])(` + // leading boundary
+		`(?:[A-Za-z]:[/\\][^\s\x{300C}\x{300D}\x{3010}\x{3011}"'\)\]\x{3002}\x{FF01}\x{FF0C}]+)` + // Windows: C:\...
+		`|(?:/[^\s\x{300C}\x{300D}\x{3010}\x{3011}"'\)\]\x{3002}\x{FF01}\x{FF0C}]{2,})` + // Unix: /...
+		`)`,
+)
+
+// ExtractDirFromText attempts to find a filesystem path mentioned in the request text.
+// It combines two strategies:
+//  1. Regex scan for Unix/Windows absolute paths.
+//  2. Context-phrase gating: the path must appear near a directory-context phrase OR
+//     stand alone as a likely path (starts with / or drive letter).
+//
+// Returns "" when nothing convincing is found.
+func ExtractDirFromText(text string) string {
+	matches := dirPathRe.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+
+	// If a directory-context phrase is nearby, return the first path match.
 	lower := strings.ToLower(text)
-	for _, kw := range recallTriggers {
-		if strings.Contains(lower, kw) {
-			return true
+	for _, phrase := range dirContextPhrases {
+		if strings.Contains(lower, phrase) {
+			// Return the first captured path from regex.
+			for _, m := range matches {
+				if len(m) >= 2 {
+					return strings.TrimRight(m[1], "/\\")
+				}
+			}
 		}
 	}
-	return false
-}
 
-// DetectTimeWindow returns how many days back the query is asking about.
-// Defaults to 30 days for generic recall queries.
-func DetectTimeWindow(text string) int {
-	lower := strings.ToLower(text)
-	switch {
-	case strings.Contains(lower, "今天") || strings.Contains(lower, "今日"):
-		return 1
-	case strings.Contains(lower, "昨天") || strings.Contains(lower, "昨日"):
-		return 2
-	case strings.Contains(lower, "这周") || strings.Contains(lower, "本周") ||
-		strings.Contains(lower, "这星期") || strings.Contains(lower, "这个星期"):
-		return 7
-	case strings.Contains(lower, "上周") || strings.Contains(lower, "上个星期"):
-		return 14
-	case strings.Contains(lower, "这个月") || strings.Contains(lower, "本月"):
-		return 30
-	case strings.Contains(lower, "最近") || strings.Contains(lower, "近期") ||
-		strings.Contains(lower, "近来") || strings.Contains(lower, "近几天"):
-		return 30
-	default:
-		return 30
+	// Even without a context phrase, if the text is a short imperative (≤120 runes)
+	// and contains an absolute path, capture it — e.g. "帮我在 /data/proj 开发爬虫".
+	if len([]rune(text)) <= 120 {
+		for _, m := range matches {
+			if len(m) >= 2 {
+				return strings.TrimRight(m[1], "/\\")
+			}
+		}
 	}
+
+	return ""
 }
 
 // ---- Keyword Extraction ----
@@ -235,7 +244,39 @@ func ExtractProject(text string) string {
 		return truncateRunes(project, 10)
 	}
 
+	// Fallback: capture a standalone ASCII identifier (≥3 chars, contains a letter)
+	// that follows an action verb. Catches phrases like "做了 aicfs"、"开发 aicfs 的 xxx".
+	if id := extractIdentAfterVerb(text); id != "" {
+		return truncateRunes(id, 16)
+	}
+
 	return ""
+}
+
+// identAfterVerbRe matches an action verb followed (within a few spaces/punct chars)
+// by an ASCII identifier of 3+ chars containing at least one letter.
+var identAfterVerbRe = regexp.MustCompile(
+	`(?:开发|做|搞|写|搭建|实现|编写|新建|创建|部署|帮我做|帮我写|帮我开发)[了过\s:：,，的个]{0,4}([A-Za-z][A-Za-z0-9_\-]{2,})`,
+)
+
+// genericIdents are common English words that look like identifiers but are not
+// real project names.
+var genericIdents = map[string]struct{}{
+	"app": {}, "api": {}, "bot": {}, "demo": {}, "test": {}, "tests": {},
+	"the": {}, "and": {}, "for": {}, "with": {}, "new": {}, "old": {},
+	"docker": {}, "k8s": {}, "项目": {},
+}
+
+func extractIdentAfterVerb(text string) string {
+	m := identAfterVerbRe.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	ident := m[1]
+	if _, generic := genericIdents[strings.ToLower(ident)]; generic {
+		return ""
+	}
+	return ident
 }
 
 // ---- Summary Construction ----
@@ -252,68 +293,6 @@ func BuildSummary(request, response, action, project string) string {
 	return req
 }
 
-// BuildRecallContext formats a list of records into a prompt context string.
-// Project summaries are capped at 5; detail records are deduplicated by (project,date) and capped at 5.
-func BuildRecallContext(records []MemRecord, projectSummaries []ProjectSummary) string {
-	if len(records) == 0 && len(projectSummaries) == 0 {
-		return ""
-	}
-
-	var sb strings.Builder
-	sb.WriteString("【历史工作记忆】以下是用户过去的工作记录，供参考：\n\n")
-
-	// Cap project overview at 5
-	shown := projectSummaries
-	if len(shown) > 5 {
-		shown = shown[:5]
-	}
-	if len(shown) > 0 {
-		sb.WriteString("## 项目概览\n")
-		for _, ps := range shown {
-			daysSince := int(time.Since(ps.Last).Hours() / 24)
-			actions := strings.Join(unique(ps.Actions), "、")
-			sb.WriteString(fmt.Sprintf("- **%s**（%s）：共 %d 次操作（%s），最近一次在 %d 天前（%s）\n",
-				ps.Project, ps.Adapter,
-				ps.Count, actions,
-				daysSince, ps.Last.Format("2006-01-02"),
-			))
-		}
-		sb.WriteString("\n")
-	}
-
-	// Deduplicate detail records by (project, date), cap at 5
-	if len(records) > 0 {
-		seen := make(map[string]struct{})
-		var deduped []MemRecord
-		for _, r := range records {
-			key := r.Project + "|" + r.Ts.Format("2006-01-02")
-			if r.Project == "" {
-				key = r.Summary + "|" + r.Ts.Format("2006-01-02")
-			}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			deduped = append(deduped, r)
-			if len(deduped) >= 5 {
-				break
-			}
-		}
-		if len(deduped) > 0 {
-			sb.WriteString("## 相关记录\n")
-			for _, r := range deduped {
-				sb.WriteString(fmt.Sprintf("- [%s][%s] %s：%s\n",
-					r.Ts.Format("2006-01-02"), r.Adapter,
-					r.Action, r.Summary,
-				))
-			}
-			sb.WriteString("\n")
-		}
-	}
-
-	return sb.String()
-}
-
 // ---- helpers ----
 
 func truncateRunes(s string, maxRunes int) string {
@@ -322,21 +301,4 @@ func truncateRunes(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "…"
-}
-
-func unique(ss []string) []string {
-	seen := make(map[string]struct{})
-	var out []string
-	for _, s := range ss {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	return out
 }
