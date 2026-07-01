@@ -90,6 +90,21 @@ func (cs *CronScheduler) Stop() error {
 	return nil
 }
 
+// AddSystemJob registers a raw cron function that is NOT persisted to storage
+// and does NOT appear in user-facing task lists. Intended for internal system
+// jobs (e.g., off-peak retry queue). cronExpr must be a valid 5-field cron
+// expression (minute-level precision). Returns an error if the expression is
+// invalid.
+func (cs *CronScheduler) AddSystemJob(cronExpr string, fn func()) error {
+	if _, err := cs.parser.Parse(cronExpr); err != nil {
+		return fmt.Errorf("cron-scheduler: invalid system job expr %q: %w", cronExpr, err)
+	}
+	if _, err := cs.cron.AddFunc(cronExpr, fn); err != nil {
+		return fmt.Errorf("cron-scheduler: add system job: %w", err)
+	}
+	return nil
+}
+
 // saveTasks 保存任务到文件
 func (cs *CronScheduler) saveTasks() error {
 	cs.tasksMu.RLock()

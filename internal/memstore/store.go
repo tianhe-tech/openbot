@@ -22,6 +22,7 @@ type MemRecord struct {
 	Response   string // first 600 chars of response
 	Summary    string // one-line human-readable summary
 	Project    string // coarse project label (e.g. "爬虫项目")
+	WorkDir    string // absolute working directory of the opencode session (e.g. "/root/openbot")
 	Action     string // "创建" / "修改" / "调试" / "部署" / "查询" / "other"
 	Tags       string // comma-separated keywords
 	Strength   float64
@@ -29,7 +30,7 @@ type MemRecord struct {
 	NextReview time.Time
 }
 
-// ProjectSummary groups records that belong to the same project.
+// ProjectSummary aggregates memory records per project.
 type ProjectSummary struct {
 	Project string
 	Adapter string
@@ -93,10 +94,85 @@ func (s *Store) migrate() error {
 			content,
 			tokenize='trigram'
 		)`,
+		// session_handoff: when an opencode session gets stuck (scheduler deadlock,
+		// see sst/opencode#21173), we save a compressed summary of the session so
+		// the next user turn on the same thread can auto-create a new session and
+		// carry the context over. One pending record per thread; consumed flag
+		// prevents re-injection; 24h TTL via created_at filter at read time.
+		`CREATE TABLE IF NOT EXISTS session_handoff (
+			thread_id       TEXT PRIMARY KEY,
+			adapter         TEXT NOT NULL,
+			user_id         TEXT NOT NULL,
+			old_session_id  TEXT NOT NULL,
+			created_at      INTEGER NOT NULL,
+			summary         TEXT NOT NULL,
+			last_user_msg   TEXT NOT NULL DEFAULT '',
+			consumed        INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_handoff_created ON session_handoff(created_at)`,
+		// skill_candidates: one row per auto-generated skill draft. status evolves
+		// draft → pending_review → approved|rejected. When approved, the installer
+		// writes skill_md to skills/<title>/SKILL.md on disk.
+		`CREATE TABLE IF NOT EXISTS skill_candidates (
+			id              TEXT PRIMARY KEY,
+			trigger         TEXT NOT NULL,
+			adapter         TEXT NOT NULL,
+			user_id         TEXT NOT NULL,
+			thread_id       TEXT NOT NULL,
+			session_id      TEXT NOT NULL,
+			status          TEXT NOT NULL,
+			score           REAL NOT NULL DEFAULT 0,
+			model_id        TEXT NOT NULL DEFAULT '',
+			title           TEXT NOT NULL,
+			skill_md        TEXT NOT NULL,
+			draft_path      TEXT NOT NULL DEFAULT '',
+			notes           TEXT NOT NULL DEFAULT '',
+			created_at      INTEGER NOT NULL,
+			reviewed_at     INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_skill_status ON skill_candidates(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_skill_user ON skill_candidates(adapter, user_id, created_at)`,
+		// skill_gen_model_stats: per-model outcome counters driving epsilon-greedy
+		// self-selection. avg_score is a running mean over approved candidates.
+		`CREATE TABLE IF NOT EXISTS skill_gen_model_stats (
+			model_id        TEXT PRIMARY KEY,
+			attempts        INTEGER NOT NULL DEFAULT 0,
+			approved        INTEGER NOT NULL DEFAULT 0,
+			rejected        INTEGER NOT NULL DEFAULT 0,
+			avg_score       REAL NOT NULL DEFAULT 0,
+			last_used_at    INTEGER NOT NULL DEFAULT 0
+		)`,
+		// pending_retry: messages that timed out (context deadline exceeded with
+		// zero accumulated reply) are queued here for automatic off-peak re-processing.
+		// status: pending → processing → done|failed.
+		// retry_count drives exponential backoff and max-retries gate.
+		`CREATE TABLE IF NOT EXISTS pending_retry (
+			id                TEXT PRIMARY KEY,
+			adapter           TEXT NOT NULL,
+			user_id           TEXT NOT NULL,
+			thread_id         TEXT NOT NULL DEFAULT '',
+			channel           TEXT NOT NULL DEFAULT '',
+			content           TEXT NOT NULL,
+			attachments_json  TEXT NOT NULL DEFAULT '',
+			metadata_json     TEXT NOT NULL DEFAULT '{}',
+			fail_reason       TEXT NOT NULL DEFAULT '',
+			status            TEXT NOT NULL DEFAULT 'pending',
+			retry_count       INTEGER NOT NULL DEFAULT 0,
+			created_at        INTEGER NOT NULL,
+			last_attempt_at   INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_retry_status    ON pending_retry(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_retry_user      ON pending_retry(adapter, user_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return fmt.Errorf("exec %q: %w", stmt[:min(40, len(stmt))], err)
+		}
+	}
+	// Add work_dir column to existing databases (ALTER TABLE is idempotent via error ignore).
+	if _, err := s.db.Exec(`ALTER TABLE mem_records ADD COLUMN work_dir TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			log.Printf("memstore: add work_dir column: %v", err)
 		}
 	}
 	// Backfill any existing records that are not yet in mem_fts.
@@ -144,10 +220,10 @@ func (s *Store) Record(rec MemRecord) error {
 
 	_, err := s.db.Exec(`
 		INSERT INTO mem_records
-			(id, adapter, user_id, ts, request, response, summary, project, action, tags, strength, recall_cnt, next_review)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			(id, adapter, user_id, ts, request, response, summary, project, work_dir, action, tags, strength, recall_cnt, next_review)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rec.ID, rec.Adapter, rec.UserID, rec.Ts.Unix(),
-		rec.Request, resp, rec.Summary, rec.Project, rec.Action, rec.Tags,
+		rec.Request, resp, rec.Summary, rec.Project, rec.WorkDir, rec.Action, rec.Tags,
 		rec.Strength, rec.RecallCnt, rec.NextReview.Unix(),
 	)
 	if err != nil {
@@ -308,7 +384,7 @@ func (s *Store) recallLIKE(keywords []string, adapter, userID string, since time
 	args = append(args, limit)
 
 	rows, err := s.db.Query(`
-		SELECT id, adapter, user_id, ts, request, response, summary, project, action, tags,
+		SELECT id, adapter, user_id, ts, request, response, summary, project, work_dir, action, tags,
 		       strength, recall_cnt, next_review
 		FROM   mem_records
 		WHERE  `+where+`
@@ -347,7 +423,7 @@ func (s *Store) fetchByIDs(ids []string, adapter, userID string, since time.Time
 	}
 
 	rows, err := s.db.Query(`
-		SELECT id, adapter, user_id, ts, request, response, summary, project, action, tags,
+		SELECT id, adapter, user_id, ts, request, response, summary, project, work_dir, action, tags,
 		       strength, recall_cnt, next_review
 		FROM   mem_records
 		WHERE  `+where, args...)
@@ -394,7 +470,7 @@ func (s *Store) RecallByProject(project, adapter string, limit int) ([]MemRecord
 	args = append(args, limit)
 
 	rows, err := s.db.Query(`
-		SELECT id, adapter, user_id, ts, request, response, summary, project, action, tags,
+		SELECT id, adapter, user_id, ts, request, response, summary, project, work_dir, action, tags,
 		       strength, recall_cnt, next_review
 		FROM   mem_records
 		WHERE  `+where+`
@@ -484,7 +560,7 @@ func (s *Store) Recent(adapter, userID string, days, limit int) ([]MemRecord, er
 	args = append(args, limit)
 
 	rows, err := s.db.Query(`
-		SELECT id, adapter, user_id, ts, request, response, summary, project, action, tags,
+		SELECT id, adapter, user_id, ts, request, response, summary, project, work_dir, action, tags,
 		       strength, recall_cnt, next_review
 		FROM   mem_records
 		WHERE  `+where+`
@@ -619,7 +695,7 @@ func scanRecords(rows *sql.Rows) ([]MemRecord, error) {
 		var ts, nextReview int64
 		if err := rows.Scan(
 			&r.ID, &r.Adapter, &r.UserID, &ts,
-			&r.Request, &r.Response, &r.Summary, &r.Project, &r.Action,
+			&r.Request, &r.Response, &r.Summary, &r.Project, &r.WorkDir, &r.Action,
 			&r.Tags, &r.Strength, &r.RecallCnt, &nextReview,
 		); err != nil {
 			return nil, fmt.Errorf("memstore: scan: %w", err)

@@ -72,6 +72,10 @@ export OPENCODE_DIRECTORY=/path/to/your/project
 | `OPENCODE_MANAGE_SERVE` | `true` | Let gateway start/restart the opencode subprocess |
 | `OPENCODE_SERVE_COMMAND` | `opencode` | Binary name for managed serve |
 | `OPENCODE_SERVE_ARGS` | `serve` | Args passed to opencode when managed |
+| `OPENCODE_MAX_RETRY_ATTEMPTS` | `5` | Max upstream-provider retries (`type:"retry"` parts, e.g. "No available channel for model …") for one turn before the gateway surfaces the error and ends the turn instead of hanging in "正在处理中" |
+| `OPENCODE_STREAM_IDLE_TIMEOUT_SECONDS` | `600` | No-content streaming idle timeout (long prefill / extended-thinking models) |
+| `OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS` | `120` | Has-content streaming idle timeout |
+| `OPENCODE_STREAM_BUSY_PROBE_EXTEND` | `true` | Extend idle timeout while the session still shows activity (`0`/`false` to disable) |
 | `MEMORY_STORE_PATH` | `<OPENCODE_DIRECTORY>/tmp/memory.db` | SQLite path for episodic memory (`""` disables) |
 
 ### DingTalk
