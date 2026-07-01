@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -39,7 +40,13 @@ func (d *OpencodeDrafter) Draft(ctx context.Context, in DraftInput) (DraftOutput
 		return DraftOutput{}, nil // not enough evidence
 	}
 	exemplar := d.loadReference()
+	if exemplar == "" {
+		log.Printf("skillgen: drafter reference skill not found or empty at path=%q, prompt quality may degrade", d.ReferenceSkillPath)
+	} else {
+		log.Printf("skillgen: drafter loaded reference skill (%d chars) from %s", len(exemplar), d.ReferenceSkillPath)
+	}
 	prompt := buildDraftPrompt(in, exemplar)
+	log.Printf("skillgen: drafter prompt built (len=%d) for thread=%s model=%s turns=%d", len(prompt), in.ThreadID, in.ModelID, len(in.Conversation))
 
 	// Use an isolated thread so the drafting work doesn't pollute user threads.
 	threadID := fmt.Sprintf("skillgen-draft-%s", in.ThreadID)
@@ -48,15 +55,21 @@ func (d *OpencodeDrafter) Draft(ctx context.Context, in DraftInput) (DraftOutput
 		UserID:   in.UserID,
 		ThreadID: threadID,
 		Content:  prompt,
+		Model:    in.ModelID, // pass selected model to opencode so it actually uses it
 	}
+	log.Printf("skillgen: drafter sending prompt to opencode (model=%s thread=%s)", in.ModelID, threadID)
 	resp, err := d.Client.SendMessage(ctx, payload)
 	if err != nil {
+		log.Printf("skillgen: drafter SendMessage failed (model=%s thread=%s): %v", in.ModelID, threadID, err)
 		return DraftOutput{}, err
 	}
+	log.Printf("skillgen: drafter received reply (len=%d) from model=%s thread=%s", len(resp.Reply), in.ModelID, threadID)
 	title, body, score, action, patchTarget := parseDraftReply(resp.Reply)
 	if title == "" || body == "" {
+		log.Printf("skillgen: drafter reply unparseable (len=%d, first 200 chars=%.200s)", len(resp.Reply), resp.Reply)
 		return DraftOutput{}, fmt.Errorf("skillgen: drafter returned unparseable reply (len=%d)", len(resp.Reply))
 	}
+	log.Printf("skillgen: drafter parsed OK (title=%s score=%.2f action=%s patchTarget=%s)", title, score, action, patchTarget)
 	return DraftOutput{
 		Title:       title,
 		SkillMD:     body,

@@ -1,6 +1,7 @@
 package wechat
 
 import (
+	"os"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -41,7 +42,7 @@ func splitTextForWeixinDelivery(content string, maxLength int, splitPerLine bool
 	// Compact mode
 	runes := []rune(content)
 	if len(runes) <= maxLength {
-		if shouldSplitShortChatBlock(content) {
+		if shortChatAutoSplitEnabled() && shouldSplitShortChatBlock(content) {
 			return filterEmpty(splitDeliveryUnits(content), content)
 		}
 		return []string{content}
@@ -258,6 +259,22 @@ func shouldSplitShortChatBlock(content string) bool {
 		}
 	}
 	return true
+}
+
+// shortChatAutoSplitEnabled controls whether compact mode should split short
+// chat-style blocks (2-6 short lines) into multiple messages.
+//
+// Env: WECHAT_SHORT_CHAT_SPLIT
+//   - true values: 1, true, yes, on
+//   - false values/default: 0, false, no, off, empty
+func shortChatAutoSplitEnabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("WECHAT_SHORT_CHAT_SPLIT")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // packMarkdownBlocks packs content into length-limited chunks,

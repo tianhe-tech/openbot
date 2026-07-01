@@ -45,7 +45,8 @@ type StreamingSessionHandler struct {
 	messageSender      MessageSender // 用于主动推送消息到用户
 	showThinking       bool          // 是否输出 reasoning/thinking 内容
 	showSteps          bool          // 是否输出 step-start/step-finish 步骤提示
-	lastTodoSummary    string        // 最近一次自动推送的 todo 文本（用于去重）
+	lastTodoSummary    string        // 最近一次自动推送的 todo 文本（用于日志参考）
+	lastTodoStateHash  string        // 最近一次 todo 列表的结构化哈希（用于去重）
 	lastTodoPushTime   time.Time     // 最近一次自动推送 todo 的时间
 	// 增量内容追踪（对照 TUI sync.tsx 中 message.part.delta / message.part.updated 机制）
 	partTextCache   sync.Map        // partID -> string: 每个 part 的累积全文，防止 message.part.updated 重复计算
@@ -54,6 +55,25 @@ type StreamingSessionHandler struct {
 	sessionTodos    []TodoItem      // 当前 todo 列表（来自 todo.updated 事件）
 	sessionDiff     []FileDiff      // 本次会话的文件变更（来自 session.diff 事件）
 	activeToolParts map[string]bool // partID -> true：当前处于 pending/running 状态的 tool part，用于判断是否仍有活跃 tool
+
+	// 上游 provider 重试状态：opencode 在模型不可用/限流时会发出 type=="retry" 的
+	// message part（{"type":"retry","attempt":N,"error":{"data":{"message":...}}}）。
+	// 这类 part 既不是 session.error，也不会写入 AssistantMessage.Error.Name，
+	// 因此需要在这里单独跟踪，否则会话会一直"正在处理中"而不报错。
+	retryAttempt    int       // 已观察到的最大 attempt
+	retryMessage    string    // 最近一次 retry 的错误信息（error.data.message）
+	retryStatusCode int       // 最近一次 retry 的 HTTP 状态码（若有）
+	lastRetryTime   time.Time // 最近一次收到 retry part 的时间
+	retrySurfaced   bool      // 是否已因超过重试上限而向用户报错
+
+	// pendingQuestionSince records when a permission.asked / question.asked
+	// event was received. The streaming ticker uses this to avoid infinite
+	// idle-extension: if the session has been waiting for user input for
+	// longer than the no-content idle threshold, a reminder is sent instead
+	// of silently extending forever (which would deadlock the session when
+	// the permission message is stuck behind a congested outbound queue).
+	pendingQuestionSince time.Time
+	pendingQuestionSent  bool // whether a "still waiting for your input" reminder has been sent
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -76,7 +96,7 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, event
 		defer h.mu.Unlock()
 		if !h.contentSent && !h.completed && !h.waitingHintSent {
 			h.waitingHintSent = true
-			_ = h.callback(QuestionSignalPrefix + "⏳ 正在努力处理中...")
+			_ = h.callback(QuestionSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
 		}
 	})
 	return h
@@ -274,6 +294,13 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						}
 					}
 				}
+
+				// 上游 provider 重试 part：opencode 在模型不可用/限流时反复重试，
+				// 每次都发一个 type=="retry" 的 part。这类 part 永远不会触发
+				// session.idle，若不拦截会导致会话一直"正在处理中"。
+				if partMeta2.Properties.Part.Type == "retry" {
+					s.handleRetryPart(jsonData)
+				}
 			}
 		}
 
@@ -307,16 +334,22 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 
 	case "question.answered", "permission.answered":
 		// 用户已回答问题或权限请求
+		s.pendingQuestionSince = time.Time{}
+		s.pendingQuestionSent = false
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
 	case "permission.replied":
 		// 权限已确认（兼容性事件）
+		s.pendingQuestionSince = time.Time{}
+		s.pendingQuestionSent = false
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
 	case "question.asked", "permission.asked":
 		// OpenCode 需要用户确认（build 模式或权限请求）
 		// ⚠️ 不再设置 waitingForResponse，以免阻止后续事件处理
 		// s.waitingForResponse = true // 注释掉，让事件继续流动
+		s.pendingQuestionSince = time.Now()
+		s.pendingQuestionSent = false
 		log.Printf("opencode: user response needed (type: %s) for session %s", event.Type, s.sessionID[:8])
 
 		question, questionMsg := s.extractQuestionFromEvent(event)
@@ -328,9 +361,15 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		}
 
 		if questionMsg == "" {
-			questionMsg = "⚠️ OpenCode 需要您的确认！\n\n" +
-				"请在钉钉中回复相应的选项。\n" +
-				"确认后结果将自动继续处理。"
+			if event.Type == "permission.asked" {
+				questionMsg = "🔔 需要您确认才能继续\n\n" +
+					"请直接回复选项编号或文字（如 1、允许、拒绝）。\n" +
+					"确认后任务将自动继续执行。"
+			} else {
+				questionMsg = "🔔 需要您回复才能继续\n\n" +
+					"请直接回复选项编号或文字。\n" +
+					"回复后任务将自动继续执行。"
+			}
 			log.Printf("opencode: using fallback message for %s", event.Type)
 		}
 		log.Printf("opencode: sending %s message (len=%d, prefix=%s) for session %s",
@@ -515,12 +554,19 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			summary := formatTodoSummaryFromTodos(todos)
 			if summary != "" {
 				now := time.Now()
-				if summary != s.lastTodoSummary {
+				// Dedup by structural hash (status+text of each item) instead
+				// of the formatted summary string. This ensures that when any
+				// todo item's status changes (e.g. pending→in_progress→completed)
+				// the update is pushed even if the formatted summary happens to
+				// be identical due to formatting quirks.
+				stateHash := todoStateHash(todos)
+				if stateHash != s.lastTodoStateHash {
 					if err := s.callback(TodoSignalPrefix + summary); err != nil {
 						log.Printf("opencode: todo auto-push callback error: %v", err)
 					} else {
 						s.emitEventFromChunk(TodoSignalPrefix + summary)
 						s.lastTodoSummary = summary
+						s.lastTodoStateHash = stateHash
 						s.lastTodoPushTime = now
 						if !s.contentSent {
 							s.stopWaitingTimer()
@@ -1317,6 +1363,161 @@ func (s *StreamingSessionHandler) GetLastEventInfo() (time.Time, string) {
 	return s.lastEventTime, s.lastEventType
 }
 
+// RetryState describes the upstream provider retry status observed for the
+// current turn. Attempt is the highest retry attempt seen; Message is the most
+// recent upstream error text (e.g. "No available channel for model GLM-5.1").
+type RetryState struct {
+	Attempt    int
+	Message    string
+	StatusCode int
+	LastAt     time.Time
+}
+
+// GetRetryState returns a snapshot of the upstream retry status for this turn.
+func (s *StreamingSessionHandler) GetRetryState() RetryState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return RetryState{
+		Attempt:    s.retryAttempt,
+		Message:    s.retryMessage,
+		StatusCode: s.retryStatusCode,
+		LastAt:     s.lastRetryTime,
+	}
+}
+
+// PendingQuestionInfo describes whether the session is currently blocked
+// waiting for user input (permission.asked / question.asked) and for how long.
+type PendingQuestionInfo struct {
+	Since        time.Time
+	ReminderSent bool
+}
+
+// GetPendingQuestionInfo returns the pending-question state for the ticker.
+func (s *StreamingSessionHandler) GetPendingQuestionInfo() PendingQuestionInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return PendingQuestionInfo{
+		Since:        s.pendingQuestionSince,
+		ReminderSent: s.pendingQuestionSent,
+	}
+}
+
+// MarkPendingQuestionReminderSent records that a "still waiting for your
+// input" reminder has been pushed, so the ticker does not spam it.
+func (s *StreamingSessionHandler) MarkPendingQuestionReminderSent() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingQuestionSent = true
+}
+
+// handleRetryPart parses a retry message part and tracks the upstream provider
+// retry status. opencode surfaces transient provider failures (model
+// unavailable, rate-limited, no available channel, etc.) as parts of type
+// "retry" with an incrementing attempt counter; these never produce a
+// session.idle event, so without intervention the adapter stays stuck in
+// "正在处理中". When the attempt count reaches maxRetryAttempts, the upstream
+// error is surfaced to the user and the turn is completed.
+//
+// Caller must NOT hold s.mu (this method locks internally).
+func (s *StreamingSessionHandler) handleRetryPart(rawJSON string) {
+	if rawJSON == "" {
+		return
+	}
+	var wrapper struct {
+		Properties struct {
+			Part struct {
+				Type    string  `json:"type"`
+				Attempt float64 `json:"attempt"`
+				Error   struct {
+					Name string `json:"name"`
+					Data struct {
+						Message      string `json:"message"`
+						StatusCode   int    `json:"statusCode"`
+						IsRetryable  bool   `json:"isRetryable"`
+						ResponseBody string `json:"responseBody"`
+					} `json:"data"`
+				} `json:"error"`
+			} `json:"part"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(rawJSON), &wrapper); err != nil {
+		log.Printf("opencode: failed to parse retry part for session %s: %v", s.sessionID[:min(8, len(s.sessionID))], err)
+		return
+	}
+
+	part := wrapper.Properties.Part
+	attempt := int(part.Attempt)
+	msg := strings.TrimSpace(part.Error.Data.Message)
+	if msg == "" {
+		msg = strings.TrimSpace(part.Error.Name)
+	}
+
+	s.mu.Lock()
+	if attempt > s.retryAttempt {
+		s.retryAttempt = attempt
+	}
+	if msg != "" {
+		s.retryMessage = msg
+	}
+	if part.Error.Data.StatusCode != 0 {
+		s.retryStatusCode = part.Error.Data.StatusCode
+	}
+	s.lastRetryTime = time.Now()
+	curAttempt := s.retryAttempt
+	curMsg := s.retryMessage
+	curCode := s.retryStatusCode
+	alreadySurfaced := s.retrySurfaced
+	reachedLimit := curAttempt >= maxRetryAttempts
+	if reachedLimit && !alreadySurfaced {
+		s.retrySurfaced = true
+	}
+	s.mu.Unlock()
+
+	log.Printf("opencode: 🔁 retry part for session %s (attempt=%d/%d, statusCode=%d, msg=%q)",
+		s.sessionID[:min(8, len(s.sessionID))], curAttempt, maxRetryAttempts, curCode, curMsg)
+
+	// 未达上限：给用户一条轻量的"重试中"提示，让体感不至于失联，但不结束会话。
+	if !reachedLimit {
+		notice := fmt.Sprintf("⏳ 上游模型暂时不可用，正在重试（第 %d 次）…", curAttempt)
+		s.emitEvent(StreamEventInfo, notice, nil, nil, nil, "retry")
+		return
+	}
+
+	// 已达上限且尚未报错过：surface 一条明确的错误并结束本轮，避免无限"正在处理中"。
+	if alreadySurfaced {
+		return
+	}
+
+	errText := fmt.Sprintf("⚠️ 上游模型多次重试仍失败（已重试 %d 次），本轮中止。", curAttempt)
+	if curMsg != "" {
+		detail := curMsg
+		if len(detail) > 300 {
+			detail = detail[:300] + "…"
+		}
+		errText += "\n\n" + detail
+	}
+	if curCode != 0 {
+		errText += fmt.Sprintf("\n(HTTP %d)", curCode)
+	}
+	errText += "\n\n会话上下文已保留，请稍后重试或更换模型。"
+
+	if err := s.callback(QuestionSignalPrefix + errText); err != nil {
+		log.Printf("opencode: retry-limit error callback failed for session %s: %v", s.sessionID[:min(8, len(s.sessionID))], err)
+	} else {
+		s.emitEvent(StreamEventError, errText, nil, nil, nil, "retry")
+		s.mu.Lock()
+		s.contentSent = true
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	s.completed = true
+	s.mu.Unlock()
+	s.notifyCompletion()
+	log.Printf("opencode: 🛑 retry limit reached for session %s, turn aborted (attempt=%d)",
+		s.sessionID[:min(8, len(s.sessionID))], curAttempt)
+}
+
 // IsActivelyProcessing 检查session是否正在活跃处理中
 // 通过判断最近30秒内是否收到过活动事件来确定
 func (s *StreamingSessionHandler) IsActivelyProcessing() bool {
@@ -1561,6 +1762,25 @@ func formatTodoSummaryFromTodos(todos []TodoItem) string {
 			statusText = "待处理"
 		}
 		sb.WriteString(fmt.Sprintf("%s [%s][优先级:%s] %s\n", icon, statusText, todo.PriorityLabel(), todo.Text()))
+	}
+	return sb.String()
+}
+
+// todoStateHash computes a structural hash of the todo list based on each
+// item's status and text. Two todo lists with the same items in the same
+// states produce the same hash, regardless of formatting. This is used for
+// dedup so that any status change (e.g. pending→in_progress) triggers a push
+// even when the formatted summary string happens to be identical.
+func todoStateHash(todos []TodoItem) string {
+	if len(todos) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, t := range todos {
+		sb.WriteString(t.Status)
+		sb.WriteByte('|')
+		sb.WriteString(t.Text())
+		sb.WriteByte('\n')
 	}
 	return sb.String()
 }

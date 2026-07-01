@@ -4061,6 +4061,12 @@ func (h *Handler) handleStatus(ctx context.Context, data *chatbot.BotCallbackDat
 	}
 	msgBuilder.WriteString(fmt.Sprintf("创建时间: %s", info.Created))
 
+	// 追加实时处理诊断（处理中/上游重试/活跃工具等），帮助用户判断为何"正在处理中"。
+	if diag := h.client.GetSessionDiagnostics(sessionID, data.ConversationId).FormatSessionStatus(); diag != "" {
+		msgBuilder.WriteString("\n\n— 实时诊断 —\n")
+		msgBuilder.WriteString(diag)
+	}
+
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String())); err != nil {
 		log.Printf("dingtalk: failed to send status: %v", err)
 		return nil, err

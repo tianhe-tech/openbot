@@ -464,6 +464,12 @@ func main() {
 							adapterName := parts[0]
 							userID := parts[1]
 
+							// skillgen uses internal drafting sessions; they are not adapter-routable
+							// and should not go through title recovery.
+							if adapterName == "skillgen" {
+								return nil
+							}
+
 							log.Printf("opencode event: recovering mapping from session title - adapter=%s, userID=%s, sessionID=%s",
 								adapterName, userID, sessionID[:min(8, len(sessionID))])
 

@@ -81,6 +81,15 @@ var (
 	streamIdleTimeoutNoContent  = parseDurationEnvSeconds("OPENCODE_STREAM_IDLE_TIMEOUT_SECONDS", 600*time.Second)
 	streamIdleTimeoutHasContent = parseDurationEnvSeconds("OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS", 120*time.Second)
 	streamBusyProbeEnabled      = parseBoolEnv("OPENCODE_STREAM_BUSY_PROBE_EXTEND", true)
+
+	// maxRetryAttempts bounds how many times opencode's upstream provider may
+	// retry a single turn (surfaced as message parts of type "retry", e.g.
+	// {"type":"retry","attempt":12,"message":"No available channel for model ..."})
+	// before the gateway gives up waiting and surfaces the error to the user.
+	// Without this, a provider stuck in an endless retry loop (no available
+	// channel, rate-limited, etc.) never emits session.idle, so the adapter
+	// hangs in "正在处理中" indefinitely. Override via OPENCODE_MAX_RETRY_ATTEMPTS.
+	maxRetryAttempts = parseIntEnv("OPENCODE_MAX_RETRY_ATTEMPTS", 5)
 )
 
 func parseDurationEnvSeconds(key string, def time.Duration) time.Duration {
@@ -106,6 +115,20 @@ func parseBoolEnv(key string, def bool) bool {
 		return true
 	}
 	return def
+}
+
+// parseIntEnv reads a positive integer from the environment, returning def when
+// unset, non-numeric, or <= 0.
+func parseIntEnv(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 // Response represents the minimal data we expect back from OpenCode.
@@ -135,6 +158,7 @@ type MessagePayload struct {
 	Streaming   bool              `json:"streaming,omitempty"` // 是否使用流式返回
 	Attachments []Attachment      `json:"attachments,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+	Model       string            `json:"model,omitempty"` // 可选：指定模型 (格式 provider/model，如 tianhe-ai/GLM-5.2)，留空则由 selectModelOverride 决定
 }
 
 // StreamCallback defines a callback for streaming responses.
@@ -298,6 +322,12 @@ type Client struct {
 	// probes (new messages / growing assistant text) even when no tool part is
 	// in a pending/running state — e.g. pure-thinking / reasoning models.
 	probeSnapshots sync.Map // map[sessionID]sessionProbeSnapshot
+
+	// activeHandlers tracks the live StreamingSessionHandler for an in-flight
+	// turn, keyed by sessionID. Populated when a streaming turn starts and
+	// removed on completion. Lets /session-status report live state (retry
+	// attempts, last event, content-sent) without touching the SSE hot path.
+	activeHandlers sync.Map // map[sessionID]*StreamingSessionHandler
 
 	// recentHandoffs tracks per-thread handoff timestamps for circuit-breaking.
 	// If a thread triggers ≥2 handoffs within handoffBreakerWindow, further
@@ -873,7 +903,17 @@ sendMessage:
 		log.Printf("opencode: attached file part #%d for session %s (mime=%s, url_len=%d)", idx+1, sessionID[:8], mimeValue, len(urlValue))
 	}
 
-	modelOverride, modelReason := c.selectModelOverride(ctx, sessionID, payload)
+	// Priority: payload.Model (explicit caller override, e.g. skillgen drafter)
+	// > selectModelOverride (session override / multimodal auto-select).
+	var modelOverride *opencode.SessionPromptParamsModel
+	modelReason := ""
+	if pid, mid, ok := parseProviderModelRef(payload.Model); ok {
+		modelOverride = modelFromRef(pid, mid)
+		modelReason = "payload.Model (caller-specified)"
+		log.Printf("opencode: using caller-specified model %s/%s for session %s", pid, mid, sessionID[:8])
+	} else {
+		modelOverride, modelReason = c.selectModelOverride(ctx, sessionID, payload)
+	}
 	log.Printf("opencode: modelOverride selected=%t reason=%s", modelOverride != nil, modelReason)
 	if modelOverride != nil {
 		ctxLen := c.getMaxContextLength(sessionID)
@@ -1618,6 +1658,7 @@ func (c *Client) AddCommandInterceptor(ci CommandInterceptor) {
 // Response when one handles the message. Ok=false means "no interceptor claimed
 // this message; proceed with normal opencode dispatch".
 func (c *Client) dispatchInterceptors(payload MessagePayload) (Response, bool) {
+	log.Printf("opencode: dispatchInterceptors: interceptors=%d content=%.50s", len(c.commandInterceptors), payload.Content)
 	for _, ci := range c.commandInterceptors {
 		if ci == nil {
 			continue
@@ -3143,6 +3184,111 @@ func (c *Client) GetSessionForThread(threadID string) (string, bool) {
 	return val.(string), true
 }
 
+// SessionStatusInfo is a point-in-time snapshot of a thread's opencode session,
+// used by the /status command to explain why a turn might appear stuck.
+type SessionStatusInfo struct {
+	SessionID    string
+	HasSession   bool
+	Running      bool // session is currently processing a turn
+	MessageCount int  // messages exchanged in this session
+	TokenCount   int  // estimated/last-reported context tokens
+	HandoffPend  bool // an async handoff save is in flight for this thread
+
+	// Live turn state (only meaningful while Running). Populated from the
+	// active StreamingSessionHandler when present.
+	HasLiveHandler bool
+	ContentSent    bool
+	ActiveTools    int
+	LastEventType  string
+	LastEventAt    time.Time
+	RetryAttempt   int
+	RetryMessage   string
+	RetryMax       int
+	// ToolStuck is set when the session has active tools running but no new
+	// events have arrived for an extended period (>= 5 minutes), indicating
+	// a subagent or tool call may be hung on the opencode server side.
+	ToolStuck bool
+}
+
+// GetSessionDiagnostics assembles a status snapshot for a session. threadID may
+// be empty; when provided it is used to report a pending handoff. It is safe to
+// call at any time and never touches the SSE hot path.
+func (c *Client) GetSessionDiagnostics(sessionID, threadID string) SessionStatusInfo {
+	info := SessionStatusInfo{RetryMax: maxRetryAttempts}
+	if sessionID == "" {
+		return info
+	}
+	info.HasSession = true
+	info.SessionID = sessionID
+	info.Running = c.IsSessionRunning(sessionID)
+	info.MessageCount = c.GetMessageCount(sessionID)
+	info.TokenCount = c.GetTokenCount(sessionID)
+	if threadID != "" {
+		if _, pending := c.pendingHandoffs.Load(threadID); pending {
+			info.HandoffPend = true
+		}
+	}
+	if v, ok := c.activeHandlers.Load(sessionID); ok {
+		if h, ok2 := v.(*StreamingSessionHandler); ok2 && h != nil {
+			info.HasLiveHandler = true
+			info.ContentSent = h.HasSentContent()
+			info.ActiveTools = h.ActiveToolCount()
+			info.LastEventAt, info.LastEventType = h.GetLastEventInfo()
+			rs := h.GetRetryState()
+			info.RetryAttempt = rs.Attempt
+			info.RetryMessage = rs.Message
+			// Detect stuck tools: active tools running but no events for >= 5 min.
+			if info.ActiveTools > 0 && !info.LastEventAt.IsZero() && time.Since(info.LastEventAt) >= 5*time.Minute {
+				info.ToolStuck = true
+			}
+		}
+	}
+	return info
+}
+
+// FormatSessionStatus renders a SessionStatusInfo into a human-readable,
+// multi-line summary suitable for sending back to a chat user. It highlights
+// the "stuck retrying" condition so users understand why a turn produced no
+// reply.
+func (info SessionStatusInfo) FormatSessionStatus() string {
+	if !info.HasSession {
+		return ""
+	}
+	var b strings.Builder
+	state := "空闲"
+	if info.Running {
+		state = "处理中"
+	}
+	b.WriteString(fmt.Sprintf("处理状态: %s\n", state))
+	if info.HasLiveHandler {
+		if info.RetryAttempt > 0 {
+			b.WriteString(fmt.Sprintf("⚠️ 上游重试: 第 %d 次（上限 %d）\n", info.RetryAttempt, info.RetryMax))
+			if info.RetryMessage != "" {
+				msg := info.RetryMessage
+				if len(msg) > 160 {
+					msg = msg[:160] + "…"
+				}
+				b.WriteString(fmt.Sprintf("   原因: %s\n", msg))
+			}
+		}
+		if info.ActiveTools > 0 {
+			b.WriteString(fmt.Sprintf("活跃工具: %d\n", info.ActiveTools))
+			if info.ToolStuck {
+				b.WriteString("⚠️ 工具可能已卡住（长时间无事件）\n")
+			}
+		}
+		b.WriteString(fmt.Sprintf("已产出内容: %t\n", info.ContentSent))
+		if !info.LastEventAt.IsZero() {
+			b.WriteString(fmt.Sprintf("最近事件: %s（%s 前）\n",
+				info.LastEventType, time.Since(info.LastEventAt).Truncate(time.Second)))
+		}
+	}
+	if info.HandoffPend {
+		b.WriteString("会话切换: 进行中\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // Directory returns current working directory configured for session actions.
 func (c *Client) Directory() string {
 	return c.directory
@@ -3558,9 +3704,11 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	handler := NewStreamingSessionHandler(sessionID, callback, eventCallback, func() {
 		c.runningSessions.Delete(sessionID)
 		c.probeSnapshots.Delete(sessionID)
+		c.activeHandlers.Delete(sessionID)
 		c.UnregisterSessionHandler(sessionID)
 	}, c, c, true, false)
 	c.RegisterSessionHandler(sessionID, handler.HandleEvent)
+	c.activeHandlers.Store(sessionID, handler)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
 
 	// 4. 使用goroutine异步发送消息
@@ -3598,6 +3746,12 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	var busyProbeExtendAt time.Time     // 若探测确认 busy，记录延长的起点
 	consecutiveNotBusy := 0             // 连续探测到 not-busy 的次数（满 2 次才宣告超时）
 	thinkingNoticeSent := false         // 是否已经向用户推送过一次"仍在处理中"提示
+	// Stuck-tool detection: when active tools are running but no events arrive
+	// for an extended period, the session is likely blocked by a hung subagent.
+	// We track the first detection time and cap extends to avoid infinite wait.
+	var toolStuckSince time.Time  // 首次检测到工具可能卡住的时间
+	var toolStuckExtendCount int  // 卡住后继续延长的次数（上限后强制收尾）
+	const maxToolStuckExtends = 6 // 最多延长 6 次（~3 分钟）后强制收尾
 
 	for {
 		select {
@@ -3648,7 +3802,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			}
 
 			// 仍无内容，返回通知（不返回 error，避免 adapter 只发错误信息）
-			notice := "⏳ 任务仍在执行中，请稍后发送消息查看结果。会话上下文已保留。"
+			notice := "⏳ 任务仍在执行中，无需操作，请稍后发送消息查看结果。会话上下文已保留。"
 			log.Printf("opencode: ⚠️ no content accumulated on context deadline for session %s, sending notice", sessionID[:8])
 			if callback != nil {
 				_ = callback(notice)
@@ -3692,6 +3846,19 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 				return c.finalizeAsyncStreamingResponse(payload, sessionID, handler, callback, asyncResponse), nil
 			}
 
+			// 上游 provider 重试上限安全网：handleRetryPart 在达到上限时会标记
+			// completed 并触发 notifyCompletion，正常情况下上面的 IsCompleted 分支
+			// 已经返回。这里作为兜底：即便 completion 信号因竞态未能及时传播，只要
+			// 观察到重试次数已达上限就立即收尾，避免会话无限"正在处理中"。
+			if isAsyncMode {
+				if rs := handler.GetRetryState(); rs.Attempt >= maxRetryAttempts {
+					log.Printf("opencode: decision=retry_limit session=%s thread=%s attempt=%d threshold=%d msg=%q",
+						sessionID[:8], payload.ThreadID, rs.Attempt, maxRetryAttempts, rs.Message)
+					c.recordMemAsync(payload, handler.GetLastContent())
+					return c.finalizeAsyncStreamingResponse(payload, sessionID, handler, callback, asyncResponse), nil
+				}
+			}
+
 			// 检查最后一次事件时间
 			lastEventTime, lastEventType := handler.GetLastEventInfo()
 			timeSinceLastEvent := time.Since(lastEventTime)
@@ -3712,6 +3879,39 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 					timeSinceLastEvent = d
 				}
 			}
+
+			// Pending-question guard: when the session is blocked waiting for
+			// user input (permission.asked / question.asked), the idle timer
+			// must NOT fire — the session is not stuck, it is waiting for the
+			// user. However, if the wait exceeds the no-content idle threshold
+			// (meaning the permission message likely never reached the user due
+			// to outbound queue congestion), send a reminder so the user knows
+			// action is needed. This breaks the deadlock where:
+			//   1. permission.asked fires → question enqueued to wechat queue
+			//   2. wechat queue is congested → permission message stuck
+			//   3. user never sees the permission request
+			//   4. session waits forever → idle timeout never fires (lastEventTime
+			//      was reset by permission.asked event)
+			if pqInfo := handler.GetPendingQuestionInfo(); !pqInfo.Since.IsZero() {
+				pqWait := time.Since(pqInfo.Since)
+				if pqWait > streamIdleTimeoutNoContent && !pqInfo.ReminderSent {
+					log.Printf("opencode: 🔔 pending question wait %v exceeds threshold %v for session %s, sending reminder",
+						pqWait, streamIdleTimeoutNoContent, sessionID[:8])
+					if eventCallback != nil {
+						_ = eventCallback(StreamEvent{
+							Kind:      StreamEventInfo,
+							SessionID: sessionID,
+							Content:   "🔔 仍在等待您的确认才能继续\n\n请回复选项编号或文字（如 1、允许、拒绝）。如果已回复，请稍候。",
+							RawType:   "pending_question_reminder",
+						})
+					}
+					handler.MarkPendingQuestionReminderSent()
+				}
+				// Skip all idle-timeout checks while waiting for user input.
+				idleCheckCount++
+				continue
+			}
+
 			hasSentContent := handler.HasSentContent()
 			hasStepFinish := handler.HasReceivedStepFinish()
 			stepFinishTime := handler.GetStepFinishTime()
@@ -3728,6 +3928,22 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 				timeSinceStepFinish := time.Since(stepFinishTime)
 				log.Printf("opencode: 📊 step-finish %v ago (activeTools=%d, hasSent=%t) for session %s — waiting for session.idle",
 					timeSinceStepFinish, handler.ActiveToolCount(), hasSentContent, sessionID[:8])
+			}
+
+			// #1: Detect stuck subagents. When active tools are running but no
+			// new events have arrived for >= 5 minutes, log a warning and mark
+			// the first detection time. This helps diagnose hung subagents
+			// (task tools) that never complete on the opencode server side.
+			if isAsyncMode && hasActiveTools && timeSinceLastEvent > 5*time.Minute {
+				if toolStuckSince.IsZero() {
+					toolStuckSince = time.Now()
+					log.Printf("opencode: ⚠️ STUCK_TOOLS session=%s activeTools=%d noEvent=%v — tools may be stuck (subagent hung?)",
+						sessionID[:8], handler.ActiveToolCount(), timeSinceLastEvent)
+				}
+			} else {
+				// Reset when tools complete or events resume.
+				toolStuckSince = time.Time{}
+				toolStuckExtendCount = 0
 			}
 
 			// 如果已发送内容且超过阈值无新事件，认为可能完成
@@ -3775,6 +3991,27 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 				return c.finalizeAsyncStreamingResponse(payload, sessionID, handler, callback, asyncResponse), nil
 			}
 
+			// #3: Cap stuck-tool extends. If tools have been stuck for >= 5 min
+			// and we've already extended maxToolStuckExtends times, surface an
+			// error instead of continuing to extend forever.
+			if isAsyncMode && hasActiveTools && !toolStuckSince.IsZero() && time.Since(toolStuckSince) > 5*time.Minute {
+				toolStuckExtendCount++
+				if toolStuckExtendCount >= maxToolStuckExtends {
+					log.Printf("opencode: decision=tool_stuck session=%s thread=%s activeTools=%d stuckSince=%v extends=%d — forcing completion",
+						sessionID[:8], payload.ThreadID, handler.ActiveToolCount(), time.Since(toolStuckSince), toolStuckExtendCount)
+					if eventCallback != nil {
+						_ = eventCallback(StreamEvent{
+							Kind:      StreamEventInfo,
+							SessionID: sessionID,
+							Content:   "⚠️ 子任务可能已卡住，请发送 /new 开始新会话或 /status 查看详情",
+							RawType:   "tool_stuck_notice",
+						})
+					}
+					c.recordMemAsync(payload, handler.GetLastContent())
+					return c.finalizeAsyncStreamingResponse(payload, sessionID, handler, callback, asyncResponse), nil
+				}
+			}
+
 			// 如果超过阈值无任何事件（即使没发送内容），认为完成。
 			// 阈值可通过 OPENCODE_STREAM_IDLE_TIMEOUT_SECONDS 调整（默认600s）。
 			// 在宣告超时前，先探测会话是否仍在运行 tool（upstream 在大 prefill 阶段
@@ -3806,7 +4043,7 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 							if cbErr := eventCallback(StreamEvent{
 								Kind:      StreamEventInfo,
 								SessionID: sessionID,
-								Content:   "⏳ 模型仍在处理中，请稍候…",
+								Content:   "⏳ 模型仍在处理中，无需操作，请稍候…",
 								RawType:   "thinking_notice",
 							}); cbErr != nil {
 								log.Printf("opencode: thinking-notice event callback error: %v", cbErr)
@@ -3874,6 +4111,11 @@ func (c *Client) recordMemAsync(payload MessagePayload, reply string) {
 func (c *Client) maybeFireLongSessionHook(payload MessagePayload, sessionID string) {
 	hook := c.skillCandidateHook
 	if hook == nil {
+		return
+	}
+	// Prevent self-trigger loops: skillgen drafting sessions must not re-trigger
+	// long-session skill mining.
+	if payload.Channel == "skillgen" || strings.HasPrefix(payload.ThreadID, "skillgen-draft-") {
 		return
 	}
 	turns := 0
@@ -4443,11 +4685,50 @@ func (c *Client) classifyStuckSession(ctx context.Context, sessionID string) (ki
 				return stuckKindProviderError, summary, nil
 			}
 		}
+		// Retry parts: opencode keeps retrying transient upstream failures
+		// (model unavailable / rate-limited / no available channel). These do
+		// not set AssistantMessage.Error.Name, so detect them via parts of
+		// type "retry" and surface the upstream message instead of handing off.
+		if summary, ok := retryPartSummary(msg.Parts); ok {
+			return stuckKindProviderError, summary, nil
+		}
 	}
 	if !sawAssistant {
 		return stuckKindNoAssistant, "", nil
 	}
 	return stuckKindNoFreshNoErr, "", nil
+}
+
+// retryPartSummary scans message parts for an upstream retry part
+// (PartRetryPart, type=="retry") and returns a human-readable summary of the
+// highest-attempt retry seen. ok is false when no retry part is present.
+func retryPartSummary(parts []opencode.Part) (summary string, ok bool) {
+	bestAttempt := -1
+	bestMsg := ""
+	for _, part := range parts {
+		if rp, isRetry := part.AsUnion().(opencode.PartRetryPart); isRetry {
+			attempt := int(rp.Attempt)
+			if attempt < bestAttempt {
+				continue
+			}
+			bestAttempt = attempt
+			bestMsg = strings.TrimSpace(rp.Error.Data.Message)
+			if bestMsg == "" {
+				bestMsg = strings.TrimSpace(string(rp.Error.Name))
+			}
+		}
+	}
+	if bestAttempt < 0 {
+		return "", false
+	}
+	s := fmt.Sprintf("上游模型重试 %d 次仍失败", bestAttempt)
+	if bestMsg != "" {
+		if len(bestMsg) > 200 {
+			bestMsg = bestMsg[:200] + "…"
+		}
+		s += ": " + bestMsg
+	}
+	return s, true
 }
 
 // recordHandoffAttempt appends 'now' to the thread's handoff history, drops
@@ -4505,6 +4786,7 @@ func (c *Client) probeSessionStillBusy(ctx context.Context, sessionID string) (b
 	runningTool := false
 	lastAssistantID := ""
 	lastAssistantTextLen := 0
+	maxRetry := -1
 	for i := len(*messages) - 1; i > lastUserIdx; i-- {
 		msg := (*messages)[i]
 		if msg.Info.Role != opencode.MessageRoleAssistant {
@@ -4521,7 +4803,21 @@ func (c *Client) probeSessionStillBusy(ctx context.Context, sessionID string) (b
 					runningTool = true
 				}
 			}
+			if rp, ok := part.AsUnion().(opencode.PartRetryPart); ok {
+				if a := int(rp.Attempt); a > maxRetry {
+					maxRetry = a
+				}
+			}
 		}
+	}
+
+	// Upstream is stuck retrying: each retry adds a new part so the activity
+	// signature keeps changing, which would otherwise read as "busy" forever.
+	// Once retries reach the limit and no tool is actively running, report
+	// not-busy so the idle path can classify it as a provider error (and the
+	// streaming handler's retry handler can surface it) instead of extending.
+	if maxRetry >= maxRetryAttempts && !runningTool {
+		return false, nil
 	}
 
 	sig := fmt.Sprintf("%d|%s|%d", len(*messages), lastAssistantID, lastAssistantTextLen)

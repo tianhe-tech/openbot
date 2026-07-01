@@ -181,6 +181,10 @@ func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
 	if s == nil || !s.cfg.Enabled || s.queue == nil || s.drafter == nil {
 		return
 	}
+	// Never mine candidates from skillgen's own drafting sessions.
+	if event.Adapter == "skillgen" || strings.HasPrefix(event.ThreadID, "skillgen-draft-") {
+		return
+	}
 	// Per-trigger gating.
 	switch event.Trigger {
 	case opencode.SkillTriggerHandoff:
@@ -238,18 +242,24 @@ func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
 func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) error {
 	// Drafter uses a dedicated session (thread "skillgen-draft-<threadID>"),
 	// so it does not interfere with the user's active Q&A. No idle-wait needed.
+	log.Printf("skillgen: pipeline start — trigger=%s thread=%s session=%s adapter=%s user=%s",
+		ev.Trigger, ev.ThreadID, ev.SessionID, ev.Adapter, ev.UserID)
 
 	// 1. Fetch conversation turns.
 	turns, err := s.fetchTurns(ctx, ev.SessionID)
 	if err != nil || len(turns) == 0 {
 		if err != nil {
-			log.Printf("skillgen: fetch turns failed for %s: %v", ev.SessionID, err)
+			log.Printf("skillgen: STEP1 fetch turns failed for %s: %v", ev.SessionID, err)
+		} else {
+			log.Printf("skillgen: STEP1 fetch turns returned 0 turns for %s (nothing to mine)", ev.SessionID)
 		}
 		return err
 	}
+	log.Printf("skillgen: STEP1 fetched %d turns from session %s", len(turns), ev.SessionID)
 
 	// 2. Pick model.
 	model := s.pickModel()
+	log.Printf("skillgen: STEP2 picked model=%q (selfSelect=%t draftModel=%s alternates=%v)", model, s.cfg.ModelSelfSelect, s.cfg.DraftModel, s.cfg.AlternateModels)
 	if s.store != nil && model != "" {
 		_ = s.store.RecordModelAttempt(model)
 	}
@@ -264,12 +274,16 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 					existingSkills = append(existingSkills, e.Name())
 				}
 			}
+			log.Printf("skillgen: STEP3 read %d existing skills from %s", len(existingSkills), s.cfg.InstallDir)
+		} else {
+			log.Printf("skillgen: STEP3 read existing skills failed from %s: %v (proceeding without patch context)", s.cfg.InstallDir, err)
 		}
 	}
 
 	// 4. Draft.
 	draftCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
+	log.Printf("skillgen: STEP4 drafting (model=%s, timeout=8m)...", model)
 	out, err := s.drafter.Draft(draftCtx, DraftInput{
 		Trigger:             string(ev.Trigger),
 		Adapter:             ev.Adapter,
@@ -280,15 +294,16 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		ExistingSkillTitles: existingSkills,
 	})
 	if err != nil {
-		log.Printf("skillgen: draft failed (model=%s thread=%s): %v", model, ev.ThreadID, err)
+		log.Printf("skillgen: STEP4 draft failed (model=%s thread=%s): %v", model, ev.ThreadID, err)
 		return err
 	}
+	log.Printf("skillgen: STEP4 draft completed (title=%s score=%.2f action=%s)", out.Title, out.Score, out.Action)
 	if strings.TrimSpace(out.SkillMD) == "" || strings.TrimSpace(out.Title) == "" {
-		log.Printf("skillgen: drafter returned empty output for thread %s", ev.ThreadID)
+		log.Printf("skillgen: STEP4 drafter returned empty output for thread %s (title=%q skillMD_len=%d)", ev.ThreadID, out.Title, len(out.SkillMD))
 		return nil
 	}
 	if s.cfg.MinConfidence > 0 && out.Score < s.cfg.MinConfidence {
-		log.Printf("skillgen: draft score %.2f < minConfidence %.2f, dropping (title=%s)", out.Score, s.cfg.MinConfidence, out.Title)
+		log.Printf("skillgen: STEP4 draft score %.2f < minConfidence %.2f, dropping (title=%s)", out.Score, s.cfg.MinConfidence, out.Title)
 		return nil
 	}
 
@@ -321,19 +336,22 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 	if out.Action == "patch" && out.PatchTarget != "" {
 		targetDir = s.cfg.InstallDir
 	}
+	log.Printf("skillgen: STEP5 writing skill file — targetDir=%s title=%s action=%s", targetDir, out.Title, out.Action)
 	path, werr := writeSkillFile(targetDir, out.Title, out.SkillMD)
 	if werr != nil {
-		log.Printf("skillgen: write skill file failed: %v", werr)
+		log.Printf("skillgen: STEP5 write skill file failed: %v", werr)
 		// Still persist the candidate so user can retrieve via /skill-view.
 	} else {
 		c.DraftPath = path
+		log.Printf("skillgen: STEP5 skill file written to %s", path)
 	}
 
 	if s.store != nil {
 		if err := s.store.SaveSkillCandidate(c); err != nil {
-			log.Printf("skillgen: save candidate failed: %v", err)
+			log.Printf("skillgen: STEP5 save candidate failed: %v", err)
 			return err
 		}
+		log.Printf("skillgen: STEP5 candidate persisted id=%s status=%s", c.ID, c.Status)
 	}
 
 	// When auto-approving, record a positive outcome so model stats accumulate.
@@ -343,12 +361,13 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 
 	// 7. Notify.
 	if s.notifier != nil && ev.Adapter != "" && ev.UserID != "" {
+		log.Printf("skillgen: STEP6 notifying user (adapter=%s user=%s candidate=%s)", ev.Adapter, ev.UserID, c.ID)
 		if err := s.notifier.NotifyCandidate(ev.Adapter, ev.UserID, c.ID, c.Title, s.cfg.ApprovalRequired); err != nil {
-			log.Printf("skillgen: notifier failed (adapter=%s user=%s): %v", ev.Adapter, ev.UserID, err)
+			log.Printf("skillgen: STEP6 notifier failed (adapter=%s user=%s): %v", ev.Adapter, ev.UserID, err)
 		}
 	}
 
-	log.Printf("skillgen: candidate %s created (title=%q status=%s score=%.2f model=%s path=%s)",
+	log.Printf("skillgen: ✅ pipeline done — candidate %s created (title=%q status=%s score=%.2f model=%s path=%s)",
 		c.ID, c.Title, c.Status, c.Score, c.ModelID, c.DraftPath)
 	return nil
 }

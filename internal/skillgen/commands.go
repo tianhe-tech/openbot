@@ -2,6 +2,7 @@ package skillgen
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -119,14 +120,18 @@ func (s *Service) cmdApprove(args []string) string {
 	if err != nil || c == nil {
 		return fmt.Sprintf("❌ 未找到候选 %s", args[0])
 	}
+	log.Printf("skillgen: /skill-approve id=%s title=%s currentStatus=%s draftPath=%s installDir=%s",
+		c.ID, c.Title, c.Status, c.DraftPath, s.cfg.InstallDir)
 	if c.Status == memstore.SkillStatusApproved {
 		return fmt.Sprintf("ℹ️ 候选 %s 已经是 approved 状态", c.ID)
 	}
 	// Move draft file from candidate dir to install dir.
 	installedPath, err := moveSkillFile(c, s.cfg.InstallDir)
 	if err != nil {
+		log.Printf("skillgen: /skill-approve moveSkillFile failed id=%s: %v", c.ID, err)
 		return fmt.Sprintf("❌ 安装失败：%v", err)
 	}
+	log.Printf("skillgen: /skill-approve moveSkillFile OK id=%s installedPath=%s", c.ID, installedPath)
 	c.Status = memstore.SkillStatusApproved
 	c.ReviewedAt = time.Now()
 	c.DraftPath = installedPath
@@ -208,19 +213,38 @@ func moveSkillFile(c *memstore.SkillCandidate, installDir string) (string, error
 	if slug == "" {
 		return "", fmt.Errorf("skillgen: invalid title")
 	}
-	destDir := filepath.Join(installDir, slug)
+	// Resolve installDir to absolute path so the written file lands in the
+	// correct location regardless of the process CWD.
+	absInstallDir, err := filepath.Abs(installDir)
+	if err != nil {
+		absInstallDir = installDir // fallback
+	}
+	destDir := filepath.Join(absInstallDir, slug)
+	log.Printf("skillgen: moveSkillFile title=%s slug=%s installDir=%s destDir=%s draftPath=%s",
+		c.Title, slug, installDir, destDir, c.DraftPath)
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		log.Printf("skillgen: moveSkillFile MkdirAll failed: %v", err)
 		return "", err
 	}
 	destPath := filepath.Join(destDir, "SKILL.md")
 	if err := os.WriteFile(destPath, []byte(c.SkillMD), 0o644); err != nil {
+		log.Printf("skillgen: moveSkillFile WriteFile failed: %v", err)
 		return "", err
+	}
+	// Verify the file was actually written.
+	if info, statErr := os.Stat(destPath); statErr != nil {
+		log.Printf("skillgen: moveSkillFile verification failed — file not found after write: %v", statErr)
+		return "", fmt.Errorf("skillgen: write verification failed: %w", statErr)
+	} else {
+		log.Printf("skillgen: moveSkillFile verified %s (%d bytes)", destPath, info.Size())
 	}
 	// Delete source draft directory if it differs.
 	if c.DraftPath != "" {
 		srcDir := filepath.Dir(c.DraftPath)
-		if srcDir != destDir {
-			_ = os.RemoveAll(srcDir)
+		absSrcDir, _ := filepath.Abs(srcDir)
+		if absSrcDir != destDir {
+			log.Printf("skillgen: moveSkillFile removing draft dir %s", absSrcDir)
+			_ = os.RemoveAll(absSrcDir)
 		}
 	}
 	return destPath, nil

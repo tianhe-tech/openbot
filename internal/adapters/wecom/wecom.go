@@ -1159,7 +1159,12 @@ func (h *Handler) handleStatus(userID string) (string, error) {
 	if !ok {
 		return "ℹ 无活跃会话", nil
 	}
-	return fmt.Sprintf(" 当前会话: %s", sessionID[:min(8, len(sessionID))]), nil
+	status := fmt.Sprintf(" 当前会话: %s", sessionID[:min(8, len(sessionID))])
+	// 追加实时处理诊断（处理中/上游重试/活跃工具等），帮助用户判断为何"正在处理中"。
+	if diag := h.client.GetSessionDiagnostics(sessionID, "").FormatSessionStatus(); diag != "" {
+		status += "\n\n— 实时诊断 —\n" + diag
+	}
+	return status, nil
 }
 
 func (h *Handler) handleSummary(userID string) (string, error) {

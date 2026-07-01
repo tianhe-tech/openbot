@@ -243,6 +243,11 @@ func (c *Client) SendWeixinMessage(msg *WeixinMessage) error {
 	}
 	if resp.Ret != 0 || resp.Errcode != 0 {
 		base := fmt.Errorf("sendmessage ret=%d errcode=%d errmsg=%s", resp.Ret, resp.Errcode, resp.Errmsg)
+		// errcode=-14 (or ret=-14) is iLink's session-expired signal. Caller
+		// should clear the cached context_token and retry once without it.
+		if resp.Errcode == -14 || resp.Ret == -14 {
+			return fmt.Errorf("%w: %s", ErrSessionExpired, base.Error())
+		}
 		// ret=-2 with empty errmsg is iLink bot rate-limit / anti-spam rejection.
 		if resp.Ret == -2 && resp.Errcode == 0 {
 			return fmt.Errorf("%w: %s", ErrRateLimited, base.Error())
@@ -255,6 +260,11 @@ func (c *Client) SendWeixinMessage(msg *WeixinMessage) error {
 // ErrRateLimited is returned (wrapped) when the iLink bot API rejects a send
 // due to anti-spam / frequency limiting (ret=-2, empty errmsg).
 var ErrRateLimited = errors.New("wechat rate limited")
+
+// ErrSessionExpired is returned (wrapped) when the iLink bot API rejects a
+// send because the context_token is stale (errcode=-14). Callers should drop
+// the cached token for the recipient and retry once without it.
+var ErrSessionExpired = errors.New("wechat session expired")
 
 type configEnvelope struct {
 	IlinkUserID  string   `json:"ilink_user_id"`
