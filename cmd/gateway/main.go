@@ -532,8 +532,18 @@ func main() {
 		}
 
 		if content == "" {
-			log.Printf("opencode event: no content extracted from event type %s for session %s",
-				eventType, sessionID[:min(8, len(sessionID))])
+			// Suppress "no content extracted" for metadata-only event types that
+			// never carry deliverable text content. These fire at high frequency
+			// (heartbeats, status updates, part metadata) and generate pure noise.
+			// Content-bearing events that produce empty content are still logged.
+			switch eventType {
+			case "session.status", "session.updated", "session.diff",
+				"message.updated", "message.part.updated":
+				// metadata-only — suppress
+			default:
+				log.Printf("opencode event: no content extracted from event type %s for session %s",
+					eventType, sessionID[:min(8, len(sessionID))])
+			}
 			return nil
 		}
 

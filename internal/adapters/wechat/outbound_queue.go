@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	defaultOutboundTickInterval = 1500 * time.Millisecond
+	defaultOutboundTickInterval = 3000 * time.Millisecond
 	defaultOutboundMaxLen       = 1600
 	defaultNonCriticalTTL       = 10 * time.Minute
 	defaultStopDrainTimeout     = 10 * time.Second
@@ -53,7 +53,7 @@ func priorityFromEventType(eventType string) int {
 	switch eventType {
 	case "question":
 		return PriorityHigh
-	case "todo", "skippable":
+	case "skippable":
 		return PriorityLow
 	default:
 		// final, flush, error_notice, error_partial, sync_reply, done,
@@ -346,8 +346,21 @@ func (q *outboundTextQueue) run() {
 	for {
 		select {
 		case <-ticker.C:
-			if _, err := q.dispatchOne(); err != nil {
-				log.Printf("wechat: outbound queue dispatch failed: %v", err)
+			// Drain as many items as possible per tick. dispatchOne returns
+			// false when the queue is empty OR when the head item was
+			// deferred (e.g. user in cooldown). In the deferral case we
+			// loop to try the next eligible item instead of waiting for
+			// the next tick — otherwise a single paused user's low-priority
+			// head would block all other users for 3s per tick.
+			for {
+				didWork, err := q.dispatchOne()
+				if err != nil {
+					log.Printf("wechat: outbound queue dispatch failed: %v", err)
+					break
+				}
+				if !didWork {
+					break
+				}
 			}
 		case <-statsTicker.C:
 			q.logStats()
@@ -393,7 +406,16 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 	// ★ Global per-user cooldown: if this user is in rate-limit cooldown,
 	// skip ALL dispatch for them (not just this item). This prevents the
 	// retry-storm where each chunk independently backs off and hammers iLink.
-	if q.IsUserPaused(item.UserID) {
+	//
+	// However, PriorityHigh (permission/question) messages MUST still be
+	// delivered even during cooldown — a missed permission prompt deadlocks
+	// the session. We skip the cooldown check for PriorityHigh items.
+	if item.Priority < PriorityHigh && q.IsUserPaused(item.UserID) {
+		// Defer this item: push its next_attempt_at forward so it doesn't
+		// get picked again immediately, and return false so the dispatcher
+		// can try other users/items on the next tick.
+		deferAt := time.Now().Add(5 * time.Second).UnixMilli()
+		_, _ = q.db.Exec(`UPDATE wechat_outbound_queue SET next_attempt_at = ? WHERE id = ?`, deferAt, item.ID)
 		return false, nil
 	}
 
@@ -511,6 +533,24 @@ func (q *outboundTextQueue) nack(id int64, attempts int, nextAt int64) error {
 	if err != nil {
 		return fmt.Errorf("wechat: outbound queue nack: %w", err)
 	}
+
+	// ★ Ordering guard: when a chunk fails and is deferred to a future
+	// next_attempt_at, later chunks of the SAME batch must not overtake it.
+	// pickNextDueHead only blocks a chunk when an *earlier* (smaller id) chunk
+	// with equal-or-higher priority is also due; a deferred head therefore lets
+	// its successors jump ahead, delivering out of order. Push every later chunk
+	// (same batch_id, larger seq) to at least this chunk's next_attempt_at so the
+	// whole batch stays in seq order. Standalone messages (empty batch_id) and
+	// cross-batch messages are unaffected.
+	if _, syncErr := q.db.Exec(`
+		UPDATE wechat_outbound_queue
+		SET next_attempt_at = MAX(next_attempt_at, ?)
+		WHERE batch_id != ''
+		  AND batch_id = (SELECT batch_id FROM wechat_outbound_queue WHERE id = ?)
+		  AND seq > (SELECT seq FROM wechat_outbound_queue WHERE id = ?)
+	`, nextAt, id, id); syncErr != nil {
+		return fmt.Errorf("wechat: outbound queue nack batch-sync: %w", syncErr)
+	}
 	return nil
 }
 
@@ -584,8 +624,10 @@ func (q *outboundTextQueue) SetUserCooldown(userID string) {
 		return
 	}
 
-	// Adaptive escalation: 120s → 240s → 300s (capped).
-	durations := []time.Duration{120 * time.Second, 240 * time.Second, 300 * time.Second}
+	// Adaptive escalation: 30s → 60s → 120s (capped).
+	// Shorter cooldowns allow faster recovery after transient iLink rate limits,
+	// while still providing escalating backpressure for persistent overload.
+	durations := []time.Duration{30 * time.Second, 60 * time.Second, 120 * time.Second}
 	idx := uc.extensions
 	if idx >= len(durations) {
 		idx = len(durations) - 1
@@ -661,6 +703,25 @@ func (q *outboundTextQueue) ClearForUser(userID string, parkFunc func(userID, se
 	n, _ := res.RowsAffected()
 	if n > 0 {
 		log.Printf("wechat: outbound queue cleared %d pending entries for user %s", n, userID)
+	}
+	return n, nil
+}
+
+// DropLowPriorityForUser deletes all PriorityLow (progress/todo) entries
+// for a user. This is called when a permission/question dialog is about to
+// be sent to the user, so the dialog isn't drowned by accumulated progress
+// messages from earlier in the task.
+func (q *outboundTextQueue) DropLowPriorityForUser(userID string) (int64, error) {
+	if q == nil {
+		return 0, nil
+	}
+	res, err := q.db.Exec(`DELETE FROM wechat_outbound_queue WHERE user_id = ? AND priority = ?`, userID, PriorityLow)
+	if err != nil {
+		return 0, fmt.Errorf("wechat: outbound queue drop low-priority for user: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		log.Printf("wechat: outbound queue dropped %d low-priority entries for user %s (permission dialog pending)", n, userID)
 	}
 	return n, nil
 }

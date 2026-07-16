@@ -210,6 +210,63 @@ func repeatRune(ch string, n int) string {
 	return string(buf)
 }
 
+// TestOutboundQueueBatchOrderingOnNack verifies that when a chunk of a split
+// message fails and is deferred to a future next_attempt_at, the later chunks
+// of the SAME batch are deferred with it and cannot leapfrog ahead. Without the
+// nack batch-sync, chunk seq=2 (still due) would be sent before the retried
+// chunk seq=1, delivering the message out of order.
+func TestOutboundQueueBatchOrderingOnNack(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "batch_order.db")
+
+	calls := 0
+	q, err := newOutboundTextQueue(dbPath, 5*time.Millisecond, 1600, func(item *queuedOutboundText) error {
+		calls++
+		if calls == 1 {
+			// Fail the first chunk (seq=1) once.
+			return errors.New("temporary failure")
+		}
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("newOutboundTextQueue failed: %v", err)
+	}
+	defer q.Stop()
+
+	// 3600 runes → three chunks (1600/1600/400) sharing one batch_id.
+	long := repeatRune("你", 3600)
+	if err := q.EnqueueText("u1", "s1", "", "final", long, true); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// First dispatch picks the head (seq=1) and fails → it is nacked to a
+	// future next_attempt_at, and the batch-sync must push seq=2 and seq=3 to
+	// the same future time.
+	did, derr := q.dispatchOne()
+	if derr != nil {
+		t.Fatalf("dispatchOne failed: %v", derr)
+	}
+	if !did {
+		t.Fatal("first dispatch should do work")
+	}
+
+	// No chunk should be due right now: the failed head and all its successors
+	// are deferred together.
+	if item, ok, perr := q.pickNextDueHead(time.Now().UnixMilli()); perr != nil {
+		t.Fatalf("pickNextDueHead failed: %v", perr)
+	} else if ok {
+		t.Fatalf("no chunk should be due after batch nack, but seq=%d is due", item.Seq)
+	}
+
+	// All three chunks remain queued.
+	pending, err := q.pendingCount()
+	if err != nil {
+		t.Fatalf("pendingCount failed: %v", err)
+	}
+	if pending != 3 {
+		t.Fatalf("expected 3 pending after batch nack, got %d", pending)
+	}
+}
+
 // TestOutboundQueuePriorityJump verifies that a PriorityHigh message
 // (e.g. permission/question confirmation) can jump ahead of a lower-priority
 // head that is blocked by a failed retry. This prevents the deadlock where:

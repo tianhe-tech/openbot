@@ -32,6 +32,8 @@ type StreamingSessionHandler struct {
 	lastUpdateTime     time.Time
 	lastEventTime      time.Time // 最后一次收到SSE事件的时间
 	lastEventType      string    // 最后一次收到的事件类型
+	lastActivityTime   time.Time // 最后一次实质任务活动时间（排除状态心跳）
+	lastActivityType   string    // 最后一次实质任务活动类型
 	mu                 sync.Mutex
 	completed          bool
 	contentSent        bool        // 标记是否已发送过内容
@@ -72,23 +74,26 @@ type StreamingSessionHandler struct {
 	// longer than the no-content idle threshold, a reminder is sent instead
 	// of silently extending forever (which would deadlock the session when
 	// the permission message is stuck behind a congested outbound queue).
-	pendingQuestionSince time.Time
-	pendingQuestionSent  bool // whether a "still waiting for your input" reminder has been sent
+	pendingQuestionSince     time.Time
+	pendingQuestionSent      bool // whether a "still waiting for your input" reminder has been sent
+	pendingQuestionReminders int  // number of reminders already sent (multi-level escalation)
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
 func NewStreamingSessionHandler(sessionID string, callback StreamCallback, eventCallback StreamEventCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool) *StreamingSessionHandler {
 	h := &StreamingSessionHandler{
-		sessionID:       sessionID,
-		callback:        callback,
-		eventCallback:   eventCallback,
-		lastUpdateTime:  time.Now(),
-		onComplete:      onComplete,
-		client:          client,
-		messageSender:   messageSender,
-		showThinking:    showThinking,
-		showSteps:       showSteps,
-		activeToolParts: make(map[string]bool),
+		sessionID:        sessionID,
+		callback:         callback,
+		eventCallback:    eventCallback,
+		lastUpdateTime:   time.Now(),
+		lastActivityTime: time.Now(),
+		lastActivityType: "turn.started",
+		onComplete:       onComplete,
+		client:           client,
+		messageSender:    messageSender,
+		showThinking:     showThinking,
+		showSteps:        showSteps,
+		activeToolParts:  make(map[string]bool),
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
@@ -242,6 +247,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 
 	s.lastEventTime = time.Now()
 	s.lastEventType = eventType
+	if eventType != "session.status" {
+		s.lastActivityTime = s.lastEventTime
+		s.lastActivityType = eventType
+	}
 
 	// 只处理 message.part.updated 事件获取增量内容
 	switch eventType {
@@ -336,12 +345,18 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		// 用户已回答问题或权限请求
 		s.pendingQuestionSince = time.Time{}
 		s.pendingQuestionSent = false
+		s.pendingQuestionReminders = 0
+		// 清理本地缓存的权限/问题（防止级联自动清理后残留过期条目）
+		s.cleanupPendingQuestionFromEvent(event)
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
 	case "permission.replied":
 		// 权限已确认（兼容性事件）
 		s.pendingQuestionSince = time.Time{}
 		s.pendingQuestionSent = false
+		s.pendingQuestionReminders = 0
+		// 清理本地缓存的权限/问题（防止级联自动清理后残留过期条目）
+		s.cleanupPendingQuestionFromEvent(event)
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
 	case "question.asked", "permission.asked":
@@ -350,6 +365,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		// s.waitingForResponse = true // 注释掉，让事件继续流动
 		s.pendingQuestionSince = time.Now()
 		s.pendingQuestionSent = false
+		s.pendingQuestionReminders = 0
 		log.Printf("opencode: user response needed (type: %s) for session %s", event.Type, s.sessionID[:8])
 
 		question, questionMsg := s.extractQuestionFromEvent(event)
@@ -358,6 +374,13 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			s.client.StorePendingQuestion(question)
 			log.Printf("opencode: stored question %s for session %s (type: %s, isPermission=%t)",
 				question.ID, s.sessionID[:8], event.Type, question.IsPermission)
+
+			// 追加待处理权限/问题计数，让用户知道总共需要回答几个
+			if question.IsPermission {
+				if total := s.client.CountPendingPermissions(s.sessionID); total > 1 {
+					questionMsg = fmt.Sprintf("🔢 共 %d 个待确认权限\n\n%s", total, questionMsg)
+				}
+			}
 		}
 
 		if questionMsg == "" {
@@ -1126,6 +1149,38 @@ func (s *StreamingSessionHandler) extractPermissionQuestion(jsonData string) (*Q
 	return question, msg
 }
 
+// cleanupPendingQuestionFromEvent extracts the question/permission ID from a
+// permission.answered, permission.replied, or question.answered event and
+// removes it from the client's pending questions map. This prevents stale
+// entries when the opencode server auto-clears related permissions (e.g. an
+// "always" answer for one permission cascades to clear other permissions for
+// the same directory, but the gateway's local cache would otherwise retain
+// those stale entries indefinitely).
+func (s *StreamingSessionHandler) cleanupPendingQuestionFromEvent(event *opencode.EventListResponse) {
+	if event == nil || s.client == nil {
+		return
+	}
+	jsonData := event.JSON.RawJSON()
+	if jsonData == "" {
+		return
+	}
+	// permission.replied / permission.answered / question.answered events have
+	// the same structure as their "asked" counterparts: {"properties":{"id":"per_xxx",...}}
+	var wrapper struct {
+		Properties struct {
+			ID string `json:"id"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(jsonData), &wrapper); err != nil {
+		return
+	}
+	if wrapper.Properties.ID != "" {
+		s.client.DeletePendingQuestion(wrapper.Properties.ID)
+		log.Printf("opencode: cleaned up pending question/permission %s after %s event for session %s",
+			wrapper.Properties.ID, event.Type, s.sessionID[:8])
+	}
+}
+
 // extractNormalQuestion 从 question.asked 事件中提取普通问题
 func (s *StreamingSessionHandler) extractNormalQuestion(jsonData string) (*Question, string) {
 	// question.asked 事件结构：
@@ -1356,11 +1411,13 @@ func (s *StreamingSessionHandler) ActiveToolCount() int {
 	return len(s.activeToolParts)
 }
 
-// GetLastEventInfo 获取最后一次事件的时间和类型
+// GetLastEventInfo returns the latest meaningful turn activity. Passive
+// session.status heartbeats are excluded so they cannot keep a stuck turn
+// alive or make /status claim the model is still making progress.
 func (s *StreamingSessionHandler) GetLastEventInfo() (time.Time, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.lastEventTime, s.lastEventType
+	return s.lastActivityTime, s.lastActivityType
 }
 
 // RetryState describes the upstream provider retry status observed for the
@@ -1388,8 +1445,9 @@ func (s *StreamingSessionHandler) GetRetryState() RetryState {
 // PendingQuestionInfo describes whether the session is currently blocked
 // waiting for user input (permission.asked / question.asked) and for how long.
 type PendingQuestionInfo struct {
-	Since        time.Time
-	ReminderSent bool
+	Since         time.Time
+	ReminderSent  bool
+	ReminderCount int
 }
 
 // GetPendingQuestionInfo returns the pending-question state for the ticker.
@@ -1397,8 +1455,9 @@ func (s *StreamingSessionHandler) GetPendingQuestionInfo() PendingQuestionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return PendingQuestionInfo{
-		Since:        s.pendingQuestionSince,
-		ReminderSent: s.pendingQuestionSent,
+		Since:         s.pendingQuestionSince,
+		ReminderSent:  s.pendingQuestionSent,
+		ReminderCount: s.pendingQuestionReminders,
 	}
 }
 
@@ -1408,6 +1467,7 @@ func (s *StreamingSessionHandler) MarkPendingQuestionReminderSent() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pendingQuestionSent = true
+	s.pendingQuestionReminders++
 }
 
 // handleRetryPart parses a retry message part and tracks the upstream provider

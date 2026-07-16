@@ -28,11 +28,10 @@ type userSender struct {
 func newSenderRegistry() *senderRegistry {
 	return &senderRegistry{
 		users:  make(map[string]*userSender),
-		minGap: 1500 * time.Millisecond,
-		// Hermes-aligned: short fixed retries instead of long exponential
-		// backoff. With tool/step/thinking previews suppressed the per-user
-		// budget is no longer being burned by background notifications, so a
-		// transient rate-limit usually clears within a few seconds.
+		minGap: 3000 * time.Millisecond,
+		// iLink rate limit is approximately 20 messages/minute per user.
+		// With a 3s minGap we get 20 msg/min max. Backoffs use moderate
+		// waits to avoid deepening the cooldown further.
 		backoffs: []time.Duration{
 			3 * time.Second,
 			3 * time.Second,
