@@ -1078,6 +1078,14 @@ sendMessage:
 
 	if err != nil {
 		c.failRequest(requestHash)
+		// Skillgen drafting sessions that fail (e.g. 500 from server due to
+		// unavailable model) should not retain their session mapping — the
+		// stale session will cause all subsequent retries to hit the same
+		// dead session. Clear the mapping so the next attempt creates a fresh
+		// session (possibly with a different model via fallback).
+		if payload.Channel == "skillgen" || strings.HasPrefix(payload.ThreadID, "skillgen-draft-") {
+			c.ClearSkillgenSession(payload.ThreadID, sessionID)
+		}
 		return Response{}, fmt.Errorf("opencode: send prompt: %w", err)
 	}
 
@@ -1799,6 +1807,31 @@ func (c *Client) IsSessionRunning(sessionID string) bool {
 		return false
 	}
 	return val.(bool)
+}
+
+// MarkSessionIdle clears the running flag for a session. This is used by
+// callers that use streaming=true (prompt_async) but manage their own
+// completion detection (e.g., skillgen drafter polls FetchSessionTurns
+// instead of registering a StreamingSessionHandler).
+func (c *Client) MarkSessionIdle(sessionID string) {
+	c.runningSessions.Delete(sessionID)
+}
+
+// ClearSkillgenSession clears all state for a skillgen session so the next
+// draft attempt (e.g. model fallback) creates a fresh session instead of
+// reusing a stale one that may contain a failed/error response.
+func (c *Client) ClearSkillgenSession(threadID, sessionID string) {
+	c.runningSessions.Delete(sessionID)
+	c.messageCount.Delete(sessionID)
+	c.toolCallCount.Delete(sessionID)
+	c.tokenCount.Delete(sessionID)
+	c.modelConfig.Delete(sessionID)
+	c.modelOverride.Delete(sessionID)
+	if threadID != "" {
+		c.sessions.Delete(threadID)
+	}
+	log.Printf("opencode: 🧹 cleared skillgen session state (thread=%s session=%s)",
+		threadID, sessionID[:min(8, len(sessionID))])
 }
 
 // ActiveSessionCount returns the number of sessions currently marked as running.
