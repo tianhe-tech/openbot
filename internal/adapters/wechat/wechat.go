@@ -551,10 +551,13 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 		}
 	}()
 
-	// Command routing
+	// Command routing. Command replies are delivered directly and
+	// synchronously (bypassing the durable outbound queue) so they return
+	// immediately and independently of the AI streaming pipeline, matching
+	// the DingTalk/Feishu behaviour.
 	if cmd, handled := h.tryCommand(ctx, userID, chatID, userText, msg); handled {
 		if cmd != "" {
-			_ = h.sendTextChunks(userID, cmd, msg.ContextToken)
+			h.sendCommandReply(userID, cmd, msg.ContextToken)
 		}
 		return nil
 	}
@@ -575,6 +578,23 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 	// This mirrors opencode TUI's session-level task serialization and
 	// guarantees task A's results are fully enqueued before task B starts.
 	if _, busy := h.dispatching.Load(userID); busy {
+		// Deadlock guard: the dispatch may be blocked waiting for the user to
+		// answer a question / permission request. In that case queueing this
+		// message would deadlock (dispatch waits for an answer, the answer sits
+		// in the pending queue). Detect the pending prompt and tell the user to
+		// answer it first instead of silently queueing.
+		if sessionID, ok := h.adapter.GetSessionForUser(userID); ok && sessionID != "" {
+			if prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID); hasPrompt {
+				var hint string
+				if prompt.IsPermission {
+					hint = "⚠️ 当前有一个待确认的权限请求，请先回复：允许 / 拒绝 / 始终允许。"
+				} else {
+					hint = "⚠️ 当前有一个待回答的问题，请先回复选项编号或文字后再继续。"
+				}
+				_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info", hint, true)
+				return nil
+			}
+		}
 		h.enqueuePending(userID, chatID, userText, ctxToken, attachments, agentName)
 		return nil
 	}
@@ -660,7 +680,7 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 	// /cmd <command>
 	if strings.HasPrefix(text, "/cmd ") {
 		command := strings.TrimPrefix(text, "/cmd ")
-		return h.handleCmd(ctx, userID, command), true
+		return h.handleCmd(ctx, userID, command, msg.ContextToken), true
 	}
 
 	// /retry [message]
@@ -749,14 +769,39 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	sessionID, _ := h.adapter.GetSessionForUser(userID)
 	threadID := chatID
 
-	// Hermes-aligned strategy: WeChat iLink is aggressively rate-limited, so
-	// only todo updates + the final answer are sent. Tool/step/thinking and
-	// intermediate previews are dropped on the floor; content is buffered
-	// silently and flushed once at the end (or on an explicit FlushSignal).
+	// ★ Proactively map the session BEFORE the streaming call to prevent a
+	// race condition where the global event handler receives events for this
+	// session before the streaming callback has a chance to call MapUserToSession.
+	// Without this, early events (message.part.delta, session.status, etc.) are
+	// silently dropped because no adapter is found for the session.
+	if sessionID != "" {
+		h.adapter.MapUserToSession(userID, sessionID)
+	}
+
+	// WeChat iLink is aggressively rate-limited, so verbose thinking is still
+	// suppressed. Tool/todo updates and occasional non-final text previews are
+	// sent as skippable progress, while the final answer remains critical.
 	var fullReplyMu sync.Mutex
 	var fullReply strings.Builder
 	lastSentLength := 0
-	sessionMapped := false
+	sessionMapped := sessionID != "" // if we pre-mapped, skip the callback-based mapping
+
+	enqueueBufferedTail := func(eventType string, critical bool) error {
+		fullReplyMu.Lock()
+		unsent := stripDSMLMarkup(fullReply.String()[lastSentLength:])
+		currentLen := fullReply.Len()
+		fullReplyMu.Unlock()
+		if strings.TrimSpace(unsent) == "" {
+			return nil
+		}
+		if err := h.enqueueAsyncText(userID, sessionID, ctxToken, eventType, unsent, critical); err != nil {
+			return err
+		}
+		fullReplyMu.Lock()
+		lastSentLength = currentLen
+		fullReplyMu.Unlock()
+		return nil
+	}
 
 	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
@@ -771,11 +816,16 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		Streaming:   true,
 		Attachments: attachments,
 	}, func(chunk string) error {
-		// Session mapping
-		if !sessionMapped && strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
-			h.adapter.MapUserToSession(userID, chunk)
-			log.Printf("wechat: mapped user %s to session %s", userID, chunk[:min(8, len(chunk))])
-			sessionMapped = true
+		// Session mapping. Always intercept ses_* chunks (they are the
+		// session ID sent by client.go's callback) so they never leak into
+		// the accumulated text buffer and get delivered to the user.
+		// If we already mapped proactively (Fix 1), just suppress the chunk.
+		if strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
+			if !sessionMapped {
+				h.adapter.MapUserToSession(userID, chunk)
+				log.Printf("wechat: mapped user %s to session %s", userID, chunk[:min(8, len(chunk))])
+				sessionMapped = true
+			}
 			return nil
 		}
 
@@ -783,50 +833,81 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		// On failure, do not advance lastSentLength so the final-send block
 		// below (and offline queue) will retry the same tail.
 		if chunk == opencode.FlushSignal {
-			fullReplyMu.Lock()
-			unsent := fullReply.String()[lastSentLength:]
-			fullReplyMu.Unlock()
-			if strings.TrimSpace(unsent) != "" {
-				if err := h.enqueueAsyncText(userID, sessionID, ctxToken, "flush", unsent, true); err != nil {
-					log.Printf("wechat: ⚠️ flush send failed user=%s: %v (will retry at final)", userID, err)
-				} else {
-					fullReplyMu.Lock()
-					lastSentLength = fullReply.Len()
-					fullReplyMu.Unlock()
-				}
+			if err := enqueueBufferedTail("flush", true); err != nil {
+				log.Printf("wechat: ⚠️ flush send failed user=%s: %v (will retry at final)", userID, err)
 			}
 			return nil
 		}
 
-		// Tool / Step / Thinking signals → dropped entirely. User has only
-		// asked to keep todo updates; other intermediate notifications would
-		// consume iLink rate-limit budget and starve the final answer.
-		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) ||
-			strings.HasPrefix(chunk, opencode.StepSignalPrefix) ||
-			strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+		// Thinking, tool, and step progress are suppressed for WeChat.
+		// WeChat iLink is aggressively rate-limited, so only the final result,
+		// todo updates, permissions, and questions are sent. Intermediate
+		// tool/step progress would flood the queue and trigger rate-limit
+		// cooldowns, delaying the final result.
+		if strings.HasPrefix(chunk, opencode.ThinkingSignalPrefix) {
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) {
+			return nil
+		}
+		if strings.HasPrefix(chunk, opencode.StepSignalPrefix) {
 			return nil
 		}
 
-		// Todo signal → critical path. With tool/step/thinking suppressed,
-		// todo updates have the full retry budget to themselves.
+		// Todo signal → critical path. Todo updates must be delivered in full
+		// and in order — they are the user's primary progress indicator.
+		// critical=true ensures they are never dropped by TTL expiry.
 		if strings.HasPrefix(chunk, opencode.TodoSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.TodoSignalPrefix))
 			if msg != "" {
-				if err := h.enqueueAsyncText(userID, sessionID, ctxToken, "todo", msg, false); err != nil {
+				if err := h.enqueueAsyncText(userID, sessionID, ctxToken, "todo", msg, true); err != nil {
 					log.Printf("wechat: ⚠️ todo enqueue failed user=%s: %v", userID, err)
 				}
 			}
 			return nil
 		}
 
-		// Question signal → critical path. Try-once; if it fails the offline
-		// queue will retry it later (questions are user-actionable so missing
-		// one is a worse failure mode than missing tool/step progress).
+		// Question signal → critical path. Send directly (bypassing the
+		// outbound queue) so the user sees the permission/question
+		// immediately even when the queue is congested with progress
+		// messages or rate-limited. Missing a question/permission is a
+		// worse failure mode than missing tool/step progress — the
+		// session blocks waiting for user input that never arrives.
 		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
 			if msg != "" {
-				if err := h.enqueueAsyncText(userID, sessionID, ctxToken, "question", msg, true); err != nil {
-					log.Printf("wechat: ⚠️ question enqueue failed user=%s: %v", userID, err)
+				// Drop accumulated low-priority (progress/todo) messages
+				// for this user so the permission/question dialog isn't
+				// flooded by stale progress updates from earlier in the
+				// task. PriorityHigh/Normal entries are preserved.
+				if h.outbound != nil {
+					if n, _ := h.outbound.DropLowPriorityForUser(userID); n > 0 {
+						log.Printf("wechat: 🧹 dropped %d low-priority queued messages before permission/question dialog user=%s", n, userID)
+					}
+				}
+
+				// ★ Sequential prompt flow: if there's already a pending prompt
+				// that the user hasn't answered yet, don't send this new one
+				// immediately — it will be shown after the current one is
+				// answered (via getNextPendingPromptMessage in handleQuickReply).
+				// The event_listener already stored it via StorePendingQuestion.
+				if sessionID != "" {
+					if existing, hasExisting := h.client.GetOldestPendingPrompt(sessionID); hasExisting {
+						// There's already a prompt being shown. Check if this
+						// new prompt is different from the existing one (i.e.
+						// it's not the same one being re-sent).
+						total := h.client.CountPendingPrompts(sessionID)
+						if total > 1 {
+							log.Printf("wechat: 🔒 queuing new prompt (total=%d pending, current=%s) — will show after user answers current one",
+								total, existing.ID)
+							return nil
+						}
+					}
+				}
+
+				if err := h.sendTextInline(userID, msg, ctxToken); err != nil {
+					log.Printf("wechat: ⚠️ question direct send failed user=%s: %v — enqueuing as PriorityHigh", userID, err)
+					_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "question", msg, true)
 				}
 			}
 			return nil
@@ -836,8 +917,10 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 			return nil
 		}
 
-		// Content chunk → accumulate silently. No intermediate previews; the
-		// full buffer is sent at the end (or on FlushSignal).
+		// Content chunk → accumulate silently. No intermediate previews are
+		// sent for WeChat — only the final result (or FlushSignal) is delivered.
+		// This avoids flooding the rate-limited iLink channel with partial text
+		// that is superseded by the final reply.
 		fullReplyMu.Lock()
 		fullReply.WriteString(chunk)
 		fullReplyMu.Unlock()
@@ -847,14 +930,8 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	if err != nil {
 		log.Printf("wechat: streaming error user=%s: %v", userID, err)
 		// Even on error, queue whatever accumulated so far.
-		fullReplyMu.Lock()
-		errUnsent := fullReply.String()[lastSentLength:]
-		fullReplyMu.Unlock()
-		if strings.TrimSpace(errUnsent) != "" {
-			log.Printf("wechat: 📦 queueing accumulated content on error (%d unsent) user=%s", len(errUnsent), userID)
-			if sendErr := h.enqueueAsyncText(userID, sessionID, ctxToken, "error_partial", errUnsent, true); sendErr != nil {
-				log.Printf("wechat: ⚠️ partial-result enqueue failed user=%s: %v", userID, sendErr)
-			}
+		if sendErr := enqueueBufferedTail("error_partial", true); sendErr != nil {
+			log.Printf("wechat: ⚠️ partial-result enqueue failed user=%s: %v", userID, sendErr)
 		}
 		_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "error_notice", "⚠️ 处理出错："+truncate(err.Error(), 300), true)
 		return
@@ -862,7 +939,7 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 
 	fullReplyMu.Lock()
 	accumulatedContent := fullReply.String()
-	unsent := accumulatedContent[lastSentLength:]
+	unsent := stripDSMLMarkup(accumulatedContent[lastSentLength:])
 	fullReplyMu.Unlock()
 
 	// Detect MEDIA: directives in accumulated content for media dispatch.
@@ -870,13 +947,13 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 
 	if strings.TrimSpace(unsent) != "" {
 		log.Printf("wechat: 📦 queueing final message (%d total, %d unsent)", len(accumulatedContent), len(unsent))
-		if sendErr := h.enqueueAsyncText(userID, sessionID, ctxToken, "final", unsent, true); sendErr != nil {
+		if sendErr := enqueueBufferedTail("final", true); sendErr != nil {
 			log.Printf("wechat: ⚠️ final enqueue failed user=%s: %v", userID, sendErr)
 		}
 	} else if len(accumulatedContent) == 0 {
 		// No content was streamed; use the synchronous reply if available.
 		if strings.TrimSpace(response.Reply) != "" {
-			if sendErr := h.enqueueAsyncText(userID, sessionID, ctxToken, "sync_reply", response.Reply, true); sendErr != nil {
+			if sendErr := h.enqueueAsyncText(userID, sessionID, ctxToken, "sync_reply", stripDSMLMarkup(response.Reply), true); sendErr != nil {
 				log.Printf("wechat: ⚠️ sync-reply enqueue failed user=%s: %v", userID, sendErr)
 			}
 		} else if len(mediaPaths) == 0 {
@@ -952,8 +1029,9 @@ func (h *Handler) enqueuePending(userID, chatID, content, ctxToken string, attac
 	h.pendingMu.Unlock()
 
 	// Notify the user immediately that their message is queued.
+	// critical=true so this notice isn't dropped by TTL during rate-limit congestion.
 	_ = h.enqueueAsyncText(userID, "", ctxToken, "info",
-		"⏳ 当前任务正在执行中，您的消息已排队，完成后将自动处理。", false)
+		"⏳ 当前任务正在执行中，您的消息已排队，完成后将自动处理。", true)
 
 	log.Printf("wechat: 📋 message queued for user %s (task in progress)", userID)
 }
@@ -983,8 +1061,9 @@ func (h *Handler) dispatchPendingIfAny(userID string) {
 
 	// Notify the user that the previous task completed and the queued
 	// message is now being processed.
+	// critical=true so this notice isn't dropped by TTL during rate-limit congestion.
 	_ = h.enqueueAsyncText(userID, "", pending.CtxToken, "info",
-		"✅ 上一个任务已完成，正在处理您的下一条消息...", false)
+		"✅ 上一个任务已完成，正在处理您的下一条消息...", true)
 
 	go h.dispatchToOpenCode(context.Background(), pending.UserID, pending.ChatID,
 		pending.Content, pending.CtxToken, pending.Attachments, pending.AgentName)
@@ -1102,6 +1181,20 @@ func (h *Handler) notifyLongRunningTask(userID string) {
 	h.pendingMu.Unlock()
 }
 
+// sendCommandReply delivers a slash-command / status reply directly and
+// synchronously, bypassing the durable outbound queue. Command responses are
+// independent of the AI streaming pipeline (matching DingTalk/Feishu), so they
+// must return immediately rather than being paced, priority-reordered, or
+// queued behind streaming task output.
+func (h *Handler) sendCommandReply(userID, text, ctxToken string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	if err := h.sendTextInline(userID, text, ctxToken); err != nil {
+		log.Printf("wechat: command reply send failed user=%s: %v", userID, err)
+	}
+}
+
 func (h *Handler) enqueueAsyncText(userID, sessionID, ctxToken, eventType, text string, critical bool) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
@@ -1150,8 +1243,9 @@ func (h *Handler) sendQueuedText(item *queuedOutboundText) error {
 
 // notifyDeferredDelivery sends a best-effort user notice that delivery is
 // deferred and will be retried by the active outbound mechanism.
+// critical=true so this notice isn't dropped by TTL during congestion.
 func (h *Handler) notifyDeferredDelivery(userID, ctxToken string) {
-	_ = h.enqueueAsyncText(userID, "", ctxToken, "deferred_notice", "⚠️ 网络繁忙，结果将稍后送达", false)
+	_ = h.enqueueAsyncText(userID, "", ctxToken, "deferred_notice", "⚠️ 网络繁忙，结果将稍后送达", true)
 }
 
 // offlineSend is the transport callback the offline worker uses to retry
@@ -1362,19 +1456,37 @@ func (h *Handler) handleDiff(_ context.Context, userID string) string {
 	return sb.String()
 }
 
-func (h *Handler) handleCmd(ctx context.Context, userID, command string) string {
+func (h *Handler) handleCmd(_ context.Context, userID, command, ctxToken string) string {
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
 		return "❌ 当前没有活跃会话，请先发送消息创建会话"
 	}
-	output, err := h.client.ExecuteShellOutput(ctx, sessionID, command)
-	if err != nil {
-		return fmt.Sprintf("❌ 命令执行失败: %v", err)
-	}
-	if strings.TrimSpace(output) != "" {
-		return fmt.Sprintf("🖥️ 命令执行结果:\n\n%s", output)
-	}
-	return "🖥️ 命令已执行，但没有可显示的输出"
+
+	// Run the shell command off the inbound poll loop. The underlying SDK
+	// Session.Shell() call has no timeout of its own and can block for minutes;
+	// executing it inline would stall the single-threaded poll loop and prevent
+	// any further WeChat messages from being processed. The goroutine bounds the
+	// execution and delivers the result via a direct send.
+	go func() {
+		cmdCtx, cancel := context.WithTimeout(context.Background(), cmdExecTimeout)
+		defer cancel()
+
+		output, err := h.client.ExecuteShellOutput(cmdCtx, sessionID, command)
+		var reply string
+		switch {
+		case err != nil && cmdCtx.Err() == context.DeadlineExceeded:
+			reply = fmt.Sprintf("⏰ 命令执行超时（超过 %.0f 分钟已中止）。如需长时间运行的命令，请拆分或在后台执行。", cmdExecTimeout.Minutes())
+		case err != nil:
+			reply = fmt.Sprintf("❌ 命令执行失败: %v", err)
+		case strings.TrimSpace(output) != "":
+			reply = fmt.Sprintf("🖥️ 命令执行结果:\n\n%s", output)
+		default:
+			reply = "🖥️ 命令已执行，但没有可显示的输出"
+		}
+		h.sendCommandReply(userID, reply, ctxToken)
+	}()
+
+	return fmt.Sprintf("🖥️ 命令执行中，最长等待 %.0f 分钟…", cmdExecTimeout.Minutes())
 }
 
 func (h *Handler) handleAnswerCommand(ctx context.Context, userID, answer string) string {
@@ -1927,22 +2039,9 @@ func (h *Handler) handleThinking(content string) string {
 func (h *Handler) handleFinal(content string) string {
 	parts := strings.Fields(strings.TrimSpace(content))
 	if len(parts) == 1 {
-		status := "off"
-		if h.client.IsFinalOnlyEnabled() {
-			status = "on"
-		}
-		return fmt.Sprintf("📦 Final-only 模式: %s\n\n/final on  - 开启\n/final off - 关闭", status)
+		return "📦 Final-only 模式: 已内置开启\n\nWeChat 默认只发送最终结果、todo更新、权限和问题，不发送中间进度。此行为不可关闭。"
 	}
-	switch strings.ToLower(parts[1]) {
-	case "on", "true", "1":
-		h.client.SetFinalOnlyEnabled(true)
-		return "✅ 已开启 final-only 模式"
-	case "off", "false", "0":
-		h.client.SetFinalOnlyEnabled(false)
-		return "✅ 已关闭 final-only 模式"
-	default:
-		return "❌ 格式错误\n\n/final on - 开启\n/final off - 关闭"
-	}
+	return "📦 Final-only 模式: 已内置开启\n\nWeChat 默认只发送最终结果、todo更新、权限和问题，不发送中间进度。此行为不可关闭。"
 }
 
 func (h *Handler) handleSteps(content string) string {
@@ -2271,7 +2370,11 @@ func (h *Handler) fetchCDNBytes(media *CDNMedia) ([]byte, error) {
 }
 
 // handleQuickReply tries to interpret non-command text as an answer to a
-// pending permission or question (mirrors dingtalk's handleQuickReply).
+// pending question or permission request (mirrors dingtalk's handleQuickReply).
+//
+// WeChat uses a sequential (FIFO) prompt flow: only the oldest pending
+// permission/question is shown to the user at a time. After the user answers
+// it, the next pending prompt (if any) is automatically sent.
 func (h *Handler) handleQuickReply(ctx context.Context, userID, content, ctxToken string) (string, bool) {
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
@@ -2280,76 +2383,215 @@ func (h *Handler) handleQuickReply(ctx context.Context, userID, content, ctxToke
 
 	log.Printf("wechat: checking quick reply '%s' for user %s (session: %s)", content, userID, sessionID[:min(8, len(sessionID))])
 
-	permission, hasP := h.client.GetLatestPendingPermission(sessionID)
-	question, hasQ := h.client.GetLatestPendingQuestion(sessionID)
-
-	// If both exist, prefer the newer one
-	preferQuestion := false
-	if hasP && hasQ && question.CreatedAt.After(permission.CreatedAt) {
-		preferQuestion = true
+	// ★ FIFO: get the oldest pending prompt (permission or question, whichever
+	// came first). This ensures the user always answers the one they currently
+	// see on screen, not whichever happened to arrive most recently.
+	prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID)
+	if !hasPrompt {
+		return "", false
 	}
 
-	// Handle permission reply
-	if hasP && !preferQuestion {
+	isPermission := strings.HasPrefix(prompt.ID, "per_")
+
+	if isPermission {
 		resp := replyToPermissionResponse(content)
 		if resp == "" {
-			if hasQ {
-				log.Printf("wechat: permission parse miss, falling back to question")
-			} else {
-				return "", false // not a recognizable reply, let normal flow handle
+			// Not a recognizable permission reply — check if there's also a
+			// pending question that might match.
+			if q, hasQ := h.client.GetOldestPendingQuestion(sessionID); hasQ {
+				return h.handleQuestionReply(ctx, userID, sessionID, ctxToken, q, content)
 			}
+			return "", false
+		}
+
+		log.Printf("wechat: permission reply '%s' -> %s for %s", content, resp, prompt.ID)
+		if err := h.client.RespondToPermission(ctx, prompt.ID, resp); err != nil {
+			log.Printf("wechat: RespondToPermission failed: %v", err)
+			return fmt.Sprintf("❌ 权限回复失败: %v", err), true
+		}
+
+		// For "always" / "reject", cascade the same answer to ALL pending
+		// permissions for this session.
+		if resp == "always" || resp == "reject" {
+			allIDs := h.client.GetAllPendingPermissionIDs(sessionID)
+			for _, id := range allIDs {
+				if id == prompt.ID {
+					continue
+				}
+				log.Printf("wechat: cascading permission response '%s' to %s", resp, id)
+				if err := h.client.RespondToPermission(ctx, id, resp); err != nil {
+					log.Printf("wechat: cascade permission %s failed: %v", id, err)
+				}
+			}
+		}
+
+		displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+		reply := fmt.Sprintf("✅ 已回复: %s", displayMap[resp])
+
+		// ★ After answering, check if there's a next pending prompt and
+		// automatically send it to the user.
+		nextMsg := h.getNextPendingPromptMessage(sessionID)
+		if nextMsg != "" {
+			reply += "\n\n" + nextMsg
 		} else {
-			log.Printf("wechat: permission reply '%s' -> %s for %s", content, resp, permission.ID)
-			if err := h.client.RespondToPermission(ctx, permission.ID, resp); err != nil {
-				log.Printf("wechat: RespondToPermission failed: %v", err)
-				return fmt.Sprintf("❌ 权限回复失败: %v", err), true
+			reply += "\n⏳ 等待继续执行..."
+		}
+		return reply, true
+	}
+
+	// Not a permission — it's a question.
+	return h.handleQuestionReply(ctx, userID, sessionID, ctxToken, prompt, content)
+}
+
+// handleQuestionReply processes a user reply as a question answer.
+func (h *Handler) handleQuestionReply(ctx context.Context, userID, sessionID, ctxToken string, question *opencode.Question, content string) (string, bool) {
+	answer := content
+	// Numeric input → convert to option label
+	if idx, err := strconv.Atoi(strings.TrimSpace(content)); err == nil {
+		if len(question.Questions) > 0 && len(question.Questions[0].Options) > 0 {
+			opts := question.Questions[0].Options
+			if idx >= 1 && idx <= len(opts) {
+				answer = opts[idx-1].Label
+				log.Printf("wechat: converted %d -> %s", idx, answer)
 			}
-			displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
-			return fmt.Sprintf("✅ 已回复: %s\n⏳ 等待继续执行...", displayMap[resp]), true
+		} else if len(question.Options) > 0 {
+			if idx >= 1 && idx <= len(question.Options) {
+				answer = question.Options[idx-1]
+				log.Printf("wechat: converted %d -> %s", idx, answer)
+			}
 		}
 	}
 
-	// Handle question reply
-	if hasQ {
-		answer := content
-		// Numeric input → convert to option label
-		if idx, err := strconv.Atoi(strings.TrimSpace(content)); err == nil {
-			if len(question.Questions) > 0 && len(question.Questions[0].Options) > 0 {
-				opts := question.Questions[0].Options
-				if idx >= 1 && idx <= len(opts) {
-					answer = opts[idx-1].Label
-					log.Printf("wechat: converted %d -> %s", idx, answer)
-				}
-			} else if len(question.Options) > 0 {
-				if idx >= 1 && idx <= len(question.Options) {
-					answer = question.Options[idx-1]
-					log.Printf("wechat: converted %d -> %s", idx, answer)
-				}
-			}
-		}
-		log.Printf("wechat: answering question %s with '%s'", question.ID, answer)
-		if err := h.client.AnswerQuestion(ctx, question.ID, answer); err != nil {
-			log.Printf("wechat: AnswerQuestion failed: %v", err)
-			return fmt.Sprintf("❌ 回复失败: %v", err), true
-		}
-		return fmt.Sprintf("✅ 已回复: %s\n⏳ 等待继续执行...", answer), true
+	// ★ Validate the answer before consuming the question.
+	if !question.IsValidAnswer(content) {
+		log.Printf("wechat: input '%s' is not a valid answer for question %s (opts=%d), ignoring",
+			content, question.ID, len(question.Options))
+		return fmt.Sprintf("⚠️ 回复未能匹配问题选项，请回复选项编号或关键词（如 %s）", formatQuestionOptions(question)), true
 	}
 
-	return "", false
+	log.Printf("wechat: answering question %s with '%s'", question.ID, answer)
+	if err := h.client.AnswerQuestion(ctx, question.ID, answer); err != nil {
+		log.Printf("wechat: AnswerQuestion failed: %v", err)
+		return fmt.Sprintf("❌ 回复失败: %v", err), true
+	}
+
+	reply := fmt.Sprintf("✅ 已回复: %s", answer)
+
+	// ★ After answering, check if there's a next pending prompt.
+	nextMsg := h.getNextPendingPromptMessage(sessionID)
+	if nextMsg != "" {
+		reply += "\n\n" + nextMsg
+	} else {
+		reply += "\n⏳ 等待继续执行..."
+	}
+	return reply, true
+}
+
+// getNextPendingPromptMessage checks if there's still a pending permission or
+// question for the session after the user answered the current one. If so,
+// returns the message text to display the next prompt to the user.
+func (h *Handler) getNextPendingPromptMessage(sessionID string) string {
+	prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID)
+	if !hasPrompt {
+		return ""
+	}
+
+	var msg string
+	if prompt.IsPermission {
+		total := h.client.CountPendingPermissions(sessionID)
+		if total > 1 {
+			msg = fmt.Sprintf("🔢 还有 %d 个待确认权限\n\n", total)
+		}
+		msg += formatPermissionPrompt(prompt)
+	} else {
+		msg = formatQuestionPrompt(prompt)
+	}
+
+	log.Printf("wechat: 📤 sending next pending prompt for session %s (id=%s)", sessionID[:8], prompt.ID)
+	return msg
+}
+
+// formatPermissionPrompt builds a concise display message for a pending permission.
+func formatPermissionPrompt(q *opencode.Question) string {
+	var b strings.Builder
+	b.WriteString("🔐 OpenCode 请求权限：\n")
+	if q.Directory != "" {
+		b.WriteString(fmt.Sprintf("【访问外部目录】\n路径: %s\n", q.Directory))
+	}
+	if q.Text != "" {
+		b.WriteString(q.Text)
+	}
+	b.WriteString("\n请回复：• 允许 - 本次允许 • 拒绝 - 拒绝此请求 • 始终允许 - 以后都允许")
+	return b.String()
+}
+
+// formatQuestionPrompt builds a concise display message for a pending question.
+func formatQuestionPrompt(q *opencode.Question) string {
+	var b strings.Builder
+	b.WriteString("❓ 需要您回复：\n")
+	if q.Text != "" {
+		b.WriteString(q.Text + "\n")
+	}
+	if len(q.Questions) > 0 {
+		for _, qi := range q.Questions {
+			if qi.Header != "" {
+				b.WriteString(fmt.Sprintf("【%s】\n", qi.Header))
+			}
+			if qi.Question != "" {
+				b.WriteString(qi.Question + "\n")
+			}
+			for i, opt := range qi.Options {
+				b.WriteString(fmt.Sprintf("  %d. %s", i+1, opt.Label))
+				if opt.Description != "" {
+					b.WriteString(fmt.Sprintf(" - %s", opt.Description))
+				}
+				b.WriteString("\n")
+			}
+		}
+	} else if len(q.Options) > 0 {
+		for i, opt := range q.Options {
+			b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, opt))
+		}
+	}
+	b.WriteString("\n请回复选项编号或文字。")
+	return b.String()
 }
 
 // replyToPermissionResponse maps user input to the API permission response value.
+// When the inbound batcher merges multiple messages separated by \n, we split
+// and try each line, returning the first match.
 func replyToPermissionResponse(input string) string {
-	s := strings.TrimSpace(input)
-	switch s {
-	case "允许", "allow", "yes", "y", "是", "1":
-		return "once"
-	case "拒绝", "deny", "reject", "no", "n", "否", "2":
-		return "reject"
-	case "始终允许", "always", "始终", "3":
-		return "always"
+	for _, line := range strings.Split(input, "\n") {
+		s := strings.TrimSpace(line)
+		switch s {
+		case "允许", "allow", "yes", "y", "是", "1":
+			return "once"
+		case "拒绝", "deny", "reject", "no", "n", "否", "2":
+			return "reject"
+		case "始终允许", "always", "始终", "3":
+			return "always"
+		}
 	}
 	return ""
+}
+
+// formatQuestionOptions returns a concise summary of the question's valid
+// options for user-facing error messages.
+func formatQuestionOptions(q *opencode.Question) string {
+	var parts []string
+	if len(q.Questions) > 0 && len(q.Questions[0].Options) > 0 {
+		for i, opt := range q.Questions[0].Options {
+			parts = append(parts, fmt.Sprintf("%d=%s", i+1, opt.Label))
+		}
+	} else if len(q.Options) > 0 {
+		for i, opt := range q.Options {
+			parts = append(parts, fmt.Sprintf("%d=%s", i+1, opt))
+		}
+	}
+	if len(parts) == 0 {
+		return "输入任意文字回复"
+	}
+	return strings.Join(parts, ", ")
 }
 
 const maxWechatTextLength = defaultOutboundMaxLen
@@ -2405,17 +2647,37 @@ func (h *Handler) sendTextInline(userID, text, ctxToken string) error {
 	return err
 }
 
-// sendTextChunksSkippable is the best-effort variant used for non-critical
-// progress notifications. With outbound queue enabled this uses non-critical
-// queue entries (TTL applies). Without outbound queue it falls back to direct
-// sending.
-func (h *Handler) sendTextChunksSkippable(userID, text, ctxToken string) error {
-	// All sends go through the queue; skippable uses non-critical priority
-	// (TTL applies) so progress notifications can be dropped under pressure.
-	return h.enqueueAsyncText(userID, "", ctxToken, "skippable", text, false)
-}
-
 // --- Outbound Media Sending ---
+
+// cmdExecTimeout bounds how long a /cmd shell execution may run before it is
+// aborted. The underlying SDK Session.Shell() call has no timeout of its own.
+const cmdExecTimeout = 5 * time.Minute
+
+// dsmlBlockPattern matches a complete leaked DSML tool-call block, including
+// the markup tags AND the payload between them, e.g.
+//
+//	<DSML｜tool_calls> … </DSML｜tool_calls>
+//
+// These arrive as plain text deltas (not tool/step signal parts), so the
+// streaming signal filters never catch them. Tag names are variable
+// (tool_calls, function_calls, …) and the separator may be an ASCII '|' or the
+// fullwidth '｜' (U+FF5C); both are accepted. (?s) lets '.' span newlines.
+var dsmlBlockPattern = regexp.MustCompile(`(?s)<DSML[|｜][^>]*>.*?</DSML[|｜][^>]*>`)
+
+// dsmlTagPattern matches any leftover standalone DSML tag (an open or close
+// tag whose pair was not present, e.g. a block split across a flush boundary).
+var dsmlTagPattern = regexp.MustCompile(`</?DSML[|｜][^>]*>`)
+
+// stripDSMLMarkup removes leaked DSML tool-call blocks (tags + payload) from
+// assembled reply content so the raw XML-like markup never reaches the user.
+func stripDSMLMarkup(content string) string {
+	if !strings.Contains(content, "DSML") {
+		return content
+	}
+	cleaned := dsmlBlockPattern.ReplaceAllString(content, "")
+	cleaned = dsmlTagPattern.ReplaceAllString(cleaned, "")
+	return cleaned
+}
 
 // mediaDirectivePattern matches MEDIA: path tags in text.
 // Go's regexp (RE2) does not support (?=...) lookahead, so we match conservatively

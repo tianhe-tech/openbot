@@ -264,6 +264,10 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		_ = s.store.RecordModelAttempt(model)
 	}
 
+	// Build the fallback chain: start with the picked model, then all other
+	// models from the pool that haven't been tried yet.
+	fallbackModels := s.buildFallbackChain(model)
+
 	// 3. Read existing installed skills from disk (zero LLM cost) so the drafter
 	// can decide to PATCH an existing skill instead of creating a duplicate.
 	var existingSkills []string
@@ -280,22 +284,41 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		}
 	}
 
-	// 4. Draft.
+	// 4. Draft — try the picked model first, then fall back to alternates
+	// if the send fails (e.g. model unavailable, 500 from server).
 	draftCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
-	log.Printf("skillgen: STEP4 drafting (model=%s, timeout=8m)...", model)
-	out, err := s.drafter.Draft(draftCtx, DraftInput{
-		Trigger:             string(ev.Trigger),
-		Adapter:             ev.Adapter,
-		UserID:              ev.UserID,
-		ThreadID:            ev.ThreadID,
-		Conversation:        turns,
-		ModelID:             model,
-		ExistingSkillTitles: existingSkills,
-	})
-	if err != nil {
-		log.Printf("skillgen: STEP4 draft failed (model=%s thread=%s): %v", model, ev.ThreadID, err)
-		return err
+
+	var out DraftOutput
+	var draftErr error
+	triedModels := map[string]bool{}
+
+	for _, tryModel := range fallbackModels {
+		if triedModels[tryModel] {
+			continue
+		}
+		triedModels[tryModel] = true
+		log.Printf("skillgen: STEP4 drafting (model=%s, timeout=8m)...", tryModel)
+		out, draftErr = s.drafter.Draft(draftCtx, DraftInput{
+			Trigger:             string(ev.Trigger),
+			Adapter:             ev.Adapter,
+			UserID:              ev.UserID,
+			ThreadID:            ev.ThreadID,
+			Conversation:        turns,
+			ModelID:             tryModel,
+			ExistingSkillTitles: existingSkills,
+		})
+		if draftErr == nil {
+			break
+		}
+		log.Printf("skillgen: STEP4 draft failed (model=%s thread=%s): %v", tryModel, ev.ThreadID, draftErr)
+		// If there are more models to try, continue; otherwise give up.
+		if len(fallbackModels) > 1 {
+			log.Printf("skillgen: STEP4 falling back to next model...")
+		}
+	}
+	if draftErr != nil {
+		return draftErr
 	}
 	log.Printf("skillgen: STEP4 draft completed (title=%s score=%.2f action=%s)", out.Title, out.Score, out.Action)
 	if strings.TrimSpace(out.SkillMD) == "" || strings.TrimSpace(out.Title) == "" {
@@ -326,14 +349,11 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		SkillMD:   out.SkillMD,
 	}
 
-	// 6. Write to disk (patch existing skill, draft dir, or install dir when auto-approving).
+	// 6. Write to disk: when ApprovalRequired is true, always write to
+	// CandidateDir for review (even for patch actions). When auto-approving,
+	// write directly to InstallDir.
 	targetDir := s.cfg.CandidateDir
 	if !s.cfg.ApprovalRequired {
-		targetDir = s.cfg.InstallDir
-	}
-	// When the drafter signals action=patch, write directly to the existing
-	// installed skill so the update lands immediately without a review step.
-	if out.Action == "patch" && out.PatchTarget != "" {
 		targetDir = s.cfg.InstallDir
 	}
 	log.Printf("skillgen: STEP5 writing skill file — targetDir=%s title=%s action=%s", targetDir, out.Title, out.Action)
@@ -396,6 +416,30 @@ func (s *Service) pickModel() string {
 		return s.cfg.DraftModel
 	}
 	return s.store.PickSkillGenModel(s.cfg.AlternateModels, s.cfg.DraftModel, s.cfg.Epsilon)
+}
+
+// buildFallbackChain returns an ordered list of models to try for drafting.
+// The first element is the picked model; subsequent elements are the other
+// models from the pool (DraftModel + AlternateModels), deduplicated. This
+// allows the pipeline to fall back to an alternate model when the primary
+// pick fails (e.g. model unavailable, 500 error).
+func (s *Service) buildFallbackChain(picked string) []string {
+	seen := map[string]bool{}
+	chain := []string{}
+	add := func(m string) {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			return
+		}
+		seen[m] = true
+		chain = append(chain, m)
+	}
+	add(picked)
+	add(s.cfg.DraftModel)
+	for _, m := range s.cfg.AlternateModels {
+		add(m)
+	}
+	return chain
 }
 
 // writeSkillFile writes SKILL.md under <root>/<slug>/SKILL.md and returns the path.

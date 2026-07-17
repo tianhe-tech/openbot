@@ -211,13 +211,15 @@ func main() {
 			MinConfidence:       cfg.SkillAutogen.MinConfidence,
 			MinToolCalls:        cfg.SkillAutogen.MinToolCalls,
 		}
-		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath)
+		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath, cfg.SkillAutogen.InstallDir)
 		notifier := skillgen.NewRegistryNotifier(adapterRegistry)
 		skillSvc := skillgen.NewService(skillCfg, memDB, ocClient, asyncQueue, drafter, notifier)
 		ocClient.SetSkillCandidateHook(skillSvc)
 		ocClient.AddCommandInterceptor(skillSvc)
-		log.Printf("main: skill autogen enabled (model=%s approvalRequired=%t maxPerDay=%d)",
-			skillCfg.DraftModel, skillCfg.ApprovalRequired, skillCfg.MaxPerDay)
+		log.Printf("main: skill autogen enabled (draftModel=%s alternates=%v selfSelect=%t approvalRequired=%t maxPerDay=%d minConfidence=%.2f onHandoff=%t onLongSession=%t longSessionMinTurns=%d)",
+			skillCfg.DraftModel, skillCfg.AlternateModels, skillCfg.ModelSelfSelect,
+			skillCfg.ApprovalRequired, skillCfg.MaxPerDay, skillCfg.MinConfidence,
+			skillCfg.OnHandoff, skillCfg.OnLongSession, skillCfg.LongSessionMinTurns)
 	} else if cfg.SkillAutogen.Enabled && memDB == nil {
 		log.Printf("main: skill autogen disabled: memory store unavailable")
 	}
@@ -532,8 +534,18 @@ func main() {
 		}
 
 		if content == "" {
-			log.Printf("opencode event: no content extracted from event type %s for session %s",
-				eventType, sessionID[:min(8, len(sessionID))])
+			// Suppress "no content extracted" for metadata-only event types that
+			// never carry deliverable text content. These fire at high frequency
+			// (heartbeats, status updates, part metadata) and generate pure noise.
+			// Content-bearing events that produce empty content are still logged.
+			switch eventType {
+			case "session.status", "session.updated", "session.diff",
+				"message.updated", "message.part.updated":
+				// metadata-only — suppress
+			default:
+				log.Printf("opencode event: no content extracted from event type %s for session %s",
+					eventType, sessionID[:min(8, len(sessionID))])
+			}
 			return nil
 		}
 
