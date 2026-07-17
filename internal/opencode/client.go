@@ -5631,6 +5631,88 @@ func (c *Client) HasPendingPermissions(sessionID string) bool {
 	return found
 }
 
+// GetOldestPendingPermission returns the earliest-created pending permission
+// for a session (FIFO order). Used by WeChat's sequential permission flow.
+func (c *Client) GetOldestPendingPermission(sessionID string) (*Question, bool) {
+	var oldest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if !strings.HasPrefix(q.ID, "per_") {
+			return true
+		}
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		if oldest == nil || q.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = q
+		}
+		return true
+	})
+	if oldest != nil {
+		return oldest, true
+	}
+	return nil, false
+}
+
+// GetOldestPendingQuestion returns the earliest-created pending question
+// (non-permission) for a session (FIFO order). Used by WeChat's sequential
+// question flow.
+func (c *Client) GetOldestPendingQuestion(sessionID string) (*Question, bool) {
+	var oldest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if strings.HasPrefix(q.ID, "per_") {
+			return true
+		}
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		if oldest == nil || q.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = q
+		}
+		return true
+	})
+	if oldest != nil {
+		return oldest, true
+	}
+	return nil, false
+}
+
+// GetOldestPendingPrompt returns the earliest-created pending permission OR
+// question for a session (FIFO order, unified). Used by WeChat's blocking
+// prompt flow to determine if any prompt is blocking the session.
+func (c *Client) GetOldestPendingPrompt(sessionID string) (*Question, bool) {
+	var oldest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		if oldest == nil || q.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = q
+		}
+		return true
+	})
+	if oldest != nil {
+		return oldest, true
+	}
+	return nil, false
+}
+
+// CountPendingPrompts returns the total number of pending permissions AND
+// questions for a session.
+func (c *Client) CountPendingPrompts(sessionID string) int {
+	count := 0
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if q.SessionID == sessionID {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
 // DeletePendingQuestion removes a pending question
 func (c *Client) DeletePendingQuestion(questionID string) {
 	c.pendingQuestions.Delete(questionID)

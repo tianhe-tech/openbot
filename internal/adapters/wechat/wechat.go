@@ -584,14 +584,14 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 		// in the pending queue). Detect the pending prompt and tell the user to
 		// answer it first instead of silently queueing.
 		if sessionID, ok := h.adapter.GetSessionForUser(userID); ok && sessionID != "" {
-			if _, hasP := h.client.GetLatestPendingPermission(sessionID); hasP {
-				_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info",
-					"⚠️ 当前有一个待确认的权限请求，请先回复：允许 / 拒绝 / 始终允许（或回复选项编号）。", true)
-				return nil
-			}
-			if _, hasQ := h.client.GetLatestPendingQuestion(sessionID); hasQ {
-				_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info",
-					"⚠️ 当前有一个待回答的问题，请先回复选项编号或文字后再继续。", true)
+			if prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID); hasPrompt {
+				var hint string
+				if prompt.IsPermission {
+					hint = "⚠️ 当前有一个待确认的权限请求，请先回复：允许 / 拒绝 / 始终允许。"
+				} else {
+					hint = "⚠️ 当前有一个待回答的问题，请先回复选项编号或文字后再继续。"
+				}
+				_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info", hint, true)
 				return nil
 			}
 		}
@@ -885,12 +885,28 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 						log.Printf("wechat: 🧹 dropped %d low-priority queued messages before permission/question dialog user=%s", n, userID)
 					}
 				}
+
+				// ★ Sequential prompt flow: if there's already a pending prompt
+				// that the user hasn't answered yet, don't send this new one
+				// immediately — it will be shown after the current one is
+				// answered (via getNextPendingPromptMessage in handleQuickReply).
+				// The event_listener already stored it via StorePendingQuestion.
+				if sessionID != "" {
+					if existing, hasExisting := h.client.GetOldestPendingPrompt(sessionID); hasExisting {
+						// There's already a prompt being shown. Check if this
+						// new prompt is different from the existing one (i.e.
+						// it's not the same one being re-sent).
+						total := h.client.CountPendingPrompts(sessionID)
+						if total > 1 {
+							log.Printf("wechat: 🔒 queuing new prompt (total=%d pending, current=%s) — will show after user answers current one",
+								total, existing.ID)
+							return nil
+						}
+					}
+				}
+
 				if err := h.sendTextInline(userID, msg, ctxToken); err != nil {
 					log.Printf("wechat: ⚠️ question direct send failed user=%s: %v — enqueuing as PriorityHigh", userID, err)
-					// Fall back to the outbound queue with PriorityHigh so the
-					// permission/question is retried and not lost. Without this
-					// fallback, a rate-limit during the direct send would
-					// silently drop the permission prompt and deadlock the session.
 					_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "question", msg, true)
 				}
 			}
@@ -2354,7 +2370,11 @@ func (h *Handler) fetchCDNBytes(media *CDNMedia) ([]byte, error) {
 }
 
 // handleQuickReply tries to interpret non-command text as an answer to a
-// pending permission or question (mirrors dingtalk's handleQuickReply).
+// pending question or permission request (mirrors dingtalk's handleQuickReply).
+//
+// WeChat uses a sequential (FIFO) prompt flow: only the oldest pending
+// permission/question is shown to the user at a time. After the user answers
+// it, the next pending prompt (if any) is automatically sent.
 func (h *Handler) handleQuickReply(ctx context.Context, userID, content, ctxToken string) (string, bool) {
 	sessionID, ok := h.adapter.GetSessionForUser(userID)
 	if !ok {
@@ -2363,90 +2383,178 @@ func (h *Handler) handleQuickReply(ctx context.Context, userID, content, ctxToke
 
 	log.Printf("wechat: checking quick reply '%s' for user %s (session: %s)", content, userID, sessionID[:min(8, len(sessionID))])
 
-	permission, hasP := h.client.GetLatestPendingPermission(sessionID)
-	question, hasQ := h.client.GetLatestPendingQuestion(sessionID)
-
-	// If both exist, prefer the newer one
-	preferQuestion := false
-	if hasP && hasQ && question.CreatedAt.After(permission.CreatedAt) {
-		preferQuestion = true
+	// ★ FIFO: get the oldest pending prompt (permission or question, whichever
+	// came first). This ensures the user always answers the one they currently
+	// see on screen, not whichever happened to arrive most recently.
+	prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID)
+	if !hasPrompt {
+		return "", false
 	}
 
-	// Handle permission reply
-	if hasP && !preferQuestion {
+	isPermission := strings.HasPrefix(prompt.ID, "per_")
+
+	if isPermission {
 		resp := replyToPermissionResponse(content)
 		if resp == "" {
-			if hasQ {
-				log.Printf("wechat: permission parse miss, falling back to question")
-			} else {
-				return "", false // not a recognizable reply, let normal flow handle
+			// Not a recognizable permission reply — check if there's also a
+			// pending question that might match.
+			if q, hasQ := h.client.GetOldestPendingQuestion(sessionID); hasQ {
+				return h.handleQuestionReply(ctx, userID, sessionID, ctxToken, q, content)
 			}
+			return "", false
+		}
+
+		log.Printf("wechat: permission reply '%s' -> %s for %s", content, resp, prompt.ID)
+		if err := h.client.RespondToPermission(ctx, prompt.ID, resp); err != nil {
+			log.Printf("wechat: RespondToPermission failed: %v", err)
+			return fmt.Sprintf("❌ 权限回复失败: %v", err), true
+		}
+
+		// For "always" / "reject", cascade the same answer to ALL pending
+		// permissions for this session.
+		if resp == "always" || resp == "reject" {
+			allIDs := h.client.GetAllPendingPermissionIDs(sessionID)
+			for _, id := range allIDs {
+				if id == prompt.ID {
+					continue
+				}
+				log.Printf("wechat: cascading permission response '%s' to %s", resp, id)
+				if err := h.client.RespondToPermission(ctx, id, resp); err != nil {
+					log.Printf("wechat: cascade permission %s failed: %v", id, err)
+				}
+			}
+		}
+
+		displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
+		reply := fmt.Sprintf("✅ 已回复: %s", displayMap[resp])
+
+		// ★ After answering, check if there's a next pending prompt and
+		// automatically send it to the user.
+		nextMsg := h.getNextPendingPromptMessage(sessionID)
+		if nextMsg != "" {
+			reply += "\n\n" + nextMsg
 		} else {
-			log.Printf("wechat: permission reply '%s' -> %s for %s", content, resp, permission.ID)
-			if err := h.client.RespondToPermission(ctx, permission.ID, resp); err != nil {
-				log.Printf("wechat: RespondToPermission failed: %v", err)
-				return fmt.Sprintf("❌ 权限回复失败: %v", err), true
-			}
+			reply += "\n⏳ 等待继续执行..."
+		}
+		return reply, true
+	}
 
-			// For "always" / "reject", cascade the same answer to ALL pending
-			// permissions for this session. A single user reply should clear all
-			// stacked permissions so the user doesn't have to reply N times.
-			// "once" is intentionally not cascaded — it means "just this one".
-			if resp == "always" || resp == "reject" {
-				allIDs := h.client.GetAllPendingPermissionIDs(sessionID)
-				for _, id := range allIDs {
-					if id == permission.ID {
-						continue // already answered above
-					}
-					log.Printf("wechat: cascading permission response '%s' to %s", resp, id)
-					if err := h.client.RespondToPermission(ctx, id, resp); err != nil {
-						log.Printf("wechat: cascade permission %s failed: %v", id, err)
-					}
-				}
-			}
+	// Not a permission — it's a question.
+	return h.handleQuestionReply(ctx, userID, sessionID, ctxToken, prompt, content)
+}
 
-			displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
-			return fmt.Sprintf("✅ 已回复: %s\n⏳ 等待继续执行...", displayMap[resp]), true
+// handleQuestionReply processes a user reply as a question answer.
+func (h *Handler) handleQuestionReply(ctx context.Context, userID, sessionID, ctxToken string, question *opencode.Question, content string) (string, bool) {
+	answer := content
+	// Numeric input → convert to option label
+	if idx, err := strconv.Atoi(strings.TrimSpace(content)); err == nil {
+		if len(question.Questions) > 0 && len(question.Questions[0].Options) > 0 {
+			opts := question.Questions[0].Options
+			if idx >= 1 && idx <= len(opts) {
+				answer = opts[idx-1].Label
+				log.Printf("wechat: converted %d -> %s", idx, answer)
+			}
+		} else if len(question.Options) > 0 {
+			if idx >= 1 && idx <= len(question.Options) {
+				answer = question.Options[idx-1]
+				log.Printf("wechat: converted %d -> %s", idx, answer)
+			}
 		}
 	}
 
-	// Handle question reply
-	if hasQ {
-		answer := content
-		// Numeric input → convert to option label
-		if idx, err := strconv.Atoi(strings.TrimSpace(content)); err == nil {
-			if len(question.Questions) > 0 && len(question.Questions[0].Options) > 0 {
-				opts := question.Questions[0].Options
-				if idx >= 1 && idx <= len(opts) {
-					answer = opts[idx-1].Label
-					log.Printf("wechat: converted %d -> %s", idx, answer)
-				}
-			} else if len(question.Options) > 0 {
-				if idx >= 1 && idx <= len(question.Options) {
-					answer = question.Options[idx-1]
-					log.Printf("wechat: converted %d -> %s", idx, answer)
-				}
-			}
-		}
-
-		// ★ Validate the answer before consuming the question. If the user's
-		// input doesn't match any option, it's likely an unrelated message —
-		// don't pollute the question with a wrong answer.
-		if !question.IsValidAnswer(content) {
-			log.Printf("wechat: input '%s' is not a valid answer for question %s (opts=%d), ignoring",
-				content, question.ID, len(question.Options))
-			return fmt.Sprintf("⚠️ 回复未能匹配问题选项，请回复选项编号或关键词（如 %s）", formatQuestionOptions(question)), true
-		}
-
-		log.Printf("wechat: answering question %s with '%s'", question.ID, answer)
-		if err := h.client.AnswerQuestion(ctx, question.ID, answer); err != nil {
-			log.Printf("wechat: AnswerQuestion failed: %v", err)
-			return fmt.Sprintf("❌ 回复失败: %v", err), true
-		}
-		return fmt.Sprintf("✅ 已回复: %s\n⏳ 等待继续执行...", answer), true
+	// ★ Validate the answer before consuming the question.
+	if !question.IsValidAnswer(content) {
+		log.Printf("wechat: input '%s' is not a valid answer for question %s (opts=%d), ignoring",
+			content, question.ID, len(question.Options))
+		return fmt.Sprintf("⚠️ 回复未能匹配问题选项，请回复选项编号或关键词（如 %s）", formatQuestionOptions(question)), true
 	}
 
-	return "", false
+	log.Printf("wechat: answering question %s with '%s'", question.ID, answer)
+	if err := h.client.AnswerQuestion(ctx, question.ID, answer); err != nil {
+		log.Printf("wechat: AnswerQuestion failed: %v", err)
+		return fmt.Sprintf("❌ 回复失败: %v", err), true
+	}
+
+	reply := fmt.Sprintf("✅ 已回复: %s", answer)
+
+	// ★ After answering, check if there's a next pending prompt.
+	nextMsg := h.getNextPendingPromptMessage(sessionID)
+	if nextMsg != "" {
+		reply += "\n\n" + nextMsg
+	} else {
+		reply += "\n⏳ 等待继续执行..."
+	}
+	return reply, true
+}
+
+// getNextPendingPromptMessage checks if there's still a pending permission or
+// question for the session after the user answered the current one. If so,
+// returns the message text to display the next prompt to the user.
+func (h *Handler) getNextPendingPromptMessage(sessionID string) string {
+	prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID)
+	if !hasPrompt {
+		return ""
+	}
+
+	var msg string
+	if prompt.IsPermission {
+		total := h.client.CountPendingPermissions(sessionID)
+		if total > 1 {
+			msg = fmt.Sprintf("🔢 还有 %d 个待确认权限\n\n", total)
+		}
+		msg += formatPermissionPrompt(prompt)
+	} else {
+		msg = formatQuestionPrompt(prompt)
+	}
+
+	log.Printf("wechat: 📤 sending next pending prompt for session %s (id=%s)", sessionID[:8], prompt.ID)
+	return msg
+}
+
+// formatPermissionPrompt builds a concise display message for a pending permission.
+func formatPermissionPrompt(q *opencode.Question) string {
+	var b strings.Builder
+	b.WriteString("🔐 OpenCode 请求权限：\n")
+	if q.Directory != "" {
+		b.WriteString(fmt.Sprintf("【访问外部目录】\n路径: %s\n", q.Directory))
+	}
+	if q.Text != "" {
+		b.WriteString(q.Text)
+	}
+	b.WriteString("\n请回复：• 允许 - 本次允许 • 拒绝 - 拒绝此请求 • 始终允许 - 以后都允许")
+	return b.String()
+}
+
+// formatQuestionPrompt builds a concise display message for a pending question.
+func formatQuestionPrompt(q *opencode.Question) string {
+	var b strings.Builder
+	b.WriteString("❓ 需要您回复：\n")
+	if q.Text != "" {
+		b.WriteString(q.Text + "\n")
+	}
+	if len(q.Questions) > 0 {
+		for _, qi := range q.Questions {
+			if qi.Header != "" {
+				b.WriteString(fmt.Sprintf("【%s】\n", qi.Header))
+			}
+			if qi.Question != "" {
+				b.WriteString(qi.Question + "\n")
+			}
+			for i, opt := range qi.Options {
+				b.WriteString(fmt.Sprintf("  %d. %s", i+1, opt.Label))
+				if opt.Description != "" {
+					b.WriteString(fmt.Sprintf(" - %s", opt.Description))
+				}
+				b.WriteString("\n")
+			}
+		}
+	} else if len(q.Options) > 0 {
+		for i, opt := range q.Options {
+			b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, opt))
+		}
+	}
+	b.WriteString("\n请回复选项编号或文字。")
+	return b.String()
 }
 
 // replyToPermissionResponse maps user input to the API permission response value.
