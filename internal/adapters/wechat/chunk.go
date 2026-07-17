@@ -82,7 +82,8 @@ func wrapCopyFriendlyLines(content string) string {
 			continue
 		}
 		if inCodeBlock || len(line) <= wrapWidth || stripped == "" ||
-			strings.HasPrefix(stripped, "|") || tableRuleRE.MatchString(stripped) {
+			strings.HasPrefix(stripped, "|") || tableRuleRE.MatchString(stripped) ||
+			headerRE.MatchString(stripped) {
 			result = append(result, line)
 			continue
 		}

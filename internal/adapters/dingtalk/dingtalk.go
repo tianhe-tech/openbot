@@ -2690,6 +2690,21 @@ func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbac
 				return nil, err
 			}
 
+			// For "always" / "reject", cascade the same answer to ALL pending
+			// permissions for this session so the user doesn't have to reply
+			// once per stacked permission.
+			if englishResponse == "always" || englishResponse == "reject" {
+				for _, id := range h.client.GetAllPendingPermissionIDs(sessionID) {
+					if id == permission.ID {
+						continue
+					}
+					log.Printf("dingtalk: cascading permission response '%s' to %s", englishResponse, id)
+					if err := h.client.RespondToPermission(ctx, id, englishResponse); err != nil {
+						log.Printf("dingtalk: cascade permission %s failed: %v", id, err)
+					}
+				}
+			}
+
 			displayMap := map[string]string{"once": "允许", "reject": "拒绝", "always": "始终允许"}
 			msg := fmt.Sprintf("✅ 已回复: %s\n\n⏳ 等待 OpenCode 继续执行...", displayMap[englishResponse])
 			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
@@ -2742,6 +2757,16 @@ func (h *Handler) handleQuickReply(ctx context.Context, data *chatbot.BotCallbac
 		} else {
 			// 文本输入，检查是否是有效的选项标签
 			log.Printf("dingtalk: using text input as answer: %s", content)
+		}
+
+		// ★ Validate the answer before consuming the question. If the user's
+		// input doesn't match any option, it's likely an unrelated message —
+		// don't pollute the question with a wrong answer.
+		if !question.IsValidAnswer(content) {
+			log.Printf("dingtalk: input '%s' is not a valid answer for question %s, ignoring", content, question.ID)
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook,
+				[]byte(fmt.Sprintf("⚠️ 回复未能匹配问题选项，请回复选项编号或关键词")))
+			return []byte("handled"), nil
 		}
 
 		log.Printf("dingtalk: submitting answer '%s' for question %s (original input: %s)", answer, question.ID, content)

@@ -365,6 +365,13 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 				log.Printf("feishu: using text input as answer: %s", content)
 			}
 
+			// ★ Validate the answer before consuming the question.
+			if !question.IsValidAnswer(content) {
+				log.Printf("feishu: input '%s' is not a valid answer for question %s, ignoring", content, question.ID)
+				_ = h.sendTextChunks(ctx, target, "⚠️ 回复未能匹配问题选项，请回复选项编号或关键词")
+				return "handled", nil
+			}
+
 			log.Printf("feishu: submitting answer '%s' for question %s (original input: %s)", answer, question.ID, content)
 
 			if err := h.client.AnswerQuestion(ctx, question.ID, answer); err != nil {

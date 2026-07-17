@@ -82,6 +82,14 @@ var (
 	streamIdleTimeoutHasContent = parseDurationEnvSeconds("OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS", 120*time.Second)
 	streamBusyProbeEnabled      = parseBoolEnv("OPENCODE_STREAM_BUSY_PROBE_EXTEND", true)
 
+	// questionReminderFirst / questionReminderSecond bound how long the session
+	// waits for a user answer to a question/permission before nudging the user.
+	// Previously the only reminder fired at streamIdleTimeoutNoContent (10 min),
+	// which felt like the bot had gone silent. Two-level escalation gives a
+	// gentle nudge early and a stronger one (with /abort hint) later.
+	questionReminderFirst  = parseDurationEnvSeconds("OPENCODE_QUESTION_REMINDER_SECONDS", 120*time.Second)
+	questionReminderSecond = parseDurationEnvSeconds("OPENCODE_QUESTION_REMINDER2_SECONDS", 600*time.Second)
+
 	// maxRetryAttempts bounds how many times opencode's upstream provider may
 	// retry a single turn (surfaced as message parts of type "retry", e.g.
 	// {"type":"retry","attempt":12,"message":"No available channel for model ..."})
@@ -257,6 +265,105 @@ type Question struct {
 	CreatedAt    time.Time      `json:"created_at"`
 }
 
+// IsValidAnswer checks whether the user input is a valid answer for this question.
+// Returns true if:
+//   - The question has no options (free-form, any text is valid)
+//   - Input is a number within 1..len(options)
+//   - Input matches an option label (case-insensitive prefix)
+//   - Input is a semicolon-separated list of valid per-question indices ("1;2" etc.)
+//
+// Returns false if the question has options and the input doesn't match any of them,
+// which means the user likely sent an unrelated message rather than answering.
+func (q *Question) IsValidAnswer(input string) bool {
+	raw := strings.TrimSpace(input)
+	if raw == "" {
+		return false
+	}
+
+	// Collect all available option labels.
+	var optionLabels []string
+	if len(q.Questions) > 0 {
+		// Multi-question format: validate as semicolon-separated per-question
+		// indices or a single index across the first question's options.
+	} else if len(q.Options) > 0 {
+		optionLabels = q.Options
+	}
+
+	// No options → free-form question, any non-empty input is valid.
+	if len(optionLabels) == 0 && len(q.Questions) == 0 {
+		return true
+	}
+
+	// Multi-question format: validate each ";" part is a valid 1-based index
+	// for its corresponding sub-question's options.
+	if len(q.Questions) > 0 && strings.Contains(raw, ";") {
+		parts := strings.Split(raw, ";")
+		allValid := true
+		for i, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				allValid = false
+				break
+			}
+			idx, err := strconv.Atoi(part)
+			if err != nil {
+				allValid = false
+				break
+			}
+			qi := 0
+			if i < len(q.Questions) {
+				qi = i
+			}
+			if len(q.Questions[qi].Options) == 0 {
+				continue // no options for this sub-question, accept any
+			}
+			if idx < 1 || idx > len(q.Questions[qi].Options) {
+				allValid = false
+				break
+			}
+		}
+		return allValid
+	}
+
+	// Single numeric index: must be within range.
+	if idx, err := strconv.Atoi(raw); err == nil {
+		if len(q.Questions) > 0 && len(q.Questions[0].Options) > 0 {
+			return idx >= 1 && idx <= len(q.Questions[0].Options)
+		}
+		if len(optionLabels) > 0 {
+			return idx >= 1 && idx <= len(optionLabels)
+		}
+		return true // no options, accept any number
+	}
+
+	// Text input: must match an option label (case-insensitive substring).
+	if len(optionLabels) > 0 {
+		lower := strings.ToLower(raw)
+		for _, label := range optionLabels {
+			if strings.Contains(strings.ToLower(label), lower) ||
+				strings.Contains(lower, strings.ToLower(label)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// If only Questions array with no semicolon, validate against first
+	// question's options.
+	if len(q.Questions) > 0 && len(q.Questions[0].Options) > 0 {
+		lower := strings.ToLower(raw)
+		for _, opt := range q.Questions[0].Options {
+			if strings.Contains(strings.ToLower(opt.Label), lower) ||
+				strings.Contains(lower, strings.ToLower(opt.Label)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return true
+}
+
 // Client knows how to talk to the remote OpenCode service using the official SDK.
 type Client struct {
 	sdk                 *opencode.Client
@@ -328,6 +435,14 @@ type Client struct {
 	// removed on completion. Lets /session-status report live state (retry
 	// attempts, last event, content-sent) without touching the SSE hot path.
 	activeHandlers sync.Map // map[sessionID]*StreamingSessionHandler
+
+	// shellSessionID caches a dedicated session used exclusively for /cmd shell
+	// execution. When a user's conversation session is busy running an AI task,
+	// the shell endpoint returns 409 SessionBusyError; running shell in this
+	// separate session (which never runs AI turns) avoids the conflict so /cmd
+	// works regardless of task state. Guarded by shellSessionMu.
+	shellSessionID string
+	shellSessionMu sync.Mutex
 
 	// recentHandoffs tracks per-thread handoff timestamps for circuit-breaking.
 	// If a thread triggers ≥2 handoffs within handoffBreakerWindow, further
@@ -963,6 +1078,14 @@ sendMessage:
 
 	if err != nil {
 		c.failRequest(requestHash)
+		// Skillgen drafting sessions that fail (e.g. 500 from server due to
+		// unavailable model) should not retain their session mapping — the
+		// stale session will cause all subsequent retries to hit the same
+		// dead session. Clear the mapping so the next attempt creates a fresh
+		// session (possibly with a different model via fallback).
+		if payload.Channel == "skillgen" || strings.HasPrefix(payload.ThreadID, "skillgen-draft-") {
+			c.ClearSkillgenSession(payload.ThreadID, sessionID)
+		}
 		return Response{}, fmt.Errorf("opencode: send prompt: %w", err)
 	}
 
@@ -1198,7 +1321,54 @@ func (c *Client) ExecuteCommand(ctx context.Context, sessionID, command string) 
 }
 
 // ExecuteShell executes a shell command in the session context.
+//
+// If the target session is busy running an AI task, OpenCode's shell endpoint
+// returns 409 SessionBusyError. Shell commands only need the working directory
+// (not the conversation history), so on a busy conflict we transparently retry
+// on a dedicated shell session that never runs AI turns. This makes /cmd work
+// regardless of whether the conversation session is mid-task.
 func (c *Client) ExecuteShell(ctx context.Context, sessionID, command string) (*opencode.AssistantMessage, error) {
+	result, err := c.runShellOnSession(ctx, sessionID, command)
+	if err == nil {
+		return result, nil
+	}
+	if !isSessionBusyError(err) {
+		return nil, err
+	}
+
+	// Conversation session busy — run on a dedicated shell session instead.
+	shellSession, shellErr := c.getOrCreateShellSession(ctx)
+	if shellErr != nil {
+		return nil, fmt.Errorf("opencode: shell session busy and dedicated shell session unavailable: %w (busy: %v)", shellErr, err)
+	}
+	if shellSession == sessionID {
+		return nil, err
+	}
+	log.Printf("opencode: session %s busy for shell, retrying on dedicated shell session %s (cmd=%q)",
+		sessionID[:min(8, len(sessionID))], shellSession[:min(8, len(shellSession))], command)
+
+	result, err2 := c.runShellOnSession(ctx, shellSession, command)
+	if err2 == nil {
+		return result, nil
+	}
+	// The cached dedicated session may be stale (deleted) or itself busy; drop
+	// it and try once more with a fresh dedicated session.
+	c.shellSessionMu.Lock()
+	if c.shellSessionID == shellSession {
+		c.shellSessionID = ""
+	}
+	c.shellSessionMu.Unlock()
+
+	freshSession, freshErr := c.getOrCreateShellSession(ctx)
+	if freshErr != nil || freshSession == "" || freshSession == sessionID {
+		return nil, fmt.Errorf("opencode: shell retry on dedicated session failed: %w", err2)
+	}
+	return c.runShellOnSession(ctx, freshSession, command)
+}
+
+// runShellOnSession performs the raw shell call against a specific session,
+// with the missing-agent HTTP fallback preserved.
+func (c *Client) runShellOnSession(ctx context.Context, sessionID, command string) (*opencode.AssistantMessage, error) {
 	result, err := c.sdk.Session.Shell(ctx, sessionID, opencode.SessionShellParams{
 		Agent:     opencode.F("build"),
 		Command:   opencode.F(command),
@@ -1221,6 +1391,39 @@ func (c *Client) ExecuteShell(ctx context.Context, sessionID, command string) (*
 	}
 
 	return fallbackResult, nil
+}
+
+// getOrCreateShellSession lazily creates and caches a dedicated session used
+// only for shell command execution, so /cmd never conflicts with a busy
+// conversation session.
+func (c *Client) getOrCreateShellSession(ctx context.Context) (string, error) {
+	c.shellSessionMu.Lock()
+	defer c.shellSessionMu.Unlock()
+	if c.shellSessionID != "" {
+		return c.shellSessionID, nil
+	}
+	newCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	session, err := c.sdk.Session.New(newCtx, opencode.SessionNewParams{
+		Title: opencode.F("[shell] dedicated command session"),
+	})
+	if err != nil {
+		return "", fmt.Errorf("opencode: create dedicated shell session: %w", err)
+	}
+	c.shellSessionID = session.ID
+	log.Printf("opencode: created dedicated shell session %s", session.ID[:min(8, len(session.ID))])
+	return c.shellSessionID, nil
+}
+
+// isSessionBusyError reports whether err is OpenCode's 409 SessionBusyError,
+// returned by the shell endpoint when the target session is mid-task.
+func isSessionBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SessionBusyError") ||
+		(strings.Contains(msg, "409") && strings.Contains(strings.ToLower(msg), "session is busy"))
 }
 
 // ExecuteShellOutput executes a shell command and returns human-readable output text.
@@ -1604,6 +1807,31 @@ func (c *Client) IsSessionRunning(sessionID string) bool {
 		return false
 	}
 	return val.(bool)
+}
+
+// MarkSessionIdle clears the running flag for a session. This is used by
+// callers that use streaming=true (prompt_async) but manage their own
+// completion detection (e.g., skillgen drafter polls FetchSessionTurns
+// instead of registering a StreamingSessionHandler).
+func (c *Client) MarkSessionIdle(sessionID string) {
+	c.runningSessions.Delete(sessionID)
+}
+
+// ClearSkillgenSession clears all state for a skillgen session so the next
+// draft attempt (e.g. model fallback) creates a fresh session instead of
+// reusing a stale one that may contain a failed/error response.
+func (c *Client) ClearSkillgenSession(threadID, sessionID string) {
+	c.runningSessions.Delete(sessionID)
+	c.messageCount.Delete(sessionID)
+	c.toolCallCount.Delete(sessionID)
+	c.tokenCount.Delete(sessionID)
+	c.modelConfig.Delete(sessionID)
+	c.modelOverride.Delete(sessionID)
+	if threadID != "" {
+		c.sessions.Delete(threadID)
+	}
+	log.Printf("opencode: 🧹 cleared skillgen session state (thread=%s session=%s)",
+		threadID, sessionID[:min(8, len(sessionID))])
 }
 
 // ActiveSessionCount returns the number of sessions currently marked as running.
@@ -3231,6 +3459,7 @@ func (c *Client) GetSessionDiagnostics(sessionID, threadID string) SessionStatus
 	if v, ok := c.activeHandlers.Load(sessionID); ok {
 		if h, ok2 := v.(*StreamingSessionHandler); ok2 && h != nil {
 			info.HasLiveHandler = true
+			info.Running = true
 			info.ContentSent = h.HasSentContent()
 			info.ActiveTools = h.ActiveToolCount()
 			info.LastEventAt, info.LastEventType = h.GetLastEventInfo()
@@ -3894,14 +4123,25 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			//      was reset by permission.asked event)
 			if pqInfo := handler.GetPendingQuestionInfo(); !pqInfo.Since.IsZero() {
 				pqWait := time.Since(pqInfo.Since)
-				if pqWait > streamIdleTimeoutNoContent && !pqInfo.ReminderSent {
-					log.Printf("opencode: 🔔 pending question wait %v exceeds threshold %v for session %s, sending reminder",
-						pqWait, streamIdleTimeoutNoContent, sessionID[:8])
+				// Two-level escalation so the user is not left in the dark for
+				// the full 10-minute idle window: a first gentle reminder after
+				// questionReminderFirst, then a stronger one (with an /abort
+				// hint) after questionReminderSecond.
+				var reminder string
+				switch {
+				case pqInfo.ReminderCount == 0 && pqWait > questionReminderFirst:
+					reminder = "🔔 仍在等待您的确认才能继续\n\n请回复选项编号或文字（如 1、允许、拒绝）。如果已回复，请稍候。"
+				case pqInfo.ReminderCount == 1 && pqWait > questionReminderSecond:
+					reminder = "⏰ 已等待较长时间仍未收到您的回复\n\n请回复选项编号或文字继续；若不再需要，发送 /abort 结束本次等待。"
+				}
+				if reminder != "" {
+					log.Printf("opencode: 🔔 pending question wait %v (level %d) for session %s, sending reminder",
+						pqWait, pqInfo.ReminderCount+1, sessionID[:8])
 					if eventCallback != nil {
 						_ = eventCallback(StreamEvent{
 							Kind:      StreamEventInfo,
 							SessionID: sessionID,
-							Content:   "🔔 仍在等待您的确认才能继续\n\n请回复选项编号或文字（如 1、允许、拒绝）。如果已回复，请稍候。",
+							Content:   reminder,
 							RawType:   "pending_question_reminder",
 						})
 					}
@@ -5350,6 +5590,129 @@ func (c *Client) GetLatestPendingQuestion(sessionID string) (*Question, bool) {
 	return nil, false
 }
 
+// CountPendingPermissions returns how many pending permissions exist for a session.
+func (c *Client) CountPendingPermissions(sessionID string) int {
+	count := 0
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if strings.HasPrefix(q.ID, "per_") && q.SessionID == sessionID {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
+// GetAllPendingPermissionIDs returns all pending permission IDs for a session.
+func (c *Client) GetAllPendingPermissionIDs(sessionID string) []string {
+	var ids []string
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if strings.HasPrefix(q.ID, "per_") && q.SessionID == sessionID {
+			ids = append(ids, q.ID)
+		}
+		return true
+	})
+	return ids
+}
+
+// HasPendingPermissions returns true if there is at least one pending permission
+// for the given session.
+func (c *Client) HasPendingPermissions(sessionID string) bool {
+	found := false
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if strings.HasPrefix(q.ID, "per_") && q.SessionID == sessionID {
+			found = true
+			return false // stop iteration
+		}
+		return true
+	})
+	return found
+}
+
+// GetOldestPendingPermission returns the earliest-created pending permission
+// for a session (FIFO order). Used by WeChat's sequential permission flow.
+func (c *Client) GetOldestPendingPermission(sessionID string) (*Question, bool) {
+	var oldest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if !strings.HasPrefix(q.ID, "per_") {
+			return true
+		}
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		if oldest == nil || q.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = q
+		}
+		return true
+	})
+	if oldest != nil {
+		return oldest, true
+	}
+	return nil, false
+}
+
+// GetOldestPendingQuestion returns the earliest-created pending question
+// (non-permission) for a session (FIFO order). Used by WeChat's sequential
+// question flow.
+func (c *Client) GetOldestPendingQuestion(sessionID string) (*Question, bool) {
+	var oldest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if strings.HasPrefix(q.ID, "per_") {
+			return true
+		}
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		if oldest == nil || q.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = q
+		}
+		return true
+	})
+	if oldest != nil {
+		return oldest, true
+	}
+	return nil, false
+}
+
+// GetOldestPendingPrompt returns the earliest-created pending permission OR
+// question for a session (FIFO order, unified). Used by WeChat's blocking
+// prompt flow to determine if any prompt is blocking the session.
+func (c *Client) GetOldestPendingPrompt(sessionID string) (*Question, bool) {
+	var oldest *Question
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if sessionID != "" && q.SessionID != sessionID {
+			return true
+		}
+		if oldest == nil || q.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = q
+		}
+		return true
+	})
+	if oldest != nil {
+		return oldest, true
+	}
+	return nil, false
+}
+
+// CountPendingPrompts returns the total number of pending permissions AND
+// questions for a session.
+func (c *Client) CountPendingPrompts(sessionID string) int {
+	count := 0
+	c.pendingQuestions.Range(func(key, value interface{}) bool {
+		q := value.(*Question)
+		if q.SessionID == sessionID {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
 // DeletePendingQuestion removes a pending question
 func (c *Client) DeletePendingQuestion(questionID string) {
 	c.pendingQuestions.Delete(questionID)
@@ -5547,6 +5910,15 @@ func (c *Client) RespondToPermission(ctx context.Context, permissionID, response
 
 	// HTTP API first (more reliable than SDK)
 	if err := c.answerPermissionViaHTTP(ctx, q, response); err != nil {
+		// 404 means the permission was already auto-cleaned by the server
+		// (e.g. an "always" answer for one permission cascades to clear
+		// other permissions for the same directory). Delete the stale
+		// local entry and treat it as success.
+		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "PermissionNotFoundError") {
+			log.Printf("opencode: permission %s already resolved on server (404), cleaning local cache", permissionID)
+			c.DeletePendingQuestion(permissionID)
+			return nil
+		}
 		log.Printf("opencode: HTTP permission API failed: %v, falling back to SDK", err)
 
 		var responseParam opencode.SessionPermissionRespondParamsResponse
