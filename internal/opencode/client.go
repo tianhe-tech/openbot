@@ -4044,9 +4044,25 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		case response := <-responseChan:
 			// 如果是Async模式（reply为空），标记并继续等待SSE事件
 			if response.Reply == "" {
-				log.Printf("opencode: streaming async mode for session %s, waiting for SSE events", sessionID[:8])
-				isAsyncMode = true
-				asyncResponse = response
+				// 压缩操作（SummarizeSession）可能在此前执行过，其产生的
+				// message.part.delta / step-finish / session.idle 事件会污染
+				// handler 状态（contentSent=true, completed=true, lastContent
+				// 含摘要文本）。若不重置，async ticker 会立即观察到
+				// IsCompleted()=true 并返回，丢弃所有真实响应事件——包括
+				// permission.asked，导致 opencode 服务端 session 死锁在
+				// 等待权限回答的状态。
+				handler.ResetForNewPrompt()
+
+				// 防御性重注册：压缩产生的 session.idle 可能在 summarizeInProgress
+				// 标志清除后到达（竞态窗口），触发 fireOnComplete → 注销 handler。
+				// 此时真实 prompt 刚发出，需要确保 handler 仍然注册以接收事件。
+				if _, ok := c.sessionHandlers.Load(sessionID); !ok {
+					c.RegisterSessionHandler(sessionID, handler.HandleEvent)
+					c.activeHandlers.Store(sessionID, handler)
+					c.runningSessions.Store(sessionID, true)
+					log.Printf("opencode: re-registered handler for session %s after compression (was deregistered by stale session.idle)", sessionID[:8])
+				}
+
 				continue
 			}
 

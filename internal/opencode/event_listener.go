@@ -417,6 +417,16 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		}
 
 	case "session.idle":
+		// 压缩操作（SummarizeSession）也会产生 session.idle 事件。如果在此期间
+		// 触发 completed，会导致 handler 提前注销，后续真实响应事件（包括
+		// permission.asked）全部被丢弃，session 在 opencode 服务端死锁。
+		// 通过 summarizeInProgress 标志区分压缩产生的 idle 和真实任务完成的 idle。
+		if s.client != nil {
+			if _, compressing := s.client.summarizeInProgress.Load(s.sessionID); compressing {
+				log.Printf("opencode: ignoring session.idle during compression for session %s", s.sessionID[:min(8, len(s.sessionID))])
+				return nil
+			}
+		}
 		s.completed = true
 		s.notifyCompletion()
 		log.Printf("opencode: 🏁 streaming session completed (session=%s, contentSent=%t, lastContentLen=%d)",
@@ -1654,6 +1664,69 @@ func (s *StreamingSessionHandler) stopWaitingTimer() {
 	if s.waitingTimer != nil {
 		s.waitingTimer.Stop()
 	}
+}
+
+// ResetForNewPrompt clears state that may have been polluted by a preceding
+// compression (SummarizeSession) operation. Compression emits its own
+// message.part.delta / step-finish / session.idle events which populate
+// lastContent, set contentSent/receivedStepFinish, and may even trigger
+// onComplete deregistration. Without resetting, the async ticker observes
+// stale "completed" state and returns immediately, dropping all real
+// response events (including permission.asked — which deadlocks the
+// session on the opencode server side).
+//
+// This must be called right after the real prompt_async is accepted and
+// before waiting for SSE events.
+func (s *StreamingSessionHandler) ResetForNewPrompt() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	log.Printf("opencode: resetting handler state for session %s (clearing compression artifacts: contentSent=%t, completed=%t, lastContentLen=%d)",
+		s.sessionID[:min(8, len(s.sessionID))], s.contentSent, s.completed, len(s.lastContent))
+
+	s.completed = false
+	s.contentSent = false
+	s.lastContent = ""
+	s.receivedStepFinish = false
+	s.stepFinishTime = time.Time{}
+	s.waitingHintSent = false
+	s.lastEventTime = time.Now()
+	s.lastEventType = ""
+	s.lastActivityTime = time.Now()
+	s.lastActivityType = ""
+	s.pendingQuestionSince = time.Time{}
+	s.pendingQuestionSent = false
+	s.pendingQuestionReminders = 0
+	s.activeToolParts = make(map[string]bool)
+	s.sessionTodos = nil
+	s.sessionDiff = nil
+	s.lastTodoSummary = ""
+	s.lastTodoStateHash = ""
+	s.lastTodoPushTime = time.Time{}
+
+	// Clear part caches so compression-era partIDs don't shadow real parts.
+	s.partTextCache.Range(func(k, _ any) bool { s.partTextCache.Delete(k); return true })
+	s.toolSignalCache.Range(func(k, _ any) bool { s.toolSignalCache.Delete(k); return true })
+	s.partRoles.Range(func(k, _ any) bool { s.partRoles.Delete(k); return true })
+
+	// Reset the onCompleteOnce so a future real session.idle can fire it.
+	// This is safe because fireOnComplete is guarded by sync.Once; resetting
+	// the Once allows the real completion (post-compression) to trigger
+	// the cleanup callback exactly once.
+	s.onCompleteOnce = sync.Once{}
+
+	// Restart the waiting hint timer for the new prompt.
+	if s.waitingTimer != nil {
+		s.waitingTimer.Stop()
+	}
+	s.waitingTimer = time.AfterFunc(8*time.Second, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.contentSent && !s.completed && !s.waitingHintSent {
+			s.waitingHintSent = true
+			_ = s.callback(QuestionSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
+		}
+	})
 }
 
 // extractPartDelta 从 message.part.delta 事件中提取增量文本
