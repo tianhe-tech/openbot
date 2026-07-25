@@ -644,6 +644,9 @@ func (h *Handler) extractText(msg *WeixinMessage, savedFiles []string) string {
 }
 
 func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, msg *WeixinMessage) (string, bool) {
+	// Trim leading/trailing whitespace so that messages with stray newlines
+	// (e.g. "\n/status" from certain WeChat clients) are still recognised.
+	text = strings.TrimSpace(text)
 	switch text {
 	case "/help", "帮助":
 		return h.helpText(), true
@@ -876,6 +879,18 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
 			if msg != "" {
+				log.Printf("wechat: QuestionSignal received user=%s session=%s msg_len=%d", userID, sessionID, len([]rune(msg)))
+
+				// Token overflow 检测：当 opencode server 压缩后仍溢出时，
+				// 会通过 session.error 发送 ContextOverflowError，经
+				// QuestionSignalPrefix 传递到这里。自动触发压缩并重试，
+				// 避免会话卡死（与 dingtalk/feishu/wecom 行为一致）。
+				if h.isTokenOverflowError(msg) && sessionID != "" {
+					log.Printf("wechat: token overflow detected for user %s session %s, auto-recovering", userID, sessionID[:min(8, len(sessionID))])
+					go h.recoverFromTokenOverflow(context.Background(), userID, sessionID, ctxToken, content, attachments, agentName)
+					return nil
+				}
+
 				// Drop accumulated low-priority (progress/todo) messages
 				// for this user so the permission/question dialog isn't
 				// flooded by stale progress updates from earlier in the
@@ -902,6 +917,7 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 								total, existing.ID)
 							return nil
 						}
+						log.Printf("wechat: QuestionSignal — existing prompt found (total=%d), proceeding with send", total)
 					}
 				}
 
@@ -1572,6 +1588,59 @@ func (h *Handler) handleSummary(ctx context.Context, userID string) string {
 		return fmt.Sprintf("❌ 压缩上下文失败: %v", err)
 	}
 	return "✅ 已触发上下文压缩"
+}
+
+// isTokenOverflowError 检测消息是否为上下文超限错误。
+// opencode server 在压缩后仍溢出时会发送 ContextOverflowError，
+// 经 session.error → QuestionSignalPrefix 传递到 adapter。
+func (h *Handler) isTokenOverflowError(msg string) bool {
+	m := strings.ToLower(strings.TrimSpace(msg))
+	if m == "" {
+		return false
+	}
+	if !strings.Contains(m, "opencode 会话出错") && !strings.Contains(m, "session error") {
+		return false
+	}
+	return strings.Contains(m, "parameter=input_tokens") ||
+		strings.Contains(m, "maximum input length") ||
+		strings.Contains(m, "context length") ||
+		strings.Contains(m, "input tokens") ||
+		strings.Contains(m, "context overflow") ||
+		strings.Contains(m, "too large to compact")
+}
+
+// recoverFromTokenOverflow 在检测到上下文超限错误后自动恢复：
+// 1. 尝试调用 SummarizeSession 压缩上下文
+// 2. 压缩成功后重新发送原始消息
+// 3. 压缩失败则通知用户，建议使用 /new 创建新会话
+func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionID, ctxToken, originalContent string, attachments []opencode.Attachment, agentName string) {
+	_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_notice",
+		"⚠️ 上下文已超限，正在自动压缩并重试...", true)
+
+	// 清除已总结标记并重置 token 计数，允许再次压缩
+	h.client.ClearSessionSummary(sessionID)
+	h.client.ResetSessionTokenCount(sessionID)
+
+	// 压缩超时：20分钟（与 dingtalk/feishu 一致）
+	recoverCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer cancel()
+
+	if err := h.client.SummarizeSession(recoverCtx, sessionID); err != nil {
+		log.Printf("wechat: auto-recovery summarize failed user=%s session=%s: %v", userID, sessionID[:min(8, len(sessionID))], err)
+		_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_fail",
+			fmt.Sprintf("❌ 自动压缩失败: %v\n\n💡 请发送 /new 创建新会话继续", err), true)
+		return
+	}
+
+	_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_done",
+		"✅ 压缩完成，正在重试消息...", true)
+
+	// 重新发送原始消息（异步，避免阻塞恢复 goroutine）
+	go func() {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		defer retryCancel()
+		h.dispatchToOpenCode(retryCtx, userID, "", originalContent, ctxToken, attachments, agentName)
+	}()
 }
 
 func (h *Handler) handleClear(ctx context.Context, userID string) string {
@@ -2622,10 +2691,13 @@ func (h *Handler) sendTextChunksDirect(userID, text, ctxToken string) error {
 // sendTextInline sends text directly via senderRegistry without queueing.
 // Used only as a fallback when the outbound queue is not initialized.
 func (h *Handler) sendTextInline(userID, text, ctxToken string) error {
+	start := time.Now()
 	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
 	if len(chunks) == 0 {
+		log.Printf("wechat: sendTextInline SKIP user=%s — no chunks (text_len=%d)", userID, len([]rune(text)))
 		return nil
 	}
+	log.Printf("wechat: sendTextInline START user=%s chunks=%d total_len=%d", userID, len(chunks), len([]rune(text)))
 	effectiveToken := ctxToken
 	delivered, err := h.sender.sendChunks(userID, chunks, func(chunk string) error {
 		h.trackSentText(userID, chunk)
@@ -2643,6 +2715,8 @@ func (h *Handler) sendTextInline(userID, text, ctxToken string) error {
 	})
 	if err != nil {
 		log.Printf("wechat: inline chunk send failed user=%s delivered=%d/%d: %v", userID, delivered, len(chunks), err)
+	} else {
+		log.Printf("wechat: sendTextInline OK user=%s delivered=%d/%d elapsed=%s", userID, delivered, len(chunks), time.Since(start))
 	}
 	return err
 }

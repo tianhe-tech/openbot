@@ -77,6 +77,12 @@ type StreamingSessionHandler struct {
 	pendingQuestionSince     time.Time
 	pendingQuestionSent      bool // whether a "still waiting for your input" reminder has been sent
 	pendingQuestionReminders int  // number of reminders already sent (multi-level escalation)
+
+	// serverCompacting 标记 opencode server 正在进行自动压缩（compaction）。
+	// 压缩期间会产生 session.idle 事件，但此时并非真正完成，需要忽略。
+	// 通过 message.part 类型为 "compaction" 来检测压缩开始，
+	// 通过 session.compacted 事件来检测压缩结束。
+	serverCompacting bool
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -310,6 +316,17 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				if partMeta2.Properties.Part.Type == "retry" {
 					s.handleRetryPart(jsonData)
 				}
+
+				// 检测 server 端自动压缩（compaction）：当 opencode server 在
+				// prompt loop 中检测到 overflow 时，会创建 type=="compaction" 的
+				// part。设置 serverCompacting 标志，使后续 session.idle 被忽略，
+				// 直到收到 session.compacted 事件才清除。
+				if partMeta2.Properties.Part.Type == "compaction" {
+					if !s.serverCompacting {
+						s.serverCompacting = true
+						log.Printf("opencode: 📦 compaction part detected for session %s, setting serverCompacting flag", s.sessionID[:8])
+					}
+				}
 			}
 		}
 
@@ -417,15 +434,13 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		}
 
 	case "session.idle":
-		// 压缩操作（SummarizeSession）也会产生 session.idle 事件。如果在此期间
-		// 触发 completed，会导致 handler 提前注销，后续真实响应事件（包括
-		// permission.asked）全部被丢弃，session 在 opencode 服务端死锁。
-		// 通过 summarizeInProgress 标志区分压缩产生的 idle 和真实任务完成的 idle。
-		if s.client != nil {
-			if _, compressing := s.client.summarizeInProgress.Load(s.sessionID); compressing {
-				log.Printf("opencode: ignoring session.idle during compression for session %s", s.sessionID[:min(8, len(s.sessionID))])
-				return nil
-			}
+		// opencode server 自动压缩（compaction）期间也会产生 session.idle 事件。
+		// 如果在此期间触发 completed，会导致 handler 提前注销，后续真实响应事件
+		// （包括 permission.asked）全部被丢弃，session 在 opencode 服务端死锁。
+		// 通过 serverCompacting 标志区分压缩产生的 idle 和真实任务完成的 idle。
+		if s.serverCompacting {
+			log.Printf("opencode: ignoring session.idle during server-side compaction for session %s", s.sessionID[:min(8, len(s.sessionID))])
+			return nil
 		}
 		s.completed = true
 		s.notifyCompletion()
@@ -638,12 +653,13 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: message removed for session %s", s.sessionID[:8])
 
 	case "session.compacted":
-		// opencode 服务端自主压缩完成通知（可能是我们调用 SummarizeSession 触发，也可能是服务端自动触发）
+		// opencode 服务端自主压缩完成通知（可能是 /summary 命令触发，也可能是服务端自动触发）
 		// 压缩后重置 token 计数器，等待下次 step-finish 携带真实值
+		s.serverCompacting = false
 		if s.client != nil {
 			s.client.tokenCount.Store(s.sessionID, 0)
 		}
-		log.Printf("opencode: ✅ session.compacted received for session %s, token counter reset", s.sessionID[:8])
+		log.Printf("opencode: ✅ session.compacted received for session %s, token counter reset, compaction flag cleared", s.sessionID[:8])
 
 	case "server.instance.disposed":
 		// 服务器重启，事件监听器主循环负责重连

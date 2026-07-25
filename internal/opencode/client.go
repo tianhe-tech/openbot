@@ -366,54 +366,53 @@ func (q *Question) IsValidAnswer(input string) bool {
 
 // Client knows how to talk to the remote OpenCode service using the official SDK.
 type Client struct {
-	sdk                 *opencode.Client
-	endpoint            string
-	apiKey              string
-	httpClient          *http.Client
-	sseClient           *http.Client // 专用于 SSE 长连接，不设超时（http.Client.Timeout 对流式响应是总时长限制）
-	eventHandlers       []EventHandler
-	eventListenerMu     sync.RWMutex
-	sessionHandlers     sync.Map     // map[sessionID]EventHandler for fast lookup
-	messageToSession    sync.Map     // map[messageID]sessionID for events with only messageID
-	messageRoles        sync.Map     // map[messageID]role("user"/"assistant")
-	sessionMu           sync.RWMutex // 用于保护 session 相关操作
-	sessions            sync.Map     // map[threadID]sessionID
-	sessionLocks        sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
-	sessionsMu          sync.RWMutex // 保护 sessions 的读写
-	messageCount        sync.Map     // map[sessionID]int tracks messages per session
-	toolCallCount       sync.Map     // map[sessionID]int tracks completed tool calls per session
-	tokenCount          sync.Map     // map[sessionID]int tracks estimated tokens per session
-	sessionSummary      sync.Map     // map[sessionID]string stores session summaries
-	summarizeInProgress sync.Map     // map[sessionID]bool tracks ongoing summarize goroutines
-	modelConfig         sync.Map     // map[sessionID]*ModelConfig caches model config per session
-	requestCache        sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
-	runningSessions     sync.Map     // map[sessionID]bool 跟踪正在运行的session
-	pendingQuestions    sync.Map     // map[questionID]*Question 待回答的问题
-	todoCache           sync.Map     // map[sessionID][]TodoItem
-	diffCache           sync.Map     // map[sessionID][]FileDiff
-	userMemory          sync.Map     // map[channel:userID][]UserMemoryFact
-	directory           string
-	timeout             time.Duration // 默认超时时间
-	retryConfig         RetryConfig   // 重试配置
-	devCoreEnabled      bool          // 是否启用开发助手内核提示词注入
-	devCorePrompt       string        // 开发助手内核提示词
-	enableSkillHint     bool          // 是否在消息中添加skill提示
-	skillHintCache      []string      // 缓存的可用skill列表
-	skillCacheMu        sync.RWMutex
-	showThinking        bool
-	finalOnly           bool
-	showSteps           bool
-	modeMu              sync.RWMutex
-	lastHealthCheck     time.Time    // 最后一次健康检查时间
-	isHealthy           bool         // OpenCode server是否健康
-	healthCheckMu       sync.RWMutex // 保护健康状态
-	modelOverride       sync.Map     // map[sessionID]opencode.SessionPromptParamsModel
-	providerCacheMu     sync.RWMutex
-	providerCacheAt     time.Time
-	providerCache       []Provider
-	capabilityCache     map[string]modelCapability // key: lower(provider/model)
-	defaultModelHint    *opencode.SessionPromptParamsModel
-	memStore            MemStoreRecorder // optional memory store (set via WithMemStore)
+	sdk              *opencode.Client
+	endpoint         string
+	apiKey           string
+	httpClient       *http.Client
+	sseClient        *http.Client // 专用于 SSE 长连接，不设超时（http.Client.Timeout 对流式响应是总时长限制）
+	eventHandlers    []EventHandler
+	eventListenerMu  sync.RWMutex
+	sessionHandlers  sync.Map     // map[sessionID]EventHandler for fast lookup
+	messageToSession sync.Map     // map[messageID]sessionID for events with only messageID
+	messageRoles     sync.Map     // map[messageID]role("user"/"assistant")
+	sessionMu        sync.RWMutex // 用于保护 session 相关操作
+	sessions         sync.Map     // map[threadID]sessionID
+	sessionLocks     sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
+	sessionsMu       sync.RWMutex // 保护 sessions 的读写
+	messageCount     sync.Map     // map[sessionID]int tracks messages per session
+	toolCallCount    sync.Map     // map[sessionID]int tracks completed tool calls per session
+	tokenCount       sync.Map     // map[sessionID]int tracks estimated tokens per session
+	sessionSummary   sync.Map     // map[sessionID]string stores session summaries
+	modelConfig      sync.Map     // map[sessionID]*ModelConfig caches model config per session
+	requestCache     sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
+	runningSessions  sync.Map     // map[sessionID]bool 跟踪正在运行的session
+	pendingQuestions sync.Map     // map[questionID]*Question 待回答的问题
+	todoCache        sync.Map     // map[sessionID][]TodoItem
+	diffCache        sync.Map     // map[sessionID][]FileDiff
+	userMemory       sync.Map     // map[channel:userID][]UserMemoryFact
+	directory        string
+	timeout          time.Duration // 默认超时时间
+	retryConfig      RetryConfig   // 重试配置
+	devCoreEnabled   bool          // 是否启用开发助手内核提示词注入
+	devCorePrompt    string        // 开发助手内核提示词
+	enableSkillHint  bool          // 是否在消息中添加skill提示
+	skillHintCache   []string      // 缓存的可用skill列表
+	skillCacheMu     sync.RWMutex
+	showThinking     bool
+	finalOnly        bool
+	showSteps        bool
+	modeMu           sync.RWMutex
+	lastHealthCheck  time.Time    // 最后一次健康检查时间
+	isHealthy        bool         // OpenCode server是否健康
+	healthCheckMu    sync.RWMutex // 保护健康状态
+	modelOverride    sync.Map     // map[sessionID]opencode.SessionPromptParamsModel
+	providerCacheMu  sync.RWMutex
+	providerCacheAt  time.Time
+	providerCache    []Provider
+	capabilityCache  map[string]modelCapability // key: lower(provider/model)
+	defaultModelHint *opencode.SessionPromptParamsModel
+	memStore         MemStoreRecorder // optional memory store (set via WithMemStore)
 
 	// asyncQueue runs background work (handoff summarization, skill candidates)
 	// off the user-facing request path. nil-safe.
@@ -918,44 +917,26 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 			goto sendMessage
 		}
 
-		// 检查是否需要原地压缩
+		// 上下文使用率监控（仅日志）：压缩由 opencode server 在 prompt loop 中
+		// 自动处理（compaction.isOverflow），gateway 通过 session.compacted 事件
+		// 感知并重置 tokenCount。不再主动调用 SummarizeSession，避免同步阻塞。
 		count, _ := c.messageCount.LoadOrStore(sessionID, 0)
 		msgCount := count.(int)
 		tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
 		currentTokens := tokens.(int)
 
-		// 估算当前消息的token数（仅用于日志和保守预判，真实计数由 step-finish 更新）
 		estimatedMsgTokens := estimateTokens(payload.Content)
 		projectedTokens := currentTokens + estimatedMsgTokens
 
-		// 获取模型上下文长度（从 capabilityCache 查表，比硬编码准确）
 		maxContextTokens := c.getMaxContextLength(sessionID)
 		contextUsage := float64(projectedTokens) / float64(maxContextTokens)
 
 		log.Printf("opencode: session %s - messages: %d, tokens: %d/%d (%.1f%%), estimated msg tokens: %d",
 			sessionID[:8], msgCount, currentTokens, maxContextTokens, contextUsage*100, estimatedMsgTokens)
 
-		// 上下文使用率超过阈值：发送前同步完成压缩，再继续发送当前消息。
-		// 必须同步等待，否则压缩还在进行中当前消息就打给了模型，超长上下文不消失。
 		if contextUsage >= ContextUsageThreshold {
-			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, compressing before send",
+			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, server will auto-compact in prompt loop",
 				sessionID[:8], contextUsage*100, ContextUsageThreshold*100)
-			// 防止同一 session 同时运行多个 summarize（流式路径可能并发）
-			if _, alreadyRunning := c.summarizeInProgress.LoadOrStore(sessionID, true); !alreadyRunning {
-				defer c.summarizeInProgress.Delete(sessionID)
-				// 同步压缩，当前消息在压缩完成前不会发出
-				sumCtx, sumCancel := context.WithTimeout(ctx, 5*time.Minute)
-				defer sumCancel()
-				if err := c.SummarizeSession(sumCtx, sessionID); err != nil {
-					log.Printf("opencode: compress before send failed for session %s: %v; proceeding anyway", sessionID[:8], err)
-				} else {
-					log.Printf("opencode: compress done for session %s, proceeding to send", sessionID[:8])
-				}
-				// 无论成功失败都重置计数，避免下一条消息再次触发
-				c.tokenCount.Store(sessionID, 0)
-			} else {
-				log.Printf("opencode: session %s compress already in progress, proceeding to send", sessionID[:8])
-			}
 		}
 	}
 	threadLock.Unlock()
@@ -1669,7 +1650,6 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	c.toolCallCount.Delete(sessionID)
 	c.tokenCount.Delete(sessionID)
 	c.sessionSummary.Delete(sessionID)
-	c.summarizeInProgress.Delete(sessionID)
 	c.modelConfig.Delete(sessionID)
 	c.modelOverride.Delete(sessionID)
 	c.runningSessions.Delete(sessionID)
@@ -3293,15 +3273,15 @@ func (c *Client) getThreadLock(threadID string) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
-// SummarizeSession 总结一个session的对话内容
+// SummarizeSession 总结一个session的对话内容。
+// 注意：此方法仅供 /summary 命令和 token overflow 错误恢复使用。
+// 正常流程中，压缩由 opencode server 在 prompt loop 中自动处理（compaction.isOverflow），
+// gateway 通过 session.compacted SSE 事件感知并重置 tokenCount。
+// 调用此方法会同步阻塞（server 端 promptSvc.loop 等待 LLM 完成），调用方应设置合理超时。
 func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
 	if !c.Ready() {
 		return fmt.Errorf("opencode: client not configured")
 	}
-
-	// 注意：已移除一次性 gate（原来的 sessionSummary.Load 检查）
-	// 原所有轮压缩后 sessionSummary 标记为 "compacted"，导致下次上下文再次充满时永远不再压缩。
-	// 现在由调用方（summarizeInProgress 锁 + tokenCount reset）防止重入和无限循环。
 
 	log.Printf("opencode: summarizing session %s", sessionID)
 
@@ -3969,12 +3949,11 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 
 	isAsyncMode := false
 	var asyncResponse Response
-	idleCheckCount := 0                 // 空闲检测计数器
-	var lastSummarizeActiveAt time.Time // 最后一次观察到 summarize 正在进行的时间
-	var lastBusyProbeAt time.Time       // 最后一次 busy 探测时间（避免频繁探测）
-	var busyProbeExtendAt time.Time     // 若探测确认 busy，记录延长的起点
-	consecutiveNotBusy := 0             // 连续探测到 not-busy 的次数（满 2 次才宣告超时）
-	thinkingNoticeSent := false         // 是否已经向用户推送过一次"仍在处理中"提示
+	idleCheckCount := 0             // 空闲检测计数器
+	var lastBusyProbeAt time.Time   // 最后一次 busy 探测时间（避免频繁探测）
+	var busyProbeExtendAt time.Time // 若探测确认 busy，记录延长的起点
+	consecutiveNotBusy := 0         // 连续探测到 not-busy 的次数（满 2 次才宣告超时）
+	thinkingNoticeSent := false     // 是否已经向用户推送过一次"仍在处理中"提示
 	// Stuck-tool detection: when active tools are running but no events arrive
 	// for an extended period, the session is likely blocked by a hung subagent.
 	// We track the first detection time and cap extends to avoid infinite wait.
@@ -4044,6 +4023,17 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		case response := <-responseChan:
 			// 如果是Async模式（reply为空），标记并继续等待SSE事件
 			if response.Reply == "" {
+				// ★ 关键修复：进入 async 模式后必须设置 isAsyncMode=true，
+				// 否则下方 ticker 的所有完成/超时检查（均以 isAsyncMode 为前置
+				// 条件）都不会触发，循环只能等到 20 分钟的 ctx 超时才退出。
+				// 这会导致 adapter 的 dispatching 标志长时间不清除，后续消息
+				// 全部进入排队队列（即使前面没有真正在执行的任务）。
+				if !isAsyncMode {
+					isAsyncMode = true
+					log.Printf("opencode: entering async mode for session %s (empty reply, waiting for SSE events)", sessionID[:8])
+				}
+				asyncResponse = response
+
 				// 压缩操作（SummarizeSession）可能在此前执行过，其产生的
 				// message.part.delta / step-finish / session.idle 事件会污染
 				// handler 状态（contentSent=true, completed=true, lastContent
@@ -4053,14 +4043,14 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 				// 等待权限回答的状态。
 				handler.ResetForNewPrompt()
 
-				// 防御性重注册：压缩产生的 session.idle 可能在 summarizeInProgress
-				// 标志清除后到达（竞态窗口），触发 fireOnComplete → 注销 handler。
+				// 防御性重注册：server 自动压缩（compaction）产生的 session.idle
+				// 可能在真实 prompt 发出前到达，触发 fireOnComplete → 注销 handler。
 				// 此时真实 prompt 刚发出，需要确保 handler 仍然注册以接收事件。
 				if _, ok := c.sessionHandlers.Load(sessionID); !ok {
 					c.RegisterSessionHandler(sessionID, handler.HandleEvent)
 					c.activeHandlers.Store(sessionID, handler)
 					c.runningSessions.Store(sessionID, true)
-					log.Printf("opencode: re-registered handler for session %s after compression (was deregistered by stale session.idle)", sessionID[:8])
+					log.Printf("opencode: re-registered handler for session %s after server-side compaction (was deregistered by stale session.idle)", sessionID[:8])
 				}
 
 				continue
@@ -4107,16 +4097,6 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			// 检查最后一次事件时间
 			lastEventTime, lastEventType := handler.GetLastEventInfo()
 			timeSinceLastEvent := time.Since(lastEventTime)
-			// 如果 summarize 正在进行中（或最近刚完成），将其视为有效的"活动时间"
-			// 防止 summarize 运行期间误触发超时
-			if _, summarizing := c.summarizeInProgress.Load(sessionID); summarizing {
-				lastSummarizeActiveAt = time.Now()
-			}
-			if !lastSummarizeActiveAt.IsZero() {
-				if d := time.Since(lastSummarizeActiveAt); d < timeSinceLastEvent {
-					timeSinceLastEvent = d
-				}
-			}
 			// 若上一次 busy 探测确认还在运行，将延长起点作为"活动时间"基线，
 			// 避免在一次长 prefill 中因 SSE 静默误触发超时/handoff。
 			if !busyProbeExtendAt.IsZero() {
@@ -4322,6 +4302,16 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 				}
 				log.Printf("opencode: decision=idle_timeout session=%s thread=%s sinceLastEvent=%v hasSent=%t notBusyStreak=%d threshold=%v",
 					sessionID[:8], payload.ThreadID, timeSinceLastEvent, hasSentContent, consecutiveNotBusy, streamIdleTimeoutNoContent)
+				// Idle 超时确认：server 侧 session 可能卡住（如压缩 LLM 挂起）。
+				// 调用 AbortSession 中止 server 侧 prompt loop，防止后续消息复用
+				// 同一 session 时被旧任务阻塞。Abort 失败不影响本地清理。
+				abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if abortErr := c.AbortSession(abortCtx, sessionID); abortErr != nil {
+					log.Printf("opencode: ⚠️ abort after idle timeout failed for session %s: %v (continuing with local cleanup)", sessionID[:8], abortErr)
+				} else {
+					log.Printf("opencode: ✅ aborted session %s after idle timeout", sessionID[:8])
+				}
+				abortCancel()
 				c.recordMemAsync(payload, handler.GetLastContent())
 				return c.finalizeAsyncStreamingResponse(payload, sessionID, handler, callback, asyncResponse), nil
 			}
