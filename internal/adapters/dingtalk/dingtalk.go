@@ -186,6 +186,20 @@ func NewHandler(ocClient *opencode.Client, cfg Config) *Handler {
 
 	h.adapter = base.NewBidirectionalAdapter("dingtalk", h)
 
+	// Register a stuck session hook for logging. DingTalk doesn't have an async
+	// push channel (messages require a sessionWebhook from an inbound message),
+	// so the user will see the stuck diagnosis via /status instead.
+	h.client.SetStuckSessionHook(func(parentSessionID, childSessionID, reason string) {
+		if childSessionID != "" {
+			log.Printf("dingtalk: ⚠️ stuck child session %s (parent=%s): %s",
+				childSessionID[:min(8, len(childSessionID))],
+				parentSessionID[:min(8, len(parentSessionID))], reason)
+		} else {
+			log.Printf("dingtalk: ⚠️ stuck session %s: %s",
+				parentSessionID[:min(8, len(parentSessionID))], reason)
+		}
+	})
+
 	return h
 }
 
@@ -1215,16 +1229,14 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				chunk[:min(30, len(chunk))], len(chunk))
 		}
 
-		// Map user to session as soon as we receive first callback
-		// This ensures the mapping exists before any question/permission events
+		// Session IDs are internal control signals for every turn, including
+		// fallback turns that reuse this callback. Never append them to the
+		// user-visible reply buffer.
 		sessionMappingMu.Lock()
-		if !sessionMapped && strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
-			// This is a special signal containing the sessionID (not actual content)
-			// SessionID format: ses_XXXXXXXXXXXXXXXXXXXXXXXXXX (around 30 chars)
+		if strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
 			h.adapter.MapUserToSession(userID, chunk)
-			// Store the session webhook for later use when sending messages from OpenCode Server
 			h.adapter.MapSessionData(chunk, "channel", data.SessionWebhook)
-			log.Printf("dingtalk stream: early mapped user %s to session %s (webhook: %s)", userID, chunk, data.SessionWebhook)
+			log.Printf("dingtalk stream: mapped user %s to session %s (webhook: %s)", userID, chunk, data.SessionWebhook)
 			sessionMapped = true
 			sessionMappingMu.Unlock()
 			return nil
@@ -1346,16 +1358,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 
 			toSend := fullReply.String()[lastSentLength:]
 			if len(toSend) > 0 {
-				if preferAICardForAllReplies {
-					log.Printf("dingtalk stream: flush signal received with %d bytes; deferring final delivery to AI Card path", len(toSend))
+				log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
+				if err := sendReply(toSend); err != nil {
+					log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
 				} else {
-					log.Printf("dingtalk stream: 📤 flush signal: sending final %d bytes", len(toSend))
-					if err := sendReply(toSend); err != nil {
-						log.Printf("dingtalk stream: ⚠️ flush send failed: %v", err)
-					} else {
-						lastSentLength = len(fullReply.String())
-						log.Printf("dingtalk stream: ✅ flush send done")
-					}
+					lastSentLength = len(fullReply.String())
+					log.Printf("dingtalk stream: ✅ flush send done")
 				}
 			}
 			return nil

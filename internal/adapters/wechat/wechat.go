@@ -171,6 +171,27 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		h.outbound = outbound
 	}
 
+	// Register a stuck session hook so the user is proactively notified when
+	// GetSessionDiagnostics detects a child or main session that appears hung
+	// on the opencode server side (zombie busy, LLM generation interrupted,
+	// tool call stuck, etc.).
+	h.client.SetStuckSessionHook(func(parentSessionID, childSessionID, reason string) {
+		userID, ok := h.adapter.GetUserForSession(parentSessionID)
+		if !ok {
+			log.Printf("wechat: stuck session hook: no user found for session %s", parentSessionID[:min(8, len(parentSessionID))])
+			return
+		}
+		var msg string
+		if childSessionID != "" {
+			msg = fmt.Sprintf("⚠️ 检测到子任务可能卡住（%s…）\n原因: %s\n\n建议：\n• 发送 /status 查看详细诊断\n• 发送 /abort 中止当前任务",
+				childSessionID[:min(8, len(childSessionID))], reason)
+		} else {
+			msg = fmt.Sprintf("⚠️ 检测到会话可能卡住\n原因: %s\n\n建议：\n• 发送 /status 查看详细诊断\n• 发送 /abort 中止当前任务\n• 发送 /new 创建新会话",
+				reason)
+		}
+		_ = h.enqueueAsyncText(userID, parentSessionID, "", "warning", msg, true)
+	})
+
 	return h
 }
 
@@ -1123,9 +1144,21 @@ func (h *Handler) notifyLongRunningTask(userID string) {
 		case diag.ToolStuck:
 			// Active tools but no SSE events for >= 5 minutes — a subagent
 			// or tool call is hung on the opencode server side.
+			// Include child session diagnostics if available (subagent tasks).
+			childInfo := ""
+			if len(diag.ChildSessions) > 0 {
+				for _, cs := range diag.ChildSessions {
+					if cs.Stuck {
+						childInfo += fmt.Sprintf("\n子任务 %s…: %s", cs.SessionID[:min(8, len(cs.SessionID))], cs.StuckReason)
+					}
+				}
+			}
+			if diag.ZombieSession {
+				childInfo += "\n⚠️ 服务器端session处于busy但gateway无活跃handler（僵尸会话）"
+			}
 			msg = fmt.Sprintf("🔴 检测到工具执行可能卡死（有活跃工具但超过5分钟无事件更新）。%s\n\n"+
 				"最后事件: %s（%s前）\n"+
-				"活跃工具数: %d\n\n"+
+				"活跃工具数: %d%s\n\n"+
 				"建议：\n"+
 				"• 发送 /abort 中止当前任务\n"+
 				"• 发送 /status 查看详细诊断\n"+
@@ -1133,7 +1166,8 @@ func (h *Handler) notifyLongRunningTask(userID string) {
 				sessionPart,
 				diag.LastEventType,
 				time.Since(diag.LastEventAt).Round(time.Second),
-				diag.ActiveTools)
+				diag.ActiveTools,
+				childInfo)
 
 		case diag.RetryAttempt > 0:
 			// Upstream provider is repeatedly retrying — model may be

@@ -76,6 +76,21 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		},
 	}
 	h.adapter = base.NewBidirectionalAdapter("wecom", h)
+
+	// Register a stuck session hook for logging. WeCom's push requires a
+	// target from an inbound message, so the user will see the stuck
+	// diagnosis via /status instead.
+	h.client.SetStuckSessionHook(func(parentSessionID, childSessionID, reason string) {
+		if childSessionID != "" {
+			log.Printf("wecom: ⚠️ stuck child session %s (parent=%s): %s",
+				childSessionID[:min(8, len(childSessionID))],
+				parentSessionID[:min(8, len(parentSessionID))], reason)
+		} else {
+			log.Printf("wecom: ⚠️ stuck session %s: %s",
+				parentSessionID[:min(8, len(parentSessionID))], reason)
+		}
+	})
+
 	return h
 }
 

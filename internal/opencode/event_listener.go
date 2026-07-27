@@ -83,10 +83,28 @@ type StreamingSessionHandler struct {
 	// 通过 message.part 类型为 "compaction" 来检测压缩开始，
 	// 通过 session.compacted 事件来检测压缩结束。
 	serverCompacting bool
+
+	// Circuit-breaker integration: the model used for this turn (so the
+	// session.error handler can attribute failures to the right provider)
+	// and the original payload (so a fallback retry can be dispatched).
+	// fallbackRetryAttempted prevents infinite retry loops: only one
+	// automatic model switch is attempted per turn.
+	lastModelUsed           *opencode.SessionPromptParamsModel
+	payload                 MessagePayload
+	fallbackRetryAttempted  bool
+	fallbackRetryDispatched bool
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
 func NewStreamingSessionHandler(sessionID string, callback StreamCallback, eventCallback StreamEventCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool) *StreamingSessionHandler {
+	return NewStreamingSessionHandlerWithModel(sessionID, callback, eventCallback, onComplete, client, messageSender, showThinking, showSteps, nil, MessagePayload{})
+}
+
+// NewStreamingSessionHandlerWithModel is the full constructor that also
+// captures the model override used for this turn and the original payload.
+// These are consumed by the session.error handler to attribute failures to
+// the correct provider/model and to dispatch an automatic fallback retry.
+func NewStreamingSessionHandlerWithModel(sessionID string, callback StreamCallback, eventCallback StreamEventCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool, modelUsed *opencode.SessionPromptParamsModel, payload MessagePayload) *StreamingSessionHandler {
 	h := &StreamingSessionHandler{
 		sessionID:        sessionID,
 		callback:         callback,
@@ -100,6 +118,8 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, event
 		showThinking:     showThinking,
 		showSteps:        showSteps,
 		activeToolParts:  make(map[string]bool),
+		lastModelUsed:    modelUsed,
+		payload:          payload,
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
@@ -111,6 +131,26 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, event
 		}
 	})
 	return h
+}
+
+// SetModelUsed records the final model selected by SendMessage. Streaming
+// handlers are registered before automatic model selection completes.
+func (s *StreamingSessionHandler) SetModelUsed(model *opencode.SessionPromptParamsModel) {
+	if model == nil {
+		return
+	}
+	copyModel := *model
+	s.mu.Lock()
+	s.lastModelUsed = &copyModel
+	s.mu.Unlock()
+}
+
+// FallbackRetryDispatched reports whether a replacement turn now owns user
+// delivery after this handler received a provider error.
+func (s *StreamingSessionHandler) FallbackRetryDispatched() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fallbackRetryDispatched
 }
 
 func (s *StreamingSessionHandler) emitEvent(kind StreamEventKind, content string, question *Question, todos []TodoItem, diff []FileDiff, rawType string) {
@@ -487,6 +527,35 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: 🔴 session.error RAW JSON: %s", rawJSON)
 		errorMsg := s.extractSessionError(event)
 		log.Printf("opencode: 🔴 session.error extracted message: %q", errorMsg)
+
+		// Circuit breaker: if this is a provider-level failure (e.g. "No
+		// available client"), record it against the model used for this
+		// turn and attempt an automatic fallback to a healthy model.
+		// The fallback re-dispatches the original payload with a new
+		// model; if it succeeds we return without notifying the user of
+		// the error (the retry turn's content reaches them instead).
+		if s.client != nil && s.client.breaker != nil && s.lastModelUsed != nil && !s.fallbackRetryAttempted {
+			if s.client.breaker.IsProviderLevelError(errorMsg) {
+				pid := s.lastModelUsed.ProviderID.Value
+				mid := s.lastModelUsed.ModelID.Value
+				s.client.breaker.RecordFailure(pid, mid, errorMsg)
+				log.Printf("opencode: 🔌 circuit breaker recorded failure for %s/%s (state=%s)",
+					pid, mid, s.client.breaker.StateString(pid, mid))
+
+				s.fallbackRetryAttempted = true
+				if s.client.attemptFallbackRetry(s.sessionID, s.payload, s.lastModelUsed, s.callback, s.eventCallback) {
+					// Fallback dispatched: do not surface the error to the
+					// user. Mark this handler complete so the SSE loop
+					// exits; the new turn's handler takes over.
+					s.fallbackRetryDispatched = true
+					s.completed = true
+					s.notifyCompletion()
+					log.Printf("opencode: session.error handled via fallback retry for session %s", s.sessionID[:8])
+					return nil
+				}
+			}
+		}
+
 		if errorMsg == "" {
 			errorMsg = "⚠️ OpenCode 会话发生错误，请稍后重试。"
 		} else {
@@ -715,17 +784,26 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 	}
 
 	type ToolInput struct {
-		Command     string `json:"command"`
-		Description string `json:"description"`
-		Filepath    string `json:"filepath"`
-		URL         string `json:"url"`
+		Command      string `json:"command"`
+		Description  string `json:"description"`
+		Filepath     string `json:"filepath"`
+		URL          string `json:"url"`
+		SubagentType string `json:"subagent_type"`
+	}
+
+	type ToolMetadata struct {
+		ParentSessionID string                 `json:"parentSessionId"`
+		SessionID       string                 `json:"sessionId"`
+		Model           map[string]interface{} `json:"model"`
+		Truncated       bool                   `json:"truncated"`
 	}
 
 	type ToolState struct {
-		Status string    `json:"status"`
-		Input  ToolInput `json:"input"`
-		Output string    `json:"output"`
-		Error  string    `json:"error"`
+		Status   string       `json:"status"`
+		Input    ToolInput    `json:"input"`
+		Output   string       `json:"output"`
+		Error    string       `json:"error"`
+		Metadata ToolMetadata `json:"metadata"`
 	}
 
 	type PartUpdateProps struct {
@@ -833,6 +911,25 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 				s.activeToolParts[partID] = true
 			case "completed", "error":
 				delete(s.activeToolParts, partID)
+			}
+		}
+
+		// Capture child session info from task tool calls (subagent sessions).
+		// The metadata.sessionId is the child session, metadata.parentSessionId
+		// is the parent (should match s.sessionID).
+		if toolName == "task" && s.client != nil && state.Metadata.SessionID != "" {
+			switch state.Status {
+			case "running", "pending":
+				s.client.RegisterChildSession(
+					s.sessionID,
+					state.Metadata.SessionID,
+					state.Input.Description,
+					state.Input.SubagentType,
+				)
+			case "completed":
+				s.client.UpdateChildSessionStatus(state.Metadata.SessionID, "completed")
+			case "error":
+				s.client.UpdateChildSessionStatus(state.Metadata.SessionID, "error")
 			}
 		}
 
@@ -1569,9 +1666,36 @@ func (s *StreamingSessionHandler) handleRetryPart(rawJSON string) {
 		return
 	}
 
-	// 已达上限且尚未报错过：surface 一条明确的错误并结束本轮，避免无限"正在处理中"。
+	// 已达上限且尚未报错过：尝试熔断 + 自动切换模型。
+	// 如果切换成功，则不向用户报错；否则 surface 一条明确的错误并结束本轮。
 	if alreadySurfaced {
 		return
+	}
+
+	// Circuit breaker: record the failure and attempt an automatic
+	// fallback to a healthy model. This is the primary path for provider
+	// failures — opencode's upstream retry exhausts, and we switch models
+	// instead of just surfacing the error.
+	if s.client != nil && s.client.breaker != nil && s.lastModelUsed != nil && !s.fallbackRetryAttempted {
+		if s.client.breaker.IsProviderLevelError(curMsg) {
+			pid := s.lastModelUsed.ProviderID.Value
+			mid := s.lastModelUsed.ModelID.Value
+			s.client.breaker.RecordFailure(pid, mid, curMsg)
+			log.Printf("opencode: 🔌 circuit breaker recorded failure for %s/%s (state=%s) from retry-limit",
+				pid, mid, s.client.breaker.StateString(pid, mid))
+
+			s.fallbackRetryAttempted = true
+			if s.client.attemptFallbackRetry(s.sessionID, s.payload, s.lastModelUsed, s.callback, s.eventCallback) {
+				// Fallback dispatched: do not surface the error to the
+				// user. Mark this handler complete so the SSE loop
+				// exits; the new turn's handler takes over.
+				s.fallbackRetryDispatched = true
+				s.completed = true
+				s.notifyCompletion()
+				log.Printf("opencode: retry-limit handled via fallback retry for session %s", s.sessionID[:8])
+				return
+			}
+		}
 	}
 
 	errText := fmt.Sprintf("⚠️ 上游模型多次重试仍失败（已重试 %d 次），本轮中止。", curAttempt)

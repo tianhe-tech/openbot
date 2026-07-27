@@ -130,6 +130,13 @@ func main() {
 	ocOptions := []opencode.Option{
 		opencode.WithDirectory(cfg.OpenCodeDirectory),
 		opencode.WithDevCoreProfile(cfg.OpenCodeDevCoreEnabled, cfg.OpenCodeDevCorePrompt),
+		opencode.WithCircuitBreaker(opencode.NewCircuitBreaker(opencode.CircuitBreakerConfig{
+			Enabled:          cfg.CircuitBreaker.Enabled,
+			FailureThreshold: cfg.CircuitBreaker.FailureThreshold,
+			Cooldown:         cfg.CircuitBreaker.Cooldown,
+			MaxCooldown:      cfg.CircuitBreaker.MaxCooldown,
+			TripKeywords:     cfg.CircuitBreaker.TripKeywords,
+		})),
 	}
 	if serveManager != nil {
 		ocOptions = append(ocOptions, opencode.WithServerUnavailableHandler(func(restartCtx context.Context, reason string) (string, error) {

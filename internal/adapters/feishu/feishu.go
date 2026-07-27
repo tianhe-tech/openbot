@@ -129,6 +129,21 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		},
 	}
 	h.adapter = base.NewBidirectionalAdapter("feishu", h)
+
+	// Register a stuck session hook for logging. Feishu's push requires a
+	// chat target from an inbound message, so the user will see the stuck
+	// diagnosis via /status instead.
+	h.client.SetStuckSessionHook(func(parentSessionID, childSessionID, reason string) {
+		if childSessionID != "" {
+			log.Printf("feishu: ⚠️ stuck child session %s (parent=%s): %s",
+				childSessionID[:min(8, len(childSessionID))],
+				parentSessionID[:min(8, len(parentSessionID))], reason)
+		} else {
+			log.Printf("feishu: ⚠️ stuck session %s: %s",
+				parentSessionID[:min(8, len(parentSessionID))], reason)
+		}
+	})
+
 	return h
 }
 
