@@ -84,6 +84,28 @@ func TestGetLastEventInfoUsesMeaningfulActivity(t *testing.T) {
 	}
 }
 
+func TestSilentModelHangCandidateExcludesExistingProgress(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler StreamingSessionHandler
+		want    bool
+	}{
+		{name: "no progress", want: true},
+		{name: "content sent", handler: StreamingSessionHandler{contentSent: true}, want: false},
+		{name: "tool observed", handler: StreamingSessionHandler{toolObserved: true}, want: false},
+		{name: "provider retry", handler: StreamingSessionHandler{retryAttempt: 1}, want: false},
+		{name: "waiting for user", handler: StreamingSessionHandler{pendingQuestionSince: time.Now()}, want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.handler.IsSilentModelHangCandidate(); got != test.want {
+				t.Fatalf("IsSilentModelHangCandidate() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSelectFallbackModelSkipsTextDefaultForImagePayload(t *testing.T) {
 	client := &Client{
 		providerCacheAt: time.Now(),

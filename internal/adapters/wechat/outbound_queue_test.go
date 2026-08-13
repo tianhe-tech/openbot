@@ -23,6 +23,7 @@ func TestOutboundQueueSplitAndDispatchOrder(t *testing.T) {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	long := repeatRune("你", 3600)
 	if err := q.EnqueueText("u1", "s1", "", "final", long, true); err != nil {
@@ -77,6 +78,7 @@ func TestOutboundQueueRetryOnRateLimit(t *testing.T) {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	if err := q.EnqueueText("u1", "s1", "", "final", "hello", true); err != nil {
 		t.Fatalf("enqueue failed: %v", err)
@@ -142,6 +144,7 @@ func TestOutboundQueuePerUserHeadLock(t *testing.T) {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	if err := q.EnqueueText("u1", "s1", "", "final", "first", true); err != nil {
 		t.Fatalf("enqueue u1 first failed: %v", err)
@@ -231,6 +234,7 @@ func TestOutboundQueueBatchOrderingOnNack(t *testing.T) {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	// 3600 runes → three chunks (1600/1600/400) sharing one batch_id.
 	long := repeatRune("你", 3600)
@@ -292,6 +296,7 @@ func TestOutboundQueuePriorityJump(t *testing.T) {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 	q.Start()
 
 	// 1. Enqueue a todo (PriorityLow) — will fail on first attempt.

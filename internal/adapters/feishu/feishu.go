@@ -675,8 +675,8 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			}
 			return nil
 		}
-		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
-			qMsg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
+		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) || strings.HasPrefix(chunk, opencode.WaitHintSignalPrefix) {
+			qMsg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix), opencode.WaitHintSignalPrefix))
 			if qMsg == "" {
 				return nil
 			}
@@ -3362,9 +3362,10 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 		if strings.HasPrefix(chunk, opencode.ToolSignalPrefix) ||
 			strings.HasPrefix(chunk, opencode.StepSignalPrefix) ||
 			strings.HasPrefix(chunk, opencode.TodoSignalPrefix) ||
-			strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
+			strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) ||
+			strings.HasPrefix(chunk, opencode.WaitHintSignalPrefix) {
 			sigMsg := chunk
-			for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix, opencode.QuestionSignalPrefix} {
+			for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix, opencode.QuestionSignalPrefix, opencode.WaitHintSignalPrefix} {
 				sigMsg = strings.TrimPrefix(sigMsg, p)
 			}
 			if strings.TrimSpace(sigMsg) != "" {

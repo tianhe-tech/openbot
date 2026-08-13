@@ -27,6 +27,18 @@ const (
 	// while guaranteeing no message is ever lost — parked chunks are
 	// recoverable via /pending /recover.
 	maxRetryAttempts = 5
+
+	// defaultOutboundMinGap is the minimum interval between two consecutive
+	// sends to the SAME user. The drain loop runs once per tick and would
+	// otherwise burst-send every due chunk of a long result back-to-back,
+	// tripping iLink's ~20 msg/min rate limit. Pacing to 3s yields 20 msg/min.
+	defaultOutboundMinGap = 3000 * time.Millisecond
+
+	// cooldownClearStreak is how many consecutive successful sends are
+	// required before an active rate-limit cooldown is cleared. A single
+	// success (e.g. a wait-hint from the next request) must NOT flush all
+	// deferred chunks of the previous task at once — that re-trips the limit.
+	cooldownClearStreak = 3
 )
 
 // Priority levels for outbound messages. Higher value = higher priority.
@@ -101,6 +113,7 @@ type outboundTextQueue struct {
 	db               *sql.DB
 	maxLen           int
 	interval         time.Duration
+	minGap           time.Duration
 	nonCriticalTTL   time.Duration
 	stopDrainTimeout time.Duration
 	statsLogInterval time.Duration
@@ -132,6 +145,16 @@ type userCooldown struct {
 	mu          sync.Mutex
 	pausedUntil time.Time
 	extensions  int // number of adaptive extensions (for escalating cooldown)
+
+	// lastSentAt is the wall-clock time of the last successful send to this
+	// user. Used to enforce minGap pacing between consecutive sends within a
+	// single drain tick (and across ticks).
+	lastSentAt time.Time
+	// successStreak counts consecutive successful sends since the last
+	// rate-limit failure. A cooldown is only cleared once this reaches
+	// cooldownClearStreak, preventing a single success from flushing all
+	// deferred chunks at once.
+	successStreak int
 }
 
 func newOutboundTextQueue(dbPath string, interval time.Duration, maxLen int, sendFunc func(item *queuedOutboundText) error, parkFunc func(userID, sessionID, ctxToken, content string)) (*outboundTextQueue, error) {
@@ -155,6 +178,7 @@ func newOutboundTextQueue(dbPath string, interval time.Duration, maxLen int, sen
 		db:               db,
 		maxLen:           maxLen,
 		interval:         interval,
+		minGap:           defaultOutboundMinGap,
 		nonCriticalTTL:   defaultNonCriticalTTL,
 		stopDrainTimeout: defaultStopDrainTimeout,
 		statsLogInterval: defaultStatsLogInterval,
@@ -176,6 +200,14 @@ func (q *outboundTextQueue) setStatsLogInterval(d time.Duration) {
 	}
 	q.mu.Lock()
 	q.statsLogInterval = d
+	q.mu.Unlock()
+}
+
+// setMinGap overrides the per-user pacing interval. Used by tests to disable
+// pacing (minGap=0) so dispatchOne returns immediately.
+func (q *outboundTextQueue) setMinGap(d time.Duration) {
+	q.mu.Lock()
+	q.minGap = d
 	q.mu.Unlock()
 }
 
@@ -419,10 +451,22 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 		return false, nil
 	}
 
+	// ★ Per-user pacing: enforce a minimum gap between consecutive sends to
+	// the same user. Without this, the drain loop (which runs once per tick
+	// and loops over every due chunk) would burst-send all chunks of a long
+	// result back-to-back, tripping iLink's ~20 msg/min rate limit. We sleep
+	// here so the whole batch is paced, not just spaced across ticks.
+	if gap := q.pacingGap(item.UserID); gap > 0 {
+		time.Sleep(gap)
+	}
+
 	err = q.sendFunc(item)
 	if err == nil {
-		// Success → clear any cooldown for this user.
-		q.ClearUserCooldown(item.UserID)
+		// Success → record it. The cooldown is only cleared after a streak of
+		// consecutive successes (cooldownClearStreak), so a single success
+		// (e.g. a wait-hint from the next request) does NOT flush all deferred
+		// chunks of the previous task at once and re-trip the limit.
+		q.RecordSendSuccess(item.UserID)
 		if ackErr := q.ackDelete(item.ID); ackErr != nil {
 			return true, ackErr
 		}
@@ -438,6 +482,22 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 
 	// ★ Exhausted retries → park to offline queue (never lose the message).
 	if item.Attempts+1 >= maxRetryAttempts {
+		// ★ PriorityHigh (permission/question) messages NEVER park. Parking
+		// sends them to the offline queue which has no automatic replay, so
+		// the user may never see the prompt — deadlocking the session that
+		// waits for their input. Instead we keep retrying with the
+		// escalating nextAttemptAt backoff (capped at 5min) until delivered.
+		// The item stays durable in SQLite across restarts.
+		if item.Priority >= PriorityHigh {
+			nextAt := q.nextAttemptAt(item.Attempts+1, err)
+			if nackErr := q.nack(item.ID, item.Attempts+1, nextAt); nackErr != nil {
+				return true, fmt.Errorf("sendErr=%v nackErr=%w", err, nackErr)
+			}
+			q.retryScheduled.Add(1)
+			log.Printf("wechat: outbound queue PriorityHigh continuing retry id=%d user=%s event=%s attempts=%d nextIn=%s err=%v",
+				item.ID, item.UserID, item.EventType, item.Attempts+1, time.Until(time.UnixMilli(nextAt)).Round(time.Second), err)
+			return true, nil
+		}
 		log.Printf("wechat: 📦 chunk id=%d user=%s event=%s exhausted %d attempts, parking to offline queue",
 			item.ID, item.UserID, item.EventType, item.Attempts+1)
 		if q.parkFunc != nil {
@@ -633,21 +693,72 @@ func (q *outboundTextQueue) SetUserCooldown(userID string) {
 		idx = len(durations) - 1
 	}
 	uc.pausedUntil = time.Now().Add(durations[idx])
+	// A rate-limit failure resets the success streak so recovery requires a
+	// fresh run of consecutive successes before the cooldown is cleared.
+	uc.successStreak = 0
 	log.Printf("wechat: 🚫 user %s rate-limit cooldown set for %s (extension #%d)",
 		userID, durations[idx], uc.extensions)
 }
 
-// ClearUserCooldown removes the rate-limit cooldown for a user. Called when
-// a send succeeds, indicating iLink has recovered.
+// pacingGap returns how long dispatchOne must sleep before sending to userID
+// to honour the per-user minGap. Returns 0 when no wait is needed (first send
+// or enough time has elapsed since the last send).
+func (q *outboundTextQueue) pacingGap(userID string) time.Duration {
+	uc := q.getUserCooldown(userID)
+	uc.mu.Lock()
+	defer uc.mu.Unlock()
+	if uc.lastSentAt.IsZero() {
+		return 0
+	}
+	elapsed := time.Since(uc.lastSentAt)
+	if elapsed >= q.minGap {
+		return 0
+	}
+	return q.minGap - elapsed
+}
+
+// RecordSendSuccess records a successful send to userID. It updates the
+// pacing timestamp and, once the user has accumulated cooldownClearStreak
+// consecutive successes, clears any active rate-limit cooldown. A single
+// success (e.g. a wait-hint from the next request) is deliberately NOT enough
+// to clear the cooldown — otherwise all deferred chunks of the previous task
+// would flush at once and re-trip iLink's limit.
+func (q *outboundTextQueue) RecordSendSuccess(userID string) {
+	uc := q.getUserCooldown(userID)
+	uc.mu.Lock()
+	defer uc.mu.Unlock()
+
+	uc.lastSentAt = time.Now()
+	uc.successStreak++
+
+	if uc.pausedUntil.IsZero() {
+		return
+	}
+	if uc.successStreak < cooldownClearStreak {
+		log.Printf("wechat: user %s send ok (streak=%d/%d), cooldown held", userID, uc.successStreak, cooldownClearStreak)
+		return
+	}
+	log.Printf("wechat: ✅ user %s rate-limit cooldown cleared after %d consecutive sends", userID, uc.successStreak)
+	uc.pausedUntil = time.Time{}
+	uc.extensions = 0
+	uc.successStreak = 0
+}
+
+// ClearUserCooldown forcibly removes the rate-limit cooldown for a user.
+// It is used by direct-send paths (sendTextInline / sendWaitHint) that prove
+// iLink has recovered. It also resets the success streak and pacing timestamp
+// so the next queued send is not delayed by stale pacing state.
 func (q *outboundTextQueue) ClearUserCooldown(userID string) {
 	uc := q.getUserCooldown(userID)
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
 	if !uc.pausedUntil.IsZero() {
-		log.Printf("wechat: ✅ user %s rate-limit cooldown cleared", userID)
+		log.Printf("wechat: ✅ user %s rate-limit cooldown cleared (forced)", userID)
 	}
 	uc.pausedUntil = time.Time{}
 	uc.extensions = 0
+	uc.successStreak = 0
+	uc.lastSentAt = time.Time{}
 }
 
 // CooldownRemaining returns how long until the user's cooldown expires, or 0

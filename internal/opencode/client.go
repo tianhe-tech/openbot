@@ -4965,6 +4965,9 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 						continue
 					}
 					if busy {
+						if c.recoverSilentModelHang(payload, sessionID, handler, callback, eventCallback) {
+							return asyncResponse, nil
+						}
 						consecutiveNotBusy = 0
 						busyProbeExtendAt = time.Now()
 						log.Printf("opencode: ⏳ streaming idle %v (threshold=%v) but session %s shows activity, extending wait",
@@ -5327,6 +5330,78 @@ func (c *Client) triggerSessionHandoff(payload MessagePayload, sessionID string)
 
 	return "⚠️ 当前会话调度异常（opencode 服务端 known issue #21173），本轮未产生回复。\n\n" +
 		"已保存本次会话摘要，下一条消息会自动开启新会话并带上上下文，你可以继续。"
+}
+
+// recoverSilentModelHang recovers only the narrow failure mode where an async
+// prompt was accepted but the model never produced an assistant message,
+// retry, question, or tool event. Long-running tools intentionally do not
+// qualify. The replacement turn uses the default healthy model selection and
+// receives a handoff containing the interrupted request.
+func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string, handler *StreamingSessionHandler, callback StreamCallback, eventCallback StreamEventCallback) bool {
+	if handler == nil || !handler.IsSilentModelHangCandidate() || strings.TrimSpace(payload.ThreadID) == "" {
+		return false
+	}
+
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	messages, err := c.sdk.Session.Messages(checkCtx, sessionID, opencode.SessionMessagesParams{})
+	checkCancel()
+	if err != nil || messages == nil || !hasNoAssistantAfterLastUser(*messages) {
+		if err != nil {
+			log.Printf("opencode: silent-hang verification failed for session %s: %v", sessionID[:min(8, len(sessionID))], err)
+		}
+		return false
+	}
+
+	abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	abortErr := c.AbortSession(abortCtx, sessionID)
+	abortCancel()
+	if abortErr != nil {
+		log.Printf("opencode: silent-hang recovery could not abort session %s: %v", sessionID[:min(8, len(sessionID))], abortErr)
+		return false
+	}
+	handler.CompleteForRecovery()
+
+	if handler.lastModelUsed != nil && c.breaker != nil {
+		c.breaker.RecordFailure(handler.lastModelUsed.ProviderID.Value, handler.lastModelUsed.ModelID.Value, "silent async model hang")
+	}
+	log.Printf("opencode: decision=silent_model_hang session=%s thread=%s model=%s; aborting and retrying in a new session",
+		sessionID[:min(8, len(sessionID))], payload.ThreadID, safeModelID(handler.lastModelUsed))
+
+	// The old override is session-scoped. Let the fresh session select a healthy
+	// default/alternate model rather than repeating the model that never started.
+	c.modelOverride.Delete(sessionID)
+	payload.Model = ""
+	c.triggerSessionHandoff(payload, sessionID)
+	if callback != nil {
+		_ = callback(QuestionSignalPrefix + "⏳ 检测到模型未进入生成或工具执行阶段，已重建会话并继续原任务。")
+	}
+
+	go func() {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), c.timeout)
+		defer retryCancel()
+		if _, retryErr := c.SendMessageStreamingWithEvents(retryCtx, payload, callback, eventCallback); retryErr != nil {
+			log.Printf("opencode: silent-hang retry failed for thread %s: %v", payload.ThreadID, retryErr)
+			if callback != nil {
+				_ = callback(QuestionSignalPrefix + fmt.Sprintf("⚠️ 新会话继续任务失败：%v", retryErr))
+			}
+		}
+	}()
+	return true
+}
+
+func hasNoAssistantAfterLastUser(messages []opencode.SessionMessagesResponse) bool {
+	lastUser := -1
+	for index, message := range messages {
+		if message.Info.Role == opencode.MessageRoleUser {
+			lastUser = index
+		}
+	}
+	for _, message := range messages[lastUser+1:] {
+		if message.Info.Role == opencode.MessageRoleAssistant {
+			return false
+		}
+	}
+	return lastUser >= 0
 }
 
 func (c *Client) finalizeAsyncStreamingResponse(payload MessagePayload, sessionID string, handler *StreamingSessionHandler, callback StreamCallback, response Response) Response {

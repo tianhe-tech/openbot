@@ -594,28 +594,36 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 		}
 	}
 
+	// ★ Pending-prompt gate (deadlock guard): whenever the session has an
+	// unanswered permission/question prompt, block new user messages and tell
+	// the user to answer it first — REGARDLESS of whether a dispatch is
+	// currently running. This restores the "a prompt must not be drowned by
+	// other messages" semantic:
+	//   1. The prompt is the only thing the user sees, so it can't be lost
+	//      among task output.
+	//   2. The blocked message never launches a new dispatch → no new output
+	//      is produced → iLink rate-limit pressure drops, making prompt
+	//      delivery dramatically more likely (feedback loop).
+	// Commands (/new /abort /status …) still work — tryCommand runs before
+	// this gate and is never blocked.
+	if sessionID, ok := h.adapter.GetSessionForUser(userID); ok && sessionID != "" {
+		if prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID); hasPrompt {
+			var hint string
+			if prompt.IsPermission {
+				hint = "⚠️ 当前有一个待确认的权限请求，请先回复：允许 / 拒绝 / 始终允许。"
+			} else {
+				hint = "⚠️ 当前有一个待回答的问题，请先回复选项编号或文字后再继续。"
+			}
+			_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info", hint, true)
+			return nil
+		}
+	}
+
 	// ★ Inbound gating: if a previous task is still dispatching for this
 	// user, queue the new message instead of launching a concurrent dispatch.
 	// This mirrors opencode TUI's session-level task serialization and
 	// guarantees task A's results are fully enqueued before task B starts.
 	if _, busy := h.dispatching.Load(userID); busy {
-		// Deadlock guard: the dispatch may be blocked waiting for the user to
-		// answer a question / permission request. In that case queueing this
-		// message would deadlock (dispatch waits for an answer, the answer sits
-		// in the pending queue). Detect the pending prompt and tell the user to
-		// answer it first instead of silently queueing.
-		if sessionID, ok := h.adapter.GetSessionForUser(userID); ok && sessionID != "" {
-			if prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID); hasPrompt {
-				var hint string
-				if prompt.IsPermission {
-					hint = "⚠️ 当前有一个待确认的权限请求，请先回复：允许 / 拒绝 / 始终允许。"
-				} else {
-					hint = "⚠️ 当前有一个待回答的问题，请先回复选项编号或文字后再继续。"
-				}
-				_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info", hint, true)
-				return nil
-			}
-		}
 		h.enqueuePending(userID, chatID, userText, ctxToken, attachments, agentName)
 		return nil
 	}
@@ -891,6 +899,22 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 			return nil
 		}
 
+		// Wait-hint signal → lightweight informational message
+		// ("⏳ 正在处理中，无需操作，请稍候..."). Delivered fire-and-forget in
+		// its own goroutine with the SHORT regular backoff (4×3s): it must
+		// never block the streaming callback and must never use the critical
+		// ~10min retry path reserved for real permission/question prompts.
+		// Blocking here previously froze the entire SSE event loop for up to
+		// 10 minutes under rate limiting (hint sent while session is active).
+		if strings.HasPrefix(chunk, opencode.WaitHintSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.WaitHintSignalPrefix))
+			if msg != "" {
+				log.Printf("wechat: wait-hint received user=%s session=%s msg_len=%d — non-blocking send", userID, sessionID, len([]rune(msg)))
+				go h.sendWaitHint(userID, msg, ctxToken)
+			}
+			return nil
+		}
+
 		// Question signal → critical path. Send directly (bypassing the
 		// outbound queue) so the user sees the permission/question
 		// immediately even when the queue is congested with progress
@@ -942,8 +966,8 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 					}
 				}
 
-				if err := h.sendTextInline(userID, msg, ctxToken); err != nil {
-					log.Printf("wechat: ⚠️ question direct send failed user=%s: %v — enqueuing as PriorityHigh", userID, err)
+				if err := h.sendCriticalText(userID, msg, ctxToken); err != nil {
+					log.Printf("wechat: ⚠️ question critical send failed user=%s: %v — enqueuing as PriorityHigh (will retry until delivered)", userID, err)
 					_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "question", msg, true)
 				}
 			}
@@ -2722,6 +2746,27 @@ func (h *Handler) sendTextChunksDirect(userID, text, ctxToken string) error {
 	return h.enqueueAsyncText(userID, "", ctxToken, "generic", text, true)
 }
 
+// sendChunkFunc builds the per-chunk transport callback shared by
+// sendTextInline and sendCriticalText. It tracks sent text for echo
+// dedup and transparently retries tokenless when the context token
+// expires mid-send.
+func (h *Handler) sendChunkFunc(userID string, effectiveToken *string) func(chunk string) error {
+	return func(chunk string) error {
+		h.trackSentText(userID, chunk)
+		sendErr := h.weClient.SendText(userID, chunk, *effectiveToken)
+		if sendErr != nil && errors.Is(sendErr, ErrSessionExpired) && *effectiveToken != "" {
+			log.Printf("wechat: session expired user=%s; clearing context_token and retrying tokenless", userID)
+			h.mu.Lock()
+			delete(h.lastContextTokens, userID)
+			h.mu.Unlock()
+			*effectiveToken = ""
+			h.trackSentText(userID, chunk)
+			sendErr = h.weClient.SendText(userID, chunk, "")
+		}
+		return sendErr
+	}
+}
+
 // sendTextInline sends text directly via senderRegistry without queueing.
 // Used only as a fallback when the outbound queue is not initialized.
 func (h *Handler) sendTextInline(userID, text, ctxToken string) error {
@@ -2733,26 +2778,78 @@ func (h *Handler) sendTextInline(userID, text, ctxToken string) error {
 	}
 	log.Printf("wechat: sendTextInline START user=%s chunks=%d total_len=%d", userID, len(chunks), len([]rune(text)))
 	effectiveToken := ctxToken
-	delivered, err := h.sender.sendChunks(userID, chunks, func(chunk string) error {
-		h.trackSentText(userID, chunk)
-		sendErr := h.weClient.SendText(userID, chunk, effectiveToken)
-		if sendErr != nil && errors.Is(sendErr, ErrSessionExpired) && effectiveToken != "" {
-			log.Printf("wechat: session expired user=%s; clearing context_token and retrying tokenless", userID)
-			h.mu.Lock()
-			delete(h.lastContextTokens, userID)
-			h.mu.Unlock()
-			effectiveToken = ""
-			h.trackSentText(userID, chunk)
-			sendErr = h.weClient.SendText(userID, chunk, "")
-		}
-		return sendErr
-	})
+	delivered, err := h.sender.sendChunks(userID, chunks, h.sendChunkFunc(userID, &effectiveToken))
 	if err != nil {
 		log.Printf("wechat: inline chunk send failed user=%s delivered=%d/%d: %v", userID, delivered, len(chunks), err)
 	} else {
 		log.Printf("wechat: sendTextInline OK user=%s delivered=%d/%d elapsed=%s", userID, delivered, len(chunks), time.Since(start))
+		// Each successfully delivered chunk is a real send to iLink, so count
+		// it toward the outbound queue's success streak. This lets a direct
+		// send contribute to clearing the cooldown (after cooldownClearStreak
+		// consecutive successes) WITHOUT unconditionally flushing all deferred
+		// chunks of the previous task at once.
+		if h.outbound != nil {
+			for i := 0; i < delivered; i++ {
+				h.outbound.RecordSendSuccess(userID)
+			}
+		}
 	}
 	return err
+}
+
+// sendCriticalText is identical to sendTextInline but retries with the
+// exponential criticalBackoffs sequence (up to ~10 minutes) instead of the
+// short 4×3s retries. It is used ONLY for permission/question prompts, where
+// a missed delivery deadlocks the session waiting for user input that never
+// arrives. Blocking the streaming callback here is acceptable: while a prompt
+// is pending the session is idle, so no new SSE events are expected.
+func (h *Handler) sendCriticalText(userID, text, ctxToken string) error {
+	start := time.Now()
+	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
+	if len(chunks) == 0 {
+		log.Printf("wechat: sendCriticalText SKIP user=%s — no chunks (text_len=%d)", userID, len([]rune(text)))
+		return nil
+	}
+	log.Printf("wechat: sendCriticalText START user=%s chunks=%d total_len=%d", userID, len(chunks), len([]rune(text)))
+	effectiveToken := ctxToken
+	delivered, err := h.sender.sendCriticalChunks(userID, chunks, h.sendChunkFunc(userID, &effectiveToken))
+	if err != nil {
+		log.Printf("wechat: critical chunk send failed user=%s delivered=%d/%d: %v", userID, delivered, len(chunks), err)
+	} else {
+		log.Printf("wechat: sendCriticalText OK user=%s delivered=%d/%d elapsed=%s", userID, delivered, len(chunks), time.Since(start))
+	}
+	return err
+}
+
+// sendWaitHint delivers an informational waiting hint ("⏳ 正在处理中...")
+// with the SHORT regular backoff (4×3s) instead of the critical ~10min
+// sequence, and always runs in its own goroutine so it can never block the
+// streaming callback or the SSE event loop. A 19-char hint is best-effort:
+// if iLink is rate-limited it may be dropped — that is acceptable, the real
+// result follows shortly.
+func (h *Handler) sendWaitHint(userID, text, ctxToken string) {
+	start := time.Now()
+	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
+	if len(chunks) == 0 {
+		return
+	}
+	log.Printf("wechat: sendWaitHint START user=%s chunks=%d total_len=%d", userID, len(chunks), len([]rune(text)))
+	effectiveToken := ctxToken
+	delivered, err := h.sender.sendChunks(userID, chunks, h.sendChunkFunc(userID, &effectiveToken))
+	if err != nil {
+		log.Printf("wechat: wait-hint send failed user=%s delivered=%d/%d: %v", userID, delivered, len(chunks), err)
+		return
+	}
+	log.Printf("wechat: sendWaitHint OK user=%s delivered=%d/%d elapsed=%s", userID, delivered, len(chunks), time.Since(start))
+	// Each delivered hint chunk is a real send to iLink — count it toward the
+	// outbound queue's success streak so the cooldown can clear after enough
+	// consecutive successes, without unconditionally flushing all deferred
+	// chunks of the previous task at once.
+	if h.outbound != nil {
+		for i := 0; i < delivered; i++ {
+			h.outbound.RecordSendSuccess(userID)
+		}
+	}
 }
 
 // --- Outbound Media Sending ---

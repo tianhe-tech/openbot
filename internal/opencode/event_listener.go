@@ -57,6 +57,7 @@ type StreamingSessionHandler struct {
 	sessionTodos    []TodoItem      // 当前 todo 列表（来自 todo.updated 事件）
 	sessionDiff     []FileDiff      // 本次会话的文件变更（来自 session.diff 事件）
 	activeToolParts map[string]bool // partID -> true：当前处于 pending/running 状态的 tool part，用于判断是否仍有活跃 tool
+	toolObserved    bool            // 本轮是否曾进入工具执行阶段；慢工具不应被当作模型静默卡死
 
 	// 上游 provider 重试状态：opencode 在模型不可用/限流时会发出 type=="retry" 的
 	// message part（{"type":"retry","attempt":N,"error":{"data":{"message":...}}}）。
@@ -123,12 +124,16 @@ func NewStreamingSessionHandlerWithModel(sessionID string, callback StreamCallba
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
+		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
+		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
 		h.mu.Lock()
-		defer h.mu.Unlock()
-		if !h.contentSent && !h.completed && !h.waitingHintSent {
-			h.waitingHintSent = true
-			_ = h.callback(QuestionSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
+		if h.contentSent || h.completed || h.waitingHintSent {
+			h.mu.Unlock()
+			return
 		}
+		h.waitingHintSent = true
+		h.mu.Unlock()
+		_ = h.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
 	})
 	return h
 }
@@ -203,6 +208,11 @@ func (s *StreamingSessionHandler) emitEventFromChunk(chunk string) {
 
 	if strings.HasPrefix(chunk, QuestionSignalPrefix) {
 		s.emitEvent(StreamEventInfo, strings.TrimPrefix(chunk, QuestionSignalPrefix), nil, nil, nil, "question")
+		return
+	}
+
+	if strings.HasPrefix(chunk, WaitHintSignalPrefix) {
+		s.emitEvent(StreamEventInfo, strings.TrimPrefix(chunk, WaitHintSignalPrefix), nil, nil, nil, "waithint")
 		return
 	}
 
@@ -355,6 +365,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				// session.idle，若不拦截会导致会话一直"正在处理中"。
 				if partMeta2.Properties.Part.Type == "retry" {
 					s.handleRetryPart(jsonData)
+				}
+				if partMeta2.Properties.Part.Type == "tool" {
+					s.toolObserved = true
 				}
 
 				// 检测 server 端自动压缩（compaction）：当 opencode server 在
@@ -1565,6 +1578,26 @@ func (s *StreamingSessionHandler) GetRetryState() RetryState {
 	}
 }
 
+// IsSilentModelHangCandidate reports whether this turn never entered model
+// generation, provider retry, user-input, or tool execution. The client still
+// verifies the server-side message history before recovering the session.
+func (s *StreamingSessionHandler) IsSilentModelHangCandidate() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.contentSent && !s.receivedStepFinish && !s.toolObserved && len(s.activeToolParts) == 0 &&
+		s.retryAttempt == 0 && s.pendingQuestionSince.IsZero()
+}
+
+// CompleteForRecovery stops local streaming ownership after the server-side
+// turn was aborted and a replacement session is being started.
+func (s *StreamingSessionHandler) CompleteForRecovery() {
+	s.mu.Lock()
+	s.completed = true
+	s.stopWaitingTimer()
+	s.mu.Unlock()
+	s.fireOnComplete()
+}
+
 // PendingQuestionInfo describes whether the session is currently blocked
 // waiting for user input (permission.asked / question.asked) and for how long.
 type PendingQuestionInfo struct {
@@ -1773,6 +1806,14 @@ const TodoSignalPrefix = "\x00todo:"
 // delivery to the user (not buffered in content accumulation).
 const QuestionSignalPrefix = "\x00question:"
 
+// WaitHintSignalPrefix marks the lightweight "⏳ 正在处理中，无需操作，请稍候..."
+// informational hint. It is semantically distinct from QuestionSignalPrefix:
+// it carries NO blocking semantics (the session is still actively working),
+// so adapters MUST deliver it fire-and-forget — never through the critical
+// retry path reserved for real permission/question prompts, and never while
+// holding the streaming handler lock.
+const WaitHintSignalPrefix = "\x00waithint:"
+
 // TodoAutoPushInterval controls minimum interval between auto todo updates.
 const TodoAutoPushInterval = 5 * time.Second
 
@@ -1838,6 +1879,7 @@ func (s *StreamingSessionHandler) ResetForNewPrompt() {
 	s.pendingQuestionSent = false
 	s.pendingQuestionReminders = 0
 	s.activeToolParts = make(map[string]bool)
+	s.toolObserved = false
 	s.sessionTodos = nil
 	s.sessionDiff = nil
 	s.lastTodoSummary = ""
@@ -1860,12 +1902,16 @@ func (s *StreamingSessionHandler) ResetForNewPrompt() {
 		s.waitingTimer.Stop()
 	}
 	s.waitingTimer = time.AfterFunc(8*time.Second, func() {
+		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
+		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if !s.contentSent && !s.completed && !s.waitingHintSent {
-			s.waitingHintSent = true
-			_ = s.callback(QuestionSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
+		if s.contentSent || s.completed || s.waitingHintSent {
+			s.mu.Unlock()
+			return
 		}
+		s.waitingHintSent = true
+		s.mu.Unlock()
+		_ = s.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
 	})
 }
 

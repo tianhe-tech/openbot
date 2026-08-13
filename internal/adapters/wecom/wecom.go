@@ -381,8 +381,8 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 			}
 			return nil
 		}
-		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
-			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
+		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) || strings.HasPrefix(chunk, opencode.WaitHintSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix), opencode.WaitHintSignalPrefix))
 			if msg != "" {
 				mu.Lock()
 				meta = append(meta, msg)
@@ -1429,7 +1429,7 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 			return nil
 		}
 		// Strip signal prefixes so they don't leak into the reply
-		for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix, opencode.QuestionSignalPrefix} {
+		for _, p := range []string{opencode.ToolSignalPrefix, opencode.StepSignalPrefix, opencode.TodoSignalPrefix, opencode.QuestionSignalPrefix, opencode.WaitHintSignalPrefix} {
 			if strings.HasPrefix(chunk, p) {
 				chunk = strings.TrimPrefix(chunk, p)
 				break
