@@ -16,7 +16,7 @@ import (
 
 const (
 	defaultOutboundTickInterval = 3000 * time.Millisecond
-	defaultOutboundMaxLen       = 1600
+	defaultOutboundMaxLen       = 4000
 	defaultNonCriticalTTL       = 10 * time.Minute
 	defaultStopDrainTimeout     = 10 * time.Second
 	defaultStatsLogInterval     = 60 * time.Second
@@ -31,14 +31,15 @@ const (
 	// defaultOutboundMinGap is the minimum interval between two consecutive
 	// sends to the SAME user. The drain loop runs once per tick and would
 	// otherwise burst-send every due chunk of a long result back-to-back,
-	// tripping iLink's ~20 msg/min rate limit. Pacing to 3s yields 20 msg/min.
-	defaultOutboundMinGap = 3000 * time.Millisecond
+	// tripping iLink's rate limit. Pacing to 4s yields 15 msg/min, leaving
+	// headroom under iLink's ~20 msg/min limit even with brief jitter.
+	defaultOutboundMinGap = 4000 * time.Millisecond
 
 	// cooldownClearStreak is how many consecutive successful sends are
 	// required before an active rate-limit cooldown is cleared. A single
 	// success (e.g. a wait-hint from the next request) must NOT flush all
 	// deferred chunks of the previous task at once — that re-trips the limit.
-	cooldownClearStreak = 3
+	cooldownClearStreak = 5
 )
 
 // Priority levels for outbound messages. Higher value = higher priority.
@@ -46,8 +47,11 @@ const (
 // A higher-priority message can jump ahead of a lower-priority head that is
 // blocked by a failed retry (nack with future next_attempt_at).
 const (
-	// PriorityLow is for non-critical progress updates (e.g. todo snapshots).
-	// Subject to TTL expiry when the queue is congested.
+	// PriorityLow is for non-critical, skippable progress updates.
+	// Subject to TTL expiry and to DropLowPriorityForUser when a
+	// permission/question dialog must jump the queue. NOTE: todo progress is
+	// intentionally NOT PriorityLow — it must be delivered in full (see
+	// priorityFromEventType).
 	PriorityLow = 0
 	// PriorityNormal is for final content, flush, error notices — the primary
 	// deliverables the user expects to receive.
@@ -67,6 +71,11 @@ func priorityFromEventType(eventType string) int {
 		return PriorityHigh
 	case "skippable":
 		return PriorityLow
+	case "todo":
+		// ★ Todo 进度必须完整、按序送达，绝不能作为可丢弃的低优先级：
+		// 用 PriorityNormal（配合 critical=true → 无 TTL 过期，且不会被
+		// DropLowPriorityForUser 删除）。
+		return PriorityNormal
 	default:
 		// final, flush, error_notice, error_partial, sync_reply, done,
 		// deferred_notice, generic, offline_drop_notice → Normal
@@ -80,6 +89,7 @@ type outboundQueueStats struct {
 	SendFailed     uint64
 	RetryScheduled uint64
 	DroppedTTL     uint64
+	ParkedOffline  uint64
 }
 
 type outboundQueueConfig struct {
@@ -132,6 +142,7 @@ type outboundTextQueue struct {
 	sendFailed     atomic.Uint64
 	retryScheduled atomic.Uint64
 	droppedTTL     atomic.Uint64
+	parkedOffline  atomic.Uint64
 
 	// userCooldowns tracks per-user rate-limit cooldown state. When iLink
 	// returns ret=-2, ALL sends for that user are paused — not just the one
@@ -439,10 +450,12 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 	// skip ALL dispatch for them (not just this item). This prevents the
 	// retry-storm where each chunk independently backs off and hammers iLink.
 	//
-	// However, PriorityHigh (permission/question) messages MUST still be
-	// delivered even during cooldown — a missed permission prompt deadlocks
-	// the session. We skip the cooldown check for PriorityHigh items.
-	if item.Priority < PriorityHigh && q.IsUserPaused(item.UserID) {
+	// This now applies to PriorityHigh (permission/question) messages too:
+	// during a cooldown iLink is rejecting sends, so hammering a permission
+	// prompt only deepens the limit and delays it further. PriorityHigh items
+	// are NOT parked and have the highest dispatch priority, so they are sent
+	// first the moment the cooldown clears (see pickNextDueHead ordering).
+	if q.IsUserPaused(item.UserID) {
 		// Defer this item: push its next_attempt_at forward so it doesn't
 		// get picked again immediately, and return false so the dispatcher
 		// can try other users/items on the next tick.
@@ -506,7 +519,7 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 		if delErr := q.ackDelete(item.ID); delErr != nil {
 			return true, delErr
 		}
-		q.droppedTTL.Add(1)
+		q.parkedOffline.Add(1)
 		return true, nil
 	}
 
@@ -693,11 +706,14 @@ func (q *outboundTextQueue) SetUserCooldown(userID string) {
 		idx = len(durations) - 1
 	}
 	uc.pausedUntil = time.Now().Add(durations[idx])
+	// ★ Escalate: the next rate-limit failure uses a longer cooldown. This is
+	// the adaptive backpressure that prevents a 30s→fail→30s→fail loop.
+	uc.extensions++
 	// A rate-limit failure resets the success streak so recovery requires a
 	// fresh run of consecutive successes before the cooldown is cleared.
 	uc.successStreak = 0
 	log.Printf("wechat: 🚫 user %s rate-limit cooldown set for %s (extension #%d)",
-		userID, durations[idx], uc.extensions)
+		userID, durations[idx], idx)
 }
 
 // pacingGap returns how long dispatchOne must sleep before sending to userID
@@ -777,10 +793,10 @@ func (q *outboundTextQueue) CooldownRemaining(userID string) time.Duration {
 // ClearForUser removes all pending queue entries for a specific user.
 // This is called when the user starts a new session (/new, /reset).
 //
-// PriorityHigh (question/permission) and PriorityLow (todo) entries are
-// deleted outright — they are session-specific and meaningless in a new
-// session. PriorityNormal entries (final AI replies, error notices) are
-// moved to the offline queue as "abandoned" entries tagged with their
+// PriorityHigh (question/permission) and PriorityLow (skippable progress)
+// entries are deleted outright — they are session-specific and meaningless in a
+// new session. PriorityNormal entries (final AI replies, error notices, todo
+// progress) are moved to the offline queue as "abandoned" entries tagged with their
 // sessionID, so the user can recover them later via /pending /recover.
 //
 // parkFunc receives the rescued entries; when nil, Normal entries are also
@@ -818,10 +834,11 @@ func (q *outboundTextQueue) ClearForUser(userID string, parkFunc func(userID, se
 	return n, nil
 }
 
-// DropLowPriorityForUser deletes all PriorityLow (progress/todo) entries
+// DropLowPriorityForUser deletes all PriorityLow (skippable progress) entries
 // for a user. This is called when a permission/question dialog is about to
 // be sent to the user, so the dialog isn't drowned by accumulated progress
-// messages from earlier in the task.
+// messages from earlier in the task. Todo progress is PriorityNormal and is
+// deliberately NOT dropped here.
 func (q *outboundTextQueue) DropLowPriorityForUser(userID string) (int64, error) {
 	if q == nil {
 		return 0, nil
@@ -848,11 +865,12 @@ func (q *outboundTextQueue) snapshotStats() outboundQueueStats {
 		SendFailed:     q.sendFailed.Load(),
 		RetryScheduled: q.retryScheduled.Load(),
 		DroppedTTL:     q.droppedTTL.Load(),
+		ParkedOffline:  q.parkedOffline.Load(),
 	}
 }
 
 func (q *outboundTextQueue) logStats() {
 	s := q.snapshotStats()
-	log.Printf("wechat: outbound queue stats pending=%d sent_ok=%d send_failed=%d retry_scheduled=%d dropped_ttl=%d",
-		s.Pending, s.SentOK, s.SendFailed, s.RetryScheduled, s.DroppedTTL)
+	log.Printf("wechat: outbound queue stats pending=%d sent_ok=%d send_failed=%d retry_scheduled=%d dropped_ttl=%d parked=%d",
+		s.Pending, s.SentOK, s.SendFailed, s.RetryScheduled, s.DroppedTTL, s.ParkedOffline)
 }

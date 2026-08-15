@@ -150,9 +150,10 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	statsLogInterval := parseDurationEnv("WECHAT_OUTBOUND_STATS_LOG_SECONDS", defaultStatsLogInterval)
 	outbound, err := newOutboundTextQueue(outboundPath, outboundInterval, outboundMaxLen, h.sendQueuedText, func(userID, sessionID, ctxToken, content string) {
 		// parkFunc: transfer exhausted chunks to the offline queue so they are
-		// never lost. The user can recover them via /pending /recover.
+		// never lost. These are NOT abandoned — the offline worker auto-retries
+		// them on a slow backoff once the rate-limit cooldown clears.
 		if h.offline != nil {
-			h.offline.enqueueWithSession(userID, sessionID, ctxToken, content)
+			h.offline.enqueueForRetry(userID, sessionID, ctxToken, content)
 		}
 	})
 	if err != nil {
@@ -337,10 +338,11 @@ func (h *Handler) Start(parentCtx context.Context) error {
 		h.outbound.Start()
 	}
 
-	// Legacy fallback worker: only enabled when the durable outbound queue
-	// failed to initialize. In normal mode, outbound_queue.db is the single
-	// source of truth for async text delivery.
-	if h.outbound == nil && h.offline != nil {
+	// Offline worker always runs (when the offline queue exists) to auto-retry
+	// chunks that the hot queue parked after exhausting maxRetryAttempts. It
+	// only touches non-Abandoned entries; entries parked by /new /reset remain
+	// Abandoned and are recovered only via explicit /recover.
+	if h.offline != nil {
 		go h.offline.runWorker(ctx, h.offlineSend, h.notifyOfflineDrop)
 	}
 
@@ -1476,7 +1478,9 @@ func (h *Handler) handleNewSession(userID string) string {
 	// Clear pending outbound messages from the previous session.
 	// PriorityNormal entries (AI replies) are parked into the offline queue
 	// tagged with sessionID so the user can recover them via /pending /recover.
-	// PriorityHigh (question/permission) and PriorityLow (todo) are discarded.
+	// PriorityHigh (question/permission) and PriorityLow (skippable progress) are
+	// discarded. PriorityNormal (AI replies, todo progress) are parked via the
+	// parkFunc below and recoverable via /pending /recover.
 	if h.outbound != nil {
 		h.outbound.ClearForUser(userID, func(uid, sid, ctxToken, content string) {
 			if h.offline != nil {
@@ -2804,6 +2808,15 @@ func (h *Handler) sendTextInline(userID, text, ctxToken string) error {
 // arrives. Blocking the streaming callback here is acceptable: while a prompt
 // is pending the session is idle, so no new SSE events are expected.
 func (h *Handler) sendCriticalText(userID, text, ctxToken string) error {
+	// ★ Respect the outbound queue's per-user rate-limit cooldown. Sending a
+	// permission/question while iLink is rejecting only deepens the limit and
+	// delays the prompt further. Defer to the queue (PriorityHigh) so it is
+	// delivered first the moment the cooldown clears — PriorityHigh is never
+	// parked and has the highest dispatch priority.
+	if h.outbound != nil && h.outbound.IsUserPaused(userID) {
+		log.Printf("wechat: sendCriticalText deferred to queue user=%s (rate-limit cooldown)", userID)
+		return h.enqueueAsyncText(userID, "", ctxToken, "question", text, true)
+	}
 	start := time.Now()
 	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
 	if len(chunks) == 0 {
@@ -2828,6 +2841,12 @@ func (h *Handler) sendCriticalText(userID, text, ctxToken string) error {
 // if iLink is rate-limited it may be dropped — that is acceptable, the real
 // result follows shortly.
 func (h *Handler) sendWaitHint(userID, text, ctxToken string) {
+	// A wait-hint is best-effort. If the user is in rate-limit cooldown,
+	// skip it entirely rather than adding another send that deepens the limit.
+	if h.outbound != nil && h.outbound.IsUserPaused(userID) {
+		log.Printf("wechat: wait-hint skipped user=%s (rate-limit cooldown)", userID)
+		return
+	}
 	start := time.Now()
 	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
 	if len(chunks) == 0 {

@@ -4660,22 +4660,23 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		case <-ctx.Done():
 			log.Printf("opencode: ⚠️ context deadline for session %s, flushing accumulated content (no abort)", sessionID[:8])
 
-			// 清理 handler，flush 积累内容。不 abort session —— 让任务在后台
-			// 继续运行，session 保持可用。下次用户发消息时可复用同一 session。
+			// ★ 不 abort session、也不注销 handler：opencode 服务端会继续在后台
+			// 运行该任务，其后续产生的 todo.updated / message.part.delta /
+			// session.idle 仍需由本 handler 接收并送达，否则长任务超时后会出现
+			// "进度停更 + 最终结果不自动送达"。这里只做两件事：
+			//   1) 停掉等待提示定时器，避免超时后仍弹 "处理中" 提示；
+			//   2) flush 当前已积累的内容。
+			// 不调用 fireOnComplete()：保留 handler 注册，等后台任务的
+			// session.idle 到达后由 notifyCompletion 正常收尾并清理。
 			if handler != nil {
 				handler.mu.Lock()
-				if !handler.completed {
-					handler.completed = true
-					handler.stopWaitingTimer()
-				}
+				handler.stopWaitingTimer()
 				handler.mu.Unlock()
 
-				// 发送 FlushSignal，确保 adapter 把所有积累的内容发出去
+				// 发送 FlushSignal，确保 adapter 把当前积累的内容发出去
 				if callback != nil {
 					_ = callback(FlushSignal)
 				}
-
-				handler.fireOnComplete()
 			}
 
 			// 返回已积累的内容（而非错误），保证最终结果送达

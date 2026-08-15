@@ -224,6 +224,18 @@ func (s *StreamingSessionHandler) emitEventFromChunk(chunk string) {
 	s.emitEvent(StreamEventTextDelta, chunk, nil, nil, nil, "text")
 }
 
+// isProgressSignal reports whether a callback chunk is a progress/lifecycle
+// signal (thinking, tool, or step) rather than real answer text. These signals
+// are NOT final content: WeChat (and other adapters) explicitly suppress them,
+// so marking contentSent=true or appending them to lastContent here would make
+// finalizeAsyncStreamingResponse believe the answer was already delivered and
+// skip fetching/sending the real final reply.
+func isProgressSignal(chunk string) bool {
+	return strings.HasPrefix(chunk, ThinkingSignalPrefix) ||
+		strings.HasPrefix(chunk, ToolSignalPrefix) ||
+		strings.HasPrefix(chunk, StepSignalPrefix)
+}
+
 // NewEventDispatcher creates a new event dispatcher.
 func NewEventDispatcher() *EventDispatcher {
 	return &EventDispatcher{
@@ -402,11 +414,16 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				}
 			} else {
 				s.emitEventFromChunk(incremental)
-				s.lastContent += incremental
-				if !s.contentSent {
-					s.stopWaitingTimer()
+				// 进度信号（thinking/tool/step）不是正文内容，不计入 lastContent/contentSent，
+				// 否则 adapter（如 wechat）忽略这些信号后，contentSent 被错误置 true，
+				// 导致 finalize 误判"内容已发送"而跳过最终答案的补发。
+				if !isProgressSignal(incremental) {
+					s.lastContent += incremental
+					if !s.contentSent {
+						s.stopWaitingTimer()
+					}
+					s.contentSent = true
 				}
-				s.contentSent = true
 			}
 			s.lastUpdateTime = time.Now()
 		}
@@ -611,11 +628,8 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						log.Printf("opencode: message.part.delta reasoning callback error: %v", err)
 					} else {
 						s.emitEventFromChunk(reasoningChunk)
-						s.lastContent += reasoningChunk
-						if !s.contentSent {
-							s.stopWaitingTimer()
-						}
-						s.contentSent = true
+						// reasoning 是进度信号（thinking），不是最终答案正文，
+						// 不计入 lastContent/contentSent（避免污染最终答案判断）。
 					}
 					s.lastUpdateTime = time.Now()
 					break
@@ -698,10 +712,11 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						s.lastTodoSummary = summary
 						s.lastTodoStateHash = stateHash
 						s.lastTodoPushTime = now
-						if !s.contentSent {
-							s.stopWaitingTimer()
-						}
-						s.contentSent = true
+						// todo 是进度信号，不是最终答案正文：不设置 contentSent，
+						// 否则长任务只产出 todo（最终文本缺失/卡住）时，
+						// finalize 会误判"答案已发送"而跳过最终答案补发。
+						// 但 todo 仍是活动信号，停止 wait-hint timer。
+						s.stopWaitingTimer()
 					}
 				}
 			}

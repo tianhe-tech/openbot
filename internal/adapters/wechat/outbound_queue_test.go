@@ -274,7 +274,7 @@ func TestOutboundQueueBatchOrderingOnNack(t *testing.T) {
 // TestOutboundQueuePriorityJump verifies that a PriorityHigh message
 // (e.g. permission/question confirmation) can jump ahead of a lower-priority
 // head that is blocked by a failed retry. This prevents the deadlock where:
-//  1. todo (PriorityLow) is enqueued first, fails, nacks with future retry
+//  1. todo (PriorityNormal) is enqueued first, fails, nacks with future retry
 //  2. question (PriorityHigh) is enqueued second
 //  3. question must be dispatchable despite the blocked todo head
 func TestOutboundQueuePriorityJump(t *testing.T) {
@@ -299,7 +299,7 @@ func TestOutboundQueuePriorityJump(t *testing.T) {
 	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 	q.Start()
 
-	// 1. Enqueue a todo (PriorityLow) — will fail on first attempt.
+	// 1. Enqueue a todo (PriorityNormal) — will fail on first attempt.
 	if err := q.EnqueueText("u1", "s1", "", "todo", "todo-update", false); err != nil {
 		t.Fatalf("enqueue todo failed: %v", err)
 	}

@@ -43,9 +43,13 @@ type offlineEntry struct {
 }
 
 const (
-	offlineMaxAttempts = 5
-	offlineTTL         = 30 * time.Minute
-	offlinePollEvery   = 30 * time.Second
+	// offlineTTL is the only safety valve on parked messages. It is long enough
+	// (7 days) that any realistic iLink rate-limit window clears long before it,
+	// while still preventing unbounded accumulation for users who are permanently
+	// unreachable. There is deliberately NO max-attempt cap — parked messages
+	// must be delivered eventually, never abandoned after N failed tries.
+	offlineTTL       = 7 * 24 * time.Hour
+	offlinePollEvery = 30 * time.Second
 )
 
 // offlineBackoff is the schedule between retry attempts. attempts is 1-based
@@ -120,8 +124,21 @@ func (q *offlineQueue) enqueue(userID, ctxToken, content string) {
 
 // enqueueWithSession adds an entry tagged with the originating sessionID and
 // immediately marks it as Abandoned so the worker does not auto-retry it.
-// The entry is recoverable via RecoverSession.
+// The entry is recoverable via RecoverSession. Used by /new /reset to park
+// old-session replies without auto-resending them.
 func (q *offlineQueue) enqueueWithSession(userID, sessionID, ctxToken, content string) {
+	q.enqueueEntry(userID, sessionID, ctxToken, content, true)
+}
+
+// enqueueForRetry adds an entry tagged with the originating sessionID that is
+// NOT abandoned: the background worker will auto-retry it on a slow backoff
+// (offlineBackoff). Used by the hot-queue parkFunc when a chunk exhausts
+// maxRetryAttempts, so no message is ever silently lost.
+func (q *offlineQueue) enqueueForRetry(userID, sessionID, ctxToken, content string) {
+	q.enqueueEntry(userID, sessionID, ctxToken, content, false)
+}
+
+func (q *offlineQueue) enqueueEntry(userID, sessionID, ctxToken, content string, abandoned bool) {
 	if content == "" || userID == "" {
 		return
 	}
@@ -135,13 +152,13 @@ func (q *offlineQueue) enqueueWithSession(userID, sessionID, ctxToken, content s
 		CreatedAt:     now,
 		NextAttemptAt: now.Add(offlineBackoff[0]),
 		SessionID:     sessionID,
-		Abandoned:     true, // parked by /new; only sent on explicit /recover
+		Abandoned:     abandoned,
 	}
 	q.mu.Lock()
 	q.entries = append(q.entries, entry)
 	q.persist()
 	q.mu.Unlock()
-	log.Printf("wechat: offline queue parked user=%s session=%s len=%d", userID, sessionID, len(content))
+	log.Printf("wechat: offline queue parked user=%s session=%s len=%d abandoned=%t", userID, sessionID, len(content), abandoned)
 }
 
 // drain runs one pass over the queue, dispatching due entries via send.
@@ -191,15 +208,12 @@ func (q *offlineQueue) drain(send func(userID, ctxToken, content string) error,
 		}
 		entry.Attempts++
 		expired := time.Since(entry.CreatedAt) >= offlineTTL
-		if entry.Attempts >= offlineMaxAttempts || expired {
+		if expired {
 			q.entries = append(q.entries[:idx], q.entries[idx+1:]...)
 			q.persist()
 			q.mu.Unlock()
-			reason := "max attempts"
-			if expired {
-				reason = "TTL"
-			}
-			log.Printf("wechat: offline queue dropping user=%s reason=%s err=%v", entry.UserID, reason, err)
+			log.Printf("wechat: offline queue dropping user=%s reason=TTL age=%s err=%v",
+				entry.UserID, time.Since(entry.CreatedAt).Round(time.Minute), err)
 			if notifyDrop != nil {
 				notifyDrop(entry.UserID)
 			}
@@ -212,8 +226,8 @@ func (q *offlineQueue) drain(send func(userID, ctxToken, content string) error,
 		entry.NextAttemptAt = time.Now().Add(offlineBackoff[slot])
 		q.persist()
 		q.mu.Unlock()
-		log.Printf("wechat: offline queue retry-failed user=%s attempt=%d/%d nextIn=%s err=%v",
-			entry.UserID, entry.Attempts, offlineMaxAttempts, offlineBackoff[slot], err)
+		log.Printf("wechat: offline queue retry-failed user=%s attempt=%d nextIn=%s err=%v",
+			entry.UserID, entry.Attempts, offlineBackoff[slot], err)
 	}
 }
 
