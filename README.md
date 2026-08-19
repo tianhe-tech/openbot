@@ -494,7 +494,6 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `WECHAT_OUTBOUND_DB_PATH` | `<stateDir>/outbound_queue.db` | 出站队列 SQLite |
 | `WECHAT_OUTBOUND_TICK_MS` | `3000` | 出站 ticker 间隔 |
 | `WECHAT_OUTBOUND_MAX_TEXT_LEN` | `4000` | 最大文本块长度 |
-| `WECHAT_OFFLINE_QUEUE_PATH` | `<stateDir>/pending_outbound.json` | 离线队列路径 |
 
 ### 语音（阿里云 NLS，可选）
 

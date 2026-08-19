@@ -355,10 +355,19 @@ func (c *Client) IsSentByUs(clientID string) bool {
 
 // SendText sends a plain text message to a WeChat user.
 func (c *Client) SendText(toUserID, text, contextToken string) error {
+	return c.SendTextWithClientID(toUserID, text, contextToken, generateClientID())
+}
+
+// SendTextWithClientID sends a plain text message using an explicit clientID.
+// Callers that persist the clientID across retries (the outbound queue) reuse
+// it on replay so a re-sent chunk carries the same clientID, giving the iLink
+// server a stable idempotency key and keeping our echo-dedup (IsSentByUs)
+// accurate for duplicates.
+func (c *Client) SendTextWithClientID(toUserID, text, contextToken, clientID string) error {
 	msg := &WeixinMessage{
 		Seq:          int(nextSeq()),
 		ToUserID:     toUserID,
-		ClientID:     generateClientID(),
+		ClientID:     clientID,
 		ContextToken: contextToken,
 		MessageType:  MessageTypeBot,
 		MessageState: MessageStateFinish,

@@ -18,7 +18,7 @@ func TestOutboundQueueSplitAndDispatchOrder(t *testing.T) {
 		defer mu.Unlock()
 		sent = append(sent, item.Content)
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestOutboundQueueRetryOnRateLimit(t *testing.T) {
 			return ErrRateLimited
 		}
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestOutboundQueuePerUserHeadLock(t *testing.T) {
 		sentUsers = append(sentUsers, item.UserID)
 		mu.Unlock()
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestOutboundQueueBatchOrderingOnNack(t *testing.T) {
 			return errors.New("temporary failure")
 		}
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestOutboundQueuePriorityJump(t *testing.T) {
 		mu.Unlock()
 		return nil
 	}
-	q, err := newOutboundTextQueue(dbPath, 50*time.Millisecond, 1600, sendFunc, nil)
+	q, err := newOutboundTextQueue(dbPath, 50*time.Millisecond, 1600, sendFunc)
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
