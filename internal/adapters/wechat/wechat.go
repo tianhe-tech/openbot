@@ -56,20 +56,12 @@ type Handler struct {
 	sentTextsMu     sync.Mutex
 	recentSentTexts map[string]time.Time // hash(userID+text) -> sentTime
 
-	// sender is fallback-only for direct sends when outbound queue is
-	// unavailable; normal runtime pacing is owned by outbound queue ticker.
-	sender *senderRegistry
-
 	// batcher coalesces rapid-fire inbound text messages from the same
 	// user so paste-splits and forwarded bursts trigger one agent call.
 	batcher *inboundBatcher
 
-	// offline persists outbound text whose live delivery failed after the
-	// per-call retry budget, so a background worker can redeliver it once
-	// the per-user cooldown has elapsed.
-	offline *offlineQueue
-
 	// outbound is the durable async text queue for streaming event delivery.
+	// It owns pacing, retries, and (via parked entries) offline recovery.
 	outbound *outboundTextQueue
 
 	// pendingMu protects pendingMsgs and pendingTimers.
@@ -121,7 +113,6 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		store:             NewStore(stateDir),
 		lastContextTokens: make(map[string]string),
 		recentSentTexts:   make(map[string]time.Time),
-		sender:            newSenderRegistry(),
 		pendingMsgs:       make(map[string]*pendingMessage),
 		pendingTimers:     make(map[string]*time.Timer),
 	}
@@ -132,14 +123,6 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	splitDelay := parseDurationEnv("WECHAT_TEXT_BATCH_SPLIT_DELAY_SECONDS", 5*time.Second)
 	h.batcher = newInboundBatcher(batchDelay, splitDelay, 1800, h.handleBatchedMessage)
 
-	// Offline queue path — sits under the configured state dir so credentials
-	// and pending sends share the same protected location.
-	queuePath := filepath.Join(stateDir, "pending_outbound.json")
-	if envPath := strings.TrimSpace(os.Getenv("WECHAT_OFFLINE_QUEUE_PATH")); envPath != "" {
-		queuePath = envPath
-	}
-	h.offline = newOfflineQueue(queuePath)
-
 	// Durable outbound queue for async event delivery.
 	outboundPath := filepath.Join(stateDir, "outbound_queue.db")
 	if envPath := strings.TrimSpace(os.Getenv("WECHAT_OUTBOUND_DB_PATH")); envPath != "" {
@@ -148,13 +131,7 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	outboundInterval := parseMillisecondsEnv("WECHAT_OUTBOUND_TICK_MS", int(defaultOutboundTickInterval/time.Millisecond), defaultOutboundTickInterval)
 	outboundMaxLen := parseIntEnv("WECHAT_OUTBOUND_MAX_TEXT_LEN", defaultOutboundMaxLen)
 	statsLogInterval := parseDurationEnv("WECHAT_OUTBOUND_STATS_LOG_SECONDS", defaultStatsLogInterval)
-	outbound, err := newOutboundTextQueue(outboundPath, outboundInterval, outboundMaxLen, h.sendQueuedText, func(userID, sessionID, ctxToken, content string) {
-		// parkFunc: transfer exhausted chunks to the offline queue so they are
-		// never lost. The user can recover them via /pending /recover.
-		if h.offline != nil {
-			h.offline.enqueueWithSession(userID, sessionID, ctxToken, content)
-		}
-	})
+	outbound, err := newOutboundTextQueue(outboundPath, outboundInterval, outboundMaxLen, h.sendQueuedText)
 	if err != nil {
 		log.Printf("wechat: outbound queue init failed, async streaming will fallback to inline send: %v", err)
 	} else {
@@ -170,6 +147,27 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		)
 		h.outbound = outbound
 	}
+
+	// Register a stuck session hook so the user is proactively notified when
+	// GetSessionDiagnostics detects a child or main session that appears hung
+	// on the opencode server side (zombie busy, LLM generation interrupted,
+	// tool call stuck, etc.).
+	h.client.SetStuckSessionHook(func(parentSessionID, childSessionID, reason string) {
+		userID, ok := h.adapter.GetUserForSession(parentSessionID)
+		if !ok {
+			log.Printf("wechat: stuck session hook: no user found for session %s", parentSessionID[:min(8, len(parentSessionID))])
+			return
+		}
+		var msg string
+		if childSessionID != "" {
+			msg = fmt.Sprintf("⚠️ 检测到子任务可能卡住（%s…）\n原因: %s\n\n建议：\n• 发送 /status 查看详细诊断\n• 发送 /abort 中止当前任务",
+				childSessionID[:min(8, len(childSessionID))], reason)
+		} else {
+			msg = fmt.Sprintf("⚠️ 检测到会话可能卡住\n原因: %s\n\n建议：\n• 发送 /status 查看详细诊断\n• 发送 /abort 中止当前任务\n• 发送 /new 创建新会话",
+				reason)
+		}
+		_ = h.enqueueAsyncText(userID, parentSessionID, "", "warning", msg, true)
+	})
 
 	return h
 }
@@ -314,13 +312,6 @@ func (h *Handler) Start(parentCtx context.Context) error {
 	h.cancel = cancel
 	if h.outbound != nil {
 		h.outbound.Start()
-	}
-
-	// Legacy fallback worker: only enabled when the durable outbound queue
-	// failed to initialize. In normal mode, outbound_queue.db is the single
-	// source of truth for async text delivery.
-	if h.outbound == nil && h.offline != nil {
-		go h.offline.runWorker(ctx, h.offlineSend, h.notifyOfflineDrop)
 	}
 
 	go h.pollLoop(ctx)
@@ -573,28 +564,36 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 		}
 	}
 
+	// ★ Pending-prompt gate (deadlock guard): whenever the session has an
+	// unanswered permission/question prompt, block new user messages and tell
+	// the user to answer it first — REGARDLESS of whether a dispatch is
+	// currently running. This restores the "a prompt must not be drowned by
+	// other messages" semantic:
+	//   1. The prompt is the only thing the user sees, so it can't be lost
+	//      among task output.
+	//   2. The blocked message never launches a new dispatch → no new output
+	//      is produced → iLink rate-limit pressure drops, making prompt
+	//      delivery dramatically more likely (feedback loop).
+	// Commands (/new /abort /status …) still work — tryCommand runs before
+	// this gate and is never blocked.
+	if sessionID, ok := h.adapter.GetSessionForUser(userID); ok && sessionID != "" {
+		if prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID); hasPrompt {
+			var hint string
+			if prompt.IsPermission {
+				hint = "⚠️ 当前有一个待确认的权限请求，请先回复：允许 / 拒绝 / 始终允许。"
+			} else {
+				hint = "⚠️ 当前有一个待回答的问题，请先回复选项编号或文字后再继续。"
+			}
+			_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info", hint, true)
+			return nil
+		}
+	}
+
 	// ★ Inbound gating: if a previous task is still dispatching for this
 	// user, queue the new message instead of launching a concurrent dispatch.
 	// This mirrors opencode TUI's session-level task serialization and
 	// guarantees task A's results are fully enqueued before task B starts.
 	if _, busy := h.dispatching.Load(userID); busy {
-		// Deadlock guard: the dispatch may be blocked waiting for the user to
-		// answer a question / permission request. In that case queueing this
-		// message would deadlock (dispatch waits for an answer, the answer sits
-		// in the pending queue). Detect the pending prompt and tell the user to
-		// answer it first instead of silently queueing.
-		if sessionID, ok := h.adapter.GetSessionForUser(userID); ok && sessionID != "" {
-			if prompt, hasPrompt := h.client.GetOldestPendingPrompt(sessionID); hasPrompt {
-				var hint string
-				if prompt.IsPermission {
-					hint = "⚠️ 当前有一个待确认的权限请求，请先回复：允许 / 拒绝 / 始终允许。"
-				} else {
-					hint = "⚠️ 当前有一个待回答的问题，请先回复选项编号或文字后再继续。"
-				}
-				_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "info", hint, true)
-				return nil
-			}
-		}
 		h.enqueuePending(userID, chatID, userText, ctxToken, attachments, agentName)
 		return nil
 	}
@@ -644,6 +643,9 @@ func (h *Handler) extractText(msg *WeixinMessage, savedFiles []string) string {
 }
 
 func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, msg *WeixinMessage) (string, bool) {
+	// Trim leading/trailing whitespace so that messages with stray newlines
+	// (e.g. "\n/status" from certain WeChat clients) are still recognised.
+	text = strings.TrimSpace(text)
 	switch text {
 	case "/help", "帮助":
 		return h.helpText(), true
@@ -867,15 +869,42 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 			return nil
 		}
 
-		// Question signal → critical path. Send directly (bypassing the
-		// outbound queue) so the user sees the permission/question
-		// immediately even when the queue is congested with progress
-		// messages or rate-limited. Missing a question/permission is a
-		// worse failure mode than missing tool/step progress — the
-		// session blocks waiting for user input that never arrives.
+		// Wait-hint signal → lightweight informational message
+		// ("⏳ 正在处理中，无需操作，请稍候..."). Delivered fire-and-forget in
+		// its own goroutine with the SHORT regular backoff (4×3s): it must
+		// never block the streaming callback and must never use the critical
+		// ~10min retry path reserved for real permission/question prompts.
+		// Blocking here previously froze the entire SSE event loop for up to
+		// 10 minutes under rate limiting (hint sent while session is active).
+		if strings.HasPrefix(chunk, opencode.WaitHintSignalPrefix) {
+			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.WaitHintSignalPrefix))
+			if msg != "" {
+				log.Printf("wechat: wait-hint received user=%s session=%s msg_len=%d — non-blocking send", userID, sessionID, len([]rune(msg)))
+				go h.sendWaitHint(userID, msg, ctxToken)
+			}
+			return nil
+		}
+
+		// Question signal → critical path. Enqueued as PriorityHigh so it
+		// jumps ahead of any queued progress content and is never parked or
+		// dropped (critical=true → no TTL). Missing a question/permission is
+		// a worse failure mode than missing tool/step progress — the session
+		// blocks waiting for user input that never arrives.
 		if strings.HasPrefix(chunk, opencode.QuestionSignalPrefix) {
 			msg := strings.TrimSpace(strings.TrimPrefix(chunk, opencode.QuestionSignalPrefix))
 			if msg != "" {
+				log.Printf("wechat: QuestionSignal received user=%s session=%s msg_len=%d", userID, sessionID, len([]rune(msg)))
+
+				// Token overflow 检测：当 opencode server 压缩后仍溢出时，
+				// 会通过 session.error 发送 ContextOverflowError，经
+				// QuestionSignalPrefix 传递到这里。自动触发压缩并重试，
+				// 避免会话卡死（与 dingtalk/feishu/wecom 行为一致）。
+				if h.isTokenOverflowError(msg) && sessionID != "" {
+					log.Printf("wechat: token overflow detected for user %s session %s, auto-recovering", userID, sessionID[:min(8, len(sessionID))])
+					go h.recoverFromTokenOverflow(context.Background(), userID, sessionID, ctxToken, content, attachments, agentName)
+					return nil
+				}
+
 				// Drop accumulated low-priority (progress/todo) messages
 				// for this user so the permission/question dialog isn't
 				// flooded by stale progress updates from earlier in the
@@ -902,13 +931,11 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 								total, existing.ID)
 							return nil
 						}
+						log.Printf("wechat: QuestionSignal — existing prompt found (total=%d), proceeding with send", total)
 					}
 				}
 
-				if err := h.sendTextInline(userID, msg, ctxToken); err != nil {
-					log.Printf("wechat: ⚠️ question direct send failed user=%s: %v — enqueuing as PriorityHigh", userID, err)
-					_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "question", msg, true)
-				}
+				_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "question", msg, true)
 			}
 			return nil
 		}
@@ -1107,9 +1134,21 @@ func (h *Handler) notifyLongRunningTask(userID string) {
 		case diag.ToolStuck:
 			// Active tools but no SSE events for >= 5 minutes — a subagent
 			// or tool call is hung on the opencode server side.
+			// Include child session diagnostics if available (subagent tasks).
+			childInfo := ""
+			if len(diag.ChildSessions) > 0 {
+				for _, cs := range diag.ChildSessions {
+					if cs.Stuck {
+						childInfo += fmt.Sprintf("\n子任务 %s…: %s", cs.SessionID[:min(8, len(cs.SessionID))], cs.StuckReason)
+					}
+				}
+			}
+			if diag.ZombieSession {
+				childInfo += "\n⚠️ 服务器端session处于busy但gateway无活跃handler（僵尸会话）"
+			}
 			msg = fmt.Sprintf("🔴 检测到工具执行可能卡死（有活跃工具但超过5分钟无事件更新）。%s\n\n"+
 				"最后事件: %s（%s前）\n"+
-				"活跃工具数: %d\n\n"+
+				"活跃工具数: %d%s\n\n"+
 				"建议：\n"+
 				"• 发送 /abort 中止当前任务\n"+
 				"• 发送 /status 查看详细诊断\n"+
@@ -1117,7 +1156,8 @@ func (h *Handler) notifyLongRunningTask(userID string) {
 				sessionPart,
 				diag.LastEventType,
 				time.Since(diag.LastEventAt).Round(time.Second),
-				diag.ActiveTools)
+				diag.ActiveTools,
+				childInfo)
 
 		case diag.RetryAttempt > 0:
 			// Upstream provider is repeatedly retrying — model may be
@@ -1190,8 +1230,24 @@ func (h *Handler) sendCommandReply(userID, text, ctxToken string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	if err := h.sendTextInline(userID, text, ctxToken); err != nil {
-		log.Printf("wechat: command reply send failed user=%s: %v", userID, err)
+	for _, chunk := range splitTextForWeixinDelivery(text, defaultOutboundMaxLen, false) {
+		if strings.TrimSpace(chunk) == "" {
+			continue
+		}
+		h.trackSentText(userID, chunk)
+		if err := h.weClient.SendText(userID, chunk, ctxToken); err != nil {
+			if errors.Is(err, ErrSessionExpired) && ctxToken != "" {
+				// Token stale: drop it and retry once tokenless.
+				h.mu.Lock()
+				delete(h.lastContextTokens, userID)
+				h.mu.Unlock()
+				h.trackSentText(userID, chunk)
+				err = h.weClient.SendText(userID, chunk, "")
+			}
+			if err != nil {
+				log.Printf("wechat: command reply send failed user=%s: %v", userID, err)
+			}
+		}
 	}
 }
 
@@ -1200,9 +1256,9 @@ func (h *Handler) enqueueAsyncText(userID, sessionID, ctxToken, eventType, text 
 		return nil
 	}
 	if h.outbound == nil {
-		// Queue not available — fall back to direct send with senderRegistry
-		// pacing so we still respect per-user rate limits.
-		return h.sendTextInline(userID, text, ctxToken)
+		// Queue not available (rare: init failed at startup) — send directly.
+		h.trackSentText(userID, text)
+		return h.weClient.SendText(userID, text, ctxToken)
 	}
 	return h.outbound.EnqueueText(userID, sessionID, ctxToken, eventType, text, critical)
 }
@@ -1215,20 +1271,14 @@ func (h *Handler) sendQueuedText(item *queuedOutboundText) error {
 	}
 	h.mu.Unlock()
 
-	// Send a single chunk. We deliberately do NOT use senderRegistry.sendChunks
-	// here because:
-	//   1. The queue already serializes per-user dispatch (pickNextDueHead
-	//      returns one item at a time per user).
-	//   2. The queue's nack/backoff handles rate-limit retries — wrapping
-	//      that in senderRegistry's own backoff would double-retry and
-	//      block the dispatch goroutine for 12s+ per failed attempt.
-	//   3. The queue tick interval (1.5s) already provides pacing between
-	//      sends, equivalent to senderRegistry's minGap.
-	//
-	// senderRegistry is still used by sendTextInline (the no-queue fallback).
+	// Send a single chunk with its persisted client_id. The queue serializes
+	// per-user dispatch (one item at a time per user), handles rate-limit
+	// retries via nack/backoff, and paces sends via minGap — so this is the
+	// only transport layer needed. Reusing item.ClientID on every retry makes
+	// the send idempotent.
 	effectiveToken := ctxToken
 	h.trackSentText(item.UserID, item.Content)
-	err := h.weClient.SendText(item.UserID, item.Content, effectiveToken)
+	err := h.weClient.SendTextWithClientID(item.UserID, item.Content, effectiveToken, item.ClientID)
 	if err != nil && errors.Is(err, ErrSessionExpired) && effectiveToken != "" {
 		log.Printf("wechat: queued send session expired user=%s; retrying tokenless", item.UserID)
 		h.mu.Lock()
@@ -1236,43 +1286,9 @@ func (h *Handler) sendQueuedText(item *queuedOutboundText) error {
 		h.mu.Unlock()
 		effectiveToken = ""
 		h.trackSentText(item.UserID, item.Content)
-		err = h.weClient.SendText(item.UserID, item.Content, "")
+		err = h.weClient.SendTextWithClientID(item.UserID, item.Content, "", item.ClientID)
 	}
 	return err
-}
-
-// notifyDeferredDelivery sends a best-effort user notice that delivery is
-// deferred and will be retried by the active outbound mechanism.
-// critical=true so this notice isn't dropped by TTL during congestion.
-func (h *Handler) notifyDeferredDelivery(userID, ctxToken string) {
-	_ = h.enqueueAsyncText(userID, "", ctxToken, "deferred_notice", "⚠️ 网络繁忙，结果将稍后送达", true)
-}
-
-// offlineSend is the transport callback the offline worker uses to retry
-// a parked message. It refreshes the context_token from the live cache (the
-// originally-captured one may have expired during the wait) before delegating
-// to the normal sender.
-func (h *Handler) offlineSend(userID, ctxToken, content string) error {
-	h.mu.Lock()
-	freshToken, ok := h.lastContextTokens[userID]
-	h.mu.Unlock()
-	if ok && freshToken != "" {
-		ctxToken = freshToken
-	}
-	// Route through the queue so the retried message respects pacing and
-	// ordering relative to any other queued messages for this user.
-	return h.enqueueAsyncText(userID, "", ctxToken, "offline_retry", content, true)
-}
-
-// notifyOfflineDrop tells the user that we have given up on an offline-queue
-// entry. Best-effort: if this notice itself can't be delivered the user will
-// have already noticed the missing result via the prior "稍后送达" notice.
-func (h *Handler) notifyOfflineDrop(userID string) {
-	h.mu.Lock()
-	ctxToken := h.lastContextTokens[userID]
-	h.mu.Unlock()
-	_ = h.enqueueAsyncText(userID, "", ctxToken,
-		"offline_drop_notice", "⚠️ 部分结果未能送达，请回复 /retry 重发上一次请求", true)
 }
 
 // --- Command handlers ---
@@ -1363,10 +1379,10 @@ func (h *Handler) handleStatus(userID string) string {
 }
 
 func (h *Handler) handlePending(userID string) string {
-	if h.offline == nil {
-		return "ℹ️ 离线队列未启用"
+	if h.outbound == nil {
+		return "ℹ️ 队列未启用"
 	}
-	entries := h.offline.ListAbandoned(userID)
+	entries := h.outbound.ListParked(userID)
 	if len(entries) == 0 {
 		return "ℹ️ 没有未送达的旧会话回复"
 	}
@@ -1388,10 +1404,13 @@ func (h *Handler) handlePending(userID string) string {
 }
 
 func (h *Handler) handleRecover(userID, sessionFilter string) string {
-	if h.offline == nil {
-		return "ℹ️ 离线队列未启用"
+	if h.outbound == nil {
+		return "ℹ️ 队列未启用"
 	}
-	n := h.offline.RecoverSession(userID, sessionFilter)
+	n, err := h.outbound.RecoverParked(userID, sessionFilter)
+	if err != nil {
+		return fmt.Sprintf("❌ 恢复失败: %v", err)
+	}
 	if n == 0 {
 		return "ℹ️ 没有找到可恢复的回复"
 	}
@@ -1400,15 +1419,11 @@ func (h *Handler) handleRecover(userID, sessionFilter string) string {
 
 func (h *Handler) handleNewSession(userID string) string {
 	// Clear pending outbound messages from the previous session.
-	// PriorityNormal entries (AI replies) are parked into the offline queue
-	// tagged with sessionID so the user can recover them via /pending /recover.
-	// PriorityHigh (question/permission) and PriorityLow (todo) are discarded.
+	// PriorityNormal entries (AI replies, todo progress) are marked parked=1
+	// so the user can recover them via /pending /recover. PriorityHigh
+	// (question/permission) and PriorityLow (skippable progress) are discarded.
 	if h.outbound != nil {
-		h.outbound.ClearForUser(userID, func(uid, sid, ctxToken, content string) {
-			if h.offline != nil {
-				h.offline.enqueueWithSession(uid, sid, ctxToken, content)
-			}
-		})
+		h.outbound.ClearForUser(userID)
 	}
 	if sessionID, ok := h.adapter.GetSessionForUser(userID); ok {
 		h.adapter.ClearSessionForUser(userID)
@@ -1572,6 +1587,59 @@ func (h *Handler) handleSummary(ctx context.Context, userID string) string {
 		return fmt.Sprintf("❌ 压缩上下文失败: %v", err)
 	}
 	return "✅ 已触发上下文压缩"
+}
+
+// isTokenOverflowError 检测消息是否为上下文超限错误。
+// opencode server 在压缩后仍溢出时会发送 ContextOverflowError，
+// 经 session.error → QuestionSignalPrefix 传递到 adapter。
+func (h *Handler) isTokenOverflowError(msg string) bool {
+	m := strings.ToLower(strings.TrimSpace(msg))
+	if m == "" {
+		return false
+	}
+	if !strings.Contains(m, "opencode 会话出错") && !strings.Contains(m, "session error") {
+		return false
+	}
+	return strings.Contains(m, "parameter=input_tokens") ||
+		strings.Contains(m, "maximum input length") ||
+		strings.Contains(m, "context length") ||
+		strings.Contains(m, "input tokens") ||
+		strings.Contains(m, "context overflow") ||
+		strings.Contains(m, "too large to compact")
+}
+
+// recoverFromTokenOverflow 在检测到上下文超限错误后自动恢复：
+// 1. 尝试调用 SummarizeSession 压缩上下文
+// 2. 压缩成功后重新发送原始消息
+// 3. 压缩失败则通知用户，建议使用 /new 创建新会话
+func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionID, ctxToken, originalContent string, attachments []opencode.Attachment, agentName string) {
+	_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_notice",
+		"⚠️ 上下文已超限，正在自动压缩并重试...", true)
+
+	// 清除已总结标记并重置 token 计数，允许再次压缩
+	h.client.ClearSessionSummary(sessionID)
+	h.client.ResetSessionTokenCount(sessionID)
+
+	// 压缩超时：20分钟（与 dingtalk/feishu 一致）
+	recoverCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer cancel()
+
+	if err := h.client.SummarizeSession(recoverCtx, sessionID); err != nil {
+		log.Printf("wechat: auto-recovery summarize failed user=%s session=%s: %v", userID, sessionID[:min(8, len(sessionID))], err)
+		_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_fail",
+			fmt.Sprintf("❌ 自动压缩失败: %v\n\n💡 请发送 /new 创建新会话继续", err), true)
+		return
+	}
+
+	_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_done",
+		"✅ 压缩完成，正在重试消息...", true)
+
+	// 重新发送原始消息（异步，避免阻塞恢复 goroutine）
+	go func() {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		defer retryCancel()
+		h.dispatchToOpenCode(retryCtx, userID, "", originalContent, ctxToken, attachments, agentName)
+	}()
 }
 
 func (h *Handler) handleClear(ctx context.Context, userID string) string {
@@ -2594,57 +2662,20 @@ func formatQuestionOptions(q *opencode.Question) string {
 	return strings.Join(parts, ", ")
 }
 
-const maxWechatTextLength = defaultOutboundMaxLen
-
-// sendTextChunks sends text using Hermes-style message chunking via the
-// per-user serialized sender. Pacing and rate-limit backoff are handled
-// inside the sender so callers may invoke this concurrently from different
-// signal paths (content / tool / step / todo / question / proactive).
-//
-// On partial delivery (some chunks succeeded, then a chunk failed) the caller
-// MUST treat the whole call as failed and not advance its cursor; otherwise
-// the un-delivered tail would be lost. The sender stops at the first failure
-// to make this contract simple.
+// sendTextChunks sends text through the durable outbound queue for ordering
+// and pacing. The queue splits long text into rune-safe chunks, assigns each
+// chunk a stable client_id, and dispatches them one-at-a-time per user with
+// minGap pacing.
 func (h *Handler) sendTextChunks(userID, text, ctxToken string) error {
-	// Unified throttling: all regular text paths enter the durable outbound
-	// queue and are paced by the ticker dispatcher.
 	return h.enqueueAsyncText(userID, "", ctxToken, "generic", text, true)
 }
 
-// sendTextChunksDirect is now a thin wrapper around enqueueAsyncText so that
-// all outbound text goes through the durable queue for ordering and pacing.
-// When the queue is not initialized, enqueueAsyncText falls back to
-// sendTextInline which applies senderRegistry throttling directly.
-func (h *Handler) sendTextChunksDirect(userID, text, ctxToken string) error {
-	return h.enqueueAsyncText(userID, "", ctxToken, "generic", text, true)
-}
-
-// sendTextInline sends text directly via senderRegistry without queueing.
-// Used only as a fallback when the outbound queue is not initialized.
-func (h *Handler) sendTextInline(userID, text, ctxToken string) error {
-	chunks := splitTextForWeixinDelivery(text, maxWechatTextLength, false)
-	if len(chunks) == 0 {
-		return nil
-	}
-	effectiveToken := ctxToken
-	delivered, err := h.sender.sendChunks(userID, chunks, func(chunk string) error {
-		h.trackSentText(userID, chunk)
-		sendErr := h.weClient.SendText(userID, chunk, effectiveToken)
-		if sendErr != nil && errors.Is(sendErr, ErrSessionExpired) && effectiveToken != "" {
-			log.Printf("wechat: session expired user=%s; clearing context_token and retrying tokenless", userID)
-			h.mu.Lock()
-			delete(h.lastContextTokens, userID)
-			h.mu.Unlock()
-			effectiveToken = ""
-			h.trackSentText(userID, chunk)
-			sendErr = h.weClient.SendText(userID, chunk, "")
-		}
-		return sendErr
-	})
-	if err != nil {
-		log.Printf("wechat: inline chunk send failed user=%s delivered=%d/%d: %v", userID, delivered, len(chunks), err)
-	}
-	return err
+// sendWaitHint delivers an informational waiting hint ("⏳ 正在处理中...")
+// as a best-effort, skippable, low-priority message with a TTL. It never
+// blocks the streaming callback and is dropped under congestion rather than
+// crowding out real content.
+func (h *Handler) sendWaitHint(userID, text, ctxToken string) {
+	_ = h.enqueueAsyncText(userID, "", ctxToken, "skippable", text, false)
 }
 
 // --- Outbound Media Sending ---
