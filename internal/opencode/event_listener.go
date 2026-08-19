@@ -57,6 +57,7 @@ type StreamingSessionHandler struct {
 	sessionTodos    []TodoItem      // 当前 todo 列表（来自 todo.updated 事件）
 	sessionDiff     []FileDiff      // 本次会话的文件变更（来自 session.diff 事件）
 	activeToolParts map[string]bool // partID -> true：当前处于 pending/running 状态的 tool part，用于判断是否仍有活跃 tool
+	toolObserved    bool            // 本轮是否曾进入工具执行阶段；慢工具不应被当作模型静默卡死
 
 	// 上游 provider 重试状态：opencode 在模型不可用/限流时会发出 type=="retry" 的
 	// message part（{"type":"retry","attempt":N,"error":{"data":{"message":...}}}）。
@@ -77,10 +78,34 @@ type StreamingSessionHandler struct {
 	pendingQuestionSince     time.Time
 	pendingQuestionSent      bool // whether a "still waiting for your input" reminder has been sent
 	pendingQuestionReminders int  // number of reminders already sent (multi-level escalation)
+
+	// serverCompacting 标记 opencode server 正在进行自动压缩（compaction）。
+	// 压缩期间会产生 session.idle 事件，但此时并非真正完成，需要忽略。
+	// 通过 message.part 类型为 "compaction" 来检测压缩开始，
+	// 通过 session.compacted 事件来检测压缩结束。
+	serverCompacting bool
+
+	// Circuit-breaker integration: the model used for this turn (so the
+	// session.error handler can attribute failures to the right provider)
+	// and the original payload (so a fallback retry can be dispatched).
+	// fallbackRetryAttempted prevents infinite retry loops: only one
+	// automatic model switch is attempted per turn.
+	lastModelUsed           *opencode.SessionPromptParamsModel
+	payload                 MessagePayload
+	fallbackRetryAttempted  bool
+	fallbackRetryDispatched bool
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
 func NewStreamingSessionHandler(sessionID string, callback StreamCallback, eventCallback StreamEventCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool) *StreamingSessionHandler {
+	return NewStreamingSessionHandlerWithModel(sessionID, callback, eventCallback, onComplete, client, messageSender, showThinking, showSteps, nil, MessagePayload{})
+}
+
+// NewStreamingSessionHandlerWithModel is the full constructor that also
+// captures the model override used for this turn and the original payload.
+// These are consumed by the session.error handler to attribute failures to
+// the correct provider/model and to dispatch an automatic fallback retry.
+func NewStreamingSessionHandlerWithModel(sessionID string, callback StreamCallback, eventCallback StreamEventCallback, onComplete func(), client *Client, messageSender MessageSender, showThinking bool, showSteps bool, modelUsed *opencode.SessionPromptParamsModel, payload MessagePayload) *StreamingSessionHandler {
 	h := &StreamingSessionHandler{
 		sessionID:        sessionID,
 		callback:         callback,
@@ -94,17 +119,43 @@ func NewStreamingSessionHandler(sessionID string, callback StreamCallback, event
 		showThinking:     showThinking,
 		showSteps:        showSteps,
 		activeToolParts:  make(map[string]bool),
+		lastModelUsed:    modelUsed,
+		payload:          payload,
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
+		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
+		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
 		h.mu.Lock()
-		defer h.mu.Unlock()
-		if !h.contentSent && !h.completed && !h.waitingHintSent {
-			h.waitingHintSent = true
-			_ = h.callback(QuestionSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
+		if h.contentSent || h.completed || h.waitingHintSent {
+			h.mu.Unlock()
+			return
 		}
+		h.waitingHintSent = true
+		h.mu.Unlock()
+		_ = h.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
 	})
 	return h
+}
+
+// SetModelUsed records the final model selected by SendMessage. Streaming
+// handlers are registered before automatic model selection completes.
+func (s *StreamingSessionHandler) SetModelUsed(model *opencode.SessionPromptParamsModel) {
+	if model == nil {
+		return
+	}
+	copyModel := *model
+	s.mu.Lock()
+	s.lastModelUsed = &copyModel
+	s.mu.Unlock()
+}
+
+// FallbackRetryDispatched reports whether a replacement turn now owns user
+// delivery after this handler received a provider error.
+func (s *StreamingSessionHandler) FallbackRetryDispatched() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fallbackRetryDispatched
 }
 
 func (s *StreamingSessionHandler) emitEvent(kind StreamEventKind, content string, question *Question, todos []TodoItem, diff []FileDiff, rawType string) {
@@ -160,12 +211,29 @@ func (s *StreamingSessionHandler) emitEventFromChunk(chunk string) {
 		return
 	}
 
+	if strings.HasPrefix(chunk, WaitHintSignalPrefix) {
+		s.emitEvent(StreamEventInfo, strings.TrimPrefix(chunk, WaitHintSignalPrefix), nil, nil, nil, "waithint")
+		return
+	}
+
 	if strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
 		s.emitEvent(StreamEventSessionReady, chunk, nil, nil, nil, "session")
 		return
 	}
 
 	s.emitEvent(StreamEventTextDelta, chunk, nil, nil, nil, "text")
+}
+
+// isProgressSignal reports whether a callback chunk is a progress/lifecycle
+// signal (thinking, tool, or step) rather than real answer text. These signals
+// are NOT final content: WeChat (and other adapters) explicitly suppress them,
+// so marking contentSent=true or appending them to lastContent here would make
+// finalizeAsyncStreamingResponse believe the answer was already delivered and
+// skip fetching/sending the real final reply.
+func isProgressSignal(chunk string) bool {
+	return strings.HasPrefix(chunk, ThinkingSignalPrefix) ||
+		strings.HasPrefix(chunk, ToolSignalPrefix) ||
+		strings.HasPrefix(chunk, StepSignalPrefix)
 }
 
 // NewEventDispatcher creates a new event dispatcher.
@@ -310,6 +378,20 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				if partMeta2.Properties.Part.Type == "retry" {
 					s.handleRetryPart(jsonData)
 				}
+				if partMeta2.Properties.Part.Type == "tool" {
+					s.toolObserved = true
+				}
+
+				// 检测 server 端自动压缩（compaction）：当 opencode server 在
+				// prompt loop 中检测到 overflow 时，会创建 type=="compaction" 的
+				// part。设置 serverCompacting 标志，使后续 session.idle 被忽略，
+				// 直到收到 session.compacted 事件才清除。
+				if partMeta2.Properties.Part.Type == "compaction" {
+					if !s.serverCompacting {
+						s.serverCompacting = true
+						log.Printf("opencode: 📦 compaction part detected for session %s, setting serverCompacting flag", s.sessionID[:8])
+					}
+				}
 			}
 		}
 
@@ -332,11 +414,16 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				}
 			} else {
 				s.emitEventFromChunk(incremental)
-				s.lastContent += incremental
-				if !s.contentSent {
-					s.stopWaitingTimer()
+				// 进度信号（thinking/tool/step）不是正文内容，不计入 lastContent/contentSent，
+				// 否则 adapter（如 wechat）忽略这些信号后，contentSent 被错误置 true，
+				// 导致 finalize 误判"内容已发送"而跳过最终答案的补发。
+				if !isProgressSignal(incremental) {
+					s.lastContent += incremental
+					if !s.contentSent {
+						s.stopWaitingTimer()
+					}
+					s.contentSent = true
 				}
-				s.contentSent = true
 			}
 			s.lastUpdateTime = time.Now()
 		}
@@ -417,6 +504,14 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		}
 
 	case "session.idle":
+		// opencode server 自动压缩（compaction）期间也会产生 session.idle 事件。
+		// 如果在此期间触发 completed，会导致 handler 提前注销，后续真实响应事件
+		// （包括 permission.asked）全部被丢弃，session 在 opencode 服务端死锁。
+		// 通过 serverCompacting 标志区分压缩产生的 idle 和真实任务完成的 idle。
+		if s.serverCompacting {
+			log.Printf("opencode: ignoring session.idle during server-side compaction for session %s", s.sessionID[:min(8, len(s.sessionID))])
+			return nil
+		}
 		s.completed = true
 		s.notifyCompletion()
 		log.Printf("opencode: 🏁 streaming session completed (session=%s, contentSent=%t, lastContentLen=%d)",
@@ -462,6 +557,35 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: 🔴 session.error RAW JSON: %s", rawJSON)
 		errorMsg := s.extractSessionError(event)
 		log.Printf("opencode: 🔴 session.error extracted message: %q", errorMsg)
+
+		// Circuit breaker: if this is a provider-level failure (e.g. "No
+		// available client"), record it against the model used for this
+		// turn and attempt an automatic fallback to a healthy model.
+		// The fallback re-dispatches the original payload with a new
+		// model; if it succeeds we return without notifying the user of
+		// the error (the retry turn's content reaches them instead).
+		if s.client != nil && s.client.breaker != nil && s.lastModelUsed != nil && !s.fallbackRetryAttempted {
+			if s.client.breaker.IsProviderLevelError(errorMsg) {
+				pid := s.lastModelUsed.ProviderID.Value
+				mid := s.lastModelUsed.ModelID.Value
+				s.client.breaker.RecordFailure(pid, mid, errorMsg)
+				log.Printf("opencode: 🔌 circuit breaker recorded failure for %s/%s (state=%s)",
+					pid, mid, s.client.breaker.StateString(pid, mid))
+
+				s.fallbackRetryAttempted = true
+				if s.client.attemptFallbackRetry(s.sessionID, s.payload, s.lastModelUsed, s.callback, s.eventCallback) {
+					// Fallback dispatched: do not surface the error to the
+					// user. Mark this handler complete so the SSE loop
+					// exits; the new turn's handler takes over.
+					s.fallbackRetryDispatched = true
+					s.completed = true
+					s.notifyCompletion()
+					log.Printf("opencode: session.error handled via fallback retry for session %s", s.sessionID[:8])
+					return nil
+				}
+			}
+		}
+
 		if errorMsg == "" {
 			errorMsg = "⚠️ OpenCode 会话发生错误，请稍后重试。"
 		} else {
@@ -504,11 +628,8 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						log.Printf("opencode: message.part.delta reasoning callback error: %v", err)
 					} else {
 						s.emitEventFromChunk(reasoningChunk)
-						s.lastContent += reasoningChunk
-						if !s.contentSent {
-							s.stopWaitingTimer()
-						}
-						s.contentSent = true
+						// reasoning 是进度信号（thinking），不是最终答案正文，
+						// 不计入 lastContent/contentSent（避免污染最终答案判断）。
 					}
 					s.lastUpdateTime = time.Now()
 					break
@@ -591,10 +712,11 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						s.lastTodoSummary = summary
 						s.lastTodoStateHash = stateHash
 						s.lastTodoPushTime = now
-						if !s.contentSent {
-							s.stopWaitingTimer()
-						}
-						s.contentSent = true
+						// todo 是进度信号，不是最终答案正文：不设置 contentSent，
+						// 否则长任务只产出 todo（最终文本缺失/卡住）时，
+						// finalize 会误判"答案已发送"而跳过最终答案补发。
+						// 但 todo 仍是活动信号，停止 wait-hint timer。
+						s.stopWaitingTimer()
 					}
 				}
 			}
@@ -628,12 +750,13 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: message removed for session %s", s.sessionID[:8])
 
 	case "session.compacted":
-		// opencode 服务端自主压缩完成通知（可能是我们调用 SummarizeSession 触发，也可能是服务端自动触发）
+		// opencode 服务端自主压缩完成通知（可能是 /summary 命令触发，也可能是服务端自动触发）
 		// 压缩后重置 token 计数器，等待下次 step-finish 携带真实值
+		s.serverCompacting = false
 		if s.client != nil {
 			s.client.tokenCount.Store(s.sessionID, 0)
 		}
-		log.Printf("opencode: ✅ session.compacted received for session %s, token counter reset", s.sessionID[:8])
+		log.Printf("opencode: ✅ session.compacted received for session %s, token counter reset, compaction flag cleared", s.sessionID[:8])
 
 	case "server.instance.disposed":
 		// 服务器重启，事件监听器主循环负责重连
@@ -689,17 +812,26 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 	}
 
 	type ToolInput struct {
-		Command     string `json:"command"`
-		Description string `json:"description"`
-		Filepath    string `json:"filepath"`
-		URL         string `json:"url"`
+		Command      string `json:"command"`
+		Description  string `json:"description"`
+		Filepath     string `json:"filepath"`
+		URL          string `json:"url"`
+		SubagentType string `json:"subagent_type"`
+	}
+
+	type ToolMetadata struct {
+		ParentSessionID string                 `json:"parentSessionId"`
+		SessionID       string                 `json:"sessionId"`
+		Model           map[string]interface{} `json:"model"`
+		Truncated       bool                   `json:"truncated"`
 	}
 
 	type ToolState struct {
-		Status string    `json:"status"`
-		Input  ToolInput `json:"input"`
-		Output string    `json:"output"`
-		Error  string    `json:"error"`
+		Status   string       `json:"status"`
+		Input    ToolInput    `json:"input"`
+		Output   string       `json:"output"`
+		Error    string       `json:"error"`
+		Metadata ToolMetadata `json:"metadata"`
 	}
 
 	type PartUpdateProps struct {
@@ -807,6 +939,25 @@ func (s *StreamingSessionHandler) extractContentFromEvent(event *opencode.EventL
 				s.activeToolParts[partID] = true
 			case "completed", "error":
 				delete(s.activeToolParts, partID)
+			}
+		}
+
+		// Capture child session info from task tool calls (subagent sessions).
+		// The metadata.sessionId is the child session, metadata.parentSessionId
+		// is the parent (should match s.sessionID).
+		if toolName == "task" && s.client != nil && state.Metadata.SessionID != "" {
+			switch state.Status {
+			case "running", "pending":
+				s.client.RegisterChildSession(
+					s.sessionID,
+					state.Metadata.SessionID,
+					state.Input.Description,
+					state.Input.SubagentType,
+				)
+			case "completed":
+				s.client.UpdateChildSessionStatus(state.Metadata.SessionID, "completed")
+			case "error":
+				s.client.UpdateChildSessionStatus(state.Metadata.SessionID, "error")
 			}
 		}
 
@@ -1442,6 +1593,26 @@ func (s *StreamingSessionHandler) GetRetryState() RetryState {
 	}
 }
 
+// IsSilentModelHangCandidate reports whether this turn never entered model
+// generation, provider retry, user-input, or tool execution. The client still
+// verifies the server-side message history before recovering the session.
+func (s *StreamingSessionHandler) IsSilentModelHangCandidate() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.contentSent && !s.receivedStepFinish && !s.toolObserved && len(s.activeToolParts) == 0 &&
+		s.retryAttempt == 0 && s.pendingQuestionSince.IsZero()
+}
+
+// CompleteForRecovery stops local streaming ownership after the server-side
+// turn was aborted and a replacement session is being started.
+func (s *StreamingSessionHandler) CompleteForRecovery() {
+	s.mu.Lock()
+	s.completed = true
+	s.stopWaitingTimer()
+	s.mu.Unlock()
+	s.fireOnComplete()
+}
+
 // PendingQuestionInfo describes whether the session is currently blocked
 // waiting for user input (permission.asked / question.asked) and for how long.
 type PendingQuestionInfo struct {
@@ -1543,9 +1714,36 @@ func (s *StreamingSessionHandler) handleRetryPart(rawJSON string) {
 		return
 	}
 
-	// 已达上限且尚未报错过：surface 一条明确的错误并结束本轮，避免无限"正在处理中"。
+	// 已达上限且尚未报错过：尝试熔断 + 自动切换模型。
+	// 如果切换成功，则不向用户报错；否则 surface 一条明确的错误并结束本轮。
 	if alreadySurfaced {
 		return
+	}
+
+	// Circuit breaker: record the failure and attempt an automatic
+	// fallback to a healthy model. This is the primary path for provider
+	// failures — opencode's upstream retry exhausts, and we switch models
+	// instead of just surfacing the error.
+	if s.client != nil && s.client.breaker != nil && s.lastModelUsed != nil && !s.fallbackRetryAttempted {
+		if s.client.breaker.IsProviderLevelError(curMsg) {
+			pid := s.lastModelUsed.ProviderID.Value
+			mid := s.lastModelUsed.ModelID.Value
+			s.client.breaker.RecordFailure(pid, mid, curMsg)
+			log.Printf("opencode: 🔌 circuit breaker recorded failure for %s/%s (state=%s) from retry-limit",
+				pid, mid, s.client.breaker.StateString(pid, mid))
+
+			s.fallbackRetryAttempted = true
+			if s.client.attemptFallbackRetry(s.sessionID, s.payload, s.lastModelUsed, s.callback, s.eventCallback) {
+				// Fallback dispatched: do not surface the error to the
+				// user. Mark this handler complete so the SSE loop
+				// exits; the new turn's handler takes over.
+				s.fallbackRetryDispatched = true
+				s.completed = true
+				s.notifyCompletion()
+				log.Printf("opencode: retry-limit handled via fallback retry for session %s", s.sessionID[:8])
+				return
+			}
+		}
 	}
 
 	errText := fmt.Sprintf("⚠️ 上游模型多次重试仍失败（已重试 %d 次），本轮中止。", curAttempt)
@@ -1623,6 +1821,14 @@ const TodoSignalPrefix = "\x00todo:"
 // delivery to the user (not buffered in content accumulation).
 const QuestionSignalPrefix = "\x00question:"
 
+// WaitHintSignalPrefix marks the lightweight "⏳ 正在处理中，无需操作，请稍候..."
+// informational hint. It is semantically distinct from QuestionSignalPrefix:
+// it carries NO blocking semantics (the session is still actively working),
+// so adapters MUST deliver it fire-and-forget — never through the critical
+// retry path reserved for real permission/question prompts, and never while
+// holding the streaming handler lock.
+const WaitHintSignalPrefix = "\x00waithint:"
+
 // TodoAutoPushInterval controls minimum interval between auto todo updates.
 const TodoAutoPushInterval = 5 * time.Second
 
@@ -1654,6 +1860,74 @@ func (s *StreamingSessionHandler) stopWaitingTimer() {
 	if s.waitingTimer != nil {
 		s.waitingTimer.Stop()
 	}
+}
+
+// ResetForNewPrompt clears state that may have been polluted by a preceding
+// compression (SummarizeSession) operation. Compression emits its own
+// message.part.delta / step-finish / session.idle events which populate
+// lastContent, set contentSent/receivedStepFinish, and may even trigger
+// onComplete deregistration. Without resetting, the async ticker observes
+// stale "completed" state and returns immediately, dropping all real
+// response events (including permission.asked — which deadlocks the
+// session on the opencode server side).
+//
+// This must be called right after the real prompt_async is accepted and
+// before waiting for SSE events.
+func (s *StreamingSessionHandler) ResetForNewPrompt() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	log.Printf("opencode: resetting handler state for session %s (clearing compression artifacts: contentSent=%t, completed=%t, lastContentLen=%d)",
+		s.sessionID[:min(8, len(s.sessionID))], s.contentSent, s.completed, len(s.lastContent))
+
+	s.completed = false
+	s.contentSent = false
+	s.lastContent = ""
+	s.receivedStepFinish = false
+	s.stepFinishTime = time.Time{}
+	s.waitingHintSent = false
+	s.lastEventTime = time.Now()
+	s.lastEventType = ""
+	s.lastActivityTime = time.Now()
+	s.lastActivityType = ""
+	s.pendingQuestionSince = time.Time{}
+	s.pendingQuestionSent = false
+	s.pendingQuestionReminders = 0
+	s.activeToolParts = make(map[string]bool)
+	s.toolObserved = false
+	s.sessionTodos = nil
+	s.sessionDiff = nil
+	s.lastTodoSummary = ""
+	s.lastTodoStateHash = ""
+	s.lastTodoPushTime = time.Time{}
+
+	// Clear part caches so compression-era partIDs don't shadow real parts.
+	s.partTextCache.Range(func(k, _ any) bool { s.partTextCache.Delete(k); return true })
+	s.toolSignalCache.Range(func(k, _ any) bool { s.toolSignalCache.Delete(k); return true })
+	s.partRoles.Range(func(k, _ any) bool { s.partRoles.Delete(k); return true })
+
+	// Reset the onCompleteOnce so a future real session.idle can fire it.
+	// This is safe because fireOnComplete is guarded by sync.Once; resetting
+	// the Once allows the real completion (post-compression) to trigger
+	// the cleanup callback exactly once.
+	s.onCompleteOnce = sync.Once{}
+
+	// Restart the waiting hint timer for the new prompt.
+	if s.waitingTimer != nil {
+		s.waitingTimer.Stop()
+	}
+	s.waitingTimer = time.AfterFunc(8*time.Second, func() {
+		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
+		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
+		s.mu.Lock()
+		if s.contentSent || s.completed || s.waitingHintSent {
+			s.mu.Unlock()
+			return
+		}
+		s.waitingHintSent = true
+		s.mu.Unlock()
+		_ = s.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
+	})
 }
 
 // extractPartDelta 从 message.part.delta 事件中提取增量文本

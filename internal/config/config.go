@@ -46,6 +46,29 @@ type Config struct {
 	// RetryQueue: offline retry for messages that timed out (context deadline
 	// exceeded with zero accumulated reply). Disabled by default.
 	RetryQueue RetryQueueConfig
+
+	// CircuitBreaker: per provider/model failure tracking. When a provider
+	// fails with a provider-level error (e.g. "No available client"), the
+	// breaker opens and selectModelOverride skips it until a half-open probe
+	// succeeds. Enabled by default.
+	CircuitBreaker CircuitBreakerConfig
+}
+
+// CircuitBreakerConfig is the env-driven sub-config for the opencode client
+// per-model circuit breaker.
+type CircuitBreakerConfig struct {
+	// Enabled: set OPENCODE_CIRCUIT_BREAKER_ENABLED=false to disable (default true).
+	Enabled bool
+	// FailureThreshold: consecutive provider-level failures before opening (default 2).
+	FailureThreshold int
+	// Cooldown: initial open duration before a half-open probe (default 60s).
+	Cooldown time.Duration
+	// MaxCooldown: cap for exponential backoff on repeated probe failures (default 30m).
+	MaxCooldown time.Duration
+	// TripKeywords: comma-separated error substrings that trip the breaker.
+	// Empty means all session.error events trip. Default covers common
+	// provider-outage messages.
+	TripKeywords []string
 }
 
 // SkillAutogenConfig is the env-driven sub-config for internal/skillgen.
@@ -167,6 +190,14 @@ func Load() (Config, error) {
 			CronExpr:   getEnv("RETRY_QUEUE_CRON", "0 22 * * *"),
 			MaxRetries: getInt("RETRY_QUEUE_MAX_RETRIES", 3),
 			BatchSize:  getInt("RETRY_QUEUE_BATCH_SIZE", 20),
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:          getBool("OPENCODE_CIRCUIT_BREAKER_ENABLED", true),
+			FailureThreshold: getInt("OPENCODE_CB_FAILURE_THRESHOLD", 2),
+			Cooldown:         getDuration("OPENCODE_CB_COOLDOWN_SECONDS", 60*time.Second),
+			MaxCooldown:      getDuration("OPENCODE_CB_MAX_COOLDOWN_SECONDS", 30*time.Minute),
+			TripKeywords: splitAndTrim(getEnv("OPENCODE_CB_TRIP_KEYWORDS",
+				"No available client,No available channel,Insufficient Balance,provider unavailable")),
 		},
 	}
 

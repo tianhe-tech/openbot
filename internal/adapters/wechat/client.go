@@ -248,9 +248,17 @@ func (c *Client) SendWeixinMessage(msg *WeixinMessage) error {
 		if resp.Errcode == -14 || resp.Ret == -14 {
 			return fmt.Errorf("%w: %s", ErrSessionExpired, base.Error())
 		}
-		// ret=-2 with empty errmsg is iLink bot rate-limit / anti-spam rejection.
+		// ret=-2 with an EMPTY errmsg is iLink bot rate-limit / anti-spam
+		// rejection. A non-empty errmsg (e.g. "prepare failed") is NOT a rate
+		// limit — the server could not prepare the conversation for this send
+		// (stale/invalid context_token). Treat that like a session problem so
+		// the caller clears the cached token and retries tokenless, instead of
+		// feeding it into the rate-limit cooldown/park machinery.
 		if resp.Ret == -2 && resp.Errcode == 0 {
-			return fmt.Errorf("%w: %s", ErrRateLimited, base.Error())
+			if resp.Errmsg == "" {
+				return fmt.Errorf("%w: %s", ErrRateLimited, base.Error())
+			}
+			return fmt.Errorf("%w: %s", ErrSessionExpired, base.Error())
 		}
 		return base
 	}
@@ -262,8 +270,10 @@ func (c *Client) SendWeixinMessage(msg *WeixinMessage) error {
 var ErrRateLimited = errors.New("wechat rate limited")
 
 // ErrSessionExpired is returned (wrapped) when the iLink bot API rejects a
-// send because the context_token is stale (errcode=-14). Callers should drop
-// the cached token for the recipient and retry once without it.
+// send because the context_token is stale (errcode=-14) or the conversation
+// could not be prepared for the send (ret=-2 with a non-empty errmsg such as
+// "prepare failed"). Callers should drop the cached token for the recipient
+// and retry once without it.
 var ErrSessionExpired = errors.New("wechat session expired")
 
 type configEnvelope struct {
@@ -345,10 +355,19 @@ func (c *Client) IsSentByUs(clientID string) bool {
 
 // SendText sends a plain text message to a WeChat user.
 func (c *Client) SendText(toUserID, text, contextToken string) error {
+	return c.SendTextWithClientID(toUserID, text, contextToken, generateClientID())
+}
+
+// SendTextWithClientID sends a plain text message using an explicit clientID.
+// Callers that persist the clientID across retries (the outbound queue) reuse
+// it on replay so a re-sent chunk carries the same clientID, giving the iLink
+// server a stable idempotency key and keeping our echo-dedup (IsSentByUs)
+// accurate for duplicates.
+func (c *Client) SendTextWithClientID(toUserID, text, contextToken, clientID string) error {
 	msg := &WeixinMessage{
 		Seq:          int(nextSeq()),
 		ToUserID:     toUserID,
-		ClientID:     generateClientID(),
+		ClientID:     clientID,
 		ContextToken: contextToken,
 		MessageType:  MessageTypeBot,
 		MessageState: MessageStateFinish,

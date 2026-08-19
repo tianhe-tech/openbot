@@ -18,11 +18,12 @@ func TestOutboundQueueSplitAndDispatchOrder(t *testing.T) {
 		defer mu.Unlock()
 		sent = append(sent, item.Content)
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	long := repeatRune("你", 3600)
 	if err := q.EnqueueText("u1", "s1", "", "final", long, true); err != nil {
@@ -72,11 +73,12 @@ func TestOutboundQueueRetryOnRateLimit(t *testing.T) {
 			return ErrRateLimited
 		}
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	if err := q.EnqueueText("u1", "s1", "", "final", "hello", true); err != nil {
 		t.Fatalf("enqueue failed: %v", err)
@@ -137,11 +139,12 @@ func TestOutboundQueuePerUserHeadLock(t *testing.T) {
 		sentUsers = append(sentUsers, item.UserID)
 		mu.Unlock()
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	if err := q.EnqueueText("u1", "s1", "", "final", "first", true); err != nil {
 		t.Fatalf("enqueue u1 first failed: %v", err)
@@ -226,11 +229,12 @@ func TestOutboundQueueBatchOrderingOnNack(t *testing.T) {
 			return errors.New("temporary failure")
 		}
 		return nil
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 
 	// 3600 runes → three chunks (1600/1600/400) sharing one batch_id.
 	long := repeatRune("你", 3600)
@@ -270,7 +274,7 @@ func TestOutboundQueueBatchOrderingOnNack(t *testing.T) {
 // TestOutboundQueuePriorityJump verifies that a PriorityHigh message
 // (e.g. permission/question confirmation) can jump ahead of a lower-priority
 // head that is blocked by a failed retry. This prevents the deadlock where:
-//  1. todo (PriorityLow) is enqueued first, fails, nacks with future retry
+//  1. todo (PriorityNormal) is enqueued first, fails, nacks with future retry
 //  2. question (PriorityHigh) is enqueued second
 //  3. question must be dispatchable despite the blocked todo head
 func TestOutboundQueuePriorityJump(t *testing.T) {
@@ -287,14 +291,15 @@ func TestOutboundQueuePriorityJump(t *testing.T) {
 		mu.Unlock()
 		return nil
 	}
-	q, err := newOutboundTextQueue(dbPath, 50*time.Millisecond, 1600, sendFunc, nil)
+	q, err := newOutboundTextQueue(dbPath, 50*time.Millisecond, 1600, sendFunc)
 	if err != nil {
 		t.Fatalf("newOutboundTextQueue failed: %v", err)
 	}
 	defer q.Stop()
+	q.setMinGap(0) // disable pacing for deterministic direct dispatch
 	q.Start()
 
-	// 1. Enqueue a todo (PriorityLow) — will fail on first attempt.
+	// 1. Enqueue a todo (PriorityNormal) — will fail on first attempt.
 	if err := q.EnqueueText("u1", "s1", "", "todo", "todo-update", false); err != nil {
 		t.Fatalf("enqueue todo failed: %v", err)
 	}
