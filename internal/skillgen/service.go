@@ -79,6 +79,17 @@ type Config struct {
 	ApprovalRequired bool
 	// MinConfidence gates drafts below this heuristic score (0..1). 0 accepts all.
 	MinConfidence float64
+	// PerModelTimeout is the drafting timeout budget for EACH model in the
+	// fallback chain (not shared). 0 defaults to 8m. This guarantees the
+	// second/third model gets a full budget instead of the leftover of the
+	// first model's budget.
+	PerModelTimeout time.Duration
+	// MaxConsecutiveFails: after this many consecutive draft failures
+	// (timeout / send error / unparseable reply) a model is temporarily
+	// demoted — skipped in pickModel for Cooldown duration. 0 defaults to 2.
+	MaxConsecutiveFails int
+	// Cooldown is how long a demoted model stays out of rotation. 0 defaults to 30m.
+	Cooldown time.Duration
 }
 
 // DefaultConfig returns a conservative, disabled-by-default config.
@@ -97,6 +108,9 @@ func DefaultConfig() Config {
 		InstallDir:          "skills",
 		ApprovalRequired:    true,
 		MinConfidence:       0.4,
+		PerModelTimeout:     8 * time.Minute,
+		MaxConsecutiveFails: 2,
+		Cooldown:            30 * time.Minute,
 	}
 }
 
@@ -154,6 +168,12 @@ type Service struct {
 	// dedup: best-effort per-thread recent-fire cache to avoid mining the same
 	// thread repeatedly on successive long-session ticks.
 	recent sync.Map // map[threadID]time.Time
+
+	// modelFails tracks consecutive draft failures per model so a persistently
+	// broken model can be temporarily demoted out of rotation. Guarded by mu.
+	mu         sync.Mutex
+	modelFails map[string]int       // modelID → consecutive failures
+	demotedAt  map[string]time.Time // modelID → when it was demoted
 }
 
 // NewService wires dependencies. queue and drafter MUST be non-nil when cfg.Enabled is true.
@@ -164,7 +184,25 @@ func NewService(cfg Config, store *memstore.Store, client *opencode.Client, queu
 	if cfg.InstallDir == "" {
 		cfg.InstallDir = "skills"
 	}
-	return &Service{cfg: cfg, store: store, client: client, queue: queue, drafter: drafter, notifier: notifier}
+	if cfg.PerModelTimeout <= 0 {
+		cfg.PerModelTimeout = 8 * time.Minute
+	}
+	if cfg.MaxConsecutiveFails <= 0 {
+		cfg.MaxConsecutiveFails = 2
+	}
+	if cfg.Cooldown <= 0 {
+		cfg.Cooldown = 30 * time.Minute
+	}
+	return &Service{
+		cfg:        cfg,
+		store:      store,
+		client:     client,
+		queue:      queue,
+		drafter:    drafter,
+		notifier:   notifier,
+		modelFails: map[string]int{},
+		demotedAt:  map[string]time.Time{},
+	}
 }
 
 // Config returns the effective config (used by command handlers to branch on settings).
@@ -286,9 +324,8 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 
 	// 4. Draft — try the picked model first, then fall back to alternates
 	// if the send fails (e.g. model unavailable, 500 from server).
-	draftCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
-	defer cancel()
-
+	// Each model gets its OWN timeout budget (PerModelTimeout) so the second
+	// model is not left with the leftover of the first model's budget.
 	var out DraftOutput
 	var draftErr error
 	triedModels := map[string]bool{}
@@ -298,7 +335,8 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 			continue
 		}
 		triedModels[tryModel] = true
-		log.Printf("skillgen: STEP4 drafting (model=%s, timeout=8m)...", tryModel)
+		log.Printf("skillgen: STEP4 drafting (model=%s, timeout=%v)...", tryModel, s.cfg.PerModelTimeout)
+		draftCtx, draftCancel := context.WithTimeout(ctx, s.cfg.PerModelTimeout)
 		out, draftErr = s.drafter.Draft(draftCtx, DraftInput{
 			Trigger:             string(ev.Trigger),
 			Adapter:             ev.Adapter,
@@ -308,9 +346,12 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 			ModelID:             tryModel,
 			ExistingSkillTitles: existingSkills,
 		})
+		draftCancel()
 		if draftErr == nil {
+			s.recordDraftSuccess(tryModel)
 			break
 		}
+		s.recordDraftFailure(tryModel)
 		log.Printf("skillgen: STEP4 draft failed (model=%s thread=%s): %v", tryModel, ev.ThreadID, draftErr)
 		// If there are more models to try, continue; otherwise give up.
 		if len(fallbackModels) > 1 {
@@ -411,11 +452,91 @@ func (s *Service) fetchTurns(ctx context.Context, sessionID string) ([]Turn, err
 
 // pickModel selects a model using memstore's epsilon-greedy helper when
 // ModelSelfSelect is on and stats are available; falls back to DraftModel.
+// Models that are currently demoted (too many consecutive failures) are
+// skipped so a broken model never blocks drafting.
 func (s *Service) pickModel() string {
 	if !s.cfg.ModelSelfSelect || s.store == nil {
+		if s.isDemoted(s.cfg.DraftModel) {
+			// DraftModel is demoted: pick the first healthy alternate.
+			for _, m := range s.cfg.AlternateModels {
+				if !s.isDemoted(m) {
+					return m
+				}
+			}
+			return s.cfg.DraftModel // all demoted; try anyway
+		}
 		return s.cfg.DraftModel
 	}
-	return s.store.PickSkillGenModel(s.cfg.AlternateModels, s.cfg.DraftModel, s.cfg.Epsilon)
+	picked := s.store.PickSkillGenModel(s.cfg.AlternateModels, s.cfg.DraftModel, s.cfg.Epsilon)
+	if !s.isDemoted(picked) {
+		return picked
+	}
+	// Picked model is demoted: fall back to the first healthy model in the pool.
+	log.Printf("skillgen: picked model %s is demoted (consecutive fails), selecting healthy alternate", picked)
+	for _, m := range s.buildFallbackChain(picked) {
+		if !s.isDemoted(m) {
+			return m
+		}
+	}
+	return picked // all demoted; try anyway rather than give up
+}
+
+// isDemoted reports whether the model is currently serving a demotion
+// cooldown after too many consecutive draft failures.
+func (s *Service) isDemoted(modelID string) bool {
+	if modelID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.demotedAt[modelID]
+	if !ok {
+		return false
+	}
+	if time.Since(at) >= s.cfg.Cooldown {
+		// Cooldown served: restore the model to rotation.
+		delete(s.demotedAt, modelID)
+		delete(s.modelFails, modelID)
+		log.Printf("skillgen: model %s demotion cooldown served, restored to rotation", modelID)
+		return false
+	}
+	return true
+}
+
+// recordDraftFailure registers a draft failure for the model. After
+// MaxConsecutiveFails consecutive failures the model is demoted for
+// Cooldown so it stops being picked first.
+func (s *Service) recordDraftFailure(modelID string) {
+	if modelID == "" {
+		return
+	}
+	// Also record a negative outcome so epsilon-greedy learns to avoid it.
+	if s.store != nil {
+		_ = s.store.RecordModelOutcome(modelID, false, 0)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelFails[modelID]++
+	if s.modelFails[modelID] >= s.cfg.MaxConsecutiveFails {
+		if _, already := s.demotedAt[modelID]; !already {
+			s.demotedAt[modelID] = time.Now()
+			log.Printf("skillgen: ⚠️ model %s demoted for %v after %d consecutive draft failures",
+				modelID, s.cfg.Cooldown, s.modelFails[modelID])
+		}
+	}
+}
+
+// recordDraftSuccess clears the consecutive-failure counter for the model
+// and promotes it to the front of the pool (persisted via a positive
+// outcome) so future pipelines prefer a model that actually works.
+func (s *Service) recordDraftSuccess(modelID string) {
+	if modelID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.modelFails, modelID)
+	delete(s.demotedAt, modelID)
+	s.mu.Unlock()
 }
 
 // buildFallbackChain returns an ordered list of models to try for drafting.

@@ -408,6 +408,12 @@ type Client struct {
 	isHealthy        bool         // OpenCode server是否健康
 	healthCheckMu    sync.RWMutex // 保护健康状态
 	modelOverride    sync.Map     // map[sessionID]opencode.SessionPromptParamsModel
+	// pendingOverride carries a user's /model override across a fallback
+	// session handoff. When attemptFallbackRetry keeps the override (because
+	// the failed model differs from the user's choice), it stores it here
+	// keyed by threadID; the next streaming turn that creates a fresh session
+	// applies it to the new sessionID so the user's model choice survives.
+	pendingOverride  sync.Map // map[threadID]opencode.SessionPromptParamsModel
 	providerCacheMu  sync.RWMutex
 	providerCacheAt  time.Time
 	providerCache    []Provider
@@ -1447,6 +1453,10 @@ func (c *Client) ListAgents(ctx context.Context) ([]opencode.Agent, error) {
 }
 
 // FindVideoSkill picks the most likely video-capable skill/agent name.
+// Only agents whose name/description explicitly reference video are
+// considered; generic tokens like "media"/"analy" alone must not match
+// (previously the generic "explore" agent was selected because its
+// description contained "media", producing wrong routing).
 func (c *Client) FindVideoSkill(ctx context.Context) string {
 	agents, err := c.ListAgents(ctx)
 	if err != nil || len(agents) == 0 {
@@ -1460,6 +1470,12 @@ func (c *Client) FindVideoSkill(ctx context.Context) string {
 		if name == "" {
 			continue
 		}
+		// 名称或描述必须显式包含 video 相关词，否则直接跳过。
+		// 只看 name+description，不看 prompt/mode（prompt 常含泛化词导致误匹配）。
+		nameDesc := strings.ToLower(strings.TrimSpace(agent.Name + " " + agent.Description))
+		if !strings.Contains(nameDesc, "video") && !strings.Contains(nameDesc, "视频") {
+			continue
+		}
 		text := strings.ToLower(strings.TrimSpace(agent.Name + " " + agent.Description + " " + agent.Prompt + " " + string(agent.Mode)))
 		score := 0
 		switch {
@@ -1468,7 +1484,7 @@ func (c *Client) FindVideoSkill(ctx context.Context) string {
 		case strings.Contains(text, "video_understanding"):
 			score += 11
 		}
-		for _, token := range []string{"video", "vision", "frame", "media", "analy", "clip", "movie"} {
+		for _, token := range []string{"video", "vision", "frame", "clip", "movie"} {
 			if strings.Contains(text, token) {
 				score += 2
 			}
@@ -3584,11 +3600,39 @@ func (c *Client) attemptFallbackRetry(oldSessionID string, payload MessagePayloa
 	log.Printf("opencode: 🔁 fallback retry: %s → %s/%s (reason=%s) for old session %s",
 		safeModelID(failedModel), fallback.ProviderID.Value, fallback.ModelID.Value, reason, oldSessionID[:min(8, len(oldSessionID))])
 
-	// Clear per-session model override so the new session does not inherit
-	// the failed model. selectModelOverride will pick the fallback via the
-	// breaker-aware path on the next turn.
+	// Preserve the user's /model override unless the failed model IS the
+	// override. When the failure comes from an auto-selected model (e.g. a
+	// multimodal fallback picked a different model than the user chose), the
+	// override must survive so the next turn keeps using the user's model.
+	// It is carried across the handoff via pendingOverride and re-applied to
+	// the fresh session by SendMessageStreamingWithEvents.
 	if failedModel != nil {
-		c.modelOverride.Delete(oldSessionID)
+		if override, ok := c.getSessionModelOverride(oldSessionID); ok {
+			failedKey := normalizeModelKey(failedModel.ProviderID.Value, failedModel.ModelID.Value)
+			overrideKey := normalizeModelKey(override.ProviderID.Value, override.ModelID.Value)
+			if failedKey == overrideKey {
+				// The user's chosen model itself failed: drop the override so
+				// the next turn picks a healthy model via the breaker-aware path.
+				c.modelOverride.Delete(oldSessionID)
+				log.Printf("opencode: fallback retry: dropping session override %s (it is the failed model)", overrideKey)
+			} else {
+				// The failed model is unrelated to the user's choice: keep the
+				// override and migrate it to the fresh session after handoff.
+				// Only possible when a thread exists to carry it across.
+				if payload.ThreadID != "" {
+					c.pendingOverride.Store(payload.ThreadID, override)
+					log.Printf("opencode: fallback retry: preserving session override %s (failed model %s differs), will re-apply to new session",
+						overrideKey, failedKey)
+				} else {
+					// No thread to carry the override; keep it on the old
+					// session id (harmless if that session is discarded).
+					log.Printf("opencode: fallback retry: preserving session override %s (failed model %s differs, no thread to migrate)",
+						overrideKey, failedKey)
+				}
+			}
+		} else {
+			c.modelOverride.Delete(oldSessionID)
+		}
 	}
 	// Force the new turn to use the selected fallback model explicitly.
 	payload.Model = fallback.ProviderID.Value + "/" + fallback.ModelID.Value
@@ -3917,6 +3961,43 @@ func (c *Client) ResetSession(threadID string) {
 		c.sessions.Delete(threadID)
 		log.Printf("opencode: reset session mapping for thread %s", threadID)
 	}
+}
+
+// InvalidateSessionCache removes all cached state for a broken session so
+// the next message for its thread creates a fresh session. This is required
+// after a session.error: the session still EXISTS on the server (so the
+// stale check passes), but its history contains a failed request that
+// opencode replays on every subsequent turn — reusing it makes every later
+// message fail with the same error. Clears:
+//   - c.sessions entries whose value == sessionID (threadID → sessionID)
+//   - per-session counters and caches (message/tool/token counts, model
+//     override/config, summary)
+func (c *Client) InvalidateSessionCache(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+
+	// 删除所有指向该 session 的 thread 映射
+	c.sessions.Range(func(key, value interface{}) bool {
+		if sid, ok := value.(string); ok && sid == sessionID {
+			if threadID, ok := key.(string); ok {
+				c.sessions.Delete(threadID)
+				log.Printf("opencode: invalidated session mapping thread %s -> %s (session.error)",
+					threadID, sessionID[:min(8, len(sessionID))])
+			}
+		}
+		return true
+	})
+
+	// 清除该 session 的计数与缓存，避免新 session 继承旧状态
+	c.messageCount.Delete(sessionID)
+	c.toolCallCount.Delete(sessionID)
+	c.tokenCount.Delete(sessionID)
+	c.modelOverride.Delete(sessionID)
+	c.modelConfig.Delete(sessionID)
+	c.sessionSummary.Delete(sessionID)
+	log.Printf("opencode: invalidated session cache for %s (session.error)", sessionID[:min(8, len(sessionID))])
 }
 
 // GetSessionForThread retrieves the session ID associated with a thread.
@@ -4562,6 +4643,23 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		log.Printf("opencode: created new session %s for streaming", sessionID)
 	}
 	threadLock.Unlock()
+
+	// Apply a pending model override carried across a fallback handoff. When
+	// attemptFallbackRetry preserved the user's /model choice (because the
+	// failed model differed from it), the override is stored under the thread
+	// and must be re-bound to the fresh session so the user's model survives.
+	// The retry turn itself still uses payload.Model (the fallback model),
+	// which takes priority in SendMessage; this only affects subsequent turns.
+	if payload.ThreadID != "" {
+		if v, ok := c.pendingOverride.Load(payload.ThreadID); ok {
+			if ov, ok2 := v.(opencode.SessionPromptParamsModel); ok2 {
+				c.modelOverride.Store(sessionID, ov)
+				c.pendingOverride.Delete(payload.ThreadID)
+				log.Printf("opencode: re-applied preserved session override %s/%s to new session %s",
+					ov.ProviderID.Value, ov.ModelID.Value, sessionID[:min(8, len(sessionID))])
+			}
+		}
+	}
 
 	// 2. 立即通过callback通知sessionID（供adapter建立user映射）
 	log.Printf("opencode: notifying sessionID %s via callback", sessionID)

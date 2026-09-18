@@ -53,6 +53,10 @@ func (d *OpencodeDrafter) Draft(ctx context.Context, in DraftInput) (DraftOutput
 	}
 	prompt := buildDraftPrompt(in, exemplar)
 	log.Printf("skillgen: drafter prompt built (len=%d) for thread=%s model=%s turns=%d", len(prompt), in.ThreadID, in.ModelID, len(in.Conversation))
+	// Cap the conversation and prompt size: a 300+ turn conversation produces
+	// a 350k+ char prompt the model cannot answer within the draft timeout.
+	in.Conversation = capConversation(in.Conversation)
+	prompt = truncatePrompt(prompt)
 
 	// Use an isolated thread so the drafting work doesn't pollute user threads.
 	threadID := fmt.Sprintf("skillgen-draft-%s", in.ThreadID)
@@ -218,6 +222,43 @@ func buildDraftPrompt(in DraftInput, reference string) string {
 		b.WriteString("\n\n")
 	}
 	return b.String()
+}
+
+// Default values capping the drafter prompt size. A 300+ turn conversation
+// produces a 350k+ char prompt that the model cannot finish answering within
+// the draft timeout — the #1 cause of "timed out waiting for assistant reply".
+const (
+	// maxDraftTurns caps how many conversation turns are sent to the drafter.
+	// The most recent turns are kept (they carry the actual procedure).
+	maxDraftTurns = 40
+	// maxDraftPromptChars caps the total prompt length.
+	maxDraftPromptChars = 60000
+)
+
+// capConversation keeps the most recent maxDraftTurns turns and prepends a
+// marker when earlier turns were dropped.
+func capConversation(turns []Turn) []Turn {
+	if len(turns) <= maxDraftTurns {
+		return turns
+	}
+	dropped := len(turns) - maxDraftTurns
+	capped := make([]Turn, 0, maxDraftTurns+1)
+	capped = append(capped, Turn{
+		Role: "user",
+		Text: fmt.Sprintf("（注意：对话共 %d 轮，前 %d 轮已省略，以下为最近 %d 轮）", len(turns), dropped, maxDraftTurns),
+	})
+	capped = append(capped, turns[dropped:]...)
+	return capped
+}
+
+// truncatePrompt hard-caps the assembled prompt so it stays within a size the
+// model can realistically process within the draft timeout.
+func truncatePrompt(prompt string) string {
+	if len(prompt) <= maxDraftPromptChars {
+		return prompt
+	}
+	log.Printf("skillgen: drafter prompt truncated %d → %d chars to fit draft timeout", len(prompt), maxDraftPromptChars)
+	return prompt[:maxDraftPromptChars] + "\n…(prompt truncated to fit timeout)…"
 }
 
 func truncate(s string, n int) string {

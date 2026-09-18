@@ -83,6 +83,11 @@ type Handler struct {
 	// between session.idle firing and the final flush completing.
 	dispatching sync.Map // map[userID]bool
 
+	// staging 暂存用户发来的媒体（无文字时），等用户补充意图后再合并发送
+	staging *base.MediaStagingStore
+	// stagingDebounce 延迟“已收到媒体”提示，文字紧随到达时静默合并
+	stagingDebounce *base.StagingPromptDebouncer
+
 	cancel context.CancelFunc
 }
 
@@ -117,6 +122,11 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		pendingTimers:     make(map[string]*time.Timer),
 	}
 	h.adapter = base.NewBidirectionalAdapter("wechat", h)
+
+	// 媒体暂存：用户只发媒体不带文字时先暂存，等用户补充意图
+	h.staging = base.NewMediaStagingStore(0)
+	h.staging.StartCleanupLoop(context.Background(), 10*time.Minute)
+	h.stagingDebounce = base.NewStagingPromptDebouncer(3 * time.Second)
 
 	// Inbound debounce window — tunable via env, defaults align with Hermes.
 	batchDelay := parseDurationEnv("WECHAT_TEXT_BATCH_DELAY_SECONDS", 3*time.Second)
@@ -517,6 +527,121 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 
 	// Build text after media extraction so saved file paths can be included.
 	userText := h.extractText(msg, savedFiles)
+
+	// ========== 媒体暂存拦截：媒体消息无文字时先暂存，等用户补充意图 ==========
+	if userText == "" && (len(attachments) > 0 || len(savedFiles) > 0) {
+		var stagedItems []base.StagedMediaItem
+		for _, att := range attachments {
+			msgType := "image"
+			if strings.HasPrefix(att.Mime, "video/") {
+				msgType = "video"
+			}
+			if msgType == "video" && strings.HasPrefix(att.URL, "data:") {
+				// 视频不走 data URI 附件：部分 provider 会拒绝 video/mp4 file part
+				// （报 'file part media type video/mp4' functionality not supported）。
+				// 改为保存到本地文件，用 MediaFileRecord 暂存（与钉钉一致），
+				// 让模型直接从磁盘读取视频文件。
+				now := time.Now().UTC()
+				relDir := base.BuildMediaRelativeDir("wechat", userID, "new", now)
+				record, saveErr := base.SaveDataURIToTempMedia(
+					att.URL, relDir, "video", strconv.FormatInt(msg.MessageID, 10), att.Filename,
+				)
+				if saveErr != nil {
+					log.Printf("wechat: ⚠️ failed to save video data URI to temp file: %v, falling back to attachment", saveErr)
+					stagedItems = append(stagedItems, base.StagedMediaItem{
+						Platform: "wechat",
+						MsgType:  msgType,
+						Filename: att.Filename,
+						Mime:     att.Mime,
+						DataURI:  att.URL,
+					})
+				} else {
+					log.Printf("wechat: 🗂️ video temp saved: %s (size: %d bytes)", record.LocalPath, record.Size)
+					stagedItems = append(stagedItems, base.StagedMediaItem{
+						Platform: "wechat",
+						MsgType:  msgType,
+						Filename: record.Filename,
+						Mime:     record.Mime,
+						MediaFile: &base.MediaFileRecord{
+							Platform:     "wechat",
+							MsgType:      "video",
+							Filename:     record.Filename,
+							Mime:         record.Mime,
+							Size:         record.Size,
+							SHA256:       record.SHA256,
+							LocalPath:    record.LocalPath,
+							RelativePath: record.RelativePath,
+							CreatedAt:    record.CreatedAt,
+							ExpireAt:     record.ExpireAt,
+						},
+					})
+				}
+				continue
+			}
+			stagedItems = append(stagedItems, base.StagedMediaItem{
+				Platform: "wechat",
+				MsgType:  msgType,
+				Filename: att.Filename,
+				Mime:     att.Mime,
+				DataURI:  att.URL,
+			})
+		}
+		for _, path := range savedFiles {
+			stagedItems = append(stagedItems, base.StagedMediaItem{
+				Platform: "wechat",
+				MsgType:  "file",
+				Filename: filepath.Base(path),
+				MediaFile: &base.MediaFileRecord{
+					Platform:  "wechat",
+					MsgType:   "file",
+					Filename:  filepath.Base(path),
+					LocalPath: path,
+				},
+			})
+		}
+		staged := h.staging.StageAll("wechat", userID, stagedItems)
+		if len(staged) > 0 {
+			hint := base.StagedItemsToPromptHint(staged)
+			prompt := fmt.Sprintf("📥 已收到%s，请告诉我你想对这些文件做什么。", hint)
+			// 延迟发送提示：若用户文字紧随其后到达，Consume 前会取消本提示，
+			// 媒体静默合并，避免“先提示再合并”的割裂体验。
+			h.stagingDebounce.Trigger(base.StageKey("wechat", userID), func() {
+				_ = h.enqueueAsyncText(userID, "", ctxToken, "info", prompt, true)
+			})
+			log.Printf("wechat: 📥 staged %d media item(s) for user %s, waiting for intent (prompt debounced)", len(staged), userID)
+			return nil
+		}
+	}
+
+	// ========== 合并暂存：用户发文字时，把之前暂存的媒体一并合并发送 ==========
+	if userText != "" {
+		// 先取消待发的“已收到媒体”提示，避免提示与合并结果先后出现。
+		h.stagingDebounce.CancelAndLog("wechat", userID)
+		if items, ok := h.staging.Consume("wechat", userID); ok {
+			for _, item := range items {
+				if item.DataURI != "" {
+					attachments = append(attachments, opencode.Attachment{
+						Mime:     item.Mime,
+						URL:      item.DataURI,
+						Filename: item.Filename,
+					})
+				}
+				if item.MediaFile != nil && item.MediaFile.LocalPath != "" {
+					savedFiles = append(savedFiles, item.MediaFile.LocalPath)
+					if item.MsgType == "video" {
+						// 视频以本地文件方式发送，提示模型读取 local_path
+						userText += fmt.Sprintf("\n[视频已保存到工作目录: %s，请直接读取该文件并分析视频内容]", item.MediaFile.LocalPath)
+					} else if item.MsgType == "file" {
+						// 文件以本地文件方式发送，提示模型读取 local_path
+						// （savedFiles 不会传给 dispatchToOpenCode，必须写进 userText）
+						userText += fmt.Sprintf("\n[文件已保存到工作目录: %s，请直接读取该文件]", filepath.Base(item.MediaFile.LocalPath))
+					}
+				}
+			}
+			log.Printf("wechat: 🔗 merged %d staged media item(s) with user text", len(items))
+		}
+	}
+
 	if userText == "" {
 		return nil
 	}
@@ -605,7 +730,6 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 
 func (h *Handler) extractText(msg *WeixinMessage, savedFiles []string) string {
 	var parts []string
-	hasMedia := false
 	for _, item := range msg.ItemList {
 		switch item.Type {
 		case ItemTypeText:
@@ -619,26 +743,26 @@ func (h *Handler) extractText(msg *WeixinMessage, savedFiles []string) string {
 				parts = append(parts, "[语音消息]")
 			}
 		case ItemTypeImage:
-			hasMedia = true
+			// 图片无文字，由 handleBatchedMessage 暂存
 		case ItemTypeFile:
 			// File info is added below from savedFiles
-			hasMedia = true
 		case ItemTypeVideo:
-			hasMedia = true
+			// 视频无文字，由 handleBatchedMessage 暂存
 		}
 	}
 
-	// Append saved file info so the model knows which files are available
-	for _, f := range savedFiles {
-		parts = append(parts, fmt.Sprintf("\n[文件已保存到工作目录: %s，请直接读取该文件]", filepath.Base(f)))
+	// Append saved file info so the model knows which files are available.
+	// Only when there is actual user text: a file-only message must return
+	// empty text so handleBatchedMessage stages it and asks for intent
+	// instead of dispatching immediately.
+	if len(parts) > 0 {
+		for _, f := range savedFiles {
+			parts = append(parts, fmt.Sprintf("\n[文件已保存到工作目录: %s，请直接读取该文件]", filepath.Base(f)))
+		}
 	}
 
 	text := strings.Join(parts, "")
-	// If there's media but no text, provide a default prompt so the model
-	// knows an attachment is present.
-	if text == "" && hasMedia {
-		text = "请查看附件内容"
-	}
+	// 媒体无文字时返回空，由 handleBatchedMessage 暂存并提示用户补充意图
 	return text
 }
 
