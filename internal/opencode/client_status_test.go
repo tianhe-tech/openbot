@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sst/opencode-sdk-go"
 )
 
 func TestGetSessionDiagnosticsLiveHandlerIsRunning(t *testing.T) {
@@ -87,14 +89,14 @@ func TestGetLastEventInfoUsesMeaningfulActivity(t *testing.T) {
 func TestSilentModelHangCandidateExcludesExistingProgress(t *testing.T) {
 	tests := []struct {
 		name    string
-		handler StreamingSessionHandler
+		handler *StreamingSessionHandler
 		want    bool
 	}{
-		{name: "no progress", want: true},
-		{name: "content sent", handler: StreamingSessionHandler{contentSent: true}, want: false},
-		{name: "tool observed", handler: StreamingSessionHandler{toolObserved: true}, want: false},
-		{name: "provider retry", handler: StreamingSessionHandler{retryAttempt: 1}, want: false},
-		{name: "waiting for user", handler: StreamingSessionHandler{pendingQuestionSince: time.Now()}, want: false},
+		{name: "no progress", handler: &StreamingSessionHandler{}, want: true},
+		{name: "content sent", handler: &StreamingSessionHandler{contentSent: true}, want: false},
+		{name: "tool observed", handler: &StreamingSessionHandler{toolObserved: true}, want: false},
+		{name: "provider retry", handler: &StreamingSessionHandler{retryAttempt: 1}, want: false},
+		{name: "waiting for user", handler: &StreamingSessionHandler{pendingQuestionSince: time.Now()}, want: false},
 	}
 
 	for _, test := range tests {
@@ -189,5 +191,71 @@ func TestStreamingHandlerTracksFallbackRetryDispatch(t *testing.T) {
 	handler := &StreamingSessionHandler{fallbackRetryDispatched: true}
 	if !handler.FallbackRetryDispatched() {
 		t.Fatal("expected fallback retry dispatch to be reported")
+	}
+}
+
+func TestAttemptFallbackRetryPreservesOverrideWhenFailedModelDiffers(t *testing.T) {
+	client := &Client{
+		providerCacheAt: time.Now(),
+		providerCache: []Provider{
+			{ID: "user-provider", Models: []Model{{ID: "user-model"}}},
+			{ID: "fallback-provider", Models: []Model{{ID: "fallback-model"}}},
+		},
+		capabilityCache: map[string]modelCapability{
+			"user-provider/user-model":         {},
+			"fallback-provider/fallback-model": {},
+		},
+	}
+	oldSessionID := "ses_override_keep"
+	override := opencode.SessionPromptParamsModel{
+		ProviderID: opencode.F("user-provider"),
+		ModelID:    opencode.F("user-model"),
+	}
+	client.modelOverride.Store(oldSessionID, override)
+
+	// Failed model differs from the user's override → override must survive
+	// and be queued for migration to the fresh session.
+	client.attemptFallbackRetry(oldSessionID, MessagePayload{
+		ThreadID: "thread_keep",
+	}, modelFromRef("fallback-provider", "fallback-model"), nil, nil)
+
+	if _, ok := client.getSessionModelOverride(oldSessionID); !ok {
+		t.Fatal("expected user override to be preserved when the failed model differs")
+	}
+	if _, ok := client.pendingOverride.Load("thread_keep"); !ok {
+		t.Fatal("expected override to be queued for migration to the new session")
+	}
+}
+
+func TestAttemptFallbackRetryDropsOverrideWhenFailedModelIsOverride(t *testing.T) {
+	client := &Client{
+		providerCacheAt: time.Now(),
+		providerCache: []Provider{
+			{ID: "user-provider", Models: []Model{{ID: "user-model"}}},
+			{ID: "fallback-provider", Models: []Model{{ID: "fallback-model"}}},
+		},
+		capabilityCache: map[string]modelCapability{
+			"user-provider/user-model":         {},
+			"fallback-provider/fallback-model": {},
+		},
+	}
+	oldSessionID := "ses_override_drop"
+	override := opencode.SessionPromptParamsModel{
+		ProviderID: opencode.F("user-provider"),
+		ModelID:    opencode.F("user-model"),
+	}
+	client.modelOverride.Store(oldSessionID, override)
+
+	// Failed model IS the user's override → override must be dropped so the
+	// next turn picks a healthy model.
+	client.attemptFallbackRetry(oldSessionID, MessagePayload{
+		ThreadID: "thread_drop",
+	}, modelFromRef("user-provider", "user-model"), nil, nil)
+
+	if _, ok := client.getSessionModelOverride(oldSessionID); ok {
+		t.Fatal("expected user override to be dropped when it is the failed model")
+	}
+	if _, ok := client.pendingOverride.Load("thread_drop"); ok {
+		t.Fatal("expected no pending override migration when the override itself failed")
 	}
 }

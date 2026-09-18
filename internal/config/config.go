@@ -89,6 +89,15 @@ type SkillAutogenConfig struct {
 	MinToolCalls        int
 	QueueCapacity       int
 	ReferenceSkillPath  string
+	// PerModelTimeout is the drafting timeout budget for EACH model in the
+	// fallback chain (default 8m). Shared budgets left later models with
+	// only the leftover time, guaranteeing their failure.
+	PerModelTimeout time.Duration
+	// MaxConsecutiveFails: consecutive draft failures before a model is
+	// temporarily demoted out of rotation (default 2).
+	MaxConsecutiveFails int
+	// Cooldown: how long a demoted model stays out of rotation (default 30m).
+	Cooldown time.Duration
 }
 
 // RetryQueueConfig is the env-driven sub-config for internal/retryworker.
@@ -184,6 +193,9 @@ func Load() (Config, error) {
 			MinConfidence:       getFloat("SKILLGEN_MIN_CONFIDENCE", 0.4),
 			QueueCapacity:       getInt("SKILLGEN_QUEUE_CAPACITY", 128),
 			ReferenceSkillPath:  getEnv("SKILLGEN_REFERENCE_SKILL", "skills/skill-creator/SKILL.md"),
+			PerModelTimeout:     getDuration("SKILLGEN_PER_MODEL_TIMEOUT", 8*time.Minute),
+			MaxConsecutiveFails: getInt("SKILLGEN_MAX_CONSECUTIVE_FAILS", 2),
+			Cooldown:            getDuration("SKILLGEN_MODEL_COOLDOWN", 30*time.Minute),
 		},
 		RetryQueue: RetryQueueConfig{
 			Enabled:    getBool("RETRY_QUEUE_ENABLED", false),

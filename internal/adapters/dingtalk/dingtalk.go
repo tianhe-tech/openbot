@@ -138,6 +138,8 @@ type Handler struct {
 	// retryStore and retryWorker support the /retry command and off-peak retry queue.
 	retryStore  *memstore.Store
 	retryWorker *retryworker.Worker
+	// staging 暂存用户发来的媒体（无文字时），等用户补充意图后再合并发送
+	staging *base.MediaStagingStore
 }
 
 const (
@@ -185,6 +187,10 @@ func NewHandler(ocClient *opencode.Client, cfg Config) *Handler {
 	}
 
 	h.adapter = base.NewBidirectionalAdapter("dingtalk", h)
+
+	// 媒体暂存：用户只发媒体不带文字时先暂存，等用户补充意图
+	h.staging = base.NewMediaStagingStore(0)
+	h.staging.StartCleanupLoop(context.Background(), 10*time.Minute)
 
 	// Register a stuck session hook for logging. DingTalk doesn't have an async
 	// push channel (messages require a sessionWebhook from an inbound message),
@@ -370,7 +376,8 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	var mediaInfo map[string]interface{}
 	var extraAttachments []opencode.Attachment // 用于 richText 等多附件场景
 	var mediaFiles []base.MediaFileRecord
-	var videoSkillName string // 视频处理 skill 名称
+	var stagedItems []base.StagedMediaItem // 暂存的媒体项（无文字时）
+	var videoSkillName string              // 视频处理 skill 名称
 	mediaSessionID := "new"
 	if existingSessionID, ok := h.adapter.GetSessionForUser(userID); ok && strings.TrimSpace(existingSessionID) != "" {
 		mediaSessionID = strings.TrimSpace(existingSessionID)
@@ -425,14 +432,24 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 			}
 		}
 		// 图片消息：构建合理的提示文本
-		// 如果有用户输入的文字就用文字，否则给模型一个识别图片的提示
+		// 如果有用户输入的文字就用文字，否则暂存图片等用户补充意图
 		content = ""
 		if data.Text.Content != "" {
 			content = data.Text.Content
 		}
-		// 如果用户没有提供文字说明，给模型一个默认提示
-		if content == "" {
-			content = "请分析这张图片的内容。"
+		// 用户没有提供文字说明：暂存图片，等用户补充意图后再发送
+		if content == "" && mediaInfo != nil {
+			if url, ok := mediaInfo["url"].(string); ok && strings.HasPrefix(url, "data:") {
+				mime, _ := mediaInfo["mime"].(string)
+				stagedItems = append(stagedItems, base.StagedMediaItem{
+					Platform: "dingtalk",
+					MsgType:  "image",
+					Filename: "dingtalk_image.jpg",
+					Mime:     mime,
+					DataURI:  url,
+				})
+				mediaInfo = nil // 不随本次消息发送
+			}
 		}
 
 	case "audio", "voice":
@@ -583,6 +600,34 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 							durSec = durRaw / 1000
 						}
 
+						// 用户没有提供文字说明：暂存视频，等用户补充意图后再发送
+						if strings.TrimSpace(data.Text.Content) == "" {
+							mediaFile := base.MediaFileRecord{
+								MessageID:    msgID,
+								UserID:       userID,
+								SessionID:    mediaSessionID,
+								Platform:     "dingtalk",
+								MsgType:      "video",
+								Filename:     saved.Filename,
+								Mime:         saved.Mime,
+								Size:         saved.Size,
+								SHA256:       saved.SHA256,
+								LocalPath:    saved.LocalPath,
+								RelativePath: saved.RelativePath,
+								CreatedAt:    saved.CreatedAt,
+								ExpireAt:     saved.ExpireAt,
+							}
+							stagedItems = append(stagedItems, base.StagedMediaItem{
+								Platform:  "dingtalk",
+								MsgType:   "video",
+								Filename:  saved.Filename,
+								Mime:      saved.Mime,
+								MediaFile: &mediaFile,
+							})
+							log.Printf("  - 📥 Video staged (no user text), waiting for user intent")
+							break
+						}
+
 						// 1. 检查是否有明确支持视频的模型
 						if h.client.HasVideoCapableModel() {
 							mediaFiles = append(mediaFiles, base.MediaFileRecord{
@@ -659,8 +704,8 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				}
 			}
 		}
-		// 如果内容为空，设置默认提示
-		if content == "" {
+		// 如果内容为空，设置默认提示（已暂存媒体时跳过，等用户补充意图）
+		if content == "" && len(stagedItems) == 0 {
 			content = "请分析这个视频的内容。"
 		}
 
@@ -717,7 +762,22 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				}
 			}
 		}
-		if strings.TrimSpace(content) == "" {
+		// 用户没有提供文字说明：暂存文件，等用户补充意图后再发送
+		if strings.TrimSpace(content) == "" && len(mediaFiles) > 0 {
+			for i := range mediaFiles {
+				record := mediaFiles[i]
+				stagedItems = append(stagedItems, base.StagedMediaItem{
+					Platform:  "dingtalk",
+					MsgType:   "file",
+					Filename:  record.Filename,
+					Mime:      record.Mime,
+					MediaFile: &record,
+				})
+			}
+			mediaFiles = nil // 不随本次消息发送
+			log.Printf("  - 📥 File staged (no user text), waiting for user intent")
+		}
+		if strings.TrimSpace(content) == "" && len(stagedItems) == 0 {
 			fileName := strings.TrimSpace(fContent.FileName)
 			if fileName == "" {
 				fileName = "未命名文件"
@@ -892,9 +952,29 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				content = strings.Join(textParts, " ")
 			}
 		}
-		// richText 消息：如果用户没有提供文字，且只有图片，给默认提示
-		if content == "" && len(extraAttachments) > 0 {
-			content = "请分析这张图片的内容。"
+		// richText 消息：如果用户没有提供文字，暂存媒体等用户补充意图
+		if content == "" && (len(extraAttachments) > 0 || len(mediaFiles) > 0) {
+			for _, att := range extraAttachments {
+				stagedItems = append(stagedItems, base.StagedMediaItem{
+					Platform: "dingtalk",
+					MsgType:  "image",
+					Filename: att.Filename,
+					Mime:     att.Mime,
+					DataURI:  att.URL,
+				})
+			}
+			for i := range mediaFiles {
+				record := mediaFiles[i]
+				stagedItems = append(stagedItems, base.StagedMediaItem{
+					Platform:  "dingtalk",
+					MsgType:   record.MsgType,
+					Filename:  record.Filename,
+					Mime:      record.Mime,
+					MediaFile: &record,
+				})
+			}
+			extraAttachments = nil
+			mediaFiles = nil
 		} else if content == "" {
 			content = "[图文消息]"
 		}
@@ -906,6 +986,19 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook,
 			[]byte(fmt.Sprintf("暂不支持 %s 类型的消息，请发送文本、图片、语音、视频或文件消息。", msgType)))
 		return nil, nil
+	}
+
+	// 媒体暂存：用户只发媒体不带文字 → 暂存并提示，等用户补充意图后再发送
+	if len(stagedItems) > 0 {
+		staged := h.staging.StageAll("dingtalk", userID, stagedItems)
+		if len(staged) > 0 {
+			hint := base.StagedItemsToPromptHint(staged)
+			msg := fmt.Sprintf("📥 已收到%s，请告诉我你想对这些文件做什么。", hint)
+			if err := h.sendReplyBySource(ctx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg); err != nil {
+				log.Printf("dingtalk stream: ⚠️ failed to send staging prompt: %v", err)
+			}
+			return nil, nil
+		}
 	}
 
 	if content == "" {
@@ -1090,6 +1183,27 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		}
 	}
 
+	// 用户补充意图：合并之前暂存的媒体一起发送
+	if isPlainTextMessage {
+		if items, ok := h.staging.Consume("dingtalk", userID); ok {
+			log.Printf("dingtalk stream: 📎 merging %d staged media item(s) with user text", len(items))
+			for _, item := range items {
+				if item.DataURI != "" {
+					attachments = append(attachments, opencode.Attachment{
+						Mime:     item.Mime,
+						URL:      item.DataURI,
+						Filename: item.Filename,
+					})
+				} else if item.MediaFile != nil {
+					mediaFiles = append(mediaFiles, *item.MediaFile)
+					if item.MsgType == "video" {
+						videoSkillName = h.client.FindVideoSkill(ctx)
+					}
+				}
+			}
+		}
+	}
+
 	// 如果是命令形式的回复，走 /answer 命令处理。
 
 	// Parse agent specification: @agent_name message content
@@ -1185,7 +1299,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		"sender_nick":       data.SenderNick,
 		"message_type":      msgType,
 	}
-	if len(mediaFiles) > 0 && (msgType == "file" || msgType == "video") {
+	if len(mediaFiles) > 0 {
 		taskSessionID := sessionID
 		if strings.TrimSpace(taskSessionID) == "" {
 			taskSessionID = mediaSessionID
