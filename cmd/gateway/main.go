@@ -217,6 +217,9 @@ func main() {
 			ApprovalRequired:    cfg.SkillAutogen.ApprovalRequired,
 			MinConfidence:       cfg.SkillAutogen.MinConfidence,
 			MinToolCalls:        cfg.SkillAutogen.MinToolCalls,
+			PerModelTimeout:     cfg.SkillAutogen.PerModelTimeout,
+			MaxConsecutiveFails: cfg.SkillAutogen.MaxConsecutiveFails,
+			Cooldown:            cfg.SkillAutogen.Cooldown,
 		}
 		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath, cfg.SkillAutogen.InstallDir)
 		notifier := skillgen.NewRegistryNotifier(adapterRegistry)
@@ -536,6 +539,12 @@ func main() {
 		if eventType == "session.error" && !isCronSession {
 			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
 				sessionID[:min(8, len(sessionID))], foundUserID)
+			// 同时清除 client 的 thread→session 缓存：坏 session 在服务端仍然
+			// 存在（stale 检查会通过），但其历史包含失败的请求，opencode 会在
+			// 后续每一轮重放，导致该用户之后所有消息都报同样的错误。
+			if ocClient != nil {
+				ocClient.InvalidateSessionCache(sessionID)
+			}
 			foundAdapter.ClearSessionForUser(foundUserID)
 			erroredSessions.Store(sessionID, struct{}{})
 		}

@@ -70,6 +70,11 @@ type Handler struct {
 	// retryStore and retryWorker support the /retry command and off-peak retry queue.
 	retryStore  *memstore.Store
 	retryWorker *retryworker.Worker
+	// staging 暂存用户发来的媒体（无文字时），等用户补充意图后再合并发送
+	staging *base.MediaStagingStore
+	// stagingDebounce 延迟“已收到媒体”提示：飞书会把同一条消息里的文件和文字
+	// 拆成两个事件先后送达，先提示再合并会让用户觉得“没有处理好”。
+	stagingDebounce *base.StagingPromptDebouncer
 }
 
 const (
@@ -129,6 +134,11 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 		},
 	}
 	h.adapter = base.NewBidirectionalAdapter("feishu", h)
+
+	// 媒体暂存：用户只发媒体不带文字时先暂存，等用户补充意图
+	h.staging = base.NewMediaStagingStore(0)
+	h.staging.StartCleanupLoop(context.Background(), 10*time.Minute)
+	h.stagingDebounce = base.NewStagingPromptDebouncer(3 * time.Second)
 
 	// Register a stuck session hook for logging. Feishu's push requires a
 	// chat target from an inbound message, so the user will see the stuck
@@ -792,7 +802,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		"receive_id":      target.receiveID,
 		"receive_id_type": target.receiveIDType,
 	}
-	if len(msg.MediaFiles) > 0 && (msg.MessageType == "file" || msg.MessageType == "video") {
+	if len(msg.MediaFiles) > 0 {
 		taskSessionID := sessionID
 		if strings.TrimSpace(taskSessionID) == "" {
 			taskSessionID = "new"
@@ -986,6 +996,79 @@ func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2Message
 		log.Printf("❌ feishu: 解析消息内容失败: %v", err)
 		return fmt.Errorf("feishu: parse content: %w", err)
 	}
+
+	// ========== 媒体暂存拦截：媒体消息无文字时先暂存，等用户补充意图 ==========
+	if content == "" && (len(attachments) > 0 || len(mediaFiles) > 0) {
+		var stagedItems []base.StagedMediaItem
+		for i := range attachments {
+			att := attachments[i]
+			stagedItems = append(stagedItems, base.StagedMediaItem{
+				Platform: "feishu",
+				MsgType:  "image",
+				Filename: att.Filename,
+				Mime:     att.Mime,
+				DataURI:  att.URL,
+			})
+		}
+		for i := range mediaFiles {
+			record := mediaFiles[i]
+			stagedItems = append(stagedItems, base.StagedMediaItem{
+				Platform:  "feishu",
+				MsgType:   record.MsgType,
+				Filename:  record.Filename,
+				Mime:      record.Mime,
+				MediaFile: &record,
+			})
+		}
+		staged := h.staging.StageAll("feishu", userID, stagedItems)
+		if len(staged) > 0 {
+			hint := base.StagedItemsToPromptHint(staged)
+			msg := fmt.Sprintf("📥 已收到%s，请告诉我你想对这些文件做什么。", hint)
+			chatID := ""
+			if event.Event.Message.ChatId != nil {
+				chatID = *event.Event.Message.ChatId
+			}
+			target := chatTarget{receiveID: chatID, receiveIDType: "chat_id"}
+			if chatID == "" {
+				target = chatTarget{receiveID: userID, receiveIDType: "open_id"}
+			}
+			// 延迟发送提示：飞书会把同一条消息里的文件和文字拆成两个事件，
+			// 若文字事件紧随其后到达，Consume 前会取消本提示，媒体静默合并。
+			stagingTarget := target
+			h.stagingDebounce.Trigger(base.StageKey("feishu", userID), func() {
+				if sendErr := h.sendTextChunks(context.Background(), stagingTarget, msg); sendErr != nil {
+					log.Printf("feishu: ⚠️ failed to send staging prompt: %v", sendErr)
+				}
+			})
+			log.Printf("feishu: 📥 staged %d media item(s) for user %s, waiting for intent (prompt debounced)", len(staged), userID[:min(12, len(userID))])
+			return nil
+		}
+	}
+
+	// ========== 合并暂存：用户发文字时，把之前暂存的媒体一并合并发送 ==========
+	if content != "" {
+		// 先取消待发的“已收到媒体”提示，避免提示与合并结果先后出现。
+		h.stagingDebounce.CancelAndLog("feishu", userID)
+		if items, ok := h.staging.Consume("feishu", userID); ok {
+			for _, item := range items {
+				if item.DataURI != "" {
+					attachments = append(attachments, opencode.Attachment{
+						Mime:     item.Mime,
+						URL:      item.DataURI,
+						Filename: item.Filename,
+					})
+				}
+				if item.MediaFile != nil {
+					mediaFiles = append(mediaFiles, *item.MediaFile)
+					if item.MsgType == "video" {
+						videoSkillName = h.client.FindVideoSkill(ctx)
+					}
+				}
+			}
+			log.Printf("feishu: 🔗 merged %d staged media item(s) with user text", len(items))
+		}
+	}
+
 	if content == "" {
 		log.Printf("⚠️  feishu: 消息内容为空 (type=%s)", messageType)
 		return nil
@@ -1450,15 +1533,16 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 	case "image":
 		var img feishuImageContent
 		if err := json.Unmarshal([]byte(rawContent), &img); err != nil || img.ImageKey == "" {
-			return "请分析这张图片的内容。", nil, nil, "", nil
+			return "", nil, nil, "", nil
 		}
 		dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, img.ImageKey, "image")
 		if err != nil {
 			log.Printf("feishu: ⚠️ image download failed: %v", err)
-			return "请分析这张图片的内容。", nil, nil, "", nil
+			return "", nil, nil, "", nil
 		}
 		log.Printf("feishu: ✅ image downloaded (mime=%s, len=%d)", mime, len(dataURI))
-		return "请分析这张图片的内容。", []opencode.Attachment{{Mime: mime, URL: dataURI}}, nil, "", nil
+		// 返回空 content，由 onMessageReceived 暂存并提示用户补充意图
+		return "", []opencode.Attachment{{Mime: mime, URL: dataURI}}, nil, "", nil
 
 	case "audio", "voice":
 		var aud feishuAudioContent
@@ -1472,7 +1556,7 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 			log.Printf("asr-summary platform=feishu mime=%s format=%s sampleRate=%d textLen=%d status=%s", asrMime, asrFormat, asrRate, asrTextLen, asrStatus)
 			return "[语音消息]", nil, nil, "", nil
 		}
-		durMs, _ := strconv.Atoi(aud.Duration)
+		durMs := int(aud.Duration)
 		durSec := durMs / 1000
 		if durSec == 0 && durMs > 0 {
 			durSec = 1
@@ -1514,8 +1598,9 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 
 	case "video", "media":
 		// 飞书的视频消息类型是 "media" 而非 "video"
-		// 尝试解析两种格式
-		var fileKey, duration string
+		// 尝试解析两种格式（duration 为 JSON 数字，单位毫秒）
+		var fileKey string
+		var duration int64
 		var fileName string
 
 		// 先尝试解析 media 格式（飞书实际发送的格式）
@@ -1524,7 +1609,7 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 			fileKey = mediaContent.FileKey
 			duration = mediaContent.Duration
 			fileName = mediaContent.FileName
-			log.Printf("feishu: parsed as media format - fileKey=%s, fileName=%s, duration=%s", fileKey, fileName, duration)
+			log.Printf("feishu: parsed as media format - fileKey=%s, fileName=%s, duration=%dms", fileKey, fileName, duration)
 		} else {
 			// 回退到 video 格式
 			var vid feishuVideoContent
@@ -1534,10 +1619,10 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 			}
 			fileKey = vid.FileKey
 			duration = vid.Duration
-			log.Printf("feishu: parsed as video format - fileKey=%s, duration=%s", fileKey, duration)
+			log.Printf("feishu: parsed as video format - fileKey=%s, duration=%dms", fileKey, duration)
 		}
 
-		durMs, _ := strconv.Atoi(strings.TrimSpace(duration))
+		durMs := int(duration)
 		durSec := durMs / 1000
 		if durSec == 0 && durMs > 0 {
 			durSec = 1
@@ -1581,12 +1666,20 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		// 3. 都没有 → 返回错误
 
 		// 1. 检查是否有明确支持视频的模型
+		// 注意：即使模型目录声明支持视频，部分 provider 实际会拒绝 video/mp4
+		// file part（例如 starfire-jd/GLM-5.3-Flash，目录声明 video 可用但请求
+		// 报 'file part media type video/mp4' functionality not supported）。
+		// 因此优先走本地文件 + MEDIA_TASK 模式（与钉钉一致，已验证可用），
+		// 让模型直接从磁盘读取视频文件，避免 file part 被拒。
 		if h.client.HasVideoCapableModel() {
-			var mediaFiles []base.MediaFileRecord
 			if videoRecord != nil {
-				mediaFiles = append(mediaFiles, *videoRecord)
+				log.Printf("feishu: ✅ video saved locally (%s), using MEDIA_TASK local_path mode", videoRecord.LocalPath)
+				// 返回空 content + mediaFiles，由 onMessageReceived 暂存，
+				// 用户补充意图后以 MEDIA_TASK + local_path 方式发送
+				return "", nil, []base.MediaFileRecord{*videoRecord}, "", nil
 			}
-			log.Printf("feishu: ✅ Using video-capable model to process video directly")
+			// 本地保存失败时回退：尝试 data URI 附件方式
+			log.Printf("feishu: ✅ Using video-capable model to process video directly (data URI fallback)")
 			dataURI, mime, err := h.downloadFeishuMediaAsDataURI(ctx, messageID, fileKey, "video")
 			if err != nil {
 				log.Printf("feishu: ⚠️ video download with type=video failed: %v, retry with type=file", err)
@@ -1598,18 +1691,12 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 				if durSec > 0 {
 					videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
 				}
-				if videoRecord != nil {
-					videoPrompt = fmt.Sprintf("视频文件已保存到: %s\n文件大小: %d bytes\n请分析这个视频。", videoRecord.LocalPath, videoRecord.Size)
-				}
-				return videoPrompt, nil, mediaFiles, "", nil
+				return videoPrompt, nil, nil, "", nil
 			}
 
 			log.Printf("feishu: ✅ video downloaded (mime=%s, len=%d)", mime, len(dataURI))
-			videoPrompt := "请分析这个视频的内容。"
-			if durSec > 0 {
-				videoPrompt = fmt.Sprintf("请分析这个视频的内容（时长: %d秒）。", durSec)
-			}
-			return videoPrompt, []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, mediaFiles, "", nil
+			// 返回空 content，由 onMessageReceived 暂存并提示用户补充意图
+			return "", []opencode.Attachment{{Mime: mime, URL: dataURI, Filename: "feishu_video.mp4"}}, nil, "", nil
 		}
 
 		// 2. 有图片模型 → Gateway 提取帧图片，然后发送帧图片（和图片一样处理）
@@ -1639,11 +1726,8 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 				}
 				if len(frameAttachments) > 0 {
 					log.Printf("feishu: 📎 Sending %d frame images as attachments", len(frameAttachments))
-					videoPrompt := "这是一个视频的关键帧截图，请分析视频内容。"
-					if durSec > 0 {
-						videoPrompt = fmt.Sprintf("这是一个视频的关键帧截图（视频时长: %d秒），请分析视频内容。", durSec)
-					}
-					return videoPrompt, frameAttachments, nil, "", nil
+					// 返回空 content，由 onMessageReceived 暂存并提示用户补充意图
+					return "", frameAttachments, nil, "", nil
 				}
 			}
 			videoPrompt := "⚠️ 视频帧提取失败。"
@@ -1665,19 +1749,16 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		var fileContent feishuFileContent
 		if err := json.Unmarshal([]byte(rawContent), &fileContent); err != nil {
 			log.Printf("feishu: ⚠️ parse file content failed: %v", err)
-			return "[文件消息]", nil, nil, "", nil
+			return "", nil, nil, "", nil
 		}
 		if strings.TrimSpace(fileContent.FileKey) == "" {
-			return "[文件消息]", nil, nil, "", nil
+			return "", nil, nil, "", nil
 		}
 
 		fileBytes, fileMime, err := h.downloadFeishuMediaBytes(ctx, messageID, fileContent.FileKey, "file")
 		if err != nil {
 			log.Printf("feishu: ⚠️ file download failed: %v", err)
-			if strings.TrimSpace(fileContent.FileName) != "" {
-				return fmt.Sprintf("[文件消息: %s]", strings.TrimSpace(fileContent.FileName)), nil, nil, "", nil
-			}
-			return "[文件消息]", nil, nil, "", nil
+			return "", nil, nil, "", nil
 		}
 
 		fileName := strings.TrimSpace(fileContent.FileName)
@@ -1688,13 +1769,11 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 		record, saveErr := saveMediaRecord("file", fileName, fileMime, fileBytes)
 		if saveErr != nil {
 			log.Printf("feishu: ⚠️ failed to save temp file: %v", saveErr)
-			if fileName != "" {
-				return fmt.Sprintf("[文件消息: %s]", fileName), nil, nil, "", nil
-			}
-			return "[文件消息]", nil, nil, "", nil
+			return "", nil, nil, "", nil
 		}
 		log.Printf("feishu: 🗂️ file temp saved: %s", record.LocalPath)
-		return fmt.Sprintf("[文件消息: %s]", fileName), nil, []base.MediaFileRecord{*record}, "", nil
+		// 返回空 content，由 onMessageReceived 暂存并提示用户补充意图
+		return "", nil, []base.MediaFileRecord{*record}, "", nil
 
 	case "post":
 		var post feishuPostContent
@@ -1736,9 +1815,9 @@ func (h *Handler) parseFeishuMessageContent(ctx context.Context, msgType, rawCon
 			}
 		}
 		text := strings.Join(textParts, "\n")
-		// 如果用户没有提供文字，且只有图片，给默认提示
+		// 如果用户没有提供文字且只有图片，返回空 content 由 onMessageReceived 暂存
 		if text == "" && len(attachments) > 0 {
-			text = "请分析这张图片的内容。"
+			return "", attachments, nil, "", nil
 		} else if text == "" {
 			text = "[图文消息]"
 		}
@@ -1969,15 +2048,16 @@ type feishuImageContent struct {
 }
 
 // feishuAudioContent 语音消息
+// 注意：飞书 duration 字段是 JSON 数字（毫秒），不是字符串
 type feishuAudioContent struct {
 	FileKey  string `json:"file_key"`
-	Duration string `json:"duration"` // 毫秒
+	Duration int64  `json:"duration"` // 毫秒
 }
 
 // feishuVideoContent 视频消息
 type feishuVideoContent struct {
 	FileKey  string `json:"file_key"`
-	Duration string `json:"duration"` // 毫秒
+	Duration int64  `json:"duration"` // 毫秒
 }
 
 // feishuMediaContent 媒体消息（飞书视频消息类型是 media 而非 video）
@@ -1985,7 +2065,7 @@ type feishuMediaContent struct {
 	FileKey  string `json:"file_key"`
 	FileName string `json:"file_name"`
 	ImageKey string `json:"image_key"` // 视频封面图
-	Duration string `json:"duration"`  // 毫秒
+	Duration int64  `json:"duration"`  // 毫秒
 }
 
 // feishuFileContent 文件消息

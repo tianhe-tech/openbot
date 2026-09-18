@@ -532,6 +532,9 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `SKILLGEN_MIN_CONFIDENCE` | `0.4` | 最低置信度 |
 | `SKILLGEN_QUEUE_CAPACITY` | `128` | 异步队列容量 |
 | `SKILLGEN_REFERENCE_SKILL` | `skills/skill-creator/SKILL.md` | 参考技能路径 |
+| `SKILLGEN_PER_MODEL_TIMEOUT` | `8m` | 每个 fallback 模型各自的 drafting 超时（非共享） |
+| `SKILLGEN_MAX_CONSECUTIVE_FAILS` | `2` | 连续失败多少次后临时降级模型 |
+| `SKILLGEN_MODEL_COOLDOWN` | `30m` | 降级冷却时长 |
 
 ### 重试队列
 
