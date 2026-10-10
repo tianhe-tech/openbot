@@ -1059,9 +1059,16 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleRetry(ctx, data, userID, strings.TrimPrefix(strings.TrimPrefix(content, "/retry"), " "))
 	}
 
-	// Handle /new or /reset command to create new session
-	if content == "/new" || content == "/reset" || content == "新会话" {
+	// Handle /new command: soft reset — save handoff summary so the next
+	// message auto-resumes with context.
+	if content == "/new" || content == "新会话" {
 		return h.handleNewSession(ctx, data, userID)
+	}
+
+	// Handle /reset command: hard reset — drop the session mapping without
+	// saving any handoff summary. The next message starts a clean session.
+	if content == "/reset" || content == "重置" {
+		return h.handleResetSession(ctx, data, userID)
 	}
 
 	// Handle /sessions or /list command to list sessions
@@ -2279,8 +2286,9 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 
 📊 会话管理：
 /status 或 状态 - 查看当前会话状态
-/new 或 /reset - 创建新会话
-/clear 或 清除 - 删除当前会话
+/new 或 新会话 - 开启新会话（保存上下文摘要，AI 记得之前做过什么）
+/reset 或 重置 - 硬重置会话（丢弃上下文，干净开始）
+/clear 或 清除 - 删除当前会话及历史
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
 /undo 或 撤销 - 撤销上一次操作
 /redo 或 重做 - 重做已撤销的操作
@@ -4080,6 +4088,38 @@ func (h *Handler) handleNewSession(ctx context.Context, data *chatbot.BotCallbac
 
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
 		log.Printf("dingtalk: failed to send new session response: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+// handleResetSession 处理 /reset 命令（硬重置）.
+// 与 /new 不同：不保存 handoff 摘要，直接删除 thread→session 映射，
+// 下一条消息在全新 session 中开始，旧上下文全部丢弃。
+func (h *Handler) handleResetSession(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	var oldSessionID string
+	if sid, ok := h.adapter.GetSessionForUser(userID); ok {
+		oldSessionID = sid
+	}
+
+	if threadID := data.ConversationId; threadID != "" {
+		h.client.ResetSession(threadID)
+	}
+	h.adapter.ClearSessionForUser(userID)
+
+	var msg string
+	if oldSessionID != "" {
+		msg = fmt.Sprintf("✅ 已重置会话（旧: %s），上下文已丢弃，下次发送消息将创建全新会话",
+			oldSessionID[:min(8, len(oldSessionID))])
+	} else {
+		msg = "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
+	}
+
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+		log.Printf("dingtalk: failed to send reset session response: %v", err)
 		return nil, err
 	}
 

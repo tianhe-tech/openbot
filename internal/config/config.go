@@ -209,7 +209,7 @@ func Load() (Config, error) {
 			Cooldown:         getDuration("OPENCODE_CB_COOLDOWN_SECONDS", 60*time.Second),
 			MaxCooldown:      getDuration("OPENCODE_CB_MAX_COOLDOWN_SECONDS", 30*time.Minute),
 			TripKeywords: splitAndTrim(getEnv("OPENCODE_CB_TRIP_KEYWORDS",
-				"No available client,No available channel,Insufficient Balance,provider unavailable")),
+				"No available client,No available channel,Insufficient Balance,provider unavailable,Access denied,Arrearage,Model not found")),
 		},
 	}
 

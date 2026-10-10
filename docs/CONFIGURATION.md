@@ -97,6 +97,26 @@ MessageThresholdForSummary = 10
 - ✅ 快速响应
 - ⚠️ 频繁切换可能影响体验
 
+## 模型错误与自动降级
+
+模型、账户或上游错误不会清除当前 session 或 `/model` 设置。自动降级只改变本轮请求使用的模型，在原 session 上重试，不通过新建会话或摘要接续恢复上下文。
+
+降级前会等待旧流式回合完成清理。如果服务端仍在重试，会中止该失败回合并等待 session 空闲；无法确认空闲时停止自动重试并提示错误，保留会话和模型设置。
+
+每条降级链不会重复尝试同一个模型；候选模型全部失败后提示错误。后续消息保留用户模型偏好；如果该模型处于熔断状态且有健康候选，则明确使用候选模型，而不是不传模型参数并回到服务端默认模型。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `OPENCODE_CIRCUIT_BREAKER_ENABLED` | `true` | 是否启用熔断和自动降级 |
+| `OPENCODE_CB_FAILURE_THRESHOLD` | `2` | 连续失败多少次后熔断 |
+| `OPENCODE_CB_COOLDOWN_SECONDS` | `60` | 初始熔断冷却时间 |
+| `OPENCODE_CB_MAX_COOLDOWN_SECONDS` | `1800` | 最大冷却时间 |
+| `OPENCODE_CB_TRIP_KEYWORDS` | 见下文 | 触发降级的错误关键词，逗号分隔 |
+
+默认关键词为 `No available client,No available channel,Insufficient Balance,provider unavailable,Access denied,Arrearage,Model not found`。除错误文本外，也检查上游 JSON 响应体中的 `error.code` 和 `error.type`。`Model not found` 按错误中的实际 provider/model 记录失败。
+
+设置 `OPENCODE_CB_TRIP_KEYWORDS` 会替换默认列表。已有自定义配置若需要处理账户异常和模型不存在，也需加入相应关键词。
+
 ## 超时配置
 
 默认超时为 180 秒，可以在创建 client 时调整：

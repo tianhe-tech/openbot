@@ -775,8 +775,10 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 		return h.helpText(), true
 	case "/fork", "派生":
 		return h.handleFork(ctx, userID), true
-	case "/new", "/reset", "新会话":
-		return h.handleNewSession(userID), true
+	case "/new", "新会话":
+		return h.handleNewSession(ctx, userID, chatID), true
+	case "/reset", "重置":
+		return h.handleResetSession(ctx, userID, chatID), true
 	case "/todo", "/todos", "任务":
 		return h.handleTodo(userID), true
 	case "/abort", "/stop", "停止":
@@ -1422,7 +1424,8 @@ func (h *Handler) helpText() string {
 
 📋 可用命令：
 /help 或 帮助     - 显示此帮助
-/new 或 新会话    - 创建新会话（旧回复自动保存）
+/new 或 新会话    - 开启新会话（保存上下文摘要）
+/reset 或 重置    - 硬重置会话（丢弃上下文）
 /pending          - 查看未送达的旧会话回复
 /recover [会话ID] - 恢复并重新送达旧回复
 /fork 或 派生     - 派生当前会话
@@ -1541,7 +1544,7 @@ func (h *Handler) handleRecover(userID, sessionFilter string) string {
 	return fmt.Sprintf("✅ 已恢复 %d 条回复，正在通过队列送达...", n)
 }
 
-func (h *Handler) handleNewSession(userID string) string {
+func (h *Handler) handleNewSession(ctx context.Context, userID, chatID string) string {
 	// Clear pending outbound messages from the previous session.
 	// PriorityNormal entries (AI replies, todo progress) are marked parked=1
 	// so the user can recover them via /pending /recover. PriorityHigh
@@ -1549,11 +1552,45 @@ func (h *Handler) handleNewSession(userID string) string {
 	if h.outbound != nil {
 		h.outbound.ClearForUser(userID)
 	}
-	if sessionID, ok := h.adapter.GetSessionForUser(userID); ok {
-		h.adapter.ClearSessionForUser(userID)
-		return fmt.Sprintf("✅ 已清除旧会话（%s），下次消息将创建新会话\n\n💡 旧会话的未送达回复已保存，发送 /pending 查看", sessionID[:min(8, len(sessionID))])
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		return "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
 	}
-	return "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
+
+	// Soft reset: save a handoff summary so the next message auto-resumes
+	// with context (same as DingTalk/Feishu). The heavy fetch+summarize runs
+	// in a goroutine so the single-threaded poll loop is not blocked; the
+	// session mapping is cleared synchronously first.
+	if chatID != "" {
+		saveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		go func() {
+			defer cancel()
+			if _, err := h.client.SaveHandoffAndReset(saveCtx, chatID, "wechat", userID, sessionID); err != nil {
+				log.Printf("wechat: handleNewSession: SaveHandoffAndReset failed: %v", err)
+			}
+		}()
+	}
+	h.adapter.ClearSessionForUser(userID)
+	return fmt.Sprintf("✅ 已开启新会话（旧: %s），上下文摘要已保存，下一条消息将自动携带\n\n💡 旧会话的未送达回复已保存，发送 /pending 查看",
+		sessionID[:min(8, len(sessionID))])
+}
+
+func (h *Handler) handleResetSession(ctx context.Context, userID, chatID string) string {
+	// Hard reset: drop the session mapping without saving any handoff
+	// summary. The next message starts a clean session with no prior context.
+	if h.outbound != nil {
+		h.outbound.ClearForUser(userID)
+	}
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		return "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
+	}
+	if chatID != "" {
+		h.client.ResetSession(chatID)
+	}
+	h.adapter.ClearSessionForUser(userID)
+	return fmt.Sprintf("✅ 已重置会话（旧: %s），上下文已丢弃，下次发送消息将创建全新会话\n\n💡 旧会话的未送达回复已保存，发送 /pending 查看",
+		sessionID[:min(8, len(sessionID))])
 }
 
 func (h *Handler) handleUndo(ctx context.Context, userID string) string {

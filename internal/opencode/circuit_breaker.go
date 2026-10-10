@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"encoding/json"
 	"log"
 	"strings"
 	"sync"
@@ -70,6 +71,9 @@ func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
 			"No available channel",
 			"Insufficient Balance",
 			"provider unavailable",
+			"Access denied",
+			"Arrearage",
+			"Model not found",
 		},
 	}
 }
@@ -335,6 +339,34 @@ func (b *CircuitBreaker) IsProviderLevelError(msg string) bool {
 		}
 	}
 	return false
+}
+
+func (b *CircuitBreaker) IsProviderSessionError(raw, message string) bool {
+	if b.IsProviderLevelError(message) {
+		return true
+	}
+	var event struct {
+		Properties struct {
+			Error struct {
+				Data struct {
+					ResponseBody string `json:"responseBody"`
+				} `json:"data"`
+			} `json:"error"`
+		} `json:"properties"`
+	}
+	if json.Unmarshal([]byte(raw), &event) != nil {
+		return false
+	}
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(event.Properties.Error.Data.ResponseBody), &response) != nil {
+		return false
+	}
+	return b.IsProviderLevelError(response.Error.Code) || b.IsProviderLevelError(response.Error.Type)
 }
 
 // splitModelKey reverses normalizeModelKey for status reporting. The key

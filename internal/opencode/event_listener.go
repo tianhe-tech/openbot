@@ -94,6 +94,9 @@ type StreamingSessionHandler struct {
 	payload                 MessagePayload
 	fallbackRetryAttempted  bool
 	fallbackRetryDispatched bool
+	failedTurn              bool
+	cleanupDone             chan struct{}
+	cleanupDoneOnce         sync.Once
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -121,6 +124,7 @@ func NewStreamingSessionHandlerWithModel(sessionID string, callback StreamCallba
 		activeToolParts:  make(map[string]bool),
 		lastModelUsed:    modelUsed,
 		payload:          payload,
+		cleanupDone:      make(chan struct{}),
 	}
 	// 8秒后若仍未发送过内容，给用户一个等待提示
 	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
@@ -529,8 +533,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				var msgUpdate struct {
 					Properties struct {
 						Info struct {
-							ID   string `json:"id"`
-							Role string `json:"role"`
+							ID         string `json:"id"`
+							Role       string `json:"role"`
+							ProviderID string `json:"providerID"`
+							ModelID    string `json:"modelID"`
 						} `json:"info"`
 					} `json:"properties"`
 				}
@@ -539,6 +545,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					role := msgUpdate.Properties.Info.Role
 					if msgID != "" && role != "" {
 						s.client.messageRoles.Store(msgID, role)
+					}
+					if role == "assistant" && msgUpdate.Properties.Info.ProviderID != "" && msgUpdate.Properties.Info.ModelID != "" {
+						s.lastModelUsed = modelFromRef(msgUpdate.Properties.Info.ProviderID, msgUpdate.Properties.Info.ModelID)
 					}
 				}
 			}
@@ -553,10 +562,14 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: session status changed for session %s", s.sessionID[:8])
 
 	case "session.error":
+		s.failedTurn = true
 		rawJSON := event.JSON.RawJSON()
 		log.Printf("opencode: 🔴 session.error RAW JSON: %s", rawJSON)
 		errorMsg := s.extractSessionError(event)
 		log.Printf("opencode: 🔴 session.error extracted message: %q", errorMsg)
+		if model := missingModelFromError(errorMsg); model != nil {
+			s.lastModelUsed = model
+		}
 
 		// Circuit breaker: if this is a provider-level failure (e.g. "No
 		// available client"), record it against the model used for this
@@ -565,7 +578,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		// model; if it succeeds we return without notifying the user of
 		// the error (the retry turn's content reaches them instead).
 		if s.client != nil && s.client.breaker != nil && s.lastModelUsed != nil && !s.fallbackRetryAttempted {
-			if s.client.breaker.IsProviderLevelError(errorMsg) {
+			if s.client.breaker.IsProviderSessionError(rawJSON, errorMsg) {
 				pid := s.lastModelUsed.ProviderID.Value
 				mid := s.lastModelUsed.ModelID.Value
 				s.client.breaker.RecordFailure(pid, mid, errorMsg)
@@ -1177,6 +1190,22 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 	return message
 }
 
+func missingModelFromError(message string) *opencode.SessionPromptParamsModel {
+	ref, ok := strings.CutPrefix(message, "Model not found: ")
+	if !ok {
+		return nil
+	}
+	fields := strings.Fields(ref)
+	if len(fields) == 0 {
+		return nil
+	}
+	providerID, modelID, ok := parseProviderModelRef(strings.TrimSuffix(fields[0], "."))
+	if !ok {
+		return nil
+	}
+	return modelFromRef(providerID, modelID)
+}
+
 // extractQuestionFromEvent 从 question.asked 或 permission.asked 事件中提取问题内容和选项
 func (s *StreamingSessionHandler) extractQuestionFromEvent(event *opencode.EventListResponse) (*Question, string) {
 	if event == nil {
@@ -1701,6 +1730,7 @@ func (s *StreamingSessionHandler) handleRetryPart(rawJSON string) {
 	reachedLimit := curAttempt >= maxRetryAttempts
 	if reachedLimit && !alreadySurfaced {
 		s.retrySurfaced = true
+		s.failedTurn = true
 	}
 	s.mu.Unlock()
 
@@ -1850,7 +1880,12 @@ func (s *StreamingSessionHandler) notifyCompletion() {
 func (s *StreamingSessionHandler) fireOnComplete() {
 	if s.onComplete != nil {
 		s.onCompleteOnce.Do(func() {
-			go s.onComplete()
+			go func() {
+				s.onComplete()
+				if s.cleanupDone != nil {
+					s.cleanupDoneOnce.Do(func() { close(s.cleanupDone) })
+				}
+			}()
 		})
 	}
 }
@@ -1876,6 +1911,9 @@ func (s *StreamingSessionHandler) stopWaitingTimer() {
 func (s *StreamingSessionHandler) ResetForNewPrompt() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failedTurn {
+		return
+	}
 
 	log.Printf("opencode: resetting handler state for session %s (clearing compression artifacts: contentSent=%t, completed=%t, lastContentLen=%d)",
 		s.sessionID[:min(8, len(s.sessionID))], s.contentSent, s.completed, len(s.lastContent))

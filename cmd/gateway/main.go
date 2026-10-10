@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -382,11 +381,6 @@ func main() {
 	adapterRegistry.Register(dingtalkHandler.GetAdapter())
 	adapterRegistry.Register(wechatHandler.GetAdapter())
 
-	// erroredSessions tracks sessions that were deliberately cleared after session.error.
-	// The title-recovery logic must not re-map these, otherwise the user gets stuck on
-	// the broken session forever.
-	var erroredSessions sync.Map // map[sessionID]struct{}
-
 	// Register event handler for OpenCode -> Adapter communication
 	ocClient.RegisterEventHandler(func(ctx context.Context, event *opencodesdk.EventListResponse) error {
 		eventType := string(event.Type)
@@ -458,11 +452,6 @@ func main() {
 		}
 
 		if foundAdapter == nil {
-			// 跳过已被清除（session.error 后）的会话，避免 title 恢复逻辑把坏 session 重新绑定给用户
-			if _, banned := erroredSessions.Load(sessionID); banned {
-				return nil
-			}
-
 			// 尝试从 session Title 中恢复映射关系
 			// Title 格式: [adapter:userId] threadId
 			if session, err := ocClient.GetSession(ctx, sessionID); err == nil && session.Title != "" {
@@ -531,22 +520,6 @@ func main() {
 		if err != nil {
 			log.Printf("opencode event: failed to extract content from event type %s: %v", event.Type, err)
 			return err
-		}
-
-		// 会话出错后清除 session 映射，使下一条消息自动建立新会话
-		// 同时将该 sessionID 加入黑名单，防止 title 恢复逻辑把坏 session 重新绑定
-		// 注意：必须在 content == "" 判断之前执行，否则清理逻辑会被跳过
-		if eventType == "session.error" && !isCronSession {
-			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
-				sessionID[:min(8, len(sessionID))], foundUserID)
-			// 同时清除 client 的 thread→session 缓存：坏 session 在服务端仍然
-			// 存在（stale 检查会通过），但其历史包含失败的请求，opencode 会在
-			// 后续每一轮重放，导致该用户之后所有消息都报同样的错误。
-			if ocClient != nil {
-				ocClient.InvalidateSessionCache(sessionID)
-			}
-			foundAdapter.ClearSessionForUser(foundUserID)
-			erroredSessions.Store(sessionID, struct{}{})
 		}
 
 		if content == "" {

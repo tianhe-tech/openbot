@@ -2,9 +2,11 @@ package opencode
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,6 +196,26 @@ func TestStreamingHandlerTracksFallbackRetryDispatch(t *testing.T) {
 	}
 }
 
+func TestProviderErrorClassification(t *testing.T) {
+	breaker := NewCircuitBreaker(DefaultCircuitBreakerConfig())
+	for _, message := range []string{"Access denied, please make sure your account is in good standing", "Model not found: squilla/auto.", "Insufficient Balance"} {
+		if !breaker.IsProviderSessionError("", message) {
+			t.Errorf("expected provider error: %s", message)
+		}
+	}
+	raw := `{"properties":{"error":{"data":{"responseBody":"{\"error\":{\"code\":\"Arrearage\"}}"}}}}`
+	if !breaker.IsProviderSessionError(raw, "Account rejected") {
+		t.Fatal("expected structured Arrearage error to trigger fallback")
+	}
+	if breaker.IsProviderSessionError("", "Invalid tool arguments") {
+		t.Fatal("tool errors must not trigger model fallback")
+	}
+	breaker = NewCircuitBreaker(CircuitBreakerConfig{Enabled: false})
+	if breaker.IsProviderSessionError(raw, "Model not found") {
+		t.Fatal("disabled breaker must not trigger fallback")
+	}
+}
+
 func TestAttemptFallbackRetryPreservesOverrideWhenFailedModelDiffers(t *testing.T) {
 	client := &Client{
 		providerCacheAt: time.Now(),
@@ -213,8 +235,7 @@ func TestAttemptFallbackRetryPreservesOverrideWhenFailedModelDiffers(t *testing.
 	}
 	client.modelOverride.Store(oldSessionID, override)
 
-	// Failed model differs from the user's override → override must survive
-	// and be queued for migration to the fresh session.
+	client.sessions.Store("thread_keep", oldSessionID)
 	client.attemptFallbackRetry(oldSessionID, MessagePayload{
 		ThreadID: "thread_keep",
 	}, modelFromRef("fallback-provider", "fallback-model"), nil, nil)
@@ -222,12 +243,12 @@ func TestAttemptFallbackRetryPreservesOverrideWhenFailedModelDiffers(t *testing.
 	if _, ok := client.getSessionModelOverride(oldSessionID); !ok {
 		t.Fatal("expected user override to be preserved when the failed model differs")
 	}
-	if _, ok := client.pendingOverride.Load("thread_keep"); !ok {
-		t.Fatal("expected override to be queued for migration to the new session")
+	if sessionID, ok := client.GetSessionForThread("thread_keep"); !ok || sessionID != oldSessionID {
+		t.Fatal("expected fallback to preserve the original session mapping")
 	}
 }
 
-func TestAttemptFallbackRetryDropsOverrideWhenFailedModelIsOverride(t *testing.T) {
+func TestAttemptFallbackRetryPreservesOverrideWhenFailedModelIsOverride(t *testing.T) {
 	client := &Client{
 		providerCacheAt: time.Now(),
 		providerCache: []Provider{
@@ -246,16 +267,250 @@ func TestAttemptFallbackRetryDropsOverrideWhenFailedModelIsOverride(t *testing.T
 	}
 	client.modelOverride.Store(oldSessionID, override)
 
-	// Failed model IS the user's override → override must be dropped so the
-	// next turn picks a healthy model.
+	client.sessions.Store("thread_drop", oldSessionID)
 	client.attemptFallbackRetry(oldSessionID, MessagePayload{
 		ThreadID: "thread_drop",
 	}, modelFromRef("user-provider", "user-model"), nil, nil)
 
-	if _, ok := client.getSessionModelOverride(oldSessionID); ok {
-		t.Fatal("expected user override to be dropped when it is the failed model")
+	if _, ok := client.getSessionModelOverride(oldSessionID); !ok {
+		t.Fatal("expected user override to survive even when its model failed")
 	}
 	if _, ok := client.pendingOverride.Load("thread_drop"); ok {
-		t.Fatal("expected no pending override migration when the override itself failed")
+		t.Fatal("expected no migration because the original session is reused")
+	}
+}
+
+func TestMissingModelFromError(t *testing.T) {
+	model := missingModelFromError("Model not found: squilla/auto. (UnknownError)")
+	if safeModelID(model) != "squilla/auto" {
+		t.Fatalf("expected actual failed model, got %s", safeModelID(model))
+	}
+	if missingModelFromError("Access denied") != nil {
+		t.Fatal("unrelated errors must not change the attributed model")
+	}
+}
+
+func TestResetForNewPromptPreservesTerminalError(t *testing.T) {
+	handler := &StreamingSessionHandler{failedTurn: true, completed: true, fallbackRetryDispatched: true}
+	handler.ResetForNewPrompt()
+	if !handler.IsCompleted() || !handler.FallbackRetryDispatched() {
+		t.Fatal("prompt acceptance must not erase an earlier terminal SSE error")
+	}
+}
+
+func TestCircuitOpenOverrideNeverSilentlyUsesServerDefault(t *testing.T) {
+	cfg := DefaultCircuitBreakerConfig()
+	cfg.FailureThreshold = 1
+	client := &Client{
+		breaker:          NewCircuitBreaker(cfg),
+		providerCacheAt:  time.Now(),
+		providerCache:    []Provider{{ID: "alternate", Models: []Model{{ID: "model"}}}},
+		capabilityCache:  map[string]modelCapability{"alternate/model": {}},
+		defaultModelHint: modelFromRef("alternate", "model"),
+	}
+	client.modelOverride.Store("ses_open_override", *modelFromRef("chosen", "model"))
+	client.breaker.RecordFailure("chosen", "model", "Access denied")
+	model, _ := client.selectModelOverride(context.Background(), "ses_open_override", MessagePayload{})
+	if safeModelID(model) != "alternate/model" {
+		t.Fatalf("expected explicit alternate, got %s", safeModelID(model))
+	}
+	client.breaker.RecordFailure("alternate", "model", "Access denied")
+	model, _ = client.selectModelOverride(context.Background(), "ses_open_override", MessagePayload{})
+	if safeModelID(model) != "chosen/model" {
+		t.Fatalf("without alternatives, retain explicit user model rather than server default, got %s", safeModelID(model))
+	}
+}
+
+func TestPrepareFallbackSessionAbortsBusyTurnWithoutResettingSession(t *testing.T) {
+	var aborted int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/session":
+			_, _ = w.Write([]byte(`[]`))
+		case "/session/status":
+			if atomic.LoadInt32(&aborted) == 0 {
+				_, _ = w.Write([]byte(`{"ses_busy_fallback":{"type":"retry"}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"ses_busy_fallback":{"type":"idle"}}`))
+			}
+		case "/session/ses_busy_fallback/abort":
+			atomic.AddInt32(&aborted, 1)
+			_, _ = w.Write([]byte(`true`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "")
+	client.sessions.Store("thread-busy", "ses_busy_fallback")
+	client.modelOverride.Store("ses_busy_fallback", *modelFromRef("chosen", "model"))
+	if err := client.prepareFallbackSession(context.Background(), "ses_busy_fallback"); err != nil {
+		t.Fatalf("prepare retry: %v", err)
+	}
+	if atomic.LoadInt32(&aborted) != 1 {
+		t.Fatal("expected one abort of the previous upstream retry loop")
+	}
+	if model, ok := client.getSessionModelOverride("ses_busy_fallback"); !ok || safeModelID(&model) != "chosen/model" {
+		t.Fatal("aborting the failed turn must preserve user model")
+	}
+	if sessionID, ok := client.GetSessionForThread("thread-busy"); !ok || sessionID != "ses_busy_fallback" {
+		t.Fatal("aborting the failed turn must preserve session mapping")
+	}
+}
+
+func TestStreamingFallbackChainReusesSession(t *testing.T) {
+	for _, withOverride := range []bool{false, true} {
+		name := "server-default"
+		if withOverride {
+			name = "session-override"
+		}
+		t.Run(name, func(t *testing.T) {
+			const sessionID = "ses_fallback_chain"
+			var client *Client
+			var created int32
+			requests := make(chan string, 4)
+			finished := make(chan struct{}, 1)
+			terminalReady := make(chan (<-chan struct{}), 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/session/status":
+					_, _ = w.Write([]byte(`{"ses_fallback_chain":{"type":"idle"}}`))
+				case "/session":
+					if r.Method == http.MethodPost {
+						atomic.AddInt32(&created, 1)
+					}
+					_, _ = w.Write([]byte(`[]`))
+				case "/session/" + sessionID:
+					_, _ = w.Write([]byte(`{"id":"ses_fallback_chain"}`))
+				case "/session/" + sessionID + "/prompt_async":
+					var body struct {
+						Model struct {
+							ProviderID string `json:"providerID"`
+							ModelID    string `json:"modelID"`
+						} `json:"model"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("decode prompt: %v", err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					requests <- body.Model.ProviderID + "/" + body.Model.ModelID
+					message := "Model not found: squilla/auto."
+					if body.Model.ModelID == "model-a" {
+						message = "Access denied, please make sure your account is in good standing"
+					} else if body.Model.ModelID == "model-b" {
+						message = "No available channel"
+					}
+					raw, _ := json.Marshal(map[string]interface{}{
+						"type": "session.error",
+						"properties": map[string]interface{}{
+							"sessionID": sessionID,
+							"error":     map[string]interface{}{"name": "APIError", "data": map[string]interface{}{"message": message}},
+						},
+					})
+					var event opencode.EventListResponse
+					if err := json.Unmarshal(raw, &event); err != nil {
+						t.Errorf("decode event: %v", err)
+						return
+					}
+					active, ok := client.activeHandlers.Load(sessionID)
+					if !ok {
+						t.Error("no active handler for retry session")
+						return
+					}
+					if body.Model.ModelID == "model-b" {
+						terminalReady <- active.(*StreamingSessionHandler).payload.fallbackReady
+					}
+					if err := active.(*StreamingSessionHandler).HandleEvent(r.Context(), &event); err != nil {
+						t.Errorf("handle event: %v", err)
+					}
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client = NewClient(server.URL, "")
+			client.timeout = 30 * time.Second
+			client.providerCacheAt = time.Now()
+			client.providerCache = []Provider{{ID: "alternate", Models: []Model{{ID: "model-a"}, {ID: "model-b"}}}}
+			client.capabilityCache = map[string]modelCapability{"alternate/model-a": {}, "alternate/model-b": {}}
+			client.defaultModelHint = modelFromRef("alternate", "model-a")
+			client.sessions.Store("thread-chain", sessionID)
+			if withOverride {
+				client.modelOverride.Store(sessionID, *modelFromRef("squilla", "auto"))
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+			_, err := client.SendMessageStreamingWithEvents(ctx, MessagePayload{
+				SessionID: sessionID, ThreadID: "thread-chain", Content: "hello", Streaming: true,
+			}, func(string) error { return nil }, func(event StreamEvent) error {
+				if event.Kind == StreamEventError {
+					finished <- struct{}{}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("streaming request: %v", err)
+			}
+			select {
+			case <-finished:
+			case <-ctx.Done():
+				t.Fatal("fallback chain did not terminate")
+			}
+			select {
+			case ready := <-terminalReady:
+				select {
+				case <-ready:
+				case <-ctx.Done():
+					t.Fatal("terminal streaming call did not exit")
+				}
+			case <-ctx.Done():
+				t.Fatal("missing terminal streaming call")
+			}
+			initial := "/"
+			if withOverride {
+				initial = "squilla/auto"
+			}
+			for _, want := range []string{initial, "alternate/model-a", "alternate/model-b"} {
+				select {
+				case got := <-requests:
+					if got != want {
+						t.Errorf("model = %s, want %s", got, want)
+					}
+				default:
+					t.Fatalf("missing prompt for %s", want)
+				}
+			}
+			select {
+			case extra := <-requests:
+				t.Fatalf("unexpected repeated model: %s", extra)
+			default:
+			}
+			if atomic.LoadInt32(&created) != 0 {
+				t.Fatal("model failure must not create a new session")
+			}
+			if _, ok := client.activeHandlers.Load(sessionID); ok {
+				t.Fatal("failed turn left an active handler after completion")
+			}
+			if _, ok := client.sessionHandlers.Load(sessionID); ok {
+				t.Fatal("prompt acceptance re-registered an already failed handler")
+			}
+			if got, ok := client.GetSessionForThread("thread-chain"); !ok || got != sessionID {
+				t.Fatal("session mapping was lost")
+			}
+			if withOverride {
+				if model, ok := client.getSessionModelOverride(sessionID); !ok || safeModelID(&model) != "squilla/auto" {
+					t.Fatal("user model preference was lost")
+				}
+			}
+			if client.breaker.StateString("squilla", "auto") == "disabled" || len(client.breaker.Snapshot()) != 3 {
+				t.Fatal("expected failures attributed to the three actual models")
+			}
+		})
 	}
 }

@@ -168,6 +168,7 @@ type MessagePayload struct {
 	Metadata                map[string]string `json:"metadata,omitempty"`
 	Model                   string            `json:"model,omitempty"` // 可选：指定模型 (格式 provider/model，如 tianhe-ai/GLM-5.2)，留空则由 selectModelOverride 决定
 	fallbackAttemptedModels map[string]struct{}
+	fallbackReady           <-chan struct{}
 }
 
 // StreamCallback defines a callback for streaming responses.
@@ -3356,6 +3357,10 @@ func (c *Client) selectModelOverride(ctx context.Context, sessionID string, payl
 		if c.breaker != nil && c.breaker.IsOpen(model.ProviderID.Value, model.ModelID.Value) {
 			log.Printf("opencode: session override %s/%s is circuit-open, skipping",
 				model.ProviderID.Value, model.ModelID.Value)
+			if fallback, reason := c.selectFallbackModel(ctx, &model, payload); fallback != nil {
+				return fallback, "session override circuit-open: " + reason
+			}
+			return &model, "session override (no healthy alternate)"
 		} else if len(requiredModalities) == 0 && !nonTextHint {
 			return &model, "session override"
 		} else {
@@ -3561,10 +3566,9 @@ func (c *Client) selectFallbackModel(ctx context.Context, failedModel *opencode.
 }
 
 // attemptFallbackRetry is invoked from the session.error handler when a
-// provider-level failure is detected. It records the failure in the circuit
-// breaker, selects a healthy alternate model, preserves the conversation
-// history via a session handoff, and re-dispatches the original payload as a
-// fresh streaming turn bound to the new model.
+// provider-level failure is detected. It selects a healthy alternate model
+// and re-dispatches the original payload on the same session without changing
+// the user's model override.
 //
 // The original callback and eventCallback are passed through so the retry
 // turn's content reaches the user through the same adapter channel.
@@ -3600,58 +3604,10 @@ func (c *Client) attemptFallbackRetry(oldSessionID string, payload MessagePayloa
 	log.Printf("opencode: 🔁 fallback retry: %s → %s/%s (reason=%s) for old session %s",
 		safeModelID(failedModel), fallback.ProviderID.Value, fallback.ModelID.Value, reason, oldSessionID[:min(8, len(oldSessionID))])
 
-	// Preserve the user's /model override unless the failed model IS the
-	// override. When the failure comes from an auto-selected model (e.g. a
-	// multimodal fallback picked a different model than the user chose), the
-	// override must survive so the next turn keeps using the user's model.
-	// It is carried across the handoff via pendingOverride and re-applied to
-	// the fresh session by SendMessageStreamingWithEvents.
-	if failedModel != nil {
-		if override, ok := c.getSessionModelOverride(oldSessionID); ok {
-			failedKey := normalizeModelKey(failedModel.ProviderID.Value, failedModel.ModelID.Value)
-			overrideKey := normalizeModelKey(override.ProviderID.Value, override.ModelID.Value)
-			if failedKey == overrideKey {
-				// The user's chosen model itself failed: drop the override so
-				// the next turn picks a healthy model via the breaker-aware path.
-				c.modelOverride.Delete(oldSessionID)
-				log.Printf("opencode: fallback retry: dropping session override %s (it is the failed model)", overrideKey)
-			} else {
-				// The failed model is unrelated to the user's choice: keep the
-				// override and migrate it to the fresh session after handoff.
-				// Only possible when a thread exists to carry it across.
-				if payload.ThreadID != "" {
-					c.pendingOverride.Store(payload.ThreadID, override)
-					log.Printf("opencode: fallback retry: preserving session override %s (failed model %s differs), will re-apply to new session",
-						overrideKey, failedKey)
-				} else {
-					// No thread to carry the override; keep it on the old
-					// session id (harmless if that session is discarded).
-					log.Printf("opencode: fallback retry: preserving session override %s (failed model %s differs, no thread to migrate)",
-						overrideKey, failedKey)
-				}
-			}
-		} else {
-			c.modelOverride.Delete(oldSessionID)
-		}
-	}
 	// Force the new turn to use the selected fallback model explicitly.
+	payload.SessionID = oldSessionID
 	payload.Model = fallback.ProviderID.Value + "/" + fallback.ModelID.Value
 	payload.fallbackAttemptedModels[normalizeModelKey(fallback.ProviderID.Value, fallback.ModelID.Value)] = struct{}{}
-
-	// Preserve conversation history: trigger a session handoff so the old
-	// session's message history is compressed into a summary and saved.
-	// The retry's SendMessageStreaming call will invoke maybeInjectHandoff,
-	// which loads the pending handoff and prepends the summary to the new
-	// session's first prompt — so the user does not lose context.
-	//
-	// triggerSessionHandoff also deletes the thread→session mapping
-	// synchronously, so the retry creates a fresh session.
-	handoffNotice := ""
-	if payload.ThreadID != "" {
-		handoffNotice = c.triggerSessionHandoff(payload, oldSessionID)
-		log.Printf("opencode: fallback retry: handoff triggered for old session %s (notice_len=%d)",
-			oldSessionID[:min(8, len(oldSessionID))], len(handoffNotice))
-	}
 
 	// Re-dispatch in a goroutine so the SSE handler returns immediately.
 	// The new streaming turn registers its own handler and drives the
@@ -3661,6 +3617,21 @@ func (c *Client) attemptFallbackRetry(oldSessionID string, payload MessagePayloa
 		// context may already be cancelled.
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), c.timeout)
 		defer retryCancel()
+		if payload.fallbackReady != nil {
+			select {
+			case <-payload.fallbackReady:
+			case <-retryCtx.Done():
+				return
+			}
+		}
+		if err := c.prepareFallbackSession(retryCtx, oldSessionID); err != nil {
+			log.Printf("opencode: fallback retry could not reuse session %s: %v", oldSessionID, err)
+			if callback != nil {
+				_ = callback(QuestionSignalPrefix + fmt.Sprintf("自动切换模型未能开始：%v。会话及模型设置已保留。", err))
+			}
+			return
+		}
+		c.requestCache.Delete(generateRequestHash(payload))
 
 		// Notify the user that a fallback is in progress using the
 		// original callback so the notice reaches them immediately.
@@ -3688,6 +3659,35 @@ func (c *Client) attemptFallbackRetry(oldSessionID string, payload MessagePayloa
 	}()
 
 	return true
+}
+
+func (c *Client) prepareFallbackSession(ctx context.Context, sessionID string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	aborted := false
+	for {
+		statuses, err := c.GetSessionStatus(ctx)
+		if err != nil {
+			return err
+		}
+		status := statuses[sessionID].Type
+		if status == "" || status == "idle" {
+			return nil
+		}
+		if !aborted {
+			if err := c.AbortSession(ctx, sessionID); err != nil {
+				return err
+			}
+			aborted = true
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // safeModelID returns "provider/model" or "<unknown>" if the model is nil.
@@ -4698,6 +4698,8 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		dm := *c.defaultModelHint
 		modelForHandler = &dm
 	}
+	retryReady := make(chan struct{})
+	payload.fallbackReady = retryReady
 	handler := NewStreamingSessionHandlerWithModel(sessionID, callback, eventCallback, func() {
 		c.runningSessions.Delete(sessionID)
 		c.probeSnapshots.Delete(sessionID)
@@ -4708,6 +4710,18 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		// parent/child session as busy; /status must retain that relationship to
 		// diagnose the resulting zombie session.
 	}, c, c, true, false, modelForHandler, payload)
+	defer func() {
+		if handler.FallbackRetryDispatched() {
+			<-handler.cleanupDone
+		}
+		handler.mu.Lock()
+		failed := handler.failedTurn
+		handler.mu.Unlock()
+		if failed {
+			c.requestCache.Delete(generateRequestHash(payload))
+		}
+		close(retryReady)
+	}()
 	c.RegisterSessionHandler(sessionID, handler.HandleEvent)
 	c.activeHandlers.Store(sessionID, handler)
 	log.Printf("opencode: registered streaming handler for session %s", sessionID[:8])
@@ -4826,6 +4840,12 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 					log.Printf("opencode: entering async mode for session %s (empty reply, waiting for SSE events)", sessionID[:8])
 				}
 				asyncResponse = response
+				handler.mu.Lock()
+				failed := handler.failedTurn
+				handler.mu.Unlock()
+				if failed {
+					continue
+				}
 
 				// 压缩操作（SummarizeSession）可能在此前执行过，其产生的
 				// message.part.delta / step-finish / session.idle 事件会污染

@@ -165,12 +165,13 @@ DINGTALK_OWNER_USERID=1601434517956472
 - **入站批处理**：自动合并快速连续的消息（粘贴/转发拆分），可调延迟
 - **用户级序列化**：同一用户的消息 FIFO 处理，第二个消息排队等待第一个完成
 - **持久化出站队列**：SQLite 3 级优先级系统
-  - `PriorityHigh`（2）：权限/问题确认 — 跳过限流冷却
+  - `PriorityHigh`（2）：权限/问题确认 — 最高派发优先级，冷却结束后最先发送
   - `PriorityNormal`（1）：最终结果、todo、错误通知
   - `PriorityLow`（0）：进度更新 — 拥堵时可 TTL 丢弃
-- **离线队列**：5 次热重试失败后进入离线队列，`/pending` `/recover` 恢复
+- **关键消息永不丢弃**：关键内容（最终结果/todo/权限/错误通知）不限重试次数，指数退避（上限 5 分钟），跨重启持久；非关键内容 5 次尝试后丢弃
 - **顺序权限确认**：多个权限请求逐个显示，回答当前才能看到下一个
-- **限流自适应**：30s→60s→120s 递增冷却，成功后自动清除
+- **限流冷却**：触发后固定 60s 冷却（暂停该用户所有发送，含 `PriorityHigh`），到期自动解除
+- **离线队列**：`/new` `/reset` 时未送达的 `PriorityNormal` 消息标记 parked 保留，`/pending` 查看、`/recover` 恢复
 
 ---
 
@@ -190,7 +191,8 @@ DINGTALK_OWNER_USERID=1601434517956472
 | 命令 | 说明 |
 |------|------|
 | `/status` / `状态` | 会话 ID、token 用量、诊断信息 |
-| `/new` / `/reset` / `新会话` | 清除旧会话，下次消息创建新会话 |
+| `/new` / `新会话` | 开启新会话（保存上下文摘要，下一条消息自动携带） |
+| `/reset` / `重置` | 硬重置会话（丢弃上下文，干净开始） |
 | `/clear` / `清除` | 删除当前会话及历史 |
 | `/fork` | 派生当前会话 |
 | `/undo` / `/redo` | 撤销/重做上次操作 |
@@ -201,7 +203,7 @@ DINGTALK_OWNER_USERID=1601434517956472
 
 | 命令 | 说明 |
 |------|------|
-| `/models` | 列出所有可用模型 |
+| `/model` | 列出所有可用模型 |
 | `/model <provider>/<model>` | 设置会话模型 |
 | `/thinking on\|off` | 切换思考过程输出 |
 | `/final on\|off` | 仅返回最终结果（WeChat 内置开启） |
@@ -245,12 +247,14 @@ DINGTALK_OWNER_USERID=1601434517956472
 | `/skill-reject <id> [原因]` | 拒绝技能 |
 | `/skill-stats` | 模型生成/批准统计 |
 
-### 微信离线队列
+### 微信专属
 
 | 命令 | 说明 |
 |------|------|
 | `/pending` | 查看待处理的离线消息 |
-| `/recover` | 恢复离线消息 |
+| `/recover [session-id前缀]` | 恢复离线消息 |
+| `/retry [消息]` | 撤销上次回复并重新发送 |
+| `/devcore [on\|off\|set\|reset\|<偏好>]` | 管理 Dev Core 偏好注入 |
 
 ### Agent 路由
 
@@ -416,9 +420,8 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `OPENCODE_API_KEY` | — | Bearer / X-API-Key 认证 |
-| `OPENCODE_SERVER_PASSWORD` | — | HTTP Basic Auth 密码 |
-| `OPENCODE_SERVER_USERNAME` | `opencode` | Basic Auth 用户名 |
+| `OPENCODE_API_KEY` | — | API Key（`Authorization: Bearer` 认证） |
+| `OPENCODE_SERVER_PASSWORD` | — | API Key 回退（未设置 `OPENCODE_API_KEY` 时使用） |
 | `OPENCODE_ENDPOINT` | `http://localhost:4096` | OpenCode 服务器地址 |
 | `OPENCODE_DIRECTORY` | `.` | 工作目录 |
 | `OPENCODE_MANAGE_SERVE` | `true` | 网关管理 opencode 子进程 |
@@ -428,6 +431,22 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `OPENCODE_STREAM_IDLE_TIMEOUT_SECONDS` | `600` | 无内容空闲超时 |
 | `OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS` | `120` | 有内容空闲超时 |
 | `OPENCODE_STREAM_BUSY_PROBE_EXTEND` | `true` | 活跃时延长超时 |
+| `OPENCODE_DEV_CORE_ENABLED` | `false` | Dev Core 偏好注入开关 |
+| `OPENCODE_DEV_CORE_PROMPT` | — | Dev Core 偏好提示词 |
+
+### 熔断器（Circuit Breaker）
+
+按模型维度的 provider 熔断：连续失败后暂时跳过该模型，冷却结束后半开探测，反复失败则指数退避。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `OPENCODE_CIRCUIT_BREAKER_ENABLED` | `true` | 总开关 |
+| `OPENCODE_CB_FAILURE_THRESHOLD` | `2` | 连续失败次数阈值 |
+| `OPENCODE_CB_COOLDOWN_SECONDS` | `60s` | 初始熔断时长 |
+| `OPENCODE_CB_MAX_COOLDOWN_SECONDS` | `30m` | 熔断时长上限 |
+| `OPENCODE_CB_TRIP_KEYWORDS` | 见下 | 触发熔断的错误关键字（逗号分隔） |
+
+默认关键字：`No available client,No available channel,Insufficient Balance,provider unavailable,Access denied,Arrearage,Model not found`。留空表示所有 `session.error` 事件都触发。
 
 ### 日志与 HTTP
 
@@ -510,7 +529,7 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `PROXY_HUB_WS_URL` | — | 中继 Hub WS URL |
 | `PROXY_KEY_FILE` | `.opencode-gateway-proxy.json` | 密钥文件 |
 | `PROXY_LOCAL_OPENCODE_ADDR` | `127.0.0.1:4096` | 本地 OpenCode 地址 |
-| `PROXY_RECONNECT_DELAY` | `5s` | 重连延迟 |
+| `PROXY_RECONNECT_DELAY` | `180s` | 重连延迟 |
 
 ### 技能自动生成
 
@@ -715,14 +734,14 @@ tail -f /var/log/openbot.log | grep -E "error|fail|refuse"
 ### 微信限流频繁
 
 - 微信 iLink API 有严格的速率限制
-- 网关已内置自适应冷却（30s→60s→120s）
+- 网关已内置固定 60s 冷却（触发后暂停该用户所有发送，到期自动解除）
 - 默认只发送最终结果和 todo 更新，不发送中间进度
 - 检查出站队列状态：日志中搜索 `outbound queue stats`
 
 ### 技能生成失败
 
 - 确认 `SKILLGEN_ENABLED=true`
-- 确认模型在 OpenCode 中可用：`/models`
+- 确认模型在 OpenCode 中可用：`/model`
 - 检查 `SKILLGEN_INSTALL_DIR` 路径存在且可写
 - 查看日志：`grep skillgen /var/log/openbot.log`
 
@@ -730,7 +749,8 @@ tail -f /var/log/openbot.log | grep -E "error|fail|refuse"
 
 - 发送 `/status` 查看会话状态
 - 发送 `/abort` 中止当前任务
-- 发送 `/new` 创建新会话
+- 发送 `/new` 开启新会话（保存上下文摘要）
+- 上下文污染时发送 `/reset` 硬重置（丢弃上下文）
 - 严重时发送 `/clear` 清除会话
 
 ---
