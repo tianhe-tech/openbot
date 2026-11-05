@@ -62,8 +62,12 @@ type wecomTokenOverflowPendingState struct {
 	Content     string
 	Attachments []opencode.Attachment
 	Metadata    map[string]string
-	CreatedAt   time.Time
-	Executing   bool // 标记 executeTokenOverflowDecision 是否已在执行中
+	// DeliveryID is the transport identity of the request that overflowed.
+	// The recovery re-dispatch reuses it so the archive records one turn with
+	// a second attempt instead of a duplicate user request.
+	DeliveryID string
+	CreatedAt  time.Time
+	Executing  bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // NewHandler wires the adapter with an OpenCode client instance.
@@ -306,14 +310,16 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 	}
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:     "wecom",
-		UserID:      userID,
-		ThreadID:    threadID,
-		SessionID:   sessionID,
-		Content:     sendContent,
-		Streaming:   true,
-		Attachments: msg.Attachments,
-		Metadata:    metadata,
+		DeliveryID:      env.MsgID,
+		OriginalContent: &content,
+		Channel:         "wecom",
+		UserID:          userID,
+		ThreadID:        threadID,
+		SessionID:       sessionID,
+		Content:         sendContent,
+		Streaming:       true,
+		Attachments:     msg.Attachments,
+		Metadata:        metadata,
 	}, func(chunk string) error {
 		if h.isTokenOverflowErrorText(chunk) {
 			state := &wecomTokenOverflowPendingState{
@@ -323,6 +329,7 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 				Content:     sendContent,
 				Attachments: append([]opencode.Attachment(nil), msg.Attachments...),
 				Metadata:    cloneStringMap(metadata),
+				DeliveryID:  env.MsgID,
 				CreatedAt:   time.Now(),
 			}
 			if state.SessionID == "" {
@@ -1440,14 +1447,16 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 	}
 
 	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
-		Channel:     "wecom",
-		UserID:      state.UserID,
-		ThreadID:    state.ThreadID,
-		SessionID:   state.SessionID,
-		Content:     state.Content,
-		Streaming:   true,
-		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
-		Metadata:    cloneStringMap(state.Metadata),
+		DeliveryID:      state.DeliveryID,
+		RetryOfDelivery: state.DeliveryID != "",
+		Channel:         "wecom",
+		UserID:          state.UserID,
+		ThreadID:        state.ThreadID,
+		SessionID:       state.SessionID,
+		Content:         state.Content,
+		Streaming:       true,
+		Attachments:     append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:        cloneStringMap(state.Metadata),
 	}, retryCallback)
 	if err != nil {
 		h.clearTokenOverflowPending(userID)

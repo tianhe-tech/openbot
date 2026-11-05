@@ -92,8 +92,12 @@ type feishuTokenOverflowPendingState struct {
 	Attachments []opencode.Attachment
 	Metadata    map[string]string
 	Target      chatTarget
-	CreatedAt   time.Time
-	Executing   bool // 标记 executeTokenOverflowDecision 是否已在执行中
+	// DeliveryID is the transport identity of the request that overflowed.
+	// The recovery re-dispatch reuses it so the archive records one turn with
+	// a second attempt instead of a duplicate user request.
+	DeliveryID string
+	CreatedAt  time.Time
+	Executing  bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // SetRetryWorker wires up the retry store and worker for /retry command and
@@ -621,6 +625,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 				Attachments: append([]opencode.Attachment(nil), msg.Attachments...),
 				Metadata:    cloneStringMap(retryMetadata),
 				Target:      target,
+				DeliveryID:  msg.MessageID,
 				CreatedAt:   time.Now(),
 			}
 			if state.SessionID == "" {
@@ -835,15 +840,17 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	retryMetadata = cloneStringMap(metadata)
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:     "feishu",
-		UserID:      msg.UserID,
-		ThreadID:    threadID,
-		SessionID:   sessionID,
-		Content:     sendContent,
-		Agent:       agentName,
-		Streaming:   true,
-		Attachments: msg.Attachments,
-		Metadata:    metadata,
+		DeliveryID:      msg.MessageID,
+		OriginalContent: &msg.Content,
+		Channel:         "feishu",
+		UserID:          msg.UserID,
+		ThreadID:        threadID,
+		SessionID:       sessionID,
+		Content:         sendContent,
+		Agent:           agentName,
+		Streaming:       true,
+		Attachments:     msg.Attachments,
+		Metadata:        metadata,
 	}, callback)
 
 	log.Printf("feishu: 🔍 SendMessageStreaming returned - user=%s, err=%v, reply_len=%d, accumulated_len=%d",
@@ -851,7 +858,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 	// Enqueue for off-peak retry when the request timed out before any content
 	// was received (pure upstream model overload, not a partial-stream timeout).
-	if retryworker.IsDeadlineErr(err) && fullReply.Len() == 0 && len(response.Reply) == 0 {
+	if !h.client.DurableCaptureEnabled() && retryworker.IsDeadlineErr(err) && fullReply.Len() == 0 && len(response.Reply) == 0 {
 		if h.retryStore != nil {
 			attJSON := ""
 			if len(msg.Attachments) > 0 {
@@ -3052,6 +3059,10 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, target chatTarget, u
 			Channel: "feishu",
 			UserID:  userID,
 			Content: "Initialize session",
+			// Bootstrap prompt: it exists only to materialize an upstream
+			// session for shell execution and is not a user request, so it
+			// must never become an archived conversation turn.
+			Internal: true,
 		})
 		if err != nil {
 			log.Printf("feishu: failed to create session: %v", err)
@@ -3509,15 +3520,17 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 	}
 
 	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
-		Channel:     "feishu",
-		UserID:      state.UserID,
-		ThreadID:    state.ThreadID,
-		SessionID:   state.SessionID,
-		Content:     state.Content,
-		Agent:       state.Agent,
-		Streaming:   true,
-		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
-		Metadata:    cloneStringMap(state.Metadata),
+		DeliveryID:      state.DeliveryID,
+		RetryOfDelivery: state.DeliveryID != "",
+		Channel:         "feishu",
+		UserID:          state.UserID,
+		ThreadID:        state.ThreadID,
+		SessionID:       state.SessionID,
+		Content:         state.Content,
+		Agent:           state.Agent,
+		Streaming:       true,
+		Attachments:     append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:        cloneStringMap(state.Metadata),
 	}, retryCallback)
 	if err != nil {
 		_ = h.sendTextChunks(runCtx, state.Target, fmt.Sprintf("❌ 已尝试%s后重试，但仍失败：%v", tokenOverflowDecisionLabel(decision), err))

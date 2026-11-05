@@ -64,6 +64,12 @@ type Handler struct {
 	// It owns pacing, retries, and (via parked entries) offline recovery.
 	outbound *outboundTextQueue
 
+	// inbound is the durable pre-admission buffer for inbound text. It closes
+	// the crash window between iLink acceptance and OpenCode client admission:
+	// a message buffered in the debounce batcher is persisted here first and
+	// replayed on the next startup if the process dies before dispatch.
+	inbound *inboundQueue
+
 	// pendingMu protects pendingMsgs and pendingTimers.
 	// When a user sends a new message while a previous task is still
 	// dispatching (dispatchToOpenCode running), the new message is queued
@@ -94,6 +100,7 @@ type Handler struct {
 // pendingMessage holds a user message that is waiting for a prior task's
 // dispatch to complete before it can be executed.
 type pendingMessage struct {
+	Capture     wechatCaptureInput
 	UserID      string
 	ChatID      string
 	Content     string
@@ -156,6 +163,21 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 			cfg.StopDrainTimeout,
 		)
 		h.outbound = outbound
+	}
+
+	// Durable pre-admission buffer for inbound text. Same lifecycle pattern as
+	// the outbound queue: a failure to open it degrades to memory-only
+	// buffering instead of disabling the adapter.
+	inboundPath := filepath.Join(stateDir, "inbound_queue.db")
+	if envPath := strings.TrimSpace(os.Getenv("WECHAT_INBOUND_DB_PATH")); envPath != "" {
+		inboundPath = envPath
+	}
+	if inbound, err := newInboundQueue(inboundPath); err != nil {
+		log.Printf("wechat: inbound queue init failed, pre-admission buffering is memory-only: %v", err)
+	} else {
+		h.inbound = inbound
+		h.batcher.queue = inbound
+		log.Printf("wechat: inbound queue configured db=%s maxReplayAge=%s", inboundPath, maxInboundReplayAge)
 	}
 
 	// Register a stuck session hook so the user is proactively notified when
@@ -324,6 +346,11 @@ func (h *Handler) Start(parentCtx context.Context) error {
 		h.outbound.Start()
 	}
 
+	// Replay anything that was buffered when the previous process stopped.
+	// This runs before polling starts so a replayed batch cannot race with a
+	// live debounce window for the same sender.
+	h.replayPendingInbound(ctx)
+
 	go h.pollLoop(ctx)
 	return nil
 }
@@ -340,6 +367,13 @@ func (h *Handler) Stop() {
 	}
 	if h.outbound != nil {
 		h.outbound.Stop()
+	}
+	// Close the inbound buffer last: flushAll above may still have persisted
+	// rows to clear, and any row left behind is intentionally kept for replay.
+	if h.inbound != nil {
+		if err := h.inbound.Close(); err != nil {
+			log.Printf("wechat: inbound queue close failed: %v", err)
+		}
 	}
 	if err := h.weClient.NotifyStop(); err != nil {
 		log.Printf("wechat: notify stop failed: %v", err)
@@ -515,6 +549,8 @@ func isCommandText(text string) bool {
 // either directly (commands / media messages) or by the batcher after its
 // quiet window elapses (aggregated text).
 func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) error {
+	ensureDeliveryIDs(msg)
+	captureInput := wechatCaptureInput{DeliveryIDs: append([]string(nil), msg.deliveryIDs...), OriginalContent: h.extractText(msg, nil)}
 	userID := msg.FromUserID
 	chatID := msg.GroupID
 	if chatID == "" {
@@ -719,12 +755,12 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 	// This mirrors opencode TUI's session-level task serialization and
 	// guarantees task A's results are fully enqueued before task B starts.
 	if _, busy := h.dispatching.Load(userID); busy {
-		h.enqueuePending(userID, chatID, userText, ctxToken, attachments, agentName)
+		h.enqueuePending(userID, chatID, userText, ctxToken, attachments, agentName, captureInput)
 		return nil
 	}
 
 	// Run dispatch in a goroutine so the poll loop is not blocked.
-	go h.dispatchToOpenCode(ctx, userID, chatID, userText, ctxToken, attachments, agentName)
+	go h.dispatchToOpenCode(ctx, userID, chatID, userText, ctxToken, attachments, agentName, captureInput)
 	return nil
 }
 
@@ -882,7 +918,8 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 	return "", false
 }
 
-func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string) {
+func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string, captureInputs ...wechatCaptureInput) {
+	captureInput := captureInputForDispatch(content, captureInputs)
 	// ★ Mark this user as dispatching. handleBatchedMessage checks this flag
 	// to decide whether to queue or execute a new message. Cleared via defer
 	// so it is always released even on panic or early return.
@@ -935,14 +972,17 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	defer cancel()
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:     "wechat",
-		UserID:      userID,
-		ThreadID:    threadID,
-		SessionID:   sessionID,
-		Content:     content,
-		Agent:       agentName,
-		Streaming:   true,
-		Attachments: attachments,
+		DeliveryID:      captureInput.deliveryID(),
+		OriginalContent: &captureInput.OriginalContent,
+		RetryOfDelivery: captureInput.Retry,
+		Channel:         "wechat",
+		UserID:          userID,
+		ThreadID:        threadID,
+		SessionID:       sessionID,
+		Content:         content,
+		Agent:           agentName,
+		Streaming:       true,
+		Attachments:     attachments,
 	}, func(chunk string) error {
 		// Session mapping. Always intercept ses_* chunks (they are the
 		// session ID sent by client.go's callback) so they never leak into
@@ -1027,7 +1067,9 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 				// 避免会话卡死（与 dingtalk/feishu/wecom 行为一致）。
 				if h.isTokenOverflowError(msg) && sessionID != "" {
 					log.Printf("wechat: token overflow detected for user %s session %s, auto-recovering", userID, sessionID[:min(8, len(sessionID))])
-					go h.recoverFromTokenOverflow(context.Background(), userID, sessionID, ctxToken, content, attachments, agentName)
+					retryInput := captureInput
+					retryInput.Retry = true
+					go h.recoverFromTokenOverflow(context.Background(), userID, sessionID, ctxToken, content, attachments, agentName, retryInput)
 					return nil
 				}
 
@@ -1152,9 +1194,12 @@ func (h *Handler) forceDispatchReset(userID string) {
 // text is appended (newline-joined) — matching the inbound batcher's
 // coalescing behaviour. A long-run reminder timer is (re)armed so the user is
 // notified if the current task takes more than 10 minutes.
-func (h *Handler) enqueuePending(userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string) {
+func (h *Handler) enqueuePending(userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string, captureInputs ...wechatCaptureInput) {
+	captureInput := captureInputForDispatch(content, captureInputs)
 	h.pendingMu.Lock()
 	if existing, ok := h.pendingMsgs[userID]; ok {
+		existing.Capture.DeliveryIDs = append(existing.Capture.DeliveryIDs, captureInput.DeliveryIDs...)
+		existing.Capture.OriginalContent += "\n" + captureInput.OriginalContent
 		existing.Content = existing.Content + "\n" + content
 		h.pendingMu.Unlock()
 		log.Printf("wechat: 📝 appended to pending queue for user %s (total len=%d)", userID, len(existing.Content))
@@ -1162,6 +1207,7 @@ func (h *Handler) enqueuePending(userID, chatID, content, ctxToken string, attac
 	}
 
 	h.pendingMsgs[userID] = &pendingMessage{
+		Capture:     captureInput,
 		UserID:      userID,
 		ChatID:      chatID,
 		Content:     content,
@@ -1219,7 +1265,7 @@ func (h *Handler) dispatchPendingIfAny(userID string) {
 		"✅ 上一个任务已完成，正在处理您的下一条消息...", true)
 
 	go h.dispatchToOpenCode(context.Background(), pending.UserID, pending.ChatID,
-		pending.Content, pending.CtxToken, pending.Attachments, pending.AgentName)
+		pending.Content, pending.CtxToken, pending.Attachments, pending.AgentName, pending.Capture)
 }
 
 // notifyLongRunningTask sends a user-facing notice when the current task has
@@ -1773,7 +1819,16 @@ func (h *Handler) isTokenOverflowError(msg string) bool {
 // 1. 尝试调用 SummarizeSession 压缩上下文
 // 2. 压缩成功后重新发送原始消息
 // 3. 压缩失败则通知用户，建议使用 /new 创建新会话
-func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionID, ctxToken, originalContent string, attachments []opencode.Attachment, agentName string) {
+//
+// captureInput carries the original transport identity so the re-dispatch is
+// archived as a second attempt on the same turn rather than a duplicate user
+// request. Without it the retry would mint a synthetic delivery ID and the
+// archive would show the user asking the same thing twice.
+func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionID, ctxToken, originalContent string, attachments []opencode.Attachment, agentName string, captureInput wechatCaptureInput) {
+	if h.client.DurableCaptureEnabled() {
+		_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_notice", "上下文超限；严格记忆模式未自动重发任务。请检查 /status 后决定是否创建新请求。", true)
+		return
+	}
 	_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_notice",
 		"⚠️ 上下文已超限，正在自动压缩并重试...", true)
 
@@ -1799,7 +1854,7 @@ func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionI
 	go func() {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer retryCancel()
-		h.dispatchToOpenCode(retryCtx, userID, "", originalContent, ctxToken, attachments, agentName)
+		h.dispatchToOpenCode(retryCtx, userID, "", originalContent, ctxToken, attachments, agentName, captureInput)
 	}()
 }
 

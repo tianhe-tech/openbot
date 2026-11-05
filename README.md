@@ -62,9 +62,8 @@
 
 ### 💾 记忆系统
 
-- **SQLite + FTS5** — 纯 Go 驱动（`modernc.org/sqlite`），trigram 分词支持中文
+- **SQLite + FTS5** — 纯 Go 驱动（`modernc.org/sqlite`），双索引：trigram 分词支持中文与任意子串，unicode61 词索引让 ASCII 词查询快 15.9 倍
 - **情景回忆** — 对话记录自动存储，BM25 搜索召回
-- **遗忘曲线** — 每小时衰减强度，模拟艾宾浩斯遗忘曲线
 - **会话 Handoff** — 卡死会话摘要保存，下次同线程自动注入
 
 ### 🔒 安全代理隧道
@@ -75,7 +74,7 @@
 
 ### 📦 其他特性
 
-- **MCP 服务器** — 将记忆库暴露为 LLM 工具（`memory_search` / `memory_list_projects` / `memory_recent`）
+- **MCP 服务器** — 将记忆库暴露为 LLM 工具（`memory_search` / `memory_get` / `memory_scroll` / `memory_list_projects` / `memory_recent` / `memory_health` / `memory_space`）
 - **离线重试** — 消息发送失败 5 次后进入离线队列，`/recover` 恢复
 - **语音输入** — 阿里云 NLS 语音转文字（钉钉 + 飞书）
 - **技能/Agent 路由** — `@agent_name` 前缀转发到指定 OpenCode 技能
@@ -337,19 +336,21 @@ SKILLGEN_INSTALL_DIR=/root/.config/opencode/skills
 ### 架构
 
 - **存储**：SQLite（`modernc.org/sqlite`，纯 Go，WAL 模式）
-- **全文搜索**：FTS5 虚拟表，trigram 分词器（支持中文）
+- **全文搜索**：FTS5 虚拟表，双索引 —— trigram 分词器（支持中文与任意子串）+ unicode61 词索引（ASCII 词快 15.9 倍），按查询词形态自动路由
 - **路径**：`MEMORY_STORE_PATH`（默认 `<OPENCODE_DIRECTORY>/mem/memory.db`）
 
 ### 功能
 
-- **情景回忆**：对话记录自动存储（请求、响应摘要、项目、工作目录、操作类型、标签）
-- **BM25 搜索**：通过 MCP 工具或 API 搜索历史对话
-- **遗忘曲线**：每小时衰减强度，模拟艾宾浩斯遗忘曲线
+- **情景回忆**：保存收到的请求和完整响应文本、项目、工作目录、操作类型和标签，不再截断为 600 字节
+- **BM25 搜索**：索引请求和响应；返回记录 ID 与原文摘录，不按项目/日期合并不同对话
+- **历史保留**：不再按历史关键词自动删除记录，不再按记忆强度排除旧记录或每小时衰减
 - **会话 Handoff**：卡死会话的摘要保存，下次同线程自动注入为新会话的前言
 
 ### 自动 MCP 注册
 
-网关启动时自动在 `opencode.json` 中注册 `gateway-memory` MCP 工具，AI 可主动搜索记忆。
+网关启动时在 `opencode.json` 中注册默认禁用的 `gateway-memory` MCP 工具。只有隔离的单用户实例才能配置固定 adapter/user 后启用；共享实例暂不支持安全的历史召回。已有配置不会被覆盖，但新版 MCP 缺少显式绑定时会拒绝启动。
+
+升级时先备份数据库，再启动新版网关：它会事务性重建一次搜索索引，包含现存响应。MCP 只读打开，不创建或迁移数据库。已经删除或截断的历史无法凭空恢复。详见 [MCP 配置与升级](docs/MCP_MEMORY_TOOL.md)。
 
 ---
 
@@ -359,24 +360,31 @@ SKILLGEN_INSTALL_DIR=/root/.config/opencode/skills
 
 | 工具 | 说明 |
 |------|------|
-| `memory_search` | FTS + 模糊搜索（query 必填，可选 project/days/limit） |
+| `memory_search` | 作用域内词法搜索。归档已迁移到 v2 时搜索原始消息正文，返回证据字节偏移、项目/时间过滤、游标分页和索引覆盖状态；未迁移时回退到 Phase 0 的 FTS 召回（query 必填，可选 days/limit/project/cursor；limit 默认 10、最大 50） |
+| `memory_get` | 按消息 ID 取回原始正文（最多 100 条，可选 budget_bytes，默认 32 KiB、最大 256 KiB）。需要已迁移的 v2 归档 |
+| `memory_scroll` | 按 seq 顺序翻页浏览单个会话（session_id 必填，可选 cursor/direction/limit；limit 默认 20、最大 100）。需要已迁移的 v2 归档 |
 | `memory_list_projects` | 项目列表（含计数和最后活跃时间） |
-| `memory_recent` | 最近对话（days 默认 7，limit 默认 20） |
+| `memory_recent` | 最近对话（days 默认 7，0 表示全部；limit 默认 10、最大 50） |
+| `memory_health` | 运维状态：作用域模式、归档 schema、分词器版本、待处理/失败的索引任务、词索引完整性与滞后、索引更新时间、消息总数、索引滞后、分块数、存储统计（块数、已压缩块数、原始字节、实际存储字节、节省字节）。不接受参数。不返回消息正文、凭据或任何按用户区分的标签，因此可以安全地暴露给模型。未迁移的归档会报告 `schema: legacy` 并说明索引在 `memory-migrate` 之前不适用，而不是返回一堆看起来像"健康的空索引"的零。存储行分别报告原始字节与实际存储字节，这样压缩是否生效是可见的而不是假设的：只报告存储字节的话，压缩生效和被静默关闭看起来完全一样 |
+| `memory_space` | 归档空间去向：整库数字（数据库文件、WAL、SHM、空闲页、全文索引页）与当前 principal 的逻辑大小（块字节、工件字节、嵌入字节）分组报告，两组永不相加——所有 principal 共享同一批页，按 principal 分摊文件大小是虚构的，而块和工件是文件的子集而不是增量。可选 `backup_path` 单独报告备份文件大小。比 `memory_health` 慢，因为全文索引开销用 `dbstat` 遍历页表测得，所以是独立工具而不是塞进健康报告。SQLite 构建没有 `dbstat` 时 `fts_bytes` 报告为 unknown 而不是 0，因为 0 会被读成"索引是空的"。不返回消息正文或按用户区分的标签 |
+
+v2 搜索在索引任务尚未处理完时返回 `Coverage: PARTIAL`，不会把"还没索引"伪装成"没有匹配"。结果里的 `mode` 说明是哪个索引回答的：`word`（纯 ASCII 词，走词索引，最快）、`fts`（含中文或 `.` `/` 等分隔符，走 trigram 索引）、`hybrid`（两种词混合，两个索引都查后合并）、`scan`（全部短于 3 个字符，两个索引都无法匹配，退化为有界扫描）。`scan` 只检查最新的 2000 条消息，一旦因此提前停止就返回 `TooBroad` 并在 `notice` 里说明"只扫描了最新 N 条"，因为"最新 2000 条里的匹配"和"全部匹配"是两个不同的答案。schema v4 升级后词索引由后台回填，未完成时 `word`/`hybrid` 查询会额外报告 `Word index: PARTIAL` —— 这与 `Coverage: PARTIAL` 不同：消息已索引，只是不在该查询使用的索引里。`memory_get` / `memory_scroll` 在未迁移的归档上直接报错，而不是返回空结果。
 
 ### 配置
 
 ```json
-// opencode.json
 {
   "mcp": {
     "gateway-memory": {
       "type": "local",
-      "command": ["./bin/openbot-mcp", "--db", "./tmp/memory.db"],
+      "command": ["./bin/openbot-mcp", "--db", "./mem/memory.db", "--single-owner", "--adapter", "wechat", "--user", "YOUR_USER_ID"],
       "enabled": true
     }
   }
 }
 ```
+
+以上启用示例仅适用于其他用户无法访问的单用户 OpenCode/MCP 实例。绑定用户不是共享进程的身份认证；请替换实际 channel/user ID，并使用与网关一致的绝对数据库路径。Windows 二进制名需要 `.exe`。
 
 ---
 
@@ -510,6 +518,7 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `WECHAT_CDN_BASE_URL` | `https://ilinkai.weixin.qq.com` | CDN 地址 |
 | `WECHAT_TEXT_BATCH_DELAY_SECONDS` | `3` | 入站批处理延迟 |
 | `WECHAT_TEXT_BATCH_SPLIT_DELAY_SECONDS` | `5` | 拆分检测延迟 |
+| `WECHAT_INBOUND_DB_PATH` | `<stateDir>/inbound_queue.db` | 入站持久化缓冲 SQLite（崩溃后重放） |
 | `WECHAT_OUTBOUND_DB_PATH` | `<stateDir>/outbound_queue.db` | 出站队列 SQLite |
 | `WECHAT_OUTBOUND_TICK_MS` | `3000` | 出站 ticker 间隔 |
 | `WECHAT_OUTBOUND_MAX_TEXT_LEN` | `4000` | 最大文本块长度 |
@@ -701,6 +710,7 @@ make help               # 显示帮助
 | [docs/CRONTASK_COMMAND.md](docs/CRONTASK_COMMAND.md) | 定时任务命令参考 |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | 部署指南（Docker/systemd/Nginx） |
 | [docs/MCP_MEMORY_TOOL.md](docs/MCP_MEMORY_TOOL.md) | MCP 记忆工具配置 |
+| [docs/MEMORY_MIGRATION.md](docs/MEMORY_MIGRATION.md) | v2 archive migration and experimental strict capture |
 | [docs/MEDIA_MESSAGE_SUPPORT.md](docs/MEDIA_MESSAGE_SUPPORT.md) | 多媒体消息支持 |
 | [docs/PROXY_TUNNEL.md](docs/PROXY_TUNNEL.md) | 代理隧道架构与配置 |
 | [docs/QUICK_START_CRONTASK.md](docs/QUICK_START_CRONTASK.md) | 定时任务快速上手 |

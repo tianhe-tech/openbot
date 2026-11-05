@@ -298,6 +298,10 @@ func (s *TaskScheduler) executeScriptTask(ctx context.Context, task *Task) (*Tas
 			UserID:   task.UserID,
 			ThreadID: task.ThreadID,
 			Content:  "Initialize session for script execution",
+			// Bootstrap prompt: it only materializes an upstream session for
+			// shell execution and is not a user request, so it must never
+			// become an archived conversation turn.
+			Internal: true,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create session: %w", err)

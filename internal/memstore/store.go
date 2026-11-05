@@ -3,8 +3,10 @@ package memstore
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"math/rand"
+	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -19,7 +21,7 @@ type MemRecord struct {
 	UserID     string
 	Ts         time.Time
 	Request    string
-	Response   string // first 600 chars of response
+	Response   string
 	Summary    string // one-line human-readable summary
 	Project    string // coarse project label (e.g. "爬虫项目")
 	WorkDir    string // absolute working directory of the opencode session (e.g. "/root/openbot")
@@ -49,18 +51,86 @@ type Store struct {
 
 // Open opens (or creates) the SQLite database at path and ensures the schema exists.
 func Open(path string) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000", path)
-	db, err := sql.Open("sqlite", dsn)
+	s, err := openDatabase(path, false)
 	if err != nil {
-		return nil, fmt.Errorf("memstore: open %s: %w", path, err)
+		return nil, err
 	}
-	db.SetMaxOpenConns(1) // SQLite WAL works fine with single writer
-	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
-		_ = db.Close()
+		_ = s.Close()
 		return nil, fmt.Errorf("memstore: migrate: %w", err)
 	}
 	return s, nil
+}
+
+func OpenReadOnly(path string) (*Store, error) {
+	s, err := openDatabase(path, true)
+	if err != nil {
+		return nil, err
+	}
+	var version int
+	err = s.db.QueryRow(`SELECT version FROM mem_search_migrations WHERE version = 1`).Scan(&version)
+	if err == nil {
+		var rows *sql.Rows
+		rows, err = s.db.Query(`SELECT r.id, r.adapter, r.user_id, r.ts, r.request, r.response,
+			r.summary, r.project, r.work_dir, r.action, r.tags, r.strength, r.recall_cnt, r.next_review,
+			f.record_id, f.content FROM mem_records r LEFT JOIN mem_fts f ON f.record_id = r.id LIMIT 0`)
+		if rows != nil {
+			rows.Close()
+		}
+	}
+	if err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("memstore: incompatible search schema; start the updated gateway to migrate this database: %w", err)
+	}
+	return s, nil
+}
+
+func openDatabase(path string, readOnly bool) (*Store, error) {
+	return openDatabaseMode(path, readOnly, !readOnly)
+}
+
+func openDatabaseMode(path string, readOnly, create bool) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("memstore: database path is required")
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("memstore: database path: %w", err)
+	}
+	if create {
+		if err := os.MkdirAll(filepath.Dir(absPath), 0o700); err != nil {
+			return nil, fmt.Errorf("memstore: database directory: %w", err)
+		}
+	}
+	uriPath := filepath.ToSlash(absPath)
+	if !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	params := url.Values{}
+	params.Add("_pragma", "busy_timeout(5000)")
+	if readOnly {
+		params.Set("mode", "ro")
+		params.Add("_pragma", "query_only(1)")
+	} else {
+		params.Add("_pragma", "journal_mode(WAL)")
+		if !create {
+			params.Set("mode", "rw")
+			params.Set("_txlock", "immediate")
+			params.Add("_pragma", "synchronous(FULL)")
+			params.Add("_pragma", "foreign_keys(1)")
+		}
+	}
+	uri := url.URL{Scheme: "file", Path: uriPath, RawQuery: params.Encode()}
+	db, err := sql.Open("sqlite", uri.String())
+	if err != nil {
+		return nil, fmt.Errorf("memstore: open %s: %w", absPath, err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("memstore: open %s: %w", absPath, err)
+	}
+	return &Store{db: db}, nil
 }
 
 // Close releases the underlying database connection.
@@ -172,22 +242,43 @@ func (s *Store) migrate() error {
 	// Add work_dir column to existing databases (ALTER TABLE is idempotent via error ignore).
 	if _, err := s.db.Exec(`ALTER TABLE mem_records ADD COLUMN work_dir TEXT NOT NULL DEFAULT ''`); err != nil {
 		if !strings.Contains(err.Error(), "duplicate column") {
-			log.Printf("memstore: add work_dir column: %v", err)
+			return fmt.Errorf("memstore: add work_dir column: %w", err)
 		}
 	}
-	// Backfill any existing records that are not yet in mem_fts.
-	// Uses a LEFT JOIN so only missing entries are inserted, safe to run on every startup.
-	_, err := s.db.Exec(`
+	return s.migrateSearchIndex()
+}
+
+func (s *Store) migrateSearchIndex() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS mem_search_migrations (version INTEGER PRIMARY KEY)`); err != nil {
+		return err
+	}
+	var migrated int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM mem_search_migrations WHERE version = 1`).Scan(&migrated); err != nil {
+		return err
+	}
+	if migrated == 0 {
+		if _, err := tx.Exec(`DELETE FROM mem_fts`); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(`
 		INSERT INTO mem_fts(record_id, content)
-		SELECT r.id, r.summary || ' ' || r.project || ' ' || r.request
+		SELECT r.id, r.summary || ' ' || r.project || ' ' || r.request || ' ' || r.response || ' ' || r.tags
 		FROM   mem_records r
 		LEFT JOIN mem_fts f ON f.record_id = r.id
 		WHERE  f.record_id IS NULL`)
 	if err != nil {
-		log.Printf("memstore: fts backfill: %v", err)
+		return fmt.Errorf("memstore: search index rebuild: %w", err)
 	}
-	s.purgeRecallNoise()
-	return nil
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO mem_search_migrations(version) VALUES (1)`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func min(a, b int) int {
@@ -212,30 +303,28 @@ func (s *Store) Record(rec MemRecord) error {
 		rec.NextReview = time.Now().Add(NextReviewAfter(0))
 	}
 
-	// Truncate response to keep DB lean
-	resp := rec.Response
-	if len(resp) > 600 {
-		resp = resp[:600]
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-
-	_, err := s.db.Exec(`
+	defer tx.Rollback()
+	_, err = tx.Exec(`
 		INSERT INTO mem_records
 			(id, adapter, user_id, ts, request, response, summary, project, work_dir, action, tags, strength, recall_cnt, next_review)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rec.ID, rec.Adapter, rec.UserID, rec.Ts.Unix(),
-		rec.Request, resp, rec.Summary, rec.Project, rec.WorkDir, rec.Action, rec.Tags,
+		rec.Request, rec.Response, rec.Summary, rec.Project, rec.WorkDir, rec.Action, rec.Tags,
 		rec.Strength, rec.RecallCnt, rec.NextReview.Unix(),
 	)
 	if err != nil {
 		return fmt.Errorf("memstore: record insert: %w", err)
 	}
-	// Index into FTS5: concatenate summary + project + request for richer coverage.
-	ftsContent := strings.TrimSpace(rec.Summary + " " + rec.Project + " " + rec.Request)
-	if _, ftsErr := s.db.Exec(`INSERT INTO mem_fts(record_id, content) VALUES(?,?)`,
+	ftsContent := strings.TrimSpace(rec.Summary + " " + rec.Project + " " + rec.Request + " " + rec.Response + " " + rec.Tags)
+	if _, ftsErr := tx.Exec(`INSERT INTO mem_fts(record_id, content) VALUES(?,?)`,
 		rec.ID, ftsContent); ftsErr != nil {
-		log.Printf("memstore: fts insert %s: %v", rec.ID, ftsErr)
+		return fmt.Errorf("memstore: fts insert %s: %w", rec.ID, ftsErr)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // Recall performs hybrid BM25 (FTS5 倒排索引) + LIKE retrieval fused via RRF.
@@ -251,7 +340,10 @@ func (s *Store) Recall(keywords []string, adapter, userID string, since time.Tim
 	pool := limit * 3 // over-fetch candidates before fusion
 
 	// 1. BM25 via FTS5 倒排索引 (3+ rune terms only; trigram tokenizer requirement)
-	bm25IDs := s.recallBM25(keywords, pool)
+	bm25IDs, err := s.recallBM25(keywords, adapter, userID, since, pool)
+	if err != nil {
+		return nil, err
+	}
 
 	// 2. LIKE fallback (covers 2-char CJK terms that trigram misses)
 	likeRows, err := s.recallLIKE(keywords, adapter, userID, since, pool)
@@ -279,10 +371,11 @@ func (s *Store) Recall(keywords []string, adapter, userID string, since time.Tim
 	}
 	if len(missingIDs) > 0 {
 		extra, ferr := s.fetchByIDs(missingIDs, adapter, userID, since)
-		if ferr == nil {
-			for _, r := range extra {
-				recordMap[r.ID] = r
-			}
+		if ferr != nil {
+			return nil, ferr
+		}
+		for _, r := range extra {
+			recordMap[r.ID] = r
 		}
 	}
 
@@ -302,21 +395,12 @@ func (s *Store) Recall(keywords []string, adapter, userID string, since time.Tim
 		}
 	}
 
-	// 6. Strengthen recalled records asynchronously (SM-2)
-	go func() {
-		for _, r := range results {
-			if err := s.strengthen(r.ID); err != nil {
-				log.Printf("memstore: strengthen %s: %v", r.ID, err)
-			}
-		}
-	}()
-
 	return results, nil
 }
 
 // recallBM25 performs FTS5 BM25 full-text search via the inverted index.
 // Only keywords with >= 3 Unicode runes are used (trigram tokenizer requirement).
-func (s *Store) recallBM25(keywords []string, limit int) []string {
+func (s *Store) recallBM25(keywords []string, adapter, userID string, since time.Time, limit int) ([]string, error) {
 	var terms []string
 	for _, kw := range keywords {
 		if len([]rune(strings.TrimSpace(kw))) < 3 {
@@ -327,29 +411,43 @@ func (s *Store) recallBM25(keywords []string, limit int) []string {
 		terms = append(terms, `"`+escaped+`"`)
 	}
 	if len(terms) == 0 {
-		return nil
+		return nil, nil
 	}
 
+	where := "mem_fts MATCH ?"
+	args := []interface{}{strings.Join(terms, " OR ")}
+	if adapter != "" {
+		where += " AND r.adapter = ?"
+		args = append(args, adapter)
+	}
+	if userID != "" {
+		where += " AND r.user_id = ?"
+		args = append(args, userID)
+	}
+	if !since.IsZero() {
+		where += " AND r.ts >= ?"
+		args = append(args, since.Unix())
+	}
+	args = append(args, limit)
 	rows, err := s.db.Query(`
-		SELECT record_id FROM mem_fts
-		WHERE  mem_fts MATCH ?
-		ORDER  BY bm25(mem_fts)
-		LIMIT  ?`,
-		strings.Join(terms, " OR "), limit)
+		SELECT f.record_id FROM mem_fts f JOIN mem_records r ON r.id = f.record_id
+		WHERE `+where+`
+		ORDER BY bm25(mem_fts), r.ts DESC, r.id
+		LIMIT ?`, args...)
 	if err != nil {
-		log.Printf("memstore: bm25 query: %v", err)
-		return nil
+		return nil, fmt.Errorf("memstore: bm25 query: %w", err)
 	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
 		}
+		ids = append(ids, id)
 	}
-	return ids
+	return ids, rows.Err()
 }
 
 // recallLIKE returns records matching keywords via SQL LIKE with all filters applied.
@@ -360,9 +458,10 @@ func (s *Store) recallLIKE(keywords []string, adapter, userID string, since time
 		if strings.TrimSpace(kw) == "" {
 			continue
 		}
-		like := "%" + strings.ToLower(kw) + "%"
-		conds = append(conds, `(LOWER(tags) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(request) LIKE ?)`)
-		args = append(args, like, like, like)
+		literal := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(kw))
+		like := "%" + literal + "%"
+		conds = append(conds, `(LOWER(tags) LIKE ? ESCAPE '\' OR LOWER(summary) LIKE ? ESCAPE '\' OR LOWER(request) LIKE ? ESCAPE '\' OR LOWER(response) LIKE ? ESCAPE '\' OR LOWER(project) LIKE ? ESCAPE '\')`)
+		args = append(args, like, like, like, like, like)
 	}
 	if len(conds) == 0 {
 		return nil, nil
@@ -380,7 +479,6 @@ func (s *Store) recallLIKE(keywords []string, adapter, userID string, since time
 		where += " AND ts >= ?"
 		args = append(args, since.Unix())
 	}
-	where += " AND strength > 0.05"
 	args = append(args, limit)
 
 	rows, err := s.db.Query(`
@@ -408,7 +506,7 @@ func (s *Store) fetchByIDs(ids []string, adapter, userID string, since time.Time
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	where := "id IN (" + placeholders + ") AND strength > 0.05"
+	where := "id IN (" + placeholders + ")"
 	if adapter != "" {
 		where += " AND adapter = ?"
 		args = append(args, adapter)
@@ -486,13 +584,18 @@ func (s *Store) RecallByProject(project, adapter string, limit int) ([]MemRecord
 // ProjectSummaries returns aggregated project info for a user across adapters.
 // adapter == "" means all adapters. since filters to records newer than that time (zero = no limit).
 // minCount excludes projects with fewer records (use 2 to filter one-off noise).
+//
+// userID is mandatory. An empty userID used to skip the filter entirely and
+// return every user's projects, which is the opposite of what Search does: it
+// rejects an unscoped call with ErrSearchScopeRequired. Two functions in the
+// same package disagreeing about whether an empty scope means "everything" or
+// "nothing" is a defect, and the safe reading is the one Search already takes.
 func (s *Store) ProjectSummaries(userID, adapter string, since time.Time, minCount int) ([]ProjectSummary, error) {
-	var args []interface{}
-	where := "1=1"
-	if userID != "" {
-		where += " AND user_id = ?"
-		args = append(args, userID)
+	if strings.TrimSpace(userID) == "" {
+		return nil, ErrSearchScopeRequired
 	}
+	args := []interface{}{userID}
+	where := "user_id = ?"
 	if adapter != "" {
 		where += " AND adapter = ?"
 		args = append(args, adapter)
@@ -541,21 +644,25 @@ func (s *Store) ProjectSummaries(userID, adapter string, since time.Time, minCou
 }
 
 // Recent returns the most recent N records across adapters (or filtered by adapter).
+//
+// userID is mandatory for the same reason as ProjectSummaries: an empty value
+// must not widen the query to every user. See the note there.
 func (s *Store) Recent(adapter, userID string, days, limit int) ([]MemRecord, error) {
+	if strings.TrimSpace(userID) == "" {
+		return nil, ErrSearchScopeRequired
+	}
 	if limit <= 0 {
 		limit = 20
 	}
-	since := time.Now().AddDate(0, 0, -days).Unix()
-	var args []interface{}
-	where := "ts >= ?"
-	args = append(args, since)
+	args := []interface{}{userID}
+	where := "user_id = ?"
+	if days > 0 {
+		where += " AND ts >= ?"
+		args = append(args, time.Now().AddDate(0, 0, -days).Unix())
+	}
 	if adapter != "" {
 		where += " AND adapter = ?"
 		args = append(args, adapter)
-	}
-	if userID != "" {
-		where += " AND user_id = ?"
-		args = append(args, userID)
 	}
 	args = append(args, limit)
 
@@ -573,120 +680,7 @@ func (s *Store) Recent(adapter, userID string, days, limit int) ([]MemRecord, er
 	return scanRecords(rows)
 }
 
-// DecayAll applies time-based strength decay to all records.
-// Safe to call periodically (e.g., once per hour) in a goroutine.
-func (s *Store) DecayAll() error {
-	rows, err := s.db.Query(`SELECT id, strength, ts FROM mem_records WHERE strength > 0.01`)
-	if err != nil {
-		return fmt.Errorf("memstore: decay query: %w", err)
-	}
-	defer rows.Close()
-
-	now := time.Now()
-	type update struct {
-		id       string
-		strength float64
-	}
-	var updates []update
-	for rows.Next() {
-		var id string
-		var strength float64
-		var ts int64
-		if err := rows.Scan(&id, &strength, &ts); err != nil {
-			continue
-		}
-		daysSince := now.Sub(time.Unix(ts, 0)).Hours() / 24
-		newStrength := EffectiveStrength(strength, daysSince)
-		if newStrength < strength-0.001 { // only update if meaningfully changed
-			updates = append(updates, update{id, newStrength})
-		}
-	}
-	if rows.Err() != nil {
-		return rows.Err()
-	}
-
-	for _, u := range updates {
-		if _, err := s.db.Exec(`UPDATE mem_records SET strength=? WHERE id=?`, u.strength, u.id); err != nil {
-			log.Printf("memstore: decay update %s: %v", u.id, err)
-		}
-	}
-	return nil
-}
-
-func (s *Store) strengthen(id string) error {
-	var recallCnt int
-	_ = s.db.QueryRow(`SELECT recall_cnt FROM mem_records WHERE id = ?`, id).Scan(&recallCnt)
-	_, err := s.db.Exec(`
-		UPDATE mem_records
-		SET    strength   = MIN(1.0, strength + 0.15),
-		       recall_cnt = recall_cnt + 1,
-		       next_review = ?
-		WHERE  id = ?`,
-		time.Now().Add(NextReviewAfter(recallCnt)).Unix(), id)
-	return err
-}
-
 // ---- helpers ----
-
-// purgeRecallNoise deletes records where the stored request is itself a recall/history query.
-// These are meta-questions ("我最近开发了啥") that were mistakenly stored as work records
-// before the RecordConversation guard was in place. Safe to call on every startup.
-func (s *Store) purgeRecallNoise() {
-	// Build OR conditions for each recall trigger keyword.
-	noisePatterns := []string{
-		// Original trigger set
-		"%之前%", "%以前%", "%上次%", "%曾经%",
-		"%开发了%", "%做过%", "%写过%", "%建过%", "%实现过%",
-		"%我做过%", "%我开发过%",
-		// Question-form triggers (new)
-		"%是啊%", "%是啥%",
-		"%啥项目%", "%啥程序%", "%啥软件%",
-		"%什么项目%", "%什么程序%",
-		"%哪些项目%", "%哪个项目%",
-		"%最近开发%", "%近期开发%", "%近来开发%",
-	}
-
-	var conds []string
-	var args []interface{}
-	for _, p := range noisePatterns {
-		conds = append(conds, "LOWER(request) LIKE ?")
-		args = append(args, p)
-	}
-	where := strings.Join(conds, " OR ")
-
-	// Collect IDs to delete so we can also remove from FTS.
-	rows, err := s.db.Query("SELECT id FROM mem_records WHERE "+where, args...)
-	if err != nil {
-		log.Printf("memstore: purge query: %v", err)
-		return
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
-		}
-	}
-	rows.Close()
-
-	if len(ids) == 0 {
-		return
-	}
-
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	idArgs := make([]interface{}, len(ids))
-	for i, id := range ids {
-		idArgs[i] = id
-	}
-
-	if _, err := s.db.Exec("DELETE FROM mem_records WHERE id IN ("+placeholders+")", idArgs...); err != nil {
-		log.Printf("memstore: purge delete records: %v", err)
-	}
-	if _, err := s.db.Exec("DELETE FROM mem_fts WHERE record_id IN ("+placeholders+")", idArgs...); err != nil {
-		log.Printf("memstore: purge delete fts: %v", err)
-	}
-	log.Printf("memstore: purged %d recall-noise records from DB", len(ids))
-}
 
 func scanRecords(rows *sql.Rows) ([]MemRecord, error) {
 	var out []MemRecord

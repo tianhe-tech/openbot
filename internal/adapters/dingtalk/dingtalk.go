@@ -158,8 +158,12 @@ type tokenOverflowPendingState struct {
 	Metadata         map[string]string
 	SessionWebhook   string
 	ConversationType string
-	CreatedAt        time.Time
-	Executing        bool // 标记 executeTokenOverflowDecision 是否已在执行中
+	// DeliveryID is the transport identity of the request that overflowed.
+	// The recovery re-dispatch reuses it so the archive records one turn with
+	// a second attempt instead of a duplicate user request.
+	DeliveryID string
+	CreatedAt  time.Time
+	Executing  bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // NewHandler wires the adapter with an OpenCode client.
@@ -1333,15 +1337,17 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	retryMetadata := cloneStringMap(metadata)
 
 	response, err := h.client.SendMessageStreamingWithEvents(sendCtx, opencode.MessagePayload{
-		Channel:     "dingtalk",
-		UserID:      userID,
-		ThreadID:    conversationID,
-		SessionID:   sessionID, // Pass existing session if available
-		Content:     sendContent,
-		Agent:       agentName,
-		Streaming:   true,
-		Attachments: attachments,
-		Metadata:    metadata,
+		DeliveryID:      msgID,
+		OriginalContent: &content,
+		Channel:         "dingtalk",
+		UserID:          userID,
+		ThreadID:        conversationID,
+		SessionID:       sessionID, // Pass existing session if available
+		Content:         sendContent,
+		Agent:           agentName,
+		Streaming:       true,
+		Attachments:     attachments,
+		Metadata:        metadata,
 	}, func(chunk string) error {
 		// 🔍 诊断：记录第一个 callback
 		if !callbackCalled {
@@ -1376,6 +1382,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				Metadata:         cloneStringMap(metadata),
 				SessionWebhook:   data.SessionWebhook,
 				ConversationType: data.ConversationType,
+				DeliveryID:       msgID,
 				CreatedAt:        time.Now(),
 			}
 			if state.SessionID == "" {
@@ -1575,7 +1582,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		userID, err, len(response.Reply), len(accumulatedContent))
 
 	// Enqueue for off-peak retry when deadline exceeded with zero content.
-	if retryworker.IsDeadlineErr(err) && len(accumulatedContent) == 0 && len(response.Reply) == 0 {
+	if !h.client.DurableCaptureEnabled() && retryworker.IsDeadlineErr(err) && len(accumulatedContent) == 0 && len(response.Reply) == 0 {
 		if h.retryStore != nil {
 			attJSON := ""
 			if len(attachments) > 0 {
@@ -2101,6 +2108,10 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, data *chatbot.BotCal
 			UserID:   userID,
 			ThreadID: data.ConversationId,
 			Content:  "Initialize session",
+			// Bootstrap prompt: it exists only to materialize an upstream
+			// session for shell execution and is not a user request, so it
+			// must never become an archived conversation turn.
+			Internal: true,
 		})
 		if err != nil {
 			log.Printf("dingtalk: failed to create session: %v", err)
@@ -3236,15 +3247,17 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 	}
 
 	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
-		Channel:     "dingtalk",
-		UserID:      state.UserID,
-		ThreadID:    state.ThreadID,
-		SessionID:   state.SessionID,
-		Content:     state.Content,
-		Agent:       state.Agent,
-		Streaming:   true,
-		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
-		Metadata:    cloneStringMap(state.Metadata),
+		DeliveryID:      state.DeliveryID,
+		RetryOfDelivery: state.DeliveryID != "",
+		Channel:         "dingtalk",
+		UserID:          state.UserID,
+		ThreadID:        state.ThreadID,
+		SessionID:       state.SessionID,
+		Content:         state.Content,
+		Agent:           state.Agent,
+		Streaming:       true,
+		Attachments:     append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:        cloneStringMap(state.Metadata),
 	}, retryCallback)
 	if err != nil {
 		_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID,

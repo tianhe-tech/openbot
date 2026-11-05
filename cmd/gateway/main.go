@@ -154,8 +154,16 @@ func main() {
 	// ========== Memory Store (optional) ==========
 	memStorePath := cfg.MemStorePath
 	if memStorePath == "" {
-		// Default: <OPENCODE_DIRECTORY>/tmp/memory.db
+		// Default: <OPENCODE_DIRECTORY>/mem/memory.db
 		memStorePath = filepath.Join(cfg.OpenCodeDirectory, "mem", "memory.db")
+	}
+	archiveWriter, archiveErr := openCaptureArchive(ctx, memStorePath, cfg.MemoryCaptureMode)
+	if archiveErr != nil {
+		log.Fatalf("main: memory capture startup failed: %v", archiveErr)
+	}
+	if archiveWriter != nil {
+		ocOptions = append(ocOptions, opencode.WithConversationRecorder(archiveWriter))
+		log.Printf("main: strict v2 capture enabled; the lexical index worker indexes archived messages for MCP search")
 	}
 	memDB, memErr := memstore.Open(memStorePath)
 	if memErr != nil {
@@ -165,21 +173,6 @@ func main() {
 		ocOptions = append(ocOptions, opencode.WithMemStore(memstore.NewGatewayAdapter(memDB)))
 		// Auto-register the MCP memory tool so the LLM can search memory proactively.
 		ensureMCPMemoryTool(cfg.OpenCodeDirectory, memStorePath)
-		// Periodic forgetting curve decay (every hour)
-		go func() {
-			ticker := time.NewTicker(time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if err := memDB.DecayAll(); err != nil {
-						log.Printf("memstore: decay error: %v", err)
-					}
-				}
-			}
-		}()
 		defer func() {
 			if err := memDB.Close(); err != nil {
 				log.Printf("memstore: close error: %v", err)
@@ -188,6 +181,48 @@ func main() {
 	}
 
 	ocClient := opencode.NewClient(opencodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
+	if archiveWriter != nil {
+		recoveryCtx, stopRecovery := context.WithCancel(ctx)
+		recoveryDone := make(chan struct{})
+		go func() { defer close(recoveryDone); ocClient.RunCaptureRecovery(recoveryCtx) }()
+		// The lexical index is what makes archived messages searchable. It runs
+		// in the background so capture latency never depends on indexing, and it
+		// is stopped before the writer closes so no pass races the drain.
+		indexCtx, stopIndex := context.WithCancel(ctx)
+		indexDone := make(chan struct{})
+		go func() {
+			defer close(indexDone)
+			archiveWriter.RunIndexWorker(indexCtx, memstore.IndexWorkerOptions{
+				OnError: func(err error) {
+					log.Printf("main: memory index pass failed: %v", err)
+				},
+			})
+		}()
+		defer func() {
+			shutdown, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := ocClient.StopCapture(shutdown); err != nil {
+				log.Printf("main: capture producer drain incomplete: %v", err)
+			}
+			stopRecovery()
+			select {
+			case <-recoveryDone:
+			case <-shutdown.Done():
+				log.Printf("main: capture recovery drain incomplete")
+			}
+			stopIndex()
+			select {
+			case <-indexDone:
+			case <-shutdown.Done():
+				log.Printf("main: memory index drain incomplete")
+			}
+			closeCtx, cancelClose := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelClose()
+			if err := archiveWriter.Close(closeCtx); err != nil {
+				log.Printf("main: capture writer drain incomplete: %v", err)
+			}
+		}()
+	}
 
 	// ========== Async work queue (handoff save, skill mining) ==========
 	asyncQueue := asyncwork.New(cfg.SkillAutogen.QueueCapacity)
@@ -317,7 +352,10 @@ func main() {
 	wechatHandler.SetNLScheduleService(nlScheduleSvc)
 
 	// ========== Offline retry queue (optional) ==========
-	if cfg.RetryQueue.Enabled && memDB != nil {
+	if cfg.RetryQueue.Enabled && archiveWriter != nil {
+		log.Printf("main: legacy offline retry worker disabled in strict capture mode; queued records retained")
+	}
+	if cfg.RetryQueue.Enabled && memDB != nil && archiveWriter == nil {
 		rwCfg := retryworker.Config{
 			Enabled:        true,
 			CronExpr:       cfg.RetryQueue.CronExpr,
@@ -710,6 +748,17 @@ func main() {
 	}
 
 	log.Println("gateway stopped")
+}
+
+func openCaptureArchive(ctx context.Context, path, mode string) (*memstore.ArchiveWriter, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "legacy":
+		return nil, nil
+	case "strict":
+		return memstore.OpenArchiveWriter(ctx, path, memstore.WriterOptions{})
+	default:
+		return nil, fmt.Errorf("MEMORY_CAPTURE_MODE must be legacy or strict")
+	}
 }
 
 func serveArgsContainPort(args []string) bool {
@@ -1169,13 +1218,14 @@ func ensureMCPMemoryTool(opencodeDir, memDBPath string) {
 		mcpSection = make(map[string]interface{})
 	}
 	if _, exists := mcpSection["gateway-memory"]; exists {
+		log.Printf("mcp: existing gateway-memory configuration retained; updated MCP requires explicit --single-owner --adapter --user binding; verify its --db path is %s", memDBPath)
 		return // already registered
 	}
 
 	mcpSection["gateway-memory"] = map[string]interface{}{
 		"type":    "local",
 		"command": []string{mcpBin, "--db", memDBPath},
-		"enabled": true,
+		"enabled": false,
 	}
 	root["mcp"] = mcpSection
 
@@ -1192,7 +1242,7 @@ func ensureMCPMemoryTool(opencodeDir, memDBPath string) {
 		log.Printf("mcp: write %s error: %v", cfgPath, err)
 		return
 	}
-	log.Printf("mcp: auto-registered gateway-memory tool in %s (binary=%s)", cfgPath, mcpBin)
+	log.Printf("mcp: registered disabled gateway-memory tool in %s (binary=%s); enable only on an isolated single-owner instance with --single-owner --adapter --user", cfgPath, mcpBin)
 }
 
 // findMCPBinary locates the openbot-mcp binary next to the current executable,

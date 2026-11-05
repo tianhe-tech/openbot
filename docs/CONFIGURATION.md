@@ -3,6 +3,71 @@
 
 ## 默认配置
 
+### Memory Storage and Recall
+
+`MEMORY_STORE_PATH` selects the SQLite database; empty uses
+`<OPENCODE_DIRECTORY>/mem/memory.db` and does not disable capture. The gateway
+creates parent directories and migrates the search index. Back up before upgrading.
+
+New `gateway-memory` MCP registrations are disabled. Recall requires an isolated
+single-owner OpenCode/MCP instance and operator-provided `--single-owner`,
+`--adapter`, and `--user` arguments. The MCP `--db` flag (or `GATEWAY_MEMORY_DB`)
+must refer to the same database. Shared-user recall is not supported yet.
+
+See [MCP memory configuration](MCP_MEMORY_TOOL.md) for executable paths, binding,
+upgrade order, limits, and read-only behavior. Hourly decay and startup keyword
+deletion are no longer enabled.
+
+`MEMORY_CAPTURE_MODE=legacy` is the default. Experimental `strict` requires an
+explicitly migrated v2 archive, commits input before dispatch, and recovers final
+assistant text independently of outbound delivery. Invalid modes or missing archive
+schema fail startup. Strict mode stops legacy conversation writes; MCP searches
+those v2 records through the chunked lexical index described below. Legacy offline
+automatic retries are disabled in strict mode so uncertain tasks are not silently
+replayed.
+
+Internal bootstrap prompts (the synthetic "initialize session" requests that only
+materialize an upstream session for shell execution) are never archived as
+conversation turns. Token-overflow recovery and explicit retries re-dispatch the
+original delivery with `RetryOfDelivery`, which continues the existing turn with a
+new attempt instead of failing closed as a replay or creating a duplicate user
+request; the adapters carry the original transport delivery ID through their
+pending-overflow state so the retry keeps the same turn identity.
+
+See [archive migration and strict capture](MEMORY_MIGRATION.md) before activation.
+Strict mode also records rolling partial snapshots (coalesced to one write per 5
+seconds or 16 KiB of additional text) and tool/attachment metadata (tool output
+bounded to 8 KiB, attachment URLs to 2 KiB, `data:` URIs reduced to their media
+type). These writes are best-effort and never interrupt delivery.
+
+Strict mode also starts a background index worker. It consumes the `kind='index'`
+jobs written with each archived message, chunks the stored body (1 KiB target,
+2 KiB cap, 128-byte overlap, boundary-aware and rune-aligned), and writes
+`mem_v2_chunks` plus the `mem_v2_chunk_fts` trigram index. Indexing is decoupled
+from capture, so a slow index never delays delivery, and a single unindexable
+message records `last_error` without stalling the queue. The worker stops before
+the archive writer drains on shutdown.
+
+`memory_search` reports `Coverage: PARTIAL` while index jobs are pending, so an
+unindexed message is never reported as a confident miss. `memory_get` and
+`memory_scroll` require the migrated archive and refuse a legacy-only database.
+
+Strict mode compresses message bodies automatically; there is no setting to
+enable or disable it. A block is stored with zstd only if it is at least 4 KiB
+and the compressed frame saves at least one byte in eight. Everything else stays
+raw, including short replies, incompressible payloads, and anything above the
+64 MiB decode ceiling. Each block records its codec, codec version, original
+length, stored length, and a checksum over the original text, and every read path
+decodes through one function, so a block written by an older binary stays
+readable. Compression runs inside the capture commit rather than in a background
+pass: the measured cost is 392 µs for a typical 16 KiB answer and 8.93 ms for a
+1 MiB message, against a 2 s commit deadline. `memory_health` reports raw versus
+stored bytes so the saving is visible rather than assumed.
+
+Knowledge extraction, semantic search, and source-backed handoff remain pending.
+Keep the default mode for production until the gates listed in
+[Gate status](MEMORY_IMPLEMENTATION_PLAN.md#gate-status) close.
+
 默认情况下，系统使用以下参数（在 `internal/opencode/client.go` 中定义）：
 
 ```go

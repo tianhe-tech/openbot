@@ -2,7 +2,12 @@ package wechat
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +28,12 @@ type inboundBatcher struct {
 	splitChars int
 
 	dispatch func(ctx context.Context, msg *WeixinMessage) error
+
+	// queue is the durable pre-admission buffer. When set, every buffered
+	// message is persisted before its debounce timer is armed and deleted only
+	// after dispatch succeeds, so a crash inside the debounce window cannot
+	// silently lose an accepted user request.
+	queue *inboundQueue
 
 	mu      sync.Mutex
 	pending map[string]*pendingInbound
@@ -70,11 +81,19 @@ func (b *inboundBatcher) keyFor(msg *WeixinMessage) string {
 // the batcher entirely.
 func (b *inboundBatcher) enqueueText(ctx context.Context, msg *WeixinMessage, text string) {
 	key := b.keyFor(msg)
+	ensureDeliveryIDs(msg)
+
+	// Persist before arming the timer: the debounce window is the last place a
+	// crash can lose an accepted request, and the row is what makes replay
+	// possible. Persisting first also means a crash between persist and timer
+	// arm still replays the message.
+	b.persistInbound(msg, text)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if existing, ok := b.pending[key]; ok {
+		existing.msg.deliveryIDs = append(existing.msg.deliveryIDs, msg.deliveryIDs...)
 		// Stop the previous timer; ignore the bool — even if Stop returns
 		// false (timer already fired) the goroutine will see pending was
 		// replaced via the *pendingInbound identity check.
@@ -102,6 +121,41 @@ func (b *inboundBatcher) enqueueText(ctx context.Context, msg *WeixinMessage, te
 	entry.timer = time.AfterFunc(delay, func() { b.flush(ctx, key, entry) })
 }
 
+type wechatCaptureInput struct {
+	DeliveryIDs     []string
+	OriginalContent string
+	// Retry marks a deliberate re-dispatch of an already archived delivery
+	// (token-overflow recovery). It continues the existing turn with a new
+	// attempt instead of being rejected as a duplicate delivery.
+	Retry bool
+}
+
+func ensureDeliveryIDs(msg *WeixinMessage) {
+	if len(msg.deliveryIDs) != 0 {
+		return
+	}
+	identity := "synthetic:" + rand.Text()
+	if msg.MessageID != 0 {
+		identity = "message:" + strconv.FormatInt(msg.MessageID, 10)
+	} else if msg.ClientID != "" {
+		identity = "client:" + msg.ClientID
+	}
+	msg.deliveryIDs = []string{identity}
+}
+
+func (input wechatCaptureInput) deliveryID() string {
+	encoded, _ := json.Marshal(input.DeliveryIDs)
+	digest := sha256.Sum256(encoded)
+	return "wechat:" + hex.EncodeToString(digest[:])
+}
+
+func captureInputForDispatch(content string, inputs []wechatCaptureInput) wechatCaptureInput {
+	if len(inputs) > 0 {
+		return inputs[0]
+	}
+	return wechatCaptureInput{DeliveryIDs: []string{"synthetic:" + rand.Text()}, OriginalContent: content}
+}
+
 func (b *inboundBatcher) flush(ctx context.Context, key string, expected *pendingInbound) {
 	b.mu.Lock()
 	current, ok := b.pending[key]
@@ -118,8 +172,13 @@ func (b *inboundBatcher) flush(ctx context.Context, key string, expected *pendin
 		return
 	}
 	if err := b.dispatch(ctx, current.msg); err != nil {
-		log.Printf("wechat: batched dispatch error from=%s: %v", current.msg.FromUserID, err)
+		// Keep the persisted rows: the message was accepted by iLink and the
+		// user is waiting for it, so a failed dispatch must be replayable after
+		// a restart rather than silently dropped.
+		log.Printf("wechat: batched dispatch error from=%s: %v (kept for replay)", current.msg.FromUserID, err)
+		return
 	}
+	b.clearInbound(current.msg)
 }
 
 // flushAll drains all pending messages synchronously. Called on shutdown so
@@ -138,8 +197,10 @@ func (b *inboundBatcher) flushAll(ctx context.Context) {
 
 	for _, p := range all {
 		if err := b.dispatch(ctx, p.msg); err != nil {
-			log.Printf("wechat: shutdown-flush dispatch error from=%s: %v", p.msg.FromUserID, err)
+			log.Printf("wechat: shutdown-flush dispatch error from=%s: %v (kept for replay)", p.msg.FromUserID, err)
+			continue
 		}
+		b.clearInbound(p.msg)
 	}
 }
 

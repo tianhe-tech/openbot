@@ -32,7 +32,8 @@ type Config struct {
 	ProxyKeyFile           string
 	ProxyLocalAddr         string
 	ProxyReconnect         time.Duration
-	MemStorePath           string // path to the SQLite memory database; "" disables memory
+	MemStorePath           string // SQLite memory path; empty uses <OpenCodeDirectory>/mem/memory.db
+	MemoryCaptureMode      string
 	WeCom                  wecom.Config
 	WeChat                 wechat.Config
 	FeiShu                 feishu.Config
@@ -133,6 +134,7 @@ func Load() (Config, error) {
 		ProxyLocalAddr:         getEnv("PROXY_LOCAL_OPENCODE_ADDR", "127.0.0.1:4096"),
 		ProxyReconnect:         getDuration("PROXY_RECONNECT_DELAY", 180*time.Second),
 		MemStorePath:           getEnv("MEMORY_STORE_PATH", ""),
+		MemoryCaptureMode:      getEnv("MEMORY_CAPTURE_MODE", "legacy"),
 		WeCom: wecom.Config{
 			Token:          os.Getenv("WECOM_TOKEN"),
 			EncodingAESKey: os.Getenv("WECOM_AES_KEY"),

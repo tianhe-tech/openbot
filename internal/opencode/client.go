@@ -98,7 +98,65 @@ var (
 	// channel, rate-limited, etc.) never emits session.idle, so the adapter
 	// hangs in "正在处理中" indefinitely. Override via OPENCODE_MAX_RETRY_ATTEMPTS.
 	maxRetryAttempts = parseIntEnv("OPENCODE_MAX_RETRY_ATTEMPTS", 5)
+
+	// waitHintDelay is how long a turn may run without producing any content
+	// before the adapter sends one "⏳ 正在处理中，无需操作，请稍候…" hint. It was
+	// hard-coded to 8s, which fired on essentially every message (first-token
+	// latency is usually longer than that, and chat adapters only "send" content
+	// when the turn flushes), so the hint became noise. Override via
+	// OPENCODE_WAIT_HINT_SECONDS.
+	waitHintDelay = parseDurationEnvSeconds("OPENCODE_WAIT_HINT_SECONDS", 30*time.Second)
+
+	// fallbackNoticeMode controls the user-visible "上游模型 X 暂时不可用，已自动
+	// 切换到 Y" notice. The default ("auto") only tells the user when the model
+	// THEY selected failed; when an auto-selected/default model is swapped out
+	// behind the scenes the switch is logged but not pushed into the chat. It
+	// used to be sent on the first message after every /new, because /new clears
+	// the session and the next turn therefore falls back to the server default
+	// model again. Override via OPENCODE_FALLBACK_NOTICE=auto|always|never.
+	fallbackNoticeMode = parseFallbackNoticeMode(os.Getenv("OPENCODE_FALLBACK_NOTICE"))
+
+	// defaultModelUnhealthyTTL is how long an auto-selected default model that
+	// just failed a whole turn is skipped in favour of a healthy alternate.
+	// Without it every fresh session (i.e. every /new) repeats the same doomed
+	// first attempt and the same notice.
+	defaultModelUnhealthyTTL = 10 * time.Minute
 )
+
+// Fallback-notice modes understood by OPENCODE_FALLBACK_NOTICE.
+const (
+	fallbackNoticeAuto   = "auto"
+	fallbackNoticeAlways = "always"
+	fallbackNoticeNever  = "never"
+)
+
+// parseFallbackNoticeMode normalizes the OPENCODE_FALLBACK_NOTICE value.
+// Anything unrecognized (including an empty value) means "auto".
+func parseFallbackNoticeMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case fallbackNoticeAlways:
+		return fallbackNoticeAlways
+	case fallbackNoticeNever:
+		return fallbackNoticeNever
+	default:
+		return fallbackNoticeAuto
+	}
+}
+
+// shouldNotifyFallbackUser reports whether an automatic model switch should be
+// announced in the chat. explicit is true when the failing model is the one the
+// user selected for this session (or the one an adapter pinned for the turn)
+// rather than an automatically chosen default.
+func shouldNotifyFallbackUser(explicit bool) bool {
+	switch fallbackNoticeMode {
+	case fallbackNoticeNever:
+		return false
+	case fallbackNoticeAlways:
+		return true
+	default:
+		return explicit
+	}
+}
 
 func parseDurationEnvSeconds(key string, def time.Duration) time.Duration {
 	v := strings.TrimSpace(os.Getenv(key))
@@ -157,6 +215,12 @@ type Attachment struct {
 
 // MessagePayload collects the metadata adapters send to OpenCode.
 type MessagePayload struct {
+	DeliveryID              string  `json:"delivery_id,omitempty"`
+	OriginalContent         *string `json:"original_content,omitempty"`
+	capture                 *TurnRef
+	captureState            *captureTurnState
+	Internal                bool              `json:"internal,omitempty"`
+	RetryOfDelivery         bool              `json:"retry_of_delivery,omitempty"`
 	Channel                 string            `json:"channel"`
 	UserID                  string            `json:"user_id"`
 	ThreadID                string            `json:"thread_id,omitempty"`
@@ -420,8 +484,18 @@ type Client struct {
 	providerCache    []Provider
 	capabilityCache  map[string]modelCapability // key: lower(provider/model)
 	defaultModelHint *opencode.SessionPromptParamsModel
-	breaker          *CircuitBreaker  // per provider/model failure tracking; nil-safe
-	memStore         MemStoreRecorder // optional memory store (set via WithMemStore)
+	// unhealthyDefaults remembers models (normally the auto-selected default)
+	// that just failed a turn, so a fresh session — e.g. the first message after
+	// /new — does not repeat the same doomed attempt. Entries expire after
+	// defaultModelUnhealthyTTL so a provider that comes back is retried
+	// automatically. key: normalizeModelKey(provider, model).
+	unhealthyDefaults    sync.Map         // map[string]time.Time (expiry)
+	breaker              *CircuitBreaker  // per provider/model failure tracking; nil-safe
+	memStore             MemStoreRecorder // optional memory store (set via WithMemStore)
+	conversationRecorder ConversationRecorder
+	captureMu            sync.Mutex
+	captureClosing       bool
+	captureProducers     sync.WaitGroup
 
 	// asyncQueue runs background work (handoff summarization, skill candidates)
 	// off the user-facing request path. nil-safe.
@@ -781,6 +855,10 @@ func (c *Client) maybeHandleServerUnavailable(ctx context.Context, err error, so
 // 2. POST /session/:id/prompt_async - 异步模式，立即返回204，通过事件流获取结果
 // 对于长时间任务，应该使用异步模式+事件监听
 func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Response, error) {
+	if err := c.enterCaptureProducer(); err != nil {
+		return Response{}, err
+	}
+	defer c.leaveCaptureProducer()
 	// Intercept synthetic slash commands (e.g., /skill-*) before any opencode
 	// dispatch so they never hit the remote server.
 	if resp, handled := c.dispatchInterceptors(payload); handled {
@@ -806,6 +884,9 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
+	}
+	if err := c.beginCapture(ctx, &payload); err != nil {
+		return Response{}, err
 	}
 
 	// ========== 会话接续注入（上一会话因 opencode 服务端死锁中断时自动恢复）==========
@@ -1059,13 +1140,28 @@ sendMessage:
 	}
 
 	// 流式模式统一使用异步 prompt_async，model override 直接放进 POST body 即可生效
+	var captureAttempt AttemptRef
+	var sourceMessageID []string
+	if payload.capture != nil {
+		var captureErr error
+		captureAttempt, captureErr = c.bindCapture(ctx, *payload.capture, sessionID, payload.RetryOfDelivery)
+		if captureErr != nil {
+			c.failRequest(requestHash)
+			return Response{}, captureErr
+		}
+		sourceMessageID = []string{captureAttempt.UserMessageID}
+		if payload.captureState != nil {
+			payload.captureState.bind(captureAttempt)
+		}
+		c.captureInputAttachments(payload)
+	}
 	if payload.Streaming {
 		if modelOverride != nil {
 			log.Printf("opencode: streaming request for session %s using async prompt with model override %s/%s",
 				sessionID[:min(8, len(sessionID))], modelOverride.ProviderID.Value, modelOverride.ModelID.Value)
 		}
 		c.runningSessions.Store(sessionID, true)
-		if err := c.sendPromptAsync(ctx, sessionID, parts, modelOverride); err != nil {
+		if err := c.sendPromptAsync(ctx, sessionID, parts, modelOverride, sourceMessageID...); err != nil {
 			c.runningSessions.Delete(sessionID)
 			c.failRequest(requestHash)
 			return Response{}, fmt.Errorf("opencode: prompt_async: %w", err)
@@ -1093,7 +1189,7 @@ sendMessage:
 	// 标记session为运行状态
 	c.runningSessions.Store(sessionID, true)
 
-	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, modelOverride)
+	result, err := c.sendPromptWithRetry(ctx, sessionID, parts, modelOverride, sourceMessageID...)
 
 	// 清除运行状态
 	c.runningSessions.Delete(sessionID)
@@ -1113,6 +1209,15 @@ sendMessage:
 
 	// Extract reply from assistant message
 	reply := extractReplyFromMessage(result)
+	if payload.capture != nil {
+		captureCtx, cancelCapture := context.WithTimeout(context.Background(), 10*time.Second)
+		captureErr := c.capturePromptResult(captureCtx, captureAttempt, result)
+		cancelCapture()
+		if captureErr != nil {
+			c.failRequest(requestHash)
+			return Response{}, fmt.Errorf("%w: response recovery remains pending: %w", ErrCapture, captureErr)
+		}
+	}
 
 	// Increment message count and token count for this session
 	count, _ := c.messageCount.LoadOrStore(sessionID, 0)
@@ -1135,7 +1240,7 @@ sendMessage:
 	c.completeRequest(requestHash, response)
 
 	// ========== 记忆存储（异步，不阻塞主流程）==========
-	if c.memStore != nil && strings.TrimSpace(reply) != "" {
+	if c.conversationRecorder == nil && c.memStore != nil && strings.TrimSpace(reply) != "" {
 		ms := c.memStore
 		ch, uid, req, rep, sid := payload.Channel, payload.UserID, payload.Content, reply, sessionID
 		go func() { ms.RecordConversation(ch, uid, req, rep, c.sessionDirectory(sid)) }()
@@ -3386,13 +3491,14 @@ func (c *Client) selectModelOverride(ctx context.Context, sessionID string, payl
 		// circuit breaker has it open, in which case fall through to
 		// pick a healthy alternate.
 		defaultOpen := c.defaultModelHint != nil &&
-			c.breaker != nil &&
-			c.breaker.IsOpen(c.defaultModelHint.ProviderID.Value, c.defaultModelHint.ModelID.Value)
+			(c.modelIsUnhealthyRef(c.defaultModelHint) ||
+				(c.breaker != nil &&
+					c.breaker.IsOpen(c.defaultModelHint.ProviderID.Value, c.defaultModelHint.ModelID.Value)))
 		if !defaultOpen {
 			return nil, ""
 		}
 		if c.defaultModelHint != nil {
-			log.Printf("opencode: default model %s/%s is circuit-open, selecting alternate",
+			log.Printf("opencode: default model %s/%s is circuit-open/unhealthy, selecting alternate",
 				c.defaultModelHint.ProviderID.Value, c.defaultModelHint.ModelID.Value)
 		}
 		// Fall through: the provider loop below will pick the first
@@ -3407,7 +3513,8 @@ func (c *Client) selectModelOverride(ctx context.Context, sessionID string, payl
 	}
 
 	if defaultModel != nil {
-		breakerOpen := c.breaker != nil && c.breaker.IsOpen(defaultModel.ProviderID.Value, defaultModel.ModelID.Value)
+		breakerOpen := c.modelIsUnhealthyRef(defaultModel) ||
+			(c.breaker != nil && c.breaker.IsOpen(defaultModel.ProviderID.Value, defaultModel.ModelID.Value))
 		if !breakerOpen {
 			if cap, ok := capabilityMap[normalizeModelKey(defaultModel.ProviderID.Value, defaultModel.ModelID.Value)]; ok {
 				if len(requiredModalities) > 0 && c.capabilitySupports(requiredModalities, cap) {
@@ -3429,6 +3536,12 @@ func (c *Client) selectModelOverride(ctx context.Context, sessionID string, payl
 		for _, model := range provider.Models {
 			// Circuit breaker: skip models that are currently open.
 			if c.breaker != nil && c.breaker.IsOpen(provider.ID, model.ID) {
+				continue
+			}
+			// Also skip models that just failed a whole turn: repeating them on
+			// the very next fresh session is what produced the same "已自动切换
+			// 模型" notice after every /new.
+			if c.modelIsUnhealthy(provider.ID, model.ID) {
 				continue
 			}
 			cap, ok := capabilityMap[normalizeModelKey(provider.ID, model.ID)]
@@ -3517,7 +3630,8 @@ func (c *Client) selectFallbackModel(ctx context.Context, failedModel *opencode.
 	nonTextHint := payloadNeedsAttachmentModel(payload)
 	if defaultModel != nil {
 		dk := normalizeModelKey(defaultModel.ProviderID.Value, defaultModel.ModelID.Value)
-		open := c.breaker != nil && c.breaker.IsOpen(defaultModel.ProviderID.Value, defaultModel.ModelID.Value)
+		open := c.modelIsUnhealthyRef(defaultModel) ||
+			(c.breaker != nil && c.breaker.IsOpen(defaultModel.ProviderID.Value, defaultModel.ModelID.Value))
 		capability, known := capabilityMap[dk]
 		supportsPayload := len(requiredModalities) == 0 && !nonTextHint
 		if known && len(requiredModalities) > 0 {
@@ -3539,6 +3653,9 @@ func (c *Client) selectFallbackModel(ctx context.Context, failedModel *opencode.
 				continue
 			}
 			if c.breaker != nil && c.breaker.IsOpen(provider.ID, model.ID) {
+				continue
+			}
+			if c.modelIsUnhealthy(provider.ID, model.ID) {
 				continue
 			}
 			cap, ok := capabilityMap[mk]
@@ -3633,15 +3750,29 @@ func (c *Client) attemptFallbackRetry(oldSessionID string, payload MessagePayloa
 		}
 		c.requestCache.Delete(generateRequestHash(payload))
 
-		// Notify the user that a fallback is in progress using the
-		// original callback so the notice reaches them immediately.
+		// Notify the user only when the model THEY chose failed. When the model
+		// was auto-selected (the usual case for the first message after /new,
+		// where the session carries no model choice and the server default is
+		// used), the swap is transparent: log it and let the answer arrive.
+		explicit := c.failedModelWasExplicit(oldSessionID, payload, failedModel)
+		if !explicit {
+			// Don't send the next fresh session into the same wall.
+			c.markModelUnhealthy(failedModel)
+		}
 		notice := fmt.Sprintf("⏳ 上游模型 %s 暂时不可用，已自动切换到 %s/%s 重试…",
 			safeModelID(failedModel), fallback.ProviderID.Value, fallback.ModelID.Value)
-		if callback != nil {
-			_ = callback(QuestionSignalPrefix + notice)
+		if shouldNotifyFallbackUser(explicit) {
+			// Fire-and-forget progress hint: adapters deliver it without the
+			// critical/never-drop semantics reserved for real permission and
+			// question prompts, which would otherwise let a burst of hints
+			// starve the actual replies in a rate-limited queue.
+			if callback != nil {
+				_ = callback(WaitHintSignalPrefix + notice)
+			}
+			log.Printf("opencode: fallback retry dispatched: %s", notice)
+		} else {
+			log.Printf("opencode: fallback retry dispatched silently (auto-selected model failed): %s", notice)
 		}
-
-		log.Printf("opencode: fallback retry dispatched: %s", notice)
 
 		// Re-dispatch via SendMessageStreaming so a new handler is
 		// registered for the fresh session. The original callback is
@@ -3696,6 +3827,79 @@ func safeModelID(m *opencode.SessionPromptParamsModel) string {
 		return "<unknown>"
 	}
 	return m.ProviderID.Value + "/" + m.ModelID.Value
+}
+
+// markModelUnhealthy remembers that provider/model just failed a whole turn, so
+// a fresh session (the next /new) skips it instead of repeating the same failed
+// attempt. Entries expire on their own after defaultModelUnhealthyTTL.
+func (c *Client) markModelUnhealthy(model *opencode.SessionPromptParamsModel) {
+	if c == nil || model == nil {
+		return
+	}
+	key := normalizeModelKey(model.ProviderID.Value, model.ModelID.Value)
+	if key == "" {
+		return
+	}
+	c.unhealthyDefaults.Store(key, time.Now().Add(defaultModelUnhealthyTTL))
+}
+
+// modelIsUnhealthy reports whether provider/model is still inside its
+// unhealthyDefaults window (expiring lazily on read).
+func (c *Client) modelIsUnhealthy(providerID, modelID string) bool {
+	if c == nil {
+		return false
+	}
+	key := normalizeModelKey(providerID, modelID)
+	if key == "" {
+		return false
+	}
+	v, ok := c.unhealthyDefaults.Load(key)
+	if !ok {
+		return false
+	}
+	until, ok := v.(time.Time)
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		c.unhealthyDefaults.Delete(key)
+		return false
+	}
+	return true
+}
+
+// modelIsUnhealthyRef is the model-pointer convenience form of modelIsUnhealthy.
+func (c *Client) modelIsUnhealthyRef(model *opencode.SessionPromptParamsModel) bool {
+	if model == nil {
+		return false
+	}
+	return c.modelIsUnhealthy(model.ProviderID.Value, model.ModelID.Value)
+}
+
+// failedModelWasExplicit reports whether the model that just failed was picked
+// on purpose — the session's /model choice, or a model an adapter pinned for
+// this turn — rather than an automatically selected default. Only the former is
+// worth telling the user about: a transparent swap of a default model is not
+// something they asked for or can act on.
+func (c *Client) failedModelWasExplicit(sessionID string, payload MessagePayload, failedModel *opencode.SessionPromptParamsModel) bool {
+	if c == nil || failedModel == nil {
+		return false
+	}
+	key := normalizeModelKey(failedModel.ProviderID.Value, failedModel.ModelID.Value)
+	if key == "" {
+		return false
+	}
+	if pid, mid, ok := parseProviderModelRef(payload.Model); ok {
+		if normalizeModelKey(pid, mid) == key {
+			return true
+		}
+	}
+	if override, ok := c.getSessionModelOverride(sessionID); ok {
+		if normalizeModelKey(override.ProviderID.Value, override.ModelID.Value) == key {
+			return true
+		}
+	}
+	return false
 }
 
 // invalidateStaleSessions 清除可能失效的 session 缓存
@@ -4576,6 +4780,10 @@ func (c *Client) SendMessageStreaming(ctx context.Context, payload MessagePayloa
 // SendMessageStreamingWithEvents sends a streaming message with both legacy chunk callback
 // and structured event callback.
 func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload MessagePayload, callback StreamCallback, eventCallback StreamEventCallback) (Response, error) {
+	if err := c.enterCaptureProducer(); err != nil {
+		return Response{}, err
+	}
+	defer c.leaveCaptureProducer()
 	fmt.Println("payload is ", payload)
 	// Intercept synthetic slash commands before anything else.
 	if resp, handled := c.dispatchInterceptors(payload); handled {
@@ -4596,6 +4804,12 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	// 需要强制当前 thread 重建 session，并把摘要+上次未回复的消息拼到首条 prompt。
 	// SendMessage 内部也会调用一次，但那时 streaming 侧已把 handler 注册在旧 session 上，
 	// 导致事件对不上，因此这里必须抢先处理。
+	if strings.TrimSpace(payload.Content) == "" {
+		return Response{}, ErrEmptyPayload
+	}
+	if err := c.beginCapture(ctx, &payload); err != nil {
+		return Response{}, err
+	}
 	c.maybeInjectHandoff(&payload)
 
 	// 1. 先确定sessionID（可能需要创建新session）
@@ -5144,7 +5358,7 @@ func (c *Client) recordMemAsync(payload MessagePayload, reply string) {
 	if strings.TrimSpace(reply) == "" {
 		return
 	}
-	if c.memStore != nil {
+	if c.conversationRecorder == nil && c.memStore != nil {
 		ms := c.memStore
 		// Resolve sessionID for this thread so we can fetch its per-session directory.
 		var sid string
@@ -5471,6 +5685,29 @@ func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string
 		return false
 	}
 
+	// Recovery circuit breaker. A silent hang tends to repeat: the retry
+	// re-sends the same (usually already over-long) prompt into a fresh session
+	// and can hang again, so without a bound this path rebuilds sessions
+	// forever, spamming the user with "已重建会话" notices and burning upstream
+	// capacity. After handoffBreakerMaxInWindow recoveries inside
+	// handoffBreakerWindow we stop rebuilding and ask the user to retry
+	// deliberately. This mirrors the breaker already applied by
+	// finalizeAsyncStreamingResponse — the silent-hang path used to bypass it.
+	if tripped, recent := c.recordHandoffAttempt(payload.ThreadID); tripped {
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if abortErr := c.AbortSession(abortCtx, sessionID); abortErr != nil {
+			log.Printf("opencode: silent-hang breaker could not abort session %s: %v", sessionID[:min(8, len(sessionID))], abortErr)
+		}
+		abortCancel()
+		handler.CompleteForRecovery()
+		log.Printf("opencode: decision=silent_model_hang_suppressed session=%s thread=%s recent_recoveries=%d — auto-recovery paused",
+			sessionID[:min(8, len(sessionID))], payload.ThreadID, recent)
+		if callback != nil {
+			_ = callback(WaitHintSignalPrefix + "⚠️ 本轮模型未产生任何输出，且近期已多次自动重建会话，已暂停自动重建以避免死循环。请稍后重新发送你的消息。")
+		}
+		return true
+	}
+
 	abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	abortErr := c.AbortSession(abortCtx, sessionID)
 	abortCancel()
@@ -5490,9 +5727,23 @@ func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string
 	// default/alternate model rather than repeating the model that never started.
 	c.modelOverride.Delete(sessionID)
 	payload.Model = ""
+	// Strip any handoff preamble that a previous recovery already injected into
+	// this payload before re-dispatching it. Otherwise each cycle wraps the
+	// previous preamble in a new one and the prompt grows without bound (the
+	// nested 【会话接续】 recursion), which is itself the most common trigger for
+	// the next silent hang.
+	if hs := c.handoffStore(); hs != nil {
+		if inner := strings.TrimSpace(hs.SanitizeUserContent(payload.Content)); inner != "" {
+			payload.Content = inner
+		}
+	}
 	c.triggerSessionHandoff(payload, sessionID)
 	if callback != nil {
-		_ = callback(QuestionSignalPrefix + "⏳ 检测到模型未进入生成或工具执行阶段，已重建会话并继续原任务。")
+		// Informational only: the recovery itself continues in the background,
+		// so this must not enter the critical permission/question path (that is
+		// what turned a recovery loop into a queue-blocking flood of hundreds of
+		// never-delivered notices).
+		_ = callback(WaitHintSignalPrefix + "⏳ 检测到模型未进入生成或工具执行阶段，已重建会话并继续原任务。")
 	}
 
 	go func() {
@@ -6248,7 +6499,16 @@ func (c *Client) calculateBackoff(attempt int) time.Duration {
 }
 
 // sendPromptWithRetry 带重试的发送消息
-func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, modelOverride *opencode.SessionPromptParamsModel) (*opencode.SessionPromptResponse, error) {
+func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, modelOverride *opencode.SessionPromptParamsModel, sourceMessageID ...string) (*opencode.SessionPromptResponse, error) {
+	if len(sourceMessageID) > 0 {
+		params := opencode.SessionPromptParams{Parts: opencode.F(parts), MessageID: opencode.F(sourceMessageID[0])}
+		if modelOverride != nil {
+			params.Model = opencode.F(*modelOverride)
+		}
+		promptCtx, cancel := context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+		return c.sdk.Session.Prompt(promptCtx, sessionID, params, option.WithMaxRetries(0))
+	}
 	var lastErr error
 
 	for attempt := 0; attempt <= c.retryConfig.MaxRetries; attempt++ {
@@ -6316,13 +6576,16 @@ func (c *Client) sendPromptWithRetry(ctx context.Context, sessionID string, part
 }
 
 // sendPromptAsync 调用 OpenCode 的 prompt_async 接口，立即返回，由事件流提供结果
-func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, modelOverride *opencode.SessionPromptParamsModel) error {
+func (c *Client) sendPromptAsync(ctx context.Context, sessionID string, parts []opencode.SessionPromptParamsPartUnion, modelOverride *opencode.SessionPromptParamsModel, sourceMessageID ...string) error {
 	if c.endpoint == "" {
 		return fmt.Errorf("opencode: prompt_async unavailable: missing endpoint")
 	}
 
 	params := opencode.SessionPromptParams{
 		Parts: opencode.F(parts),
+	}
+	if len(sourceMessageID) > 0 {
+		params.MessageID = opencode.F(sourceMessageID[0])
 	}
 	if modelOverride != nil {
 		params.Model = opencode.F(*modelOverride)
@@ -6375,6 +6638,9 @@ func generateRequestHash(payload MessagePayload) string {
 		streaming = "1"
 	}
 	data := fmt.Sprintf("%s|%s|%s|%s|%s", payload.Channel, payload.UserID, payload.ThreadID, payload.Content, streaming)
+	if payload.capture != nil {
+		data = payload.capture.ID + "|" + streaming
+	}
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:16]) // 使用前16字节
 }

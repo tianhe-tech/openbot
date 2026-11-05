@@ -59,6 +59,10 @@ type StreamingSessionHandler struct {
 	activeToolParts map[string]bool // partID -> true：当前处于 pending/running 状态的 tool part，用于判断是否仍有活跃 tool
 	toolObserved    bool            // 本轮是否曾进入工具执行阶段；慢工具不应被当作模型静默卡死
 
+	// lastAssistantMessageID 是最近一次观察到的 assistant message ID，
+	// 用于给滚动部分快照（partial snapshot）打上上游消息标识。
+	lastAssistantMessageID string
+
 	// 上游 provider 重试状态：opencode 在模型不可用/限流时会发出 type=="retry" 的
 	// message part（{"type":"retry","attempt":N,"error":{"data":{"message":...}}}）。
 	// 这类 part 既不是 session.error，也不会写入 AssistantMessage.Error.Name，
@@ -126,20 +130,35 @@ func NewStreamingSessionHandlerWithModel(sessionID string, callback StreamCallba
 		payload:          payload,
 		cleanupDone:      make(chan struct{}),
 	}
-	// 8秒后若仍未发送过内容，给用户一个等待提示
-	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
-		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
-		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
-		h.mu.Lock()
-		if h.contentSent || h.completed || h.waitingHintSent {
-			h.mu.Unlock()
+	h.startWaitingHintTimer()
+	return h
+}
+
+// startWaitingHintTimer (re)arms the one-shot "still working" hint for the
+// current turn. It fires only if the turn is still running without any content
+// after waitHintDelay (default 30s; override via OPENCODE_WAIT_HINT_SECONDS).
+//
+// The delay used to be a hard-coded 8s, which is shorter than the typical
+// first-token latency — and chat adapters only "send" content when the turn
+// flushes — so nearly every message produced the hint and users learned to
+// ignore it. A turn never gets more than one hint.
+func (s *StreamingSessionHandler) startWaitingHintTimer() {
+	if s.waitingTimer != nil {
+		s.waitingTimer.Stop()
+	}
+	s.waitingTimer = time.AfterFunc(waitHintDelay, func() {
+		// Mark under the lock, send outside it: the hint is informational and
+		// must never block the SSE event loop synchronously (a critical retry
+		// under rate limiting would freeze it for minutes).
+		s.mu.Lock()
+		if s.contentSent || s.completed || s.waitingHintSent {
+			s.mu.Unlock()
 			return
 		}
-		h.waitingHintSent = true
-		h.mu.Unlock()
-		_ = h.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
+		s.waitingHintSent = true
+		s.mu.Unlock()
+		_ = s.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
 	})
-	return h
 }
 
 // SetModelUsed records the final model selected by SendMessage. Streaming
@@ -335,9 +354,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			var partMeta2 struct {
 				Properties struct {
 					Part struct {
-						ID     string `json:"id"`
-						Type   string `json:"type"`
-						Tokens struct {
+						ID        string `json:"id"`
+						MessageID string `json:"messageID"`
+						Type      string `json:"type"`
+						Tokens    struct {
 							Input  int `json:"input"`
 							Output int `json:"output"`
 							Total  int `json:"total"`
@@ -355,6 +375,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					partID[:min(8, len(partID))], role, partMeta2.Properties.Part.Type)
 				if partID != "" && role != "" {
 					s.partRoles.Store(partID, role)
+				}
+				if partMeta2.Properties.Part.MessageID != "" {
+					s.lastAssistantMessageID = partMeta2.Properties.Part.MessageID
 				}
 				if partMeta2.Properties.Part.Type == "step-finish" {
 					s.receivedStepFinish = true
@@ -384,6 +407,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				}
 				if partMeta2.Properties.Part.Type == "tool" {
 					s.toolObserved = true
+					if s.client != nil {
+						s.client.captureToolEvent(s.payload, event)
+					}
 				}
 
 				// 检测 server 端自动压缩（compaction）：当 opencode server 在
@@ -427,6 +453,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						s.stopWaitingTimer()
 					}
 					s.contentSent = true
+					if s.client != nil {
+						s.client.capturePartial(s.payload, s.lastAssistantMessageID, s.lastContent)
+					}
 				}
 			}
 			s.lastUpdateTime = time.Now()
@@ -695,6 +724,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						s.stopWaitingTimer()
 					}
 					s.contentSent = true
+					if s.client != nil {
+						s.client.capturePartial(s.payload, d.Properties.MessageID, s.lastContent)
+					}
 				}
 				s.lastUpdateTime = time.Now()
 			}
@@ -1951,21 +1983,7 @@ func (s *StreamingSessionHandler) ResetForNewPrompt() {
 	s.onCompleteOnce = sync.Once{}
 
 	// Restart the waiting hint timer for the new prompt.
-	if s.waitingTimer != nil {
-		s.waitingTimer.Stop()
-	}
-	s.waitingTimer = time.AfterFunc(8*time.Second, func() {
-		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
-		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
-		s.mu.Lock()
-		if s.contentSent || s.completed || s.waitingHintSent {
-			s.mu.Unlock()
-			return
-		}
-		s.waitingHintSent = true
-		s.mu.Unlock()
-		_ = s.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
-	})
+	s.startWaitingHintTimer()
 }
 
 // extractPartDelta 从 message.part.delta 事件中提取增量文本

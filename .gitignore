@@ -29,6 +29,13 @@ Thumbs.db
 .env
 .env.local
 
+# SSH private keys — never commit these
+huoshanyun*
+hunshanyun*
+*.pem
+id_rsa
+id_ed25519
+
 # Test coverage
 *.cover
 coverage.txt

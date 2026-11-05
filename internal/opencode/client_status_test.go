@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -512,5 +513,91 @@ func TestStreamingFallbackChainReusesSession(t *testing.T) {
 				t.Fatal("expected failures attributed to the three actual models")
 			}
 		})
+	}
+}
+
+// The "已自动切换到 …" notice must only reach the user when the model THEY chose
+// failed; an automatic swap of the default model is transparent.
+func TestShouldNotifyFallbackUser(t *testing.T) {
+	original := fallbackNoticeMode
+	t.Cleanup(func() { fallbackNoticeMode = original })
+
+	tests := []struct {
+		mode     string
+		explicit bool
+		want     bool
+	}{
+		{mode: fallbackNoticeAuto, explicit: true, want: true},
+		{mode: fallbackNoticeAuto, explicit: false, want: false},
+		{mode: fallbackNoticeAlways, explicit: false, want: true},
+		{mode: fallbackNoticeNever, explicit: true, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.mode+"_explicit="+strconv.FormatBool(test.explicit), func(t *testing.T) {
+			fallbackNoticeMode = test.mode
+			if got := shouldNotifyFallbackUser(test.explicit); got != test.want {
+				t.Fatalf("shouldNotifyFallbackUser(%t) with mode %s = %t, want %t", test.explicit, test.mode, got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseFallbackNoticeModeDefaultsToAuto(t *testing.T) {
+	for _, raw := range []string{"", "  ", "AUTO", "bogus"} {
+		if got := parseFallbackNoticeMode(raw); got != fallbackNoticeAuto {
+			t.Fatalf("parseFallbackNoticeMode(%q) = %q, want %q", raw, got, fallbackNoticeAuto)
+		}
+	}
+	if got := parseFallbackNoticeMode("NEVER"); got != fallbackNoticeNever {
+		t.Fatalf("parseFallbackNoticeMode(\"NEVER\") = %q", got)
+	}
+}
+
+// A fresh session (the first message after /new) must not walk into the same
+// failing default model again while it is marked unhealthy — that is what made
+// every /new repeat the "上游模型 squilla/auto 暂时不可用" message.
+func TestSelectModelOverrideSkipsUnhealthyDefault(t *testing.T) {
+	newClient := func() *Client {
+		return &Client{
+			providerCacheAt: time.Now(),
+			providerCache: []Provider{
+				{ID: "squilla", Models: []Model{{ID: "auto"}}},
+				{ID: "Tianhe-AI", Models: []Model{{ID: "Qwen3.8-27B"}}},
+			},
+			capabilityCache: map[string]modelCapability{
+				"squilla/auto": {
+					ProviderID:      "squilla",
+					ModelID:         "auto",
+					InputModalities: map[string]struct{}{"text": {}},
+				},
+				"tianhe-ai/qwen3.8-27b": {
+					ProviderID:      "Tianhe-AI",
+					ModelID:         "Qwen3.8-27B",
+					InputModalities: map[string]struct{}{"text": {}},
+				},
+			},
+			defaultModelHint: modelFromRef("squilla", "auto"),
+		}
+	}
+
+	// Healthy default: no explicit override is needed, the server default is used.
+	healthy := newClient()
+	if model, reason := healthy.selectModelOverride(context.Background(), "ses_healthy", MessagePayload{}); model != nil {
+		t.Fatalf("healthy default should not force an override, got %s (reason=%s)", safeModelID(model), reason)
+	}
+
+	// Unhealthy default: the next fresh session must pick a healthy alternate
+	// instead of retrying the model that just failed.
+	unhealthy := newClient()
+	unhealthy.markModelUnhealthy(modelFromRef("squilla", "auto"))
+	model, reason := unhealthy.selectModelOverride(context.Background(), "ses_fresh_after_new", MessagePayload{})
+	if model == nil {
+		t.Fatal("expected a healthy alternate model after the default was marked unhealthy")
+	}
+	if got := safeModelID(model); got == "squilla/auto" {
+		t.Fatalf("unhealthy default was selected again (reason=%s)", reason)
+	}
+	if got := safeModelID(model); got != "Tianhe-AI/Qwen3.8-27B" {
+		t.Fatalf("expected the healthy alternate, got %s (reason=%s)", got, reason)
 	}
 }

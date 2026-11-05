@@ -23,6 +23,23 @@ OpenCode Gateway 是一个企业级消息网关，实现了 OpenCode AI 服务�
 
 ### 核心组件
 
+The legacy memory path stores received request/response text and its FTS5 index
+atomically in SQLite. Gateway startup owns the one-time response-index migration;
+the MCP process opens the database read-only and filters every tool query to an
+explicitly bound adapter/user. New tool registrations are disabled until an
+isolated single-owner deployment is configured. There is no automatic keyword
+deletion or strength-based history exclusion.
+
+Durable v2 capture is implemented behind `MEMORY_CAPTURE_MODE=strict`. It records
+sessions, turns, attempts, blocks, messages, partial snapshots, tool calls, and
+attachment metadata into the `mem_v2_*` tables (archive schema v3). The gateway
+also runs a background index worker that chunks archived message bodies and
+writes `mem_v2_chunks` plus the `mem_v2_chunk_fts` trigram index, so capture
+latency never depends on indexing. The MCP server reads that index for
+`memory_search`, `memory_get`, and `memory_scroll`; it never builds it. See
+[memory setup](MCP_MEMORY_TOOL.md) and the
+[implementation plan](MEMORY_IMPLEMENTATION_PLAN.md).
+
 ```mermaid
 flowchart LR
     U[用户\n钉钉/飞书/企微] -->|消息/命令| B[openbot\ncmd/gateway]

@@ -229,10 +229,30 @@ var thinkBlockRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
 // was truncated mid-reasoning).
 var openThinkTailRe = regexp.MustCompile(`(?s)<think>.*$`)
 
-// handoffInnerUserRe extracts the real user input from a previously-injected
-// handoff preamble. BuildHandoffPreamble always ends with
-// "---\n\n【当前用户消息】\n<actual user text>".
-var handoffInnerUserRe = regexp.MustCompile(`(?s)【当前用户消息】\s*\n(.*)$`)
+// handoffUserMsgMarker separates the injected context from the real user input
+// inside a handoff preamble; BuildHandoffPreamble always ends with
+// "---\n\n" + handoffUserMsgMarker + "\n<actual user text>".
+const handoffUserMsgMarker = "【当前用户消息】"
+
+// unwrapHandoffPreamble extracts the innermost real user input from text that
+// may have been wrapped by one or more handoff preambles (recovery A → B → C).
+//
+// The LAST marker delimits the real input: taking the first one (the previous
+// behaviour) kept the entire nested blob as the "user message", so every
+// recovery cycle re-embedded the whole previous prompt and the request doubled
+// in size until the upstream model stopped producing output — which produced
+// yet another recovery. Measured on a live incident: 271 KB of nested
+// 【会话接续】 text, ~211k prompt tokens, 171 "已重建会话" notices queued.
+//
+// Returns "" when no marker is present (or nothing follows it), so callers can
+// keep the original content untouched.
+func unwrapHandoffPreamble(s string) string {
+	idx := strings.LastIndex(s, handoffUserMsgMarker)
+	if idx < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[idx+len(handoffUserMsgMarker):])
+}
 
 // SanitizeHandoffContent prepares one turn's text for inclusion in a new
 // handoff summary or for saving as lastUserMsg. It removes:
@@ -263,8 +283,8 @@ func sanitizeHandoffContent(role, content string) string {
 	// inner real user text becomes the turn's content. Without this, the
 	// next-generation handoff's 【目标】 is the previous preamble verbatim.
 	if role == "user" {
-		if m := handoffInnerUserRe.FindStringSubmatch(s); len(m) == 2 {
-			s = strings.TrimSpace(m[1])
+		if inner := unwrapHandoffPreamble(s); inner != "" {
+			s = inner
 		}
 		// Strip memstore recall prefix: "【历史工作记忆】... <blank line> <real text>".
 		// The real user text follows the first blank line after the block, but
@@ -282,25 +302,60 @@ func sanitizeHandoffContent(role, content string) string {
 	return strings.TrimSpace(s)
 }
 
+// Caps for the injected session-handoff preamble. They exist because an
+// uncapped preamble lets each recovery embed the previous one verbatim, growing
+// the prompt until the upstream model can no longer start generating.
+const (
+	// maxHandoffPreambleChars is the hard ceiling for the whole preamble.
+	maxHandoffPreambleChars = 4000
+	// maxHandoffSummaryChars caps the condensed recap inside the preamble.
+	maxHandoffSummaryChars = 1500
+	// maxHandoffPrevUnansweredChars caps the auto-resent previous user question.
+	maxHandoffPrevUnansweredChars = 500
+)
+
 // BuildHandoffPreamble renders the preamble injected as the first part of
 // the new session's prompt, combining the saved summary, the previously
 // unanswered user message (auto-resent), and the current turn's user input.
+//
+// The result is hard-capped: an unbounded preamble is what turned recovery into
+// a self-amplifying loop (each new preamble embedded the previous one until the
+// prompt no longer fit any useful prefill budget). The current user message —
+// the turn actually being executed — wins whatever budget is left.
 func BuildHandoffPreamble(summary, prevUnanswered, currentUserMsg string) string {
+	summary = truncateRunes(strings.TrimSpace(summary), maxHandoffSummaryChars)
+	prevUnanswered = truncateRunes(strings.TrimSpace(prevUnanswered), maxHandoffPrevUnansweredChars)
+	// Never wrap an already-wrapped message: keep only the innermost real user
+	// text so repeated recoveries cannot nest preambles.
+	if inner := unwrapHandoffPreamble(currentUserMsg); inner != "" {
+		currentUserMsg = inner
+	}
+	currentUserMsg = strings.TrimSpace(currentUserMsg)
+
 	var b strings.Builder
 	b.WriteString("【会话接续·自动恢复】\n")
 	b.WriteString("上一会话因服务端调度异常中断，以下是压缩摘要：\n\n")
-	if strings.TrimSpace(summary) != "" {
+	if summary != "" {
 		b.WriteString(summary)
 		b.WriteString("\n\n")
 	}
-	if strings.TrimSpace(prevUnanswered) != "" {
+	if prevUnanswered != "" {
 		b.WriteString("【上一轮用户提问（未获回复，已自动重发）】\n")
-		b.WriteString(truncateRunes(prevUnanswered, 600))
+		b.WriteString(prevUnanswered)
 		b.WriteString("\n\n")
 	}
-	b.WriteString("---\n\n【当前用户消息】\n")
-	b.WriteString(currentUserMsg)
-	return b.String()
+	b.WriteString("---\n\n" + handoffUserMsgMarker + "\n")
+
+	// Leave one rune of headroom: truncateRunes appends an ellipsis.
+	if budget := maxHandoffPreambleChars - len([]rune(b.String())) - 1; budget > 0 {
+		b.WriteString(truncateRunes(currentUserMsg, budget))
+	}
+
+	out := b.String()
+	if runes := []rune(out); len(runes) > maxHandoffPreambleChars { // defensive; budget above already holds
+		out = string(runes[:maxHandoffPreambleChars])
+	}
+	return out
 }
 
 // firstSentence returns the first sentence (or line) of s, trimmed.
