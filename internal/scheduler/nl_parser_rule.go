@@ -62,7 +62,8 @@ func (p *RuleBasedNLScheduleIntentParser) Parse(text string) (*NLScheduleIntent,
 	case containsAny(lower, []string{"试运行", "立即运行", "执行一次", "run once", "test run"}):
 		intent.Action = NLScheduleActionRunOnce
 		intent.Confidence = 0.82
-	case containsAny(lower, []string{"修改任务", "更新任务", "change schedule", "update schedule", "reschedule"}):
+	case containsAny(lower, []string{"修改任务", "更新任务", "change schedule", "update schedule", "reschedule",
+		"改到", "改成", "改为", "调整任务", "调整时间"}):
 		intent.Action = NLScheduleActionUpdate
 		intent.Confidence = 0.8
 	case containsAny(lower, []string{"/crontask add", "创建定时任务", "新增定时任务"}) ||
@@ -76,12 +77,19 @@ func (p *RuleBasedNLScheduleIntentParser) Parse(text string) (*NLScheduleIntent,
 		intent.Selector.TaskID = taskID
 	}
 
-	if intent.Action == NLScheduleActionCreate {
+	// Create and Update both carry a schedule, so both need the cron expression
+	// resolved. Only Create treats the whole sentence as the task content: for
+	// Update the sentence is an instruction ("把每日检查改到10点"), and copying it
+	// into Content would overwrite the task's prompt with the instruction.
+	if intent.Action == NLScheduleActionCreate || intent.Action == NLScheduleActionUpdate {
 		intent.CronExpr = extractCronExpression(trimmed)
 		if intent.CronExpr == "" {
 			intent.CronExpr = inferCronFromNaturalText(trimmed)
 		}
 		intent.TimeExpression = extractTimeExpression(trimmed)
+	}
+
+	if intent.Action == NLScheduleActionCreate {
 		if intent.Content == "" {
 			intent.Content = trimmed
 		}
@@ -91,6 +99,10 @@ func (p *RuleBasedNLScheduleIntentParser) Parse(text string) (*NLScheduleIntent,
 		if strings.TrimSpace(intent.CronExpr) == "" {
 			intent.Ambiguities = append(intent.Ambiguities, "未解析出标准 cron 表达式")
 		}
+	}
+
+	if intent.Action == NLScheduleActionUpdate && strings.TrimSpace(intent.CronExpr) == "" {
+		intent.Ambiguities = append(intent.Ambiguities, "未解析出新的执行时间")
 	}
 
 	intent.RequiresConfirm = intent.IsWriteAction()

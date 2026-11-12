@@ -216,8 +216,32 @@ func TestSpaceReportCountsFTSBytes(t *testing.T) {
 	if report.FTSBytes <= 0 {
 		t.Fatal("FTSBytes must be positive after indexing a message")
 	}
-	if report.FTSBytes > report.FileBytes {
-		t.Fatalf("FTSBytes = %d cannot exceed FileBytes = %d", report.FTSBytes, report.FileBytes)
+	// The bound is LogicalBytes, not FileBytes. dbstat reads through the pager,
+	// so it counts pages that are still in the WAL, while FileBytes is os.Stat
+	// on the main file alone. This fixture writes a 32 KiB message and indexes
+	// it, which leaves most of the pages in the WAL: FileBytes is 368,640 while
+	// the database logically holds 2,723,840. Comparing against FileBytes
+	// therefore failed for a reason that has nothing to do with the index.
+	//
+	// This assertion is older than schema v7 and passed until v7 landed, because
+	// the old in-place index update wrote few enough pages that the WAL never
+	// grew past the main file. The migration's copy-then-swap writes both tables
+	// in full, which is what exposed it.
+	if report.FTSBytes > report.LogicalBytes {
+		t.Fatalf("FTSBytes = %d cannot exceed LogicalBytes = %d", report.FTSBytes, report.LogicalBytes)
+	}
+	// Schema v7 made both FTS indexes contentless, so the index holds postings
+	// and no text. This zero is the migration's measurement, not a regression:
+	// before v7 the same archive reported 2.24-2.26 copies of the chunk text
+	// here, and that duplicated copy was 35.9-37.4% of the archive file.
+	//
+	// Asserting zero rather than "small" is deliberate. A content column
+	// reintroduced by a later schema change would keep search working and would
+	// only show up as a larger archive, so nothing else in the suite would
+	// notice it.
+	if report.FTSContentBytes != 0 {
+		t.Fatalf("FTSContentBytes = %d; schema v7 made both indexes contentless, so it must be zero",
+			report.FTSContentBytes)
 	}
 }
 

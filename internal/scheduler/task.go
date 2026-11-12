@@ -72,6 +72,8 @@ type ScheduledTask struct {
 	Enabled       bool                   `json:"enabled"`         // 是否启用
 	AdapterType   string                 `json:"adapter_type"`    // 发送结果到哪个adapter
 	Channel       string                 `json:"channel"`         // 发送到哪个channel
+	UserID        string                 `json:"user_id"`         // 任务归属用户，用于 session 标题前缀
+	ThreadID      string                 `json:"thread_id"`       // 会话/群ID，用于 session 标题后缀
 	Content       string                 `json:"content"`         // 固定内容或提示词
 	Agent         string                 `json:"agent"`           // 使用的agent
 	ScriptPath    string                 `json:"script_path"`     // 脚本路径

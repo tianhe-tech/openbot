@@ -18,6 +18,12 @@ explicitly configured, isolated single-owner OpenCode/MCP instance.
 - MCP opens with SQLite `mode=ro` and `query_only=1`: it never creates, migrates,
   purges, or strengthens records. Missing/old databases produce an actionable error.
   SQLite may still require access to WAL/shared-memory sidecars for a live database.
+- The server checks the archive's schema version at startup and refuses to run
+  against an archive written by a newer binary. Upgrade the MCP binary rather
+  than downgrading the archive: a newer archive still has every table this
+  binary knows about, so nothing would fail on its own and the process would
+  answer from rows whose meaning it does not understand. `memory_health` prints
+  the exact version, and names both numbers when they differ.
 - New automatic registrations are disabled. Existing entries are not overwritten;
   verify their binary and database paths and configure the binding below.
 
@@ -70,8 +76,8 @@ tool only after the operator has ensured instance isolation.
 | `memory_scroll` | Pages one session chronologically by sequence. `session_id` required; optional `cursor`, `direction` (`forward`/`backward`, default `forward`), `limit` (default 20, max 100). Requires a migrated v2 archive. |
 | `memory_list_projects` | Scoped project counts and last activity. Optional `days` (default 90). |
 | `memory_recent` | Scoped chronological records. Optional `days` (default 7), `limit` (default 10). |
-| `memory_health` | Operational status for the bound principal: scope mode, archive schema, tokenizer version, pending and failed index jobs, word-index completeness and lag, index updated-at, message totals, index lag, chunk count, and storage totals (blocks, compressed blocks, raw bytes, stored bytes, bytes saved). Takes no arguments. Reports no message bodies, no credentials, and no per-user labels, so it is safe to expose to a model. On a legacy-only archive it reports `schema: legacy` and states that indexing is not applicable until `memory-migrate` runs, rather than reporting zeros that would look like a healthy empty index. The storage lines report raw and stored bytes separately so the effect of compression is visible rather than assumed: a report that showed only stored bytes would look identical whether compression worked or was silently disabled. |
-| `memory_space` | Where the archive's bytes go. Reports whole-file numbers (database file, WAL, SHM, free pages, full-text index pages) and, separately, the bound principal's logical sizes (block bytes, artifact bytes, embedding bytes). Optional `backup_path` reports a backup file's size in its own field. The two groups are never added together: every principal shares the same pages, so a per-principal share of the file would be a fiction, and the block and artifact totals are subsets of the file rather than additions to it. Slower than `memory_health` because the full-text index cost is measured with `dbstat`, which walks the page map, so it is a separate tool rather than more lines in the health report. When the SQLite build has no `dbstat`, `fts_bytes` is reported as unknown rather than as zero, because zero would read as "the index is empty". Reports no message bodies and no per-user labels. |
+| `memory_health` | Operational status for the bound principal: scope mode, archive schema, tokenizer version, pending and failed index jobs, word-index completeness and lag, index updated-at, message totals, index lag, chunk count, storage totals (blocks, compressed blocks, raw bytes, stored bytes, bytes saved), and capture state (pending and failed reconcile jobs, active turns, turns awaiting reconciliation, last capture time, and the instance lease). Takes no arguments. Reports no message bodies, no credentials, and no per-user labels, so it is safe to expose to a model. On a legacy-only archive it reports `schema: legacy` and states that indexing is not applicable until `memory-migrate` runs, rather than reporting zeros that would look like a healthy empty index. The storage lines report raw and stored bytes separately so the effect of compression is visible rather than assumed: a report that showed only stored bytes would look identical whether compression worked or was silently disabled. The capture lines report the durable backlog rather than the writer's in-memory queue, because this process opens the archive read-only and cannot see the gateway's queue — and a snapshot of a millisecond-scale latency buffer would be noise even if it could. `instance_lease` is the one line that names an identity, and it is a process (`<hostname>:<pid>`), not a person; an expired lease is reported as expired rather than held, because that is the state a crash leaves behind and calling it held would tell an operator that a dead process is running. |
+| `memory_space` | Where the archive's bytes go. Reports whole-file numbers (database file, WAL, SHM, free pages, logical size, full-text index pages, and the part of the index that is stored text) and, separately, the bound principal's logical sizes (block bytes, artifact bytes, embedding bytes). Optional `backup_path` reports a backup file's size in its own field. The two groups are never added together: every principal shares the same pages, so a per-principal share of the file would be a fiction, and the block and artifact totals are subsets of the file rather than additions to it. Slower than `memory_health` because the full-text index cost is measured with `dbstat`, which walks the page map, so it is a separate tool rather than more lines in the health report. When the SQLite build has no `dbstat`, `fts_bytes` is reported as unknown rather than as zero, because zero would read as "the index is empty". `fts_bytes` is a subset of `logical_bytes`, not of `file_bytes`: `dbstat` reads through the pager and counts pages still in the WAL, while `file_bytes` is the main file alone, so on a freshly written archive the index can legitimately appear larger than the file. `fts_content_bytes` is zero on a schema v7 archive, which made both indexes contentless; a non-zero value means the archive predates v7 or a later change reintroduced a content column. Reports no message bodies and no per-user labels. |
 
 Days must be integers from 0 to 36500; 0 means all history. Limits must be integers
 from 1 to 50. Invalid values are errors.
@@ -124,6 +130,31 @@ Both v2 tools refuse a legacy-only archive with an explicit error instead of
 returning an empty result, so an unmigrated deployment cannot look like an empty
 memory.
 
+### Reading the health report
+
+`memory_health` answers two different questions, and the lines are grouped so
+they are not confused:
+
+- **Is retrieval keeping up?** `pending_index_jobs`, `failed_index_jobs`,
+  `index_lag_messages`, `word_index_complete`. A non-zero lag means a missing
+  search hit may simply not be indexed yet.
+- **Is capture keeping up?** `pending_reconcile_jobs`, `failed_reconcile_jobs`,
+  `active_turns`, `awaiting_reconcile_turns`, `last_capture_at`,
+  `instance_lease`. A turn that stays `active` across restarts, or a reconcile
+  job that stays pending, is the durable evidence that something is stuck.
+
+The capture lines deliberately do not report the writer's queue depth. The MCP
+process opens the archive read-only and is a separate process from the gateway,
+so it cannot read that queue; and the queue is a latency buffer measured in
+milliseconds, so a snapshot of it would be noise rather than a signal. The
+durable backlog is what answers the question an operator is actually asking.
+
+Every count is scoped to the bound principal. An archive-wide count would let
+one principal infer another's activity — "3 turns are stuck" is a disclosure
+even though it carries no text. The lease is the single exception: it is
+archive-wide by construction and holds only `<hostname>:<pid>`, which identifies
+a process rather than a person.
+
 ## How It Works
 
 ```
@@ -134,6 +165,13 @@ The server implements JSON-RPC 2.0 over stdio (the MCP "local" transport).
 When the LLM calls a tool, the server queries the same SQLite database that the
 gateway writes to, returning formatted results. The MCP process opens the
 database read-only, so it can never mutate or purge history.
+
+That read-only guarantee is why deletion is not a tool here. Removing a
+principal's archive is done with `cmd/memory-delete`, a separate operator
+command, because a model must not be able to delete a user's history because a
+prompt asked it to. Adding a delete tool would make the guarantee conditional on
+a handler behaving, which is not a guarantee. See
+[docs/MEMORY_DELETION.md](MEMORY_DELETION.md).
 
 The gateway owns indexing. When strict v2 capture is enabled it runs a
 background index worker that turns archived messages into chunks and FTS rows in

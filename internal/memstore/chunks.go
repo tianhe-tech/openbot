@@ -366,7 +366,15 @@ func (writer *ArchiveWriter) IndexPending(ctx context.Context, limit int) (int, 
 			indexed++
 		}
 		if len(jobs) > 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE mem_v2_index_state SET updated_at=? WHERE id=1`, now); err != nil {
+			// The generation is bumped monotonically rather than assigned the
+			// clock. Search cursors are bound to this value, so it has to
+			// strictly increase on every change to the ranked dataset: two
+			// changes in the same millisecond would otherwise leave it
+			// unchanged and a cursor issued between them would be accepted
+			// against a ranking that had already moved. Scoped deletion bumps
+			// the same counter, so both writers have to agree on the rule.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE mem_v2_index_state SET updated_at=MAX(updated_at+1, ?) WHERE id=1`, now); err != nil {
 				return err
 			}
 		}
@@ -476,9 +484,23 @@ func (writer *ArchiveWriter) BackfillWordIndex(ctx context.Context, limit int) (
 			`SELECT word_backfill_rowid FROM mem_v2_index_state WHERE id=1`).Scan(&highWater); err != nil {
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT c.id, ft.content
+		// The chunk text is reconstructed from the message block rather than
+		// read out of the trigram index, because schema v7 made both indexes
+		// contentless. This used to be `SELECT c.id, ft.content FROM
+		// mem_v2_chunks c JOIN mem_v2_chunk_fts ft ON ft.rowid=c.id`, which was
+		// one row read per chunk; it is now one block decode per chunk, and a
+		// block can hold a whole message. The backfill is a background pass
+		// with its own scaled deadline, so the extra cost is absorbed there
+		// rather than on a user-facing path.
+		//
+		// The join to mem_v2_messages is what reaches the block, and the
+		// byte range comes from the chunk row itself, so the text written into
+		// the word index is byte-identical to what indexMessage writes.
+		rows, err := tx.QueryContext(ctx, `SELECT c.id, c.start_byte, c.end_byte,
+				b.codec, b.codec_version, b.raw_bytes, b.payload
 			FROM mem_v2_chunks c
-			JOIN mem_v2_chunk_fts ft ON ft.rowid=c.id
+			JOIN mem_v2_messages m ON m.id=c.message_id
+			JOIN mem_v2_blocks b ON b.id=m.block_id
 			WHERE c.id>?
 			ORDER BY c.id
 			LIMIT ?`, highWater, limit)
@@ -492,10 +514,28 @@ func (writer *ArchiveWriter) BackfillWordIndex(ctx context.Context, limit int) (
 		var batch []chunkRow
 		for rows.Next() {
 			var row chunkRow
-			if err := rows.Scan(&row.id, &row.content); err != nil {
+			var start, end int
+			var codec string
+			var codecVersion int
+			var rawBytes int64
+			var payload []byte
+			if err := rows.Scan(&row.id, &start, &end,
+				&codec, &codecVersion, &rawBytes, &payload); err != nil {
 				rows.Close()
 				return err
 			}
+			decoded, err := decodeBlock(codec, codecVersion, rawBytes, payload)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("memstore: word backfill chunk %d: %w", row.id, err)
+			}
+			text := string(decoded)
+			if start < 0 || end > len(text) || start > end {
+				rows.Close()
+				return fmt.Errorf("memstore: word backfill chunk %d: range [%d,%d) is outside a %d-byte body",
+					row.id, start, end, len(text))
+			}
+			row.content = text[start:end]
 			batch = append(batch, row)
 		}
 		err = rows.Err()

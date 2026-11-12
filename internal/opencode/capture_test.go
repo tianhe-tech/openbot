@@ -30,6 +30,20 @@ func (recorder *captureRecorderStub) BeginTurn(_ context.Context, input TurnInpu
 	return TurnRef{ID: "turn", Existing: recorder.existing}, recorder.err
 }
 
+func TestCaptureAcknowledgesOnlyCommittedInput(t *testing.T) {
+	recorder := &captureRecorderStub{err: errors.New("storage full")}
+	client := &Client{conversationRecorder: recorder}
+	acknowledged := false
+	payload := MessagePayload{Channel: "wechat", UserID: "owner", Content: "input", OnCaptureCommitted: func() { acknowledged = true }}
+	if err := client.beginCapture(context.Background(), &payload); err == nil || acknowledged {
+		t.Fatal("failed capture acknowledged input")
+	}
+	recorder.err = nil
+	if err := client.beginCapture(context.Background(), &payload); err != nil || !acknowledged {
+		t.Fatalf("committed capture not acknowledged: %v", err)
+	}
+}
+
 func TestCaptureFailurePreventsDispatch(t *testing.T) {
 	recorder := &captureRecorderStub{err: errors.New("storage full")}
 	client := &Client{sdk: sdk.NewClient(), conversationRecorder: recorder}

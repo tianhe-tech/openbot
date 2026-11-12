@@ -65,8 +65,17 @@ func BenchmarkTokenizerComparison(b *testing.B) {
 		b.Fatal(err)
 	}
 
+	// The chunk text is reconstructed from the message block, not read out of
+	// the trigram index: schema v7 made both indexes contentless, so
+	// `SELECT content FROM mem_v2_chunk_fts` now returns NULL for every row.
+	// The byte range comes from the chunk row, so the text is byte-identical to
+	// what the index was built from.
 	rows, err := store.db.QueryContext(ctx,
-		`SELECT rowid, content FROM mem_v2_chunk_fts`)
+		`SELECT c.id, c.start_byte, c.end_byte, b.codec, b.codec_version, b.raw_bytes, b.payload
+		FROM mem_v2_chunks c
+		JOIN mem_v2_messages m ON m.id=c.message_id
+		JOIN mem_v2_blocks b ON b.id=m.block_id
+		ORDER BY c.id`)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -82,11 +91,23 @@ func BenchmarkTokenizerComparison(b *testing.B) {
 	var copied int
 	for rows.Next() {
 		var id int64
-		var content string
-		if err := rows.Scan(&id, &content); err != nil {
+		var start, end int
+		var codec string
+		var codecVersion int
+		var rawBytes int64
+		var payload []byte
+		if err := rows.Scan(&id, &start, &end, &codec, &codecVersion, &rawBytes, &payload); err != nil {
 			b.Fatal(err)
 		}
-		if _, err := insert.ExecContext(ctx, id, content); err != nil {
+		decoded, err := decodeBlock(codec, codecVersion, rawBytes, payload)
+		if err != nil {
+			b.Fatalf("decode chunk %d: %v", id, err)
+		}
+		text := string(decoded)
+		if start < 0 || end > len(text) || start > end {
+			b.Fatalf("chunk %d range [%d,%d) is outside a %d-byte body", id, start, end, len(text))
+		}
+		if _, err := insert.ExecContext(ctx, id, text[start:end]); err != nil {
 			b.Fatal(err)
 		}
 		copied++

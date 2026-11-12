@@ -3,6 +3,7 @@ package wechat
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +19,41 @@ func newTestInboundQueue(t *testing.T) *inboundQueue {
 	}
 	t.Cleanup(func() { _ = q.Close() })
 	return q
+}
+
+func TestInboundDeferredDispatchRetainsRowsUntilCapture(t *testing.T) {
+	queue := newTestInboundQueue(t)
+	if err := queue.Save("owner", "owner", "delivery", "request", "token"); err != nil {
+		t.Fatal(err)
+	}
+	replayInboundQueue(context.Background(), queue, func(context.Context, *WeixinMessage) error {
+		return errInboundDeferred
+	})
+	if count, err := queue.Count(); err != nil || count != 1 {
+		t.Fatalf("async acceptance removed inbox: %d %v", count, err)
+	}
+	handler := &Handler{inbound: queue}
+	handler.acknowledgeCapture(wechatCaptureInput{DeliveryIDs: []string{"delivery"}})
+	if count, err := queue.Count(); err != nil || count != 0 {
+		t.Fatalf("capture did not clear inbox: %d %v", count, err)
+	}
+}
+
+func TestInboundReplayReadsBeyondFirstPage(t *testing.T) {
+	queue := newTestInboundQueue(t)
+	for index := 0; index < 205; index++ {
+		if err := queue.Save("owner", "owner", fmt.Sprintf("message:%d", index), "input", "token"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := 0
+	replayInboundQueue(context.Background(), queue, func(_ context.Context, message *WeixinMessage) error {
+		seen += len(message.deliveryIDs)
+		return errInboundDeferred
+	})
+	if seen != 205 {
+		t.Fatalf("replayed %d of 205 entries", seen)
+	}
 }
 
 // A duplicate poll delivery or a retried persist must not create a second row:

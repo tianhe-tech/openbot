@@ -382,13 +382,20 @@ func (cs *CronScheduler) executeScheduledTask(taskID string) {
 		scheduledTask.Name, scheduledTask.Type, scheduledTask.RunCount)
 
 	// 创建执行任务
+	//
+	// UserID/ThreadID 必须透传：SendMessage 用它们拼 session 标题
+	// "[channel:userID] threadID"，而 /sessions 的所有权过滤依赖这个前缀。
+	// 漏传会让每次定时执行都新建一个标题为 "[dingtalk:] " 的孤儿 session，
+	// 既不属于任何用户，又会把真正属于用户的 session 挤出列表。
 	task := &Task{
 		ID:          fmt.Sprintf("%s-run-%d", scheduledTask.ID, scheduledTask.RunCount),
 		Type:        TaskTypeCron, // 标记为定时任务类型
 		Priority:    PriorityNormal,
 		Status:      TaskStatusPending,
 		AdapterType: scheduledTask.AdapterType,
+		UserID:      scheduledTask.UserID,
 		Channel:     scheduledTask.Channel,
+		ThreadID:    scheduledTask.ThreadID,
 		Content:     scheduledTask.Content,
 		Agent:       scheduledTask.Agent,
 		ScriptPath:  scheduledTask.ScriptPath,

@@ -6,12 +6,23 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+var errInboundDeferred = errors.New("wechat: inbound awaiting durable capture")
+
+func (h *Handler) acknowledgeCapture(input wechatCaptureInput) {
+	if h.inbound != nil {
+		if err := h.inbound.Delete(input.DeliveryIDs); err != nil {
+			log.Printf("wechat: captured inbound acknowledgement failed: %v", err)
+		}
+	}
+}
 
 // inboundBatcher coalesces rapid-fire inbound text messages from the same
 // user into a single dispatch. iLink delivers WeChat messages individually,
@@ -172,6 +183,9 @@ func (b *inboundBatcher) flush(ctx context.Context, key string, expected *pendin
 		return
 	}
 	if err := b.dispatch(ctx, current.msg); err != nil {
+		if errors.Is(err, errInboundDeferred) {
+			return
+		}
 		// Keep the persisted rows: the message was accepted by iLink and the
 		// user is waiting for it, so a failed dispatch must be replayable after
 		// a restart rather than silently dropped.
@@ -197,6 +211,9 @@ func (b *inboundBatcher) flushAll(ctx context.Context) {
 
 	for _, p := range all {
 		if err := b.dispatch(ctx, p.msg); err != nil {
+			if errors.Is(err, errInboundDeferred) {
+				continue
+			}
 			log.Printf("wechat: shutdown-flush dispatch error from=%s: %v (kept for replay)", p.msg.FromUserID, err)
 			continue
 		}

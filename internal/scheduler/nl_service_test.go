@@ -208,3 +208,116 @@ func TestNLScheduleServiceConfirmFailureIsRecoverable(t *testing.T) {
 		t.Fatalf("pending state should be kept after confirm failure")
 	}
 }
+
+func TestNLScheduleServiceUpdateChangesCronAndKeepsIdentity(t *testing.T) {
+	cron := NewCronScheduler(nil)
+	existing := &ScheduledTask{
+		ID:          "cron-1",
+		Name:        "每日检查",
+		Type:        TaskTypeAgent,
+		CronExpr:    "0 0 9 * * *",
+		Enabled:     true,
+		AdapterType: "dingtalk",
+		Channel:     "c1",
+		Content:     "检查系统状态",
+	}
+	if err := cron.AddScheduledTask(existing); err != nil {
+		t.Fatalf("AddScheduledTask error = %v", err)
+	}
+
+	state := NewInMemoryNLScheduleStateStore(0)
+	parser := &staticIntentParser{intent: &NLScheduleIntent{
+		Action:   NLScheduleActionUpdate,
+		CronExpr: "0 0 10 * * *",
+		Selector: NLScheduleTaskSelector{TaskID: "cron-1"},
+	}}
+	svc := NewNLScheduleService(cron, nil, parser, state)
+
+	ctx := context.Background()
+	req := NLScheduleRequest{AdapterType: "dingtalk", UserID: "u4", Channel: "c1", Text: "把每日检查改到10点"}
+
+	first, err := svc.HandleText(ctx, req)
+	if err != nil {
+		t.Fatalf("HandleText(draft) error = %v", err)
+	}
+	if first == nil || !first.Handled || !first.NeedConfirm {
+		t.Fatalf("update should require confirmation before mutating")
+	}
+	// The draft must not have touched the scheduler yet.
+	if got, _ := cron.GetScheduledTask("cron-1"); got.CronExpr != "0 0 9 * * *" {
+		t.Fatalf("cron changed before confirm: %q", got.CronExpr)
+	}
+
+	second, err := svc.HandleText(ctx, NLScheduleRequest{AdapterType: "dingtalk", UserID: "u4", Channel: "c1", Text: "确认"})
+	if err != nil {
+		t.Fatalf("HandleText(confirm) error = %v", err)
+	}
+	if second == nil || !second.Handled || second.NeedConfirm {
+		t.Fatalf("confirm should succeed without NeedConfirm")
+	}
+
+	updated, err := cron.GetScheduledTask("cron-1")
+	if err != nil {
+		t.Fatalf("GetScheduledTask error = %v", err)
+	}
+	if updated.CronExpr != "0 0 10 * * *" {
+		t.Fatalf("cron = %q, want %q", updated.CronExpr, "0 0 10 * * *")
+	}
+	// Identity and payload must survive an update that only names a new time.
+	if updated.ID != "cron-1" || updated.Name != "每日检查" || updated.Content != "检查系统状态" {
+		t.Fatalf("update clobbered identity: %+v", updated)
+	}
+	if got := len(cron.GetScheduledTasksByAdapter("dingtalk")); got != 1 {
+		t.Fatalf("tasks = %d, want 1 (update must not create a second task)", got)
+	}
+}
+
+func TestNLScheduleServiceUpdateWithoutSelectorIsRecoverable(t *testing.T) {
+	cron := NewCronScheduler(nil)
+	state := NewInMemoryNLScheduleStateStore(0)
+	parser := &staticIntentParser{intent: &NLScheduleIntent{
+		Action:   NLScheduleActionUpdate,
+		CronExpr: "0 0 10 * * *",
+	}}
+	svc := NewNLScheduleService(cron, nil, parser, state)
+
+	ctx := context.Background()
+	if _, err := svc.HandleText(ctx, NLScheduleRequest{AdapterType: "feishu", UserID: "u5", Channel: "chat1", Text: "改一下任务时间"}); err != nil {
+		t.Fatalf("HandleText(draft) error = %v", err)
+	}
+
+	resp, err := svc.HandleText(ctx, NLScheduleRequest{AdapterType: "feishu", UserID: "u5", Channel: "chat1", Text: "确认"})
+	if err != nil {
+		t.Fatalf("HandleText(confirm) error = %v", err)
+	}
+	if resp == nil || !resp.Handled || !resp.NeedConfirm {
+		t.Fatalf("missing selector should be a recoverable failure")
+	}
+	// The hint must name the actual problem. Telling the user to restate the
+	// time would be wrong here: the time parsed fine, the target did not.
+	if !strings.Contains(resp.Message, "任务") {
+		t.Fatalf("message = %q, want a selector hint", resp.Message)
+	}
+	if strings.Contains(resp.Message, "补充更明确的时间") {
+		t.Fatalf("message = %q, want a selector hint rather than a time hint", resp.Message)
+	}
+	if _, ok := state.Get("u5", "feishu"); !ok {
+		t.Fatalf("pending state should be kept after confirm failure")
+	}
+}
+
+func TestBuildDraftMessageRendersActionInChinese(t *testing.T) {
+	// The draft is a user-facing confirmation prompt. Printing the raw action
+	// constant ("update") leaks an internal identifier into a Chinese sentence.
+	msg := buildDraftMessage(&NLScheduleIntent{
+		Action:   NLScheduleActionUpdate,
+		CronExpr: "0 0 10 * * *",
+		Selector: NLScheduleTaskSelector{TaskID: "cron-1"},
+	})
+	if !strings.Contains(msg, "修改") {
+		t.Fatalf("draft = %q, want the action rendered as 修改", msg)
+	}
+	if strings.Contains(msg, "update") {
+		t.Fatalf("draft = %q, must not leak the raw action constant", msg)
+	}
+}

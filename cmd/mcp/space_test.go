@@ -25,7 +25,7 @@ func TestMemorySpaceReportsFileAndPrincipalSeparately(t *testing.T) {
 	for _, expected := range []string{
 		"scope_mode: single-owner",
 		"### Database file (whole archive, shared by every principal)",
-		"file_bytes:", "wal_bytes:", "shm_bytes:", "free_bytes:",
+		"file_bytes:", "wal_bytes:", "shm_bytes:", "free_bytes:", "logical_bytes:",
 		"### This principal (logical sizes, subsets of the file above)",
 		"block_bytes:", "artifact_bytes:", "embedding_bytes:",
 		"file_mib:",
@@ -33,6 +33,18 @@ func TestMemorySpaceReportsFileAndPrincipalSeparately(t *testing.T) {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("space report missing %q: %s", expected, output)
 		}
+	}
+
+	// The stored-text line is the number the contentless migration was decided
+	// on, so it must still be printed. Schema v7 made both indexes contentless,
+	// which means the honest value for an indexed archive is now zero: the text
+	// lives in the message blocks and nowhere else. Printing the line anyway is
+	// what lets an operator confirm the migration took effect on their archive.
+	if !strings.Contains(output, "fts_content_bytes:") {
+		t.Fatalf("space report did not print fts_content_bytes: %s", output)
+	}
+	if !strings.Contains(output, "fts_content_bytes: 0 ") {
+		t.Fatalf("fts_content_bytes is not zero for a v7 archive: %s", output)
 	}
 
 	// The fixture wrote two messages, so the principal's block bytes must be

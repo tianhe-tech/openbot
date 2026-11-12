@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -296,6 +297,141 @@ func TestV2ScrollPaginatesSession(t *testing.T) {
 	}
 }
 
+// TestSchemaHandshakeRefusesANewerArchive pins the one skew that cannot be
+// caught by a query failing.
+//
+// An older archive is missing tables, so every v2 tool errors and the operator
+// is told to migrate. A newer archive is the opposite: every table this binary
+// knows about still exists, so every query succeeds, and the process answers
+// from rows whose meaning it does not know while reporting a schema version it
+// cannot interpret. Nothing in the read path can notice that, which is why the
+// check has to happen at startup and why it is asserted here rather than left
+// to the health report.
+func TestSchemaHandshakeRefusesANewerArchive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	store, err := memstore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateArchive(context.Background()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	store.Close()
+
+	// Write a version the binary does not know. This is what a downgrade looks
+	// like from the archive's side: the file is newer than the reader. It is
+	// written through database/sql rather than through memstore because
+	// memstore deliberately has no API for recording a version it cannot
+	// produce — the only writer that would do this is a later binary.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO mem_v2_schema(version, applied_at) VALUES (99, 0)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+
+	reader, err := memstore.OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	status, err := reader.SchemaStatus(context.Background())
+	if err != nil {
+		t.Fatalf("schema status: %v", err)
+	}
+	if !status.Newer() {
+		t.Fatalf("a version-99 archive was not reported as newer: %+v", status)
+	}
+	if status.Exact() || status.Older() {
+		t.Fatalf("newer archive also reported as exact or older: %+v", status)
+	}
+	// The read path still claims the tables are usable, which is exactly why
+	// the startup check cannot be replaced by one of these calls.
+	if !reader.SupportsV2Retrieval(context.Background()) {
+		t.Fatal("fixture is wrong: a newer archive should still have the v2 tables")
+	}
+	// The rendered status must name both numbers. "schema: v2" would be true of
+	// version 99 and would hide the skew entirely.
+	rendered := status.String()
+	for _, expected := range []string{"99", "newer"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("status %q does not mention %q", rendered, expected)
+		}
+	}
+}
+
+// TestSchemaHandshakeReportsAnOlderArchive covers the direction that does fail
+// loudly, so that the two are not conflated: an older archive is a migration
+// instruction, not a refusal to run.
+func TestSchemaHandshakeReportsAnOlderArchive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	store, err := memstore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateArchive(context.Background()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	store.Close()
+
+	// Drop the newest version row so the archive looks like it predates this
+	// binary. The tables are still present, which is what makes this the
+	// "migrate me" case rather than the "you are too old" case.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM mem_v2_schema WHERE version = (SELECT MAX(version) FROM mem_v2_schema)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+
+	reader, err := memstore.OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	status, err := reader.SchemaStatus(context.Background())
+	if err != nil {
+		t.Fatalf("schema status: %v", err)
+	}
+	if !status.Older() {
+		t.Fatalf("an archive one version behind was not reported as older: %+v", status)
+	}
+	if status.Newer() {
+		t.Fatalf("older archive also reported as newer: %+v", status)
+	}
+	if !strings.Contains(status.String(), "memory-migrate") {
+		t.Fatalf("older status does not name the remedy: %q", status.String())
+	}
+}
+
+// TestSchemaHandshakeReportsAnUnmigratedArchive pins the third state. A store
+// that was never migrated has no mem_v2_schema table at all, which is a normal
+// legacy deployment and not an error, so it must not be reported as version 0
+// of a schema that exists.
+func TestSchemaHandshakeReportsAnUnmigratedArchive(t *testing.T) {
+	server := memoryServerForTest(t, nil)
+	status, err := server.store.SchemaStatus(context.Background())
+	if err != nil {
+		t.Fatalf("schema status: %v", err)
+	}
+	if status.Version != 0 || status.Newer() || status.Older() || status.Exact() {
+		t.Fatalf("unmigrated archive reported as a version: %+v", status)
+	}
+	if !strings.Contains(status.String(), "not migrated") {
+		t.Fatalf("unmigrated status is not self-describing: %q", status.String())
+	}
+}
+
 func TestV2ToolsRequireMigratedArchive(t *testing.T) {
 	// A legacy-only store has no v2 tables, so the v2 tools must refuse rather
 	// than silently returning nothing.
@@ -364,12 +500,26 @@ func TestMemoryHealthReportsLagWithoutLeaking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
+	// The schema version is read from the archive rather than written into the
+	// assertion. It was hardcoded to "version 6" and went stale the moment
+	// schema v7 landed, which made a correct health report look like a
+	// regression. A literal here tests the constant, not the report.
+	version, err := server.store.ArchiveSchemaVersion(context.Background())
+	if err != nil {
+		t.Fatalf("schema version: %v", err)
+	}
 	for _, expected := range []string{
-		"scope_mode: single-owner", "schema: v2", "pending_index_jobs:",
+		"scope_mode: single-owner", fmt.Sprintf("schema: version %d", version),
+		"pending_index_jobs:",
 		"failed_index_jobs:", "messages_total:", "messages_indexed:",
 		"index_lag_messages:", "chunks:", "word_index_complete:",
 		"blocks:", "blocks_compressed:", "storage_raw_bytes:",
 		"storage_stored_bytes:", "storage_saved_bytes:",
+		// Capture state. These are the durable facts that answer "is anything
+		// stuck", which is the question the writer's in-memory queue would
+		// answer if this process could read it.
+		"pending_reconcile_jobs:", "failed_reconcile_jobs:", "active_turns:",
+		"awaiting_reconcile_turns:", "last_capture_at:", "instance_lease:",
 	} {
 		if !strings.Contains(health, expected) {
 			t.Fatalf("health missing %q: %s", expected, health)
@@ -379,13 +529,40 @@ func TestMemoryHealthReportsLagWithoutLeaking(t *testing.T) {
 	if !strings.Contains(health, "index_lag_messages: 0") {
 		t.Fatalf("fully indexed archive reported lag: %s", health)
 	}
+	// The fixture writes through RecordMessage, which is the import-shaped path:
+	// it creates a turn and leaves it open because there is no attempt to finish
+	// it. So exactly one turn is active and nothing is awaiting reconciliation.
+	// Asserting the real number rather than zero is the point — a health tool
+	// that reported a comfortable zero here would be reporting a number it did
+	// not read.
+	for _, settled := range []string{
+		"pending_reconcile_jobs: 0", "failed_reconcile_jobs: 0",
+		"active_turns: 1", "awaiting_reconcile_turns: 0",
+	} {
+		if !strings.Contains(health, settled) {
+			t.Fatalf("health did not report %q: %s", settled, health)
+		}
+	}
+	// The capture timestamp must be the newest archived message, not the oldest
+	// and not the wall clock.
+	if !strings.Contains(health, "last_capture_at: 2023-11-14T22:13:21Z") {
+		t.Fatalf("last_capture_at is not the newest message: %s", health)
+	}
 	// No conversation content, no project names, no principal labels. The mode
 	// line names the mode ("single-owner ... one principal") and that is not a
 	// label, so the assertion targets the keys a label would appear under.
+	//
+	// The lease line is the one place a non-principal identity is printed, and
+	// it is deliberate: the holder is "<hostname>:<pid>", which identifies a
+	// process rather than a person. It is asserted to be absent here only
+	// because this fixture never acquires a lease.
 	for _, forbidden := range []string{"systemctl restart", "opencode-gateway", "session-v2", "user_id:", "adapter:"} {
 		if strings.Contains(health, forbidden) {
 			t.Fatalf("health leaked %q: %s", forbidden, health)
 		}
+	}
+	if !strings.Contains(health, "instance_lease: none") {
+		t.Fatalf("unleased archive did not report the absence of a holder: %s", health)
 	}
 
 	// A legacy-only archive has no index, and the tool must say so rather than
@@ -397,7 +574,7 @@ func TestMemoryHealthReportsLagWithoutLeaking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("legacy health: %v", err)
 	}
-	if !strings.Contains(legacyHealth, "schema: legacy") {
+	if !strings.Contains(legacyHealth, "schema: not migrated") {
 		t.Fatalf("legacy archive did not report its schema: %s", legacyHealth)
 	}
 	if strings.Contains(legacyHealth, "secret request body") {

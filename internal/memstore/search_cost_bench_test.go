@@ -19,10 +19,23 @@ import (
 // made the "realistic" benchmark measure the worst case. The same discipline
 // applies here, so the breakdown is measured rather than assumed.
 //
-// The layers are cumulative. count_only isolates FTS5 match enumeration,
-// inner_rank adds bm25 scoring and the scope joins, and full_search adds the
-// coverage query and the excerpt join. The difference between consecutive rows
-// is the cost of that layer.
+// The layers are cumulative, but only within one index. count_only isolates
+// FTS5 match enumeration on the trigram index, inner_rank adds bm25 scoring and
+// the scope joins on that same index, and full_search adds the coverage query
+// and the excerpt join — but full_search routes queries[0] to the *word* index,
+// because all three of its terms are plain ASCII words. So full_search is not
+// the sum of the two rows above it, and subtracting them from it measures the
+// difference between two indexes rather than the cost of a layer.
+//
+// That is not a defect to be papered over: the two indexes are the point of the
+// routing, and the word index is 15.9x cheaper on the same rows. It does mean
+// the rows must be read as two groups. count_only and inner_rank describe the
+// trigram path; full_search and the per-query rows describe the production path
+// for the query they name. An earlier revision of this comment claimed the
+// layers were cumulative without qualification, and the resulting table showed
+// full_search faster than the inner_rank it supposedly contains — which reads
+// as an impossible measurement until you notice the two rows read different
+// indexes.
 //
 // index_status is measured after full_search on purpose. The coverage query
 // scans mem_v2_chunks, and whether those pages are already resident changes its
@@ -48,14 +61,14 @@ func BenchmarkSearchCostBreakdown(b *testing.B) {
 		b.Cleanup(func() { store.Close() })
 		ctx := context.Background()
 
+		var dbMB float64
 		if info, err := os.Stat(path); err == nil {
-			b.ReportMetric(float64(info.Size())/(1024*1024), "db-mb")
+			dbMB = float64(info.Size()) / (1024 * 1024)
 		}
 		var chunks int64
 		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mem_v2_chunks`).Scan(&chunks); err != nil {
 			b.Fatal(err)
 		}
-		b.ReportMetric(float64(chunks), "chunks")
 
 		// The same four queries the target benchmark rotates through, so the
 		// per-query rows below explain that benchmark's aggregate number.
@@ -65,11 +78,21 @@ func BenchmarkSearchCostBreakdown(b *testing.B) {
 			benchWord(44) + " " + benchWord(55),
 			benchCJKWord(33) + " " + benchCJKWord(44),
 		}
+		// CROSS JOIN, matching searchIndex. This row is a hand-built copy of the
+		// production inner query, so it has to track production exactly: with
+		// plain JOIN the planner drove from mem_v2_messages through
+		// mem_v2_message_scan and probed the FTS table once per message. That
+		// measured 64,454 ms p50 at 5k messages against 25.98 ms for the full
+		// search that contains it — an inner layer 2,500x slower than the whole,
+		// which is impossible and is how the drift was caught. The attribution
+		// benchmark already carried this fix and this comment; this copy did
+		// not, and a copy that drifts from production does not measure
+		// production.
 		inner := `SELECT mem_v2_chunk_fts.rowid, bm25(mem_v2_chunk_fts)
 			FROM mem_v2_chunk_fts
-			JOIN mem_v2_chunks c ON c.id=mem_v2_chunk_fts.rowid
-			JOIN mem_v2_messages m ON m.id=c.message_id
-			JOIN mem_v2_sessions s ON s.id=m.session_id
+			CROSS JOIN mem_v2_chunks c ON c.id=mem_v2_chunk_fts.rowid
+			CROSS JOIN mem_v2_messages m ON m.id=c.message_id
+			CROSS JOIN mem_v2_sessions s ON s.id=m.session_id
 			WHERE mem_v2_chunk_fts MATCH ? AND m.principal_id=?
 			ORDER BY bm25(mem_v2_chunk_fts) LIMIT ?`
 		principal := archiveID("principal", "bench", "owner")
@@ -88,6 +111,13 @@ func BenchmarkSearchCostBreakdown(b *testing.B) {
 				}
 				b.StopTimer()
 				reportLatencies(b, summarizeLatencies(samples))
+				// The corpus shape is reported on every row rather than once on
+				// the parent. A benchmark that only calls b.Run never prints a
+				// line of its own, so a metric reported on the parent is
+				// silently discarded — which is how the archive size went
+				// missing from every recorded run of this table.
+				b.ReportMetric(dbMB, "db-mb")
+				b.ReportMetric(float64(chunks), "chunks")
 			})
 		}
 
@@ -99,12 +129,16 @@ func BenchmarkSearchCostBreakdown(b *testing.B) {
 		warmSearchCache(b, store, scope, queries)
 
 		first := buildMatchQuery(searchTerms(queries[0]))
-		run("count_only", func() error {
+		// The trigram rows are labelled with the index they read. Without the
+		// label the table invites the reading that full_search contains
+		// inner_rank, which it does not: queries[0] is three ASCII words, so
+		// Search routes it to the word index and never touches this one.
+		run("trigram_count_only", func() error {
 			var n int64
 			return store.db.QueryRowContext(ctx,
 				`SELECT COUNT(*) FROM mem_v2_chunk_fts WHERE mem_v2_chunk_fts MATCH ?`, first).Scan(&n)
 		})
-		run("inner_rank", func() error {
+		run("trigram_inner_rank", func() error {
 			rows, err := store.db.QueryContext(ctx, inner, first, principal, maxSearchCandidates)
 			if err != nil {
 				return err

@@ -54,6 +54,21 @@ func main() {
 	}
 	defer store.Close()
 
+	// Refuse to serve an archive written by a later binary. Every table this
+	// binary knows about still exists in a newer archive, so nothing would fail
+	// on its own: the process would answer questions from rows whose meaning it
+	// does not know, and report a schema version it cannot interpret. Failing at
+	// startup is the only point where the skew is still visible to an operator.
+	status, err := store.SchemaStatus(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read archive schema: %v\n", err)
+		os.Exit(1)
+	}
+	if status.Newer() {
+		fmt.Fprintf(os.Stderr, "archive schema %s; upgrade this binary instead of downgrading the archive\n", status)
+		os.Exit(1)
+	}
+
 	srv.store = store
 	srv.run()
 }
@@ -210,6 +225,10 @@ func (s *mcpServer) toolDefinitions() []mcpToolDef {
 						Type:        "string",
 						Description: "搜索关键词，如 '爬虫'、'部署'、'Python项目'。支持中英文。",
 					},
+					"project": {
+						Type:        "string",
+						Description: "Optional project filter. Only messages archived under this project are searched. Omit to search every project the bound principal owns.",
+					},
 					"days": {
 						Type:        "integer",
 						Description: "Lookback days (0-36500). Default 0 searches all stored history.",
@@ -217,6 +236,10 @@ func (s *mcpServer) toolDefinitions() []mcpToolDef {
 					"limit": {
 						Type:        "integer",
 						Description: "Maximum records (1-50), default 10. Results include bounded original-text excerpts and record IDs.",
+					},
+					"cursor": {
+						Type:        "string",
+						Description: "Opaque continuation token from a previous result's next_cursor. Omit for the first page. A cursor is bound to its query and scope, so changing either requires a fresh search.",
 					},
 				},
 				Required: []string{"query"},
@@ -525,12 +548,23 @@ func (s *mcpServer) toolMemoryHealth(args map[string]interface{}) (string, error
 	sb.WriteString("## Memory health\n\n")
 	sb.WriteString("scope_mode: single-owner (process bound to one principal)\n")
 
+	// The version is printed rather than the word "v2", because "v2" is true of
+	// every version from 2 upward and so cannot show the skew that matters: an
+	// archive one version behind this binary still answers every query, and the
+	// operator would have no way to see that a migration is pending. It is read
+	// here rather than cached at startup because the gateway can migrate the
+	// archive underneath this read-only connection, and a cached value would
+	// then describe a file that no longer exists.
+	schema, err := s.store.SchemaStatus(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read archive schema: %w", err)
+	}
 	if !s.store.SupportsV2Retrieval(ctx) {
-		sb.WriteString("schema: legacy (v2 archive not migrated; search falls back to legacy recall)\n")
+		sb.WriteString(fmt.Sprintf("schema: %s\n", schema))
 		sb.WriteString("index: not applicable until memory-migrate runs\n")
 		return sb.String(), nil
 	}
-	sb.WriteString("schema: v2\n")
+	sb.WriteString(fmt.Sprintf("schema: %s\n", schema))
 
 	coverage, err := s.store.IndexCoverage(ctx)
 	if err != nil {
@@ -576,6 +610,38 @@ func (s *mcpServer) toolMemoryHealth(args map[string]interface{}) (string, error
 	sb.WriteString(fmt.Sprintf("storage_stored_bytes: %d\n", codecStats.StoredBytes))
 	sb.WriteString(fmt.Sprintf("storage_saved_bytes: %d\n", codecStats.SavedBytes()))
 
+	// Capture state. The writer's in-memory queue is not readable from this
+	// process and would not be a useful number if it were: it is a latency
+	// buffer measured in milliseconds, so a snapshot of it is noise. What is
+	// reported instead is the durable backlog, which is what answers "is
+	// anything stuck", plus the lease, which is the only way a read-only
+	// process can tell whether a gateway is actually running.
+	capture, err := s.store.CaptureHealth(ctx, s.scope())
+	if err != nil {
+		return "", fmt.Errorf("read capture health: %w", err)
+	}
+	sb.WriteString(fmt.Sprintf("pending_reconcile_jobs: %d\n", capture.PendingReconcileJobs))
+	sb.WriteString(fmt.Sprintf("failed_reconcile_jobs: %d\n", capture.FailedReconcileJobs))
+	sb.WriteString(fmt.Sprintf("active_turns: %d\n", capture.ActiveTurns))
+	sb.WriteString(fmt.Sprintf("awaiting_reconcile_turns: %d\n", capture.AwaitingReconcile))
+	if capture.LastCaptureAt > 0 {
+		sb.WriteString(fmt.Sprintf("last_capture_at: %s\n",
+			time.UnixMilli(capture.LastCaptureAt).UTC().Format(time.RFC3339)))
+	} else {
+		sb.WriteString("last_capture_at: never\n")
+	}
+	if capture.LeaseHolder == "" {
+		sb.WriteString("instance_lease: none (no gateway is capturing into this archive)\n")
+	} else if capture.LeaseLive(time.Now()) {
+		sb.WriteString(fmt.Sprintf("instance_lease: held until %s\n",
+			time.UnixMilli(capture.LeaseExpiresAt).UTC().Format(time.RFC3339)))
+	} else {
+		// An expired row is the state a crash leaves behind. Reporting it as
+		// held would tell an operator that a dead process is running.
+		sb.WriteString(fmt.Sprintf("instance_lease: expired at %s (the holder stopped without releasing)\n",
+			time.UnixMilli(capture.LeaseExpiresAt).UTC().Format(time.RFC3339)))
+	}
+
 	if status.TotalMessages > status.IndexedMessages {
 		sb.WriteString("\nCoverage: PARTIAL - recent messages are not searchable yet.\n")
 	}
@@ -617,8 +683,22 @@ func (s *mcpServer) toolMemorySpace(args map[string]interface{}) (string, error)
 	sb.WriteString(fmt.Sprintf("wal_bytes: %d\n", report.WALBytes))
 	sb.WriteString(fmt.Sprintf("shm_bytes: %d\n", report.SHMBytes))
 	sb.WriteString(fmt.Sprintf("free_bytes: %d\n", report.FreeBytes))
+	// logical_bytes is printed because fts_bytes is a subset of it and not of
+	// file_bytes. In WAL mode a committed page can still be in the -wal file,
+	// so file_bytes can be far smaller than the pages the database holds, and
+	// an operator comparing the two without this line would read a correct
+	// report as a contradiction.
+	sb.WriteString(fmt.Sprintf("logical_bytes: %d (page_count * page_size; "+
+		"file_bytes plus pages still in the WAL)\n", report.LogicalBytes))
 	if report.TableBreakdownAvailable {
 		sb.WriteString(fmt.Sprintf("fts_bytes: %d\n", report.FTSBytes))
+		// The stored text is reported separately because it is the only part of
+		// the index that a contentless index removes. Schema v7 made both
+		// indexes contentless, so this is zero on a current archive; a non-zero
+		// value means the archive predates v7 or a later change reintroduced a
+		// content column.
+		sb.WriteString(fmt.Sprintf("fts_content_bytes: %d (a second copy of the chunk text; "+
+			"zero since schema v7 made both indexes contentless)\n", report.FTSContentBytes))
 	} else {
 		// A zero here would read as "the index is empty", which is a different
 		// claim from "this SQLite build cannot measure it".

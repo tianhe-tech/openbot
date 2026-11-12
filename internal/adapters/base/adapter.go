@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 )
 
@@ -11,6 +12,12 @@ import (
 type MessageSender interface {
 	SendMessage(ctx context.Context, channel, userID, content string) error
 }
+
+// MaxSessionListRows bounds how many sessions a /sessions reply renders.
+// The list is ordered newest first, so the rows that get cut are the ones a
+// user is least likely to want, and the reply stays inside the message-size
+// limits of every platform.
+const MaxSessionListRows = 10
 
 // BidirectionalAdapter enables two-way communication between OpenCode and messaging platforms.
 type BidirectionalAdapter struct {
@@ -79,6 +86,40 @@ func (a *BidirectionalAdapter) GetUserForSession(sessionID string) (string, bool
 	return "", false
 }
 
+// SoleUser returns the only user this adapter has ever seen, and reports
+// ok=false when there is none or more than one.
+//
+// It backs the channel-only claim form ("[feishu] my work"), which exists so a
+// single-user deployment does not have to type a platform user ID into
+// /rename. Returning ok=false for an ambiguous adapter is deliberate: guessing
+// would deliver one user's session output to another.
+//
+// Cron pseudo-users ("cron:<sessionID>") are ignored — they are internal
+// bookkeeping, not a person, and counting them would make every adapter that
+// has ever run a scheduled task look ambiguous.
+func (a *BidirectionalAdapter) SoleUser() (string, bool) {
+	var (
+		sole  string
+		count int
+	)
+	a.userSessions.Range(func(key, _ any) bool {
+		userID, ok := key.(string)
+		if !ok || userID == "" || strings.HasPrefix(userID, "cron:") {
+			return true
+		}
+		count++
+		if count > 1 {
+			return false
+		}
+		sole = userID
+		return true
+	})
+	if count != 1 {
+		return "", false
+	}
+	return sole, true
+}
+
 // ClearSessionForUser removes the session mapping for a user.
 func (a *BidirectionalAdapter) ClearSessionForUser(userID string) {
 	if sessionID, ok := a.userSessions.Load(userID); ok {
@@ -86,6 +127,35 @@ func (a *BidirectionalAdapter) ClearSessionForUser(userID string) {
 		a.sessionUsers.Delete(sessionID)
 		a.sessionData.Delete(sessionID)
 	}
+}
+
+// SwitchUserSession points a user at an existing session, replacing whatever
+// session they were on.
+//
+// This is the adapter half of /switch. It differs from MapUserToSession in one
+// way that matters: the previous session's reverse mapping and per-session data
+// are dropped first. Leaving them behind would keep routing that session's
+// events to this user after they moved away from it, and would leak the old
+// session's webhook/receive_id into the new one.
+//
+// The caller must also bind the thread on the opencode client
+// (Client.BindSessionToThread). The two maps are independent: this one is what
+// the adapters read to fill MessagePayload.SessionID, and the client's is the
+// fallback used when that field is empty. Updating only one leaves the other
+// pointing at the previous session.
+func (a *BidirectionalAdapter) SwitchUserSession(userID, sessionID string) {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == "" || sessionID == "" {
+		return
+	}
+	if previous, ok := a.userSessions.Load(userID); ok {
+		if previousID, ok := previous.(string); ok && previousID != sessionID {
+			a.sessionUsers.Delete(previousID)
+			a.sessionData.Delete(previousID)
+		}
+	}
+	a.MapUserToSession(userID, sessionID)
 }
 
 // SendToUser sends a message to a user via the platform's messaging API.

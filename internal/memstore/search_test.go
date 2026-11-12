@@ -24,6 +24,39 @@ type turnSpec struct {
 	UserID string
 }
 
+func TestSearchCursorRejectsInvalidOffsets(t *testing.T) {
+	for _, offset := range []int{-1, maxSearchCandidates + 1, int(^uint(0) >> 1)} {
+		if _, err := decodeSearchCursor(encodeSearchCursor(searchCursor{Offset: offset})); err == nil {
+			t.Fatalf("accepted offset %d", offset)
+		}
+	}
+}
+
+func TestDetailContinuationReconstructsLongMessage(t *testing.T) {
+	_, writer := archiveForTest(t, WriterOptions{})
+	body := strings.Repeat("中文abc", 50000) + "TAIL"
+	recordTurn(t, writer, turnSpec{Delivery: "detail-long", Request: "question", Answer: body, Created: 1000})
+	scope := SearchScope{Adapter: "test", UserID: "owner"}
+	ids := []string{"answer-" + archiveID("fixture", "detail-long")}
+	var rebuilt strings.Builder
+	for page := 0; page < 10; page++ {
+		result, err := writer.store.GetMessages(context.Background(), scope, ids, maxDetailBudget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, message := range result.Messages {
+			rebuilt.WriteString(message.Text)
+		}
+		if !result.Truncated {
+			break
+		}
+		ids = []string{result.NextCursor}
+	}
+	if rebuilt.String() != body {
+		t.Fatalf("continuation returned %d bytes, want %d", rebuilt.Len(), len(body))
+	}
+}
+
 // recordTurn writes a user message and an assistant answer for one turn using
 // the low-level archive API, so the fixture controls timestamps and project
 // keys exactly. The lifecycle path is covered separately by

@@ -1,6 +1,6 @@
 # Memory System Implementation Plan
 
-Status: Phase 0 / PR 1 and the PR 2 storage foundation are implemented in the working tree. PR 3 core capture, including partial snapshots and tool/attachment metadata, is implemented experimentally. PR 4 scoped lexical search, detail, and scroll are implemented: archive schema v3 adds the chunk FTS index, the gateway runs a background index worker, and the MCP server exposes `memory_search` (v2-backed when the archive is migrated), `memory_get`, and `memory_scroll`. PR 3's external gates and PR 5 onward remain pending; [Gate status](#gate-status) is the authoritative list.
+Status: Phase 0 / PR 1 and the PR 2 storage foundation are implemented in the working tree. PR 3 core capture, including partial snapshots and tool/attachment metadata, is implemented experimentally, and PR 3's real-upstream compatibility gate now passes against a live `opencode serve`. PR 4 scoped lexical search, detail, and scroll are implemented: archive schema v3 adds the chunk FTS index, the gateway runs a background index worker, and the MCP server exposes `memory_search` (v2-backed when the archive is migrated), `memory_get`, and `memory_scroll`. PR 5 principal isolation, structured health output, and host tool wiring are implemented. PR 6 compression, space reporting, scoped artifact dedupe, and scoped deletion are implemented; archive schema v6 adds the instance lease plus an explicit WAL maintenance policy, and schema v7 converts both full-text indexes to contentless, removing the duplicated copy of the chunk text. Block packing was measured and declined. PR 7 source-backed durable knowledge is implemented: archive schema v8 adds the fact, evidence, and job tables, `internal/knowledge` runs extraction off a durable job queue, and `/remember` `/forget` `/knowledge-list` `/knowledge-help` are wired into the command interceptor. PR 3's CGO race gate, the §15 benchmark gates, and PR 8 onward remain pending; [Gate status](#gate-status) is the authoritative list.
 
 Phase 0 includes loss prevention, read-only owner-bound MCP access, response-index
 migration, atomic legacy record/index writes, and honest evidence excerpts.
@@ -134,6 +134,7 @@ Introduce versioned `mem_v2_*` tables in the existing database. Use a memory-spe
 | `mem_v2_chunk_word_fts` | FTS5 `content` with the `unicode61` tokenizer; rowid is `mem_v2_chunks.id` |
 | `mem_v2_index_state` | single row `id=1`: `tokenizer_version`, `updated_at`, `word_backfill_rowid` |
 | `mem_v2_jobs` | `id`, `kind`, `source_id`, `source_revision`, `status`, `attempts`, `lease_until`, `next_run_at`, `last_error`; unique kind + source + revision |
+| `mem_v2_instance_lease` | single row `id=1`: `holder`, `acquired_at`, `heartbeat_at`, `expires_at`; the process currently capturing into this archive |
 | `mem_v2_legacy_map` | `legacy_id`, `turn_id`, `import_version`; unique legacy ID for resumable import |
 
 Create indexes for principal/project/session/time filtering, session sequence scrolling, unfinished turns, due jobs, and message-to-chunk joins. Derive authorization from session ownership; any denormalized principal field must be set and checked by trusted writer code.
@@ -193,6 +194,7 @@ Historical deletion and truncation are irreversible without a backup or upstream
 - Validate operations before batching. Transaction failure fails all affected receipts; retry transient locks within deadlines using the same IDs. Do not discard an unknown commit outcome; idempotent retry resolves it.
 - Insert finalized messages and index-job rows in the same transaction. In-process workers submit state changes through the writer; lease jobs durably to recover from crashes.
 - Checkpoint WAL under an explicit maintenance policy. A second gateway targeting the same store must be rejected by an instance lease or supported by tested coordination; do not rely on single-process assumptions silently.
+  - **Status: implemented.** `RunMaintenance` checkpoints on an interval (default 5 minutes) only when the `-wal` file exceeds a threshold (default 64 MiB), using `wal_checkpoint(TRUNCATE)` rather than `PASSIVE` because `PASSIVE` leaves the file at its high-water mark. The gateway runs it alongside the index worker and stops it before the writer drains. `AcquireLease` takes a single-row lease in `mem_v2_instance_lease` (schema version 6) with a 90-second TTL and a heartbeat every `TTL/3`; the gateway acquires it before capturing and releases it after the writer closes. Acquisition is one `INSERT … ON CONFLICT DO UPDATE … WHERE expires_at <= now RETURNING holder` statement, because a read followed by a write would let two processes both observe an expired lease and both claim it. The lease is a separate call rather than automatic in `OpenArchiveWriter` so `TestArchiveConcurrentWritersAndIdentityIsolation` can still open two writers to prove the writer's own conflict handling; the gateway always takes it. Tests: `TestCheckpointTruncatesTheWAL`, `TestCheckpointSkipsASmallWAL`, `TestCheckpointPreservesData`, `TestMaintenanceLoopStopsOnCancel`, `TestLeaseRejectsASecondHolder`, `TestLeaseReleaseAllowsTakeover`, `TestLeaseExpiresAfterACrash`, `TestLeaseHeartbeatKeepsItAlive`, `TestLeaseHolderIgnoresAnExpiredRow`.
 - Shutdown order: stop intake, stop/drain producers, flush capture, stop workers, then close SQLite using an independent bounded shutdown context.
 
 ### Capture ownership
@@ -220,6 +222,8 @@ Historical deletion and truncation are irreversible without a backup or upstream
 
 Gate: process-kill tests after commit, duplicate delivery tests, late-completion tests, fallback tests, restart reconciliation, disk-full errors, and migration restart all preserve the documented semantics.
 
+- **Status: implemented.** The capture gate above passes in `internal/opencode/capture_test.go`. The separate real-upstream compatibility gate passes in `internal/opencode/upstream_compat_test.go`, which asserts the wire format against a live `opencode serve` rather than a fake server. It is skipped unless `OPENCODE_ENDPOINT` is set, so `go test ./...` stays hermetic; run it with `opencode serve --port 4096 --hostname 127.0.0.1` and `$env:OPENCODE_ENDPOINT = "http://127.0.0.1:4096"`. Every prompt uses `noReply: true`, so the server persists the message and emits the events without invoking a provider — that is what makes the gate runnable without paid model access. Two real-server facts are pinned as assertions because the gateway's parsers depend on them: a real `message.part.updated` carries no `properties.message`, so the role must come from the `message.updated` pre-dispatch, and `/global/event` emits a `payload.type == "sync"` variant with no `properties` object that the unwrap-then-decode path must tolerate.
+
 ## 8. Phase 2: Lexical search and evidence retrieval
 
 - Chunk user and assistant text at paragraph/code boundaries, initially targeting 1 KiB and capping at 2 KiB of UTF-8 text with a small bounded overlap. Preserve source byte offsets and split exceptionally long lines safely.
@@ -242,7 +246,7 @@ Gate: response-only terms, old messages, exact commands, CJK terms, punctuation,
 Implemented in `internal/memstore/chunks.go`, `search.go`, `detail.go`, and archive schema v4.
 
 - Chunking targets 1 KiB, caps at 2 KiB, and overlaps 128 bytes. Boundaries prefer paragraph, then line, then sentence punctuation, then space, then a rune-aligned hard cut. Chunks always cover the whole body with no gaps, so every byte of stored text is reachable.
-- `mem_v2_chunk_fts` is a standalone FTS5 trigram table whose rowid is `mem_v2_chunks.id`. Text is duplicated rather than contentless; contentless FTS is deferred to the space phase as planned.
+- `mem_v2_chunk_fts` is a standalone FTS5 trigram table whose rowid is `mem_v2_chunks.id`. It was created with a content column and converted to contentless by schema v7, which removed the duplicated copy of the chunk text; the excerpt is now reconstructed from the message block. See [§15](#15-benchmarks-and-targets) for the measurement that justified it and the read-path cost it was traded against.
 - Schema v4 adds `mem_v2_chunk_word_fts`, a second FTS5 table over the same chunk text with the `unicode61` tokenizer, keyed by the same chunk rowid. It exists because the trigram tokenizer is correct but slow: measured on identical chunk text, the same three-term query costs 117.4 ms against the trigram index and 7.38 ms against a `unicode61` index, a factor of 15.9, while matching 1157 and 1142 chunks respectively. The cost is the tokenizer, not the query and not the joins. See [§15](#15-benchmarks-and-targets) for the measurement.
 - The word index is added rather than substituted because the two tokenizers answer different questions. `unicode61` splits on word boundaries, so it finds whole tokens and cannot find a substring inside one; trigram finds any substring, which is what makes CJK search work at all, since a CJK phrase has no spaces to split on. Keeping both lets a query be routed to the index that can answer it.
 - `Search` routes each term by its shape and reports the choice in `filters.mode`: `word` when every term is a plain ASCII word, `fts` when every term needs the trigram index (CJK, or a term containing a separator such as `.` or `/`), `hybrid` when the query mixes both, and `scan` when every term is shorter than three runes and neither index can match it. A hybrid query merges the two result sets by message ID, summing scores and keeping the better excerpt.
@@ -291,26 +295,36 @@ Gate: principal A cannot search, fetch, scroll, count, infer, or reuse a cursor 
 
 - Add the maintained Go Zstandard implementation from `github.com/klauspost/compress/zstd` only in this phase; pin a reviewed version through Go modules.
 - Compress finalized large messages. Leave small or incompressible payloads raw; record codec, uncompressed length, and checksum, and enforce maximum decode size. **Implemented synchronously inside the commit, not asynchronously, and that is a measured decision rather than an omission.** The original wording asked for asynchronous compression, but compressing after the commit means writing the block raw and then rewriting it compressed in a second transaction that repoints the message and removes the old block — which is exactly the crash-safe repacking this phase also requires and which is not built. Doing it asynchronously without that machinery would trade a bounded, measured CPU cost on the capture path for an unbounded, unmeasured window in which a crash leaves a block half-rewritten. The measured cost is small enough that the trade is not worth making yet: `BenchmarkCompressBlockCost` reports 40 µs for 4 KiB, 222 µs for 16 KiB, 815 µs for 64 KiB, and 6.3 ms for 1 MiB of realistic text, against a 2 s capture deadline whose measured worst commit is 329 ms in a 40k archive. Even the largest message the writer accepts (16 MiB, the `QueueBytes` limit) extrapolates to roughly 100 ms, about 5% of the deadline. Revisit this when repacking exists, because that is when asynchronous compression becomes cheap to adopt rather than a new failure mode.
-- Benchmark per-message compression against session-local 32-128 KiB blocks. Pack only within the same principal and compatible retention class, so deletion and access boundaries remain tractable.
+- Benchmark per-message compression against session-local 32-128 KiB blocks. Pack only within the same principal and compatible retention class, so deletion and access boundaries remain tractable. **Measured, and the answer is to not build it yet.** `packing_bench_test.go` reports a 40% space saving (2,234,727 → 1,327,512 bytes on a 4 MiB conversation) against a 1.6–1.9× page-fetch regression (83 µs → 155 µs) and 2.3–3× more allocation per page. Both numbers are far below the latency budget, so the gate as written would pass; the reason to decline is that the saving is available elsewhere for a read-path cost that looked negligible, and the index is the larger consumer. Revisit after the FTS work. **The FTS measurement below then confirmed that reason rather than weakening it:** contentless FTS5 recovers about 36% of the archive, which is within a few points of packing's 40%, and the read-path cost was measured at 1.13× at 2k messages and indistinguishable at 20k, so the index work is the better first move and may remove the reason to pack at all. The corpus generator is in the test file so the size-mix assumption can be changed and the measurement re-run rather than re-argued.
 - In one transaction, insert the new block, repoint all affected message references, and remove obsolete unreferenced blocks. Existing read transactions must retain a consistent view.
 - Deduplicate large exact tool/artifact payloads using scoped SHA-256 content identities, verifying content on reuse. Do not deduplicate conversation rows, and do not create cross-principal hash-existence side channels. **Implemented in `dedupe.go` for tool outputs.** The block ID is derived from `(principal, checksum, untruncated length)`. The principal is in the identity so a write cannot be deduplicated against another principal's block, which would otherwise let one principal detect that another has stored a payload by watching its own write get shared. The untruncated length is in the identity because two calls can retain the same truncated prefix while their originals differed, and sharing would give the second call the first call's `raw_bytes`. Every write reads the row back and compares the bytes rather than trusting the digest, because the failure that matters — digest matched, content did not — is indistinguishable from a first write without the read. Conversation rows are untouched: only `mem_v2_tool_calls.artifact_ref` participates, and `SavePartial` still writes its snapshots inline.
-- Evaluate contentless FTS5 with supported deletion/update semantics under the pinned SQLite library; reconstruct snippets from original message offsets. Benchmark index-detail options before sacrificing phrase/ranking behavior.
+- Evaluate contentless FTS5 with supported deletion/update semantics under the pinned SQLite library; reconstruct snippets from original message offsets. Benchmark index-detail options before sacrificing phrase/ranking behavior. **Measured, and the answer is yes.** `fts_contentless_probe_test.go` establishes three things. First, the pinned driver bundles SQLite 3.51.3 and `contentless_delete=1` works: insert, MATCH, `bm25()`, DELETE by rowid, and UPDATE by rowid all succeed, so the deletion path is not what blocks adoption. Second, `snippet()` and `highlight()` return empty on a contentless table, so the excerpt must be reconstructed from the chunk's byte range into the message text — which is what `searchScan` already does with `excerptWindow`, so the machinery exists. Third, **the saving is a constant per index, not a percentage**: every configuration saves exactly one copy of the chunk text (2,736,128 bytes on a 2,000-chunk corpus), because contentless removes the stored text and keeps the postings. The percentage therefore depends entirely on how large the postings are, and the postings are large for trigram. Measured: word index 86.5% (narrow vocabulary) to 76.8% (wide), trigram 50.9% to 31.3%. **The archive runs both indexes and each stores its own copy, so the saving is the sum of two rows, not one.** `fts_contentless_ratio_test.go` measures that on a conversation-shaped archive written through the real write path: the stored text is 2.24–2.26 copies of the chunk text, and removing it would take **35.9–37.4% of the archive file**. An earlier revision of this bullet divided a single row's saving by the combined index size and reported 15%; that was an arithmetic error, and it is recorded rather than silently reverted because the wrong number had already been used to argue that packing was the larger remaining lever. The saving is within a few points of packing's 40%, and the read-path cost was measured at 1.13× at 2k messages and indistinguishable at 20k, because the decode is bounded by `maxSearchCandidates` while the ranking work grows with the archive. So the index work is the better first move. The remaining decision is whether to spend a migration plus a read-path change on it, and the answer depends on the real archive's ratio, which `memory_space` now reports directly as `fts_content_bytes` against `fts_bytes` and `file_bytes`.
 - Defer custom dictionaries, vector quantization, external blob stores, and multi-tier caches until profiling demonstrates value.
 - Optional bounded decoded-block cache is keyed by principal/block revision and byte capacity; deletion invalidates entries. Add only if detail-fetch profiling warrants it.
 - Count main DB, WAL, FTS, artifacts, and embeddings in space reports. Report backup size separately. VACUUM/checkpoint work is scheduled, not performed on the prompt path. **Implemented in `space.go` and exposed as the `memory_space` MCP tool.** The report keeps whole-file numbers and per-principal numbers in separate groups and never adds them, because every principal shares the same pages: a per-principal share of the file would be a fiction, and the block and artifact totals are subsets of the file rather than additions to it. `FTSBytes` sums every FTS5 shadow table by name prefix rather than only the table named in the `CREATE` statement, and `ArtifactBytes` deduplicates through an `IN` subquery so a retained output referenced by two tool calls is counted once. `TableBreakdownAvailable` separates "this SQLite build has no `dbstat`" from "the index is empty", because a zero would read as the latter. It is a separate tool from `memory_health` because `dbstat` walks the page map and health is deliberately built from cheap indexed lookups. VACUUM and checkpoint remain unscheduled work: the report measures free pages so an operator can decide, but nothing runs them on the prompt path.
 
-Gate: exact round-trip text, UTF-8 offsets, block corruption handling, crash-safe repacking, and scoped deletion pass. Ship compression settings only if they improve total storage without violating agreed read/write latency gates. **Status: round-trip, UTF-8 offsets, corruption handling, and scoped dedupe pass. Crash-safe repacking and scoped deletion do not, because neither is implemented — dedupe shares a block at write time and never rewrites an existing one, so it adds no new crash window, but it also does not reclaim anything already written.**
+Gate: exact round-trip text, UTF-8 offsets, block corruption handling, crash-safe repacking, and scoped deletion pass. Ship compression settings only if they improve total storage without violating agreed read/write latency gates. **Status: round-trip, UTF-8 offsets, corruption handling, scoped dedupe, and scoped deletion pass. Crash-safe repacking does not, because it is not implemented — dedupe shares a block at write time and never rewrites an existing one, so it adds no new crash window, but it also does not reclaim anything already written.**
+
+Scoped deletion is implemented in `delete.go` and reachable through `cmd/memory-delete`; the semantics are documented in `docs/MEMORY_DELETION.md`. It runs as one transaction on the writer's queue, so it cannot interleave with capture, and every statement carries the principal predicate — there is no code path where an ID alone is enough. Three decisions in it are worth recording because each was wrong in the first draft:
+
+- **The selection is materialized into temporary tables before anything is deleted.** The first version re-ran the selection subquery after deleting from it, which silently did no work: by the time the later statements ran, the rows they were selecting were already gone. Temporary tables are safe here only because the writer holds exactly one connection (`db.SetMaxOpenConns(1)`), so the table is private to the transaction.
+- **Attempts are selected per turn, not per attempt.** A time-bounded deletion can remove some of a turn's messages and leave the rest. Selecting attempts by "no surviving message references this attempt" would delete an attempt that a surviving message still points at, breaking the foreign key. Requiring the *turn* to have no surviving message is the conservative reading and the only one that cannot over-delete.
+- **The index generation is bumped monotonically, not assigned the clock.** A deletion changes the ranked dataset, so a cursor issued before it must be refused. A plain assignment to `time.Now()` would leave the value unchanged when an index write and a deletion land in the same millisecond, and a cursor issued between them would be accepted against a ranking that had already moved. `IndexPending` uses the same `MAX(updated_at+1, ?)` rule, so both writers agree.
+
+The block sweep is by reference rather than ownership, because a block can be shared: two tool calls with identical output resolve to the same content-addressed block, so deleting one principal's session must not remove a block another record still uses. That also makes deletion resumable — a crash mid-transaction leaves the archive consistent, and a later run collects any block that became unreferenced. Deletion is logical, not a secure erase: the bytes can survive in free pages, in the WAL, and in any backup taken beforehand. `docs/MEMORY_DELETION.md` states that plainly rather than letting an operator promise more than the software can deliver.
 
 ## 11. Phase 5: Source-backed durable knowledge
 
-- Use durable jobs triggered by completed meaningful work or explicit remember requests; do not call an LLM for every message.
-- Inject a drafter interface following the existing skill-generation pattern. Bound input, output, retry count, and daily cost; mark origin so extraction never schedules itself recursively.
-- Require structured outputs: kind, scoped statement, supporting message IDs, observed/proposed/completed/verified status, and candidate supersession.
-- Validate that evidence IDs belong to the source principal and actually exist. Unsupported claims are rejected; confidence is not proof.
-- Redact configured sensitive data before extraction where required, and record archive redaction policy explicitly. Full-fidelity storage applies to permitted captured data, not deliberately excluded secrets.
-- Store corrections as supersession rather than overwriting historical evidence. User-requested forgetting removes derived facts, search entries, artifacts, and caches under the documented deletion policy.
-- Load only a small scoped knowledge index at session start, initially up to 1,500 tokens using an available tokenizer or conservative byte budget. Retrieve details on demand.
-- Add explicit remember/forget controls with trusted authorization and auditable outcomes. An assistant statement that it remembered something is not a successful write receipt.
+**Status: implemented, off by default.** `internal/memstore/knowledge.go` holds the store API and schema v8; `internal/knowledge` holds the extraction service, the drafter, and the `/remember` `/forget` `/knowledge-list` `/knowledge-help` commands; `internal/opencode` fires the candidate hook and injects the index. `MEMORY_KNOWLEDGE_ENABLED` defaults to false and is rejected unless strict capture is on, because extraction reads the archive that capture writes.
+
+- Use durable jobs triggered by completed meaningful work or explicit remember requests; do not call an LLM for every message. **Implemented as `mem_v2_knowledge_jobs`, unique on `(principal, source_kind, source_id)`, so the same session enqueued three times is one job. The service also dedups the same thread inside a 30-minute window and enforces a daily cap by counting the principal's facts written in the last 24 hours.**
+- Inject a drafter interface following the existing skill-generation pattern. Bound input, output, retry count, and daily cost; mark origin so extraction never schedules itself recursively. **`knowledge.Drafter` mirrors `skillgen`; the input is bounded by `MaxEvidenceMessages` (20) and the output by `knowledgeStatementMaxBytes` (512) per statement; each model in the chain gets its own `PerModelTimeout` (3 min); the recursion guard rejects any event whose adapter is `knowledge` or whose thread starts with `knowledge-draft-`, and every fact is stamped `origin='extraction'` so a later pass can tell its own output from a user's.**
+- Require structured outputs: kind, scoped statement, supporting message IDs, observed/proposed/completed/verified status, and candidate supersession. **`DraftFact` carries all five, and `validateKnowledgeFact` rejects a fact that omits any of them.**
+- Validate that evidence IDs belong to the source principal and actually exist. Unsupported claims are rejected; confidence is not proof. **`verifyKnowledgeEvidence` runs a per-ID `SELECT COUNT(*) … WHERE id=? AND principal_id=?` inside the write transaction, so a fabricated ID and another principal's real ID fail the same way. `TestSaveKnowledgeFactRejectsForeignEvidence` sets confidence to 1.0 in every case to make the point.**
+- Redact configured sensitive data before extraction where required, and record archive redaction policy explicitly. Full-fidelity storage applies to permitted captured data, not deliberately excluded secrets. **`redaction_policy` is a column on every fact, defaulting to `none`; the drafter prompt instructs the model not to extract secrets, and a fact that names one is still the user's to forget.**
+- Store corrections as supersession rather than overwriting historical evidence. User-requested forgetting removes derived facts, search entries, artifacts, and caches under the documented deletion policy. **`superseded_by` is a column, not a delete, so the old fact and its evidence survive; `SupersedeKnowledgeFact` refuses to fork an already-superseded fact, and `ForgetKnowledgeFact` un-supersedes whatever the removed fact had replaced, so forgetting a correction restores the original rather than leaving a hole. `delete.go` now removes facts whose evidence was deleted, session facts whose session was deleted, and jobs whose source was deleted, in the same transaction.**
+- Load only a small scoped knowledge index at session start, initially up to 1,500 tokens using an available tokenizer or conservative byte budget. Retrieve details on demand. **`KnowledgeIndex` renders at most 40 facts inside a 3,000-byte default budget (12,000 hard ceiling), most-specific-first, with a header that says the facts may be stale and that the current instruction wins. 3,000 bytes is the conservative reading of 1,500 tokens: it is under the token count for any tokenizer that maps a byte to less than half a token, and it cannot overflow a context window by being wrong about the tokenizer.**
+- Add explicit remember/forget controls with trusted authorization and auditable outcomes. An assistant statement that it remembered something is not a successful write receipt. **`/remember` cites the newest archived message as evidence and prints the fact ID and that message ID; when there is no archived message it refuses and says so rather than claiming success. `TestRememberWithoutEvidenceRefusesToClaimSuccess` pins that.**
 
 Gate: facts have valid provenance, user corrections supersede old facts, task-local instructions do not become global preferences, and extraction failures do not affect capture or search.
 
@@ -332,30 +346,46 @@ Update [handoff.go](../internal/memstore/handoff.go) and the client handoff inte
 
 - Build handoff context from recorded messages and verified facts with source references; retain recent originals within a budget.
 - Reserve handoff state and mark it consumed only after successful prompt acceptance. Persist a correlation ID and reconcile unknown outcomes to avoid duplicate injection.
-- Expiry applies to automatic handoff injection, not archive search. Keep thread-to-session continuation separate from durable evidence.
+- Expiry applies to automatic handoff injection, not archive search. Keep thread-to-session continuation separate from durable evidence. **The read path already filters by `HandoffTTL`; the row purge is now wired too.** `PurgeExpiredHandoffs` existed with no caller, so `session_handoff` rows accumulated forever — `SaveHandoff` upserts per thread, so a thread that is never used again is never overwritten. The gateway now runs it on the same 6-hour ticker as the retry purge. The purge boundary is `2*HandoffTTL`, deliberately twice the read cutoff: a row that is merely expired is still the most recent thing known about that thread, and deleting it at the read boundary would discard the only record of a session that might still be resumed. `TestPurgeExpiredHandoffsKeepsRowsInsideTheRetentionWindow` asserts against the table rather than through `LoadPendingHandoff`, because the read path filters by TTL and would report an expired row as absent whether it was deleted or merely filtered.
 - Replace age-based search exclusion with explicit retention classes: conversation, tool artifact, partial snapshot, derived fact. Start with no automatic conversation expiry.
-- Implement explicit scoped deletion as a transaction over messages, chunks, FTS, derived sources/facts, jobs, and block references. Repack shared blocks when necessary; never delete another record's content.
-- Document WAL, backups, and external artifacts: logical deletion is immediate, physical erasure follows storage/backup policy. Do not promise secure erase from SQLite DELETE alone.
+- Implement explicit scoped deletion as a transaction over messages, chunks, FTS, derived sources/facts, jobs, and block references. Repack shared blocks when necessary; never delete another record's content. **Implemented in `delete.go` for messages, chunks, both FTS tables, index and reconcile jobs, partials, tool calls, attachments, attempts, turns, sessions, the legacy import map, and unreferenced blocks. Derived facts joined the same transaction when PR 7 landed, in two phases: facts whose evidence was deleted are selected from `mem_v2_knowledge_evidence` before the messages go, and session-scoped facts whose session no longer exists are selected after the session delete, because a session-scoped fact has no evidence row that names the session. Knowledge jobs are removed by source. The evidence foreign key is deliberately not `ON DELETE CASCADE`, so a deletion that forgot this step aborts loudly instead of leaving a fact pointing at a message that no longer exists. Repacking is not needed by the deletion itself — the sweep removes only blocks nothing references, so a shared block survives by being referenced rather than by being rewritten.**
+- Document WAL, backups, and external artifacts: logical deletion is immediate, physical erasure follows storage/backup policy. Do not promise secure erase from SQLite DELETE alone. **Implemented in `docs/MEMORY_DELETION.md`.** It states what survives — free pages inside the database file, WAL frames until a checkpoint truncates them, any backup taken beforehand, and anything the gateway wrote outside the archive — and gives the accurate sentence an operator can use: the data is no longer readable through the gateway, the MCP tools, or search, and it will be gone from the file once the WAL is checkpointed and the file is vacuumed, subject to whatever backups exist. `VACUUM` is recommended after a deletion but is not presented as a guarantee, because it can leave remnants in the rollback journal and in the filesystem's own free space.
 
 ## 14. Configuration proposal
 
 Preserve `MEMORY_STORE_PATH`; introduce a validated nested Memory configuration while keeping a deprecation bridge for callers using `MemStorePath`.
 
-| Setting | Initial default / behavior |
-| --- | --- |
-| `MEMORY_ENABLED` | true; explicit false disables capture and recall |
-| `MEMORY_STORE_PATH` | `<OPENCODE_DIRECTORY>/mem/memory.db`; resolve once to absolute path |
-| `MEMORY_CAPTURE_MODE` | `strict`; `best_effort` is explicit and observable |
-| `MEMORY_BATCH_MAX_ITEMS` / `MEMORY_BATCH_MAX_BYTES` | 64 / 262144 |
-| `MEMORY_BATCH_MAX_DELAY_MS` | 10 |
-| `MEMORY_QUEUE_MAX_ITEMS` / `MEMORY_QUEUE_MAX_BYTES` | 1024 / 16777216; validate against attachment handling |
-| `MEMORY_COMMIT_TIMEOUT_MS` | 2000; errors visible; benchmark before production tuning |
-| `MEMORY_SCOPE_MODE` | disabled recall until single-owner or isolated scope is configured |
-| `MEMORY_COMPRESSION` | **not implemented, and deliberately not a setting.** The original proposal was a switch that stayed off until the Phase 4 gate and then turned raw-or-zstd on automatically. The gate has passed, so the switch would have exactly one reachable value, and a knob with one value is a way to be misconfigured rather than a way to be configured. Compression is therefore unconditional in strict mode: a block is stored zstd only if it is at least 4 KiB and the frame saves at least one byte in eight, and everything else stays raw. If a future need for a raw-only archive appears — a debugging aid, or a codec regression — add the switch then, with the reason recorded. |
-| `MEMORY_KNOWLEDGE_ENABLED` / `MEMORY_SEMANTIC_ENABLED` | false |
-| `MEMORY_CONVERSATION_RETENTION_DAYS` | 0 means no age-based deletion, not no search history |
+**Status: implemented.** `internal/config` exposes `MemoryConfig`, validates it in `validateMemory`, and `cmd/gateway` passes the resolved values into `memstore.WriterOptions`. `MemStorePath` and `MemoryCaptureMode` remain populated as copies of the validated values so existing callers keep compiling; they are documented as deprecated and changing them has no effect. `internal/config/memory_test.go` pins the defaults, the millisecond parsing, the rejection cases, and the deprecation bridge.
+
+| Setting | Initial default / behavior | Status |
+| --- | --- | --- |
+| `MEMORY_ENABLED` | true; explicit false disables capture and recall | implemented |
+| `MEMORY_STORE_PATH` | `<OPENCODE_DIRECTORY>/mem/memory.db`; resolve once to absolute path | implemented |
+| `MEMORY_CAPTURE_MODE` | `strict`; `best_effort` is explicit and observable | implemented for `legacy`/`strict`; `best_effort` is **not** implemented and is rejected rather than silently accepted. **The shipped default is `legacy`, not the `strict` proposed here**, because strict capture needs a migrated archive and normal gateway startup does not migrate one; `strict` is opt-in and observable. |
+| `MEMORY_BATCH_MAX_ITEMS` / `MEMORY_BATCH_MAX_BYTES` | 64 / 262144 | implemented |
+| `MEMORY_BATCH_MAX_DELAY_MS` | 10 | implemented; a bare number is milliseconds, not seconds |
+| `MEMORY_QUEUE_MAX_ITEMS` / `MEMORY_QUEUE_MAX_BYTES` | 1024 / 16777216; validate against attachment handling | implemented |
+| `MEMORY_COMMIT_TIMEOUT_MS` | 2000; errors visible; benchmark before production tuning | implemented |
+| `MEMORY_SCOPE_MODE` | disabled recall until single-owner or isolated scope is configured | implemented as a validated declaration; the MCP `--single-owner --adapter --user` binding is still what actually gates recall |
+| `MEMORY_COMPRESSION` | **not implemented, and deliberately not a setting.** The original proposal was a switch that stayed off until the Phase 4 gate and then turned raw-or-zstd on automatically. The gate has passed, so the switch would have exactly one reachable value, and a knob with one value is a way to be misconfigured rather than a way to be configured. Compression is therefore unconditional in strict mode: a block is stored zstd only if it is at least 4 KiB and the frame saves at least one byte in eight, and everything else stays raw. If a future need for a raw-only archive appears — a debugging aid, or a codec regression — add the switch then, with the reason recorded. | deliberately absent |
+| `MEMORY_KNOWLEDGE_ENABLED` | false; requires `MEMORY_ENABLED=true` and `MEMORY_CAPTURE_MODE=strict` | implemented. Extraction reads the archive that capture writes, so enabling it without strict capture would produce a service that can never find evidence. The combination is rejected at startup rather than silently doing nothing, because a no-op would look like a bug in the feature rather than a misconfiguration. `/remember`, `/forget`, `/knowledge-list`, and `/knowledge-help` are available even when extraction is off — they are explicit user actions, not extraction. |
+| `MEMORY_SEMANTIC_ENABLED` | false | **not implemented.** PR 8 does not exist, so the setting does not either. |
+| `MEMORY_CONVERSATION_RETENTION_DAYS` | 0 means no age-based deletion, not no search history | **not implemented.** Retention classes are PR 9. |
+
+Two settings are rejected at startup rather than clamped: a batch larger than the queue (it can never be filled, so the writer would wait for a batch that cannot exist), and a negative value for any limit. A negative `_MS` value is parsed and then rejected by name instead of being replaced by the default, because silently substituting the default makes a typo look like a working configuration.
 
 MCP accepts `--db` and the existing `GATEWAY_MEMORY_DB` fallback. Deprecate or explicitly support documented aliases rather than silently changing names. Validate existing MCP entries and report stale/disabled paths without overwriting intentional operator configuration. Define version handshake behavior for gateway/MCP binary skew.
+
+**Version handshake: implemented in `memstore.SchemaStatus`.** The MCP reads the archive's schema version at startup and refuses to serve an archive newer than the version its own binary supports. The two directions of skew are not equally dangerous, and the asymmetry is the whole reason the check exists:
+
+- An **older** archive is missing tables and columns, so every v2 query fails on its own and the operator is told to run `memory-migrate`. It needs no handshake to be noticed.
+- A **newer** archive is the quiet case. Every table this binary knows about still exists, so every query succeeds, and the process then answers from rows whose meaning it does not know while reporting a schema version it cannot interpret. Nothing in the read path can detect that, which is why the check has to happen before the first request.
+
+`SupportsV2Retrieval` deliberately keeps answering the narrower question — "do the tables exist" — because that is a fact about the file, and a newer archive does have them. Conflating the two questions is what made the skew invisible: the old code used `version >= archiveSchemaVersion`, so a version-99 archive was reported as fully supported. `memory_health` now prints the exact version and both numbers when they differ, rather than the word `v2`, which is true of every version from 2 upward and therefore cannot show a pending migration.
+
+**The gateway performs the same check, with the same wording.** `checkArchiveSchema` already refused a mismatched archive before the writer opened, so the gateway was never able to run against a newer archive by accident. What it did not do was say which direction the skew was in: the message was `unsupported archive schema 7 (want 6)`, which is accurate and leaves the operator to work out which side is wrong. The two remedies are opposite — a version above the binary's means upgrade the binary, a version below means run `memory-migrate` — and guessing wrong on a newer archive means downgrading it, which discards whatever the newer binary wrote. Both binaries now render the skew through `SchemaStatus.String()`, so the gateway and the MCP cannot describe the same archive differently, and the newer case names its remedy explicitly. `TestWriterRefusalNamesTheDirectionOfTheSkew` pins both directions, including that the older case does *not* borrow the "upgrade this binary" wording: telling an operator to upgrade a binary that is already current sends them looking for a release that does not exist.
+
+The never-migrated archive keeps its own message rather than being folded into the skew report, because it is a different problem with a different remedy: there is no version to compare, and the fix is to run the migration rather than to change binaries.
 
 ## 15. Verification and performance gates
 
@@ -369,7 +399,7 @@ status, because three copies of the same list had already drifted apart.
 | --- | --- | --- |
 | PR 1-2 package tests, vet, build | passed | none |
 | PR 3 capture tests (sync, stream, fallback, timeout, restart, retry, internal prompts) | passed | none |
-| PR 3 real-upstream compatibility | **open** | not written. Not blocked: `opencode.exe` v1.18.32 is installed on the development machine and `opencode serve --port 4096` answers `GET /config/providers` with 200, so a real server is available locally. The test must assert the wire format (session creation, message and part JSON shape, event envelope) against that server, not model quality, so it needs no paid model access. A fake server does not satisfy this gate. |
+| PR 3 real-upstream compatibility | passed | `internal/opencode/upstream_compat_test.go` asserts the wire format against a real `opencode serve` (v1.18.32), not a fake server, and not model quality. Six tests: session creation (`ses_` id, version, directory, projectID, positive `time.created`, and the SDK decoding the same body into the same fields); message and part shape (a caller-supplied `messageID` is accepted and echoed back in the response, in the part, and in `Session.Messages`, with `prt_` part ids and the text round-tripping verbatim); the `/event` envelope (no `payload` wrapper, `evt_` ids, `server.connected` first, and `session.created`/`message.updated`/`message.part.updated` all present); the `/global/event` envelope (every frame wrapped in `payload`, decorated with `directory`, and carrying the `sync` variant that has no `properties`); and the gateway's own parsers fed real captured events (`extractSessionIDFromEvent`, `isSessionScopedEvent`, and `extractContentFromEvent` both filtering the user's own text and yielding it once the role is assistant). The gate is runnable without paid model access because every prompt is sent with `noReply: true`: the server persists the message and emits the events without invoking a provider. The tests skip unless `OPENCODE_ENDPOINT` is set, so `go test ./...` stays hermetic. Two findings are pinned as assertions: a real `message.part.updated` does **not** carry `properties.message`, so the `role` the gateway reads from it is always empty and the role must come from the `message.updated` pre-dispatch; and `/global/event` emits a `payload.type == "sync"` variant with no `properties` object, which the unwrap-then-decode path must tolerate. |
 | PR 3 CGO race run | **open** | unexecutable on the development machine: `gcc` is not installed and `CGO_ENABLED=0`. Must run on a CGO-enabled runner. |
 | PR 4 search, detail, scroll, index tests | passed | none |
 | §15 benchmarks at 5k, 20k, and 100k | measured, but the verdict is not established | 100k search still misses its target, but the cause is no longer the tokenizer. The word index is implemented (schema v4) and measured on the production path at 100k: 463.0 ms p95, against 764.3 ms for the trigram path and 191.5 ms for the hybrid path. The redesign helped and did not finish the job, and the ~37 ms projection that predicted it would is refuted. The word index is proven faster on every isolated layer at 20k (25.0x on bm25 scoring, 7.9x on enumeration, 3.5x on the inner query) while matching 98.7% of the same chunks, and it is 3.4x faster than the trigram index on the full path in the same process. What is not established is the absolute verdict: `inner_rank` at 20k has been measured at 75.20, 125.2, 260.6, and 361.1 ms on identical code, a 4.8x spread, and the word path's full search at 40.71 and 102.5 ms at the same corpus size. The 100k miss is 4.6x, which is the same size as the drift, so a single-process measurement cannot call it. The gate needs a pinned machine with a recorded baseline row; a ratio against a reference operation measured in the same run was tried and does not work (best of five candidates cut the CV from 20.0% to 16.0%, and between processes the ratio was noisier than the raw number). The bounded scan's 13.8 s is fixed and measured (347.1 ms p95 after schema v5), and schema v5's index was then found to have broken the search path by 1388x — fixed with `CROSS JOIN` and pinned by `TestSearchIndexQueryPlanPinsFTSDriver` |
@@ -377,14 +407,21 @@ status, because three copies of the same list had already drifted apart.
 | §15 cold-cache, p99, saturation, concurrent readers, capture-active measurement | **open** | not started |
 | Competitor comparison | **open** | requires the same corpus and operation definitions first |
 | PR 5 principal isolation (search, fetch, scroll, count, cursor) | passed | `TestPrincipalCannotReachAnotherPrincipal` covers all five vectors against two principals sharing one adapter and one project name. It also caught a real defect: `Recent` and `ProjectSummaries` skipped the `user_id` filter when it was empty and returned every user's records, while `Search` rejected the same call. Both now return `ErrSearchScopeRequired`. |
-| PR 5 structured health output | passed | `memory_health` reports scope mode, schema, tokenizer version, pending and failed jobs, word-index completeness and lag, index updated-at, message totals, index lag, and chunk count. It reports no bodies, no credentials, and no per-user labels, and `TestMemoryHealthReportsLagWithoutLeaking` asserts that. |
-| PR 5 host tool wiring | passed | the gate says "verify actual host tool wiring, not only unit tests with manually supplied scope". `wiring_test.go` drives `handleRequest` with real JSON-RPC `tools/call` lines, so the scope is supplied the way a host would supply it. It asserts that a caller-supplied `user_id`/`adapter` is ignored and the bound principal answers, that an unbound server refuses every tool with "memory recall disabled" rather than returning an empty success, and that `memory_health` is actually advertised in `tools/list`. The fixture seeds both principals with a hit for the same query, so the test cannot pass by finding nothing. This required a writer seam on `mcpServer`; production still writes to `os.Stdout`. |
+| PR 5 structured health output | passed | `memory_health` reports scope mode, schema, tokenizer version, pending and failed index jobs, word-index completeness and lag, index updated-at, message totals, index lag, chunk count, storage totals, and capture state. The capture lines are the durable backlog — pending and failed reconcile jobs, active turns, turns awaiting reconciliation, last capture time, and the instance lease — because this process opens the archive read-only and is separate from the gateway, so the writer's in-memory queue is unreadable from here; a snapshot of a millisecond-scale latency buffer would be noise even if it were readable. Every count is scoped to the bound principal, because an archive-wide count lets one principal infer another's activity: "3 turns are stuck" is a disclosure even though it carries no text. `mem_v2_jobs` has no principal column, so the reconcile counts reach the principal through `mem_v2_jobs → mem_v2_attempts → mem_v2_turns`. The lease is the one archive-wide line and holds only `<hostname>:<pid>`, which identifies a process rather than a person; an expired lease is reported as expired rather than held, because that is the state a crash leaves behind. It reports no bodies, no credentials, and no per-user labels, and `TestMemoryHealthReportsLagWithoutLeaking` asserts that. `TestCaptureHealthCountsOnlyTheBoundPrincipal`, `TestCaptureHealthRequiresAScope`, `TestCaptureHealthReportsTheLease`, and `TestCaptureHealthCountsOpenWork` cover the query itself, including that a principal with no messages reports zero rather than borrowing the archive's newest timestamp. |
+| PR 5 host tool wiring | passed | the gate says "verify actual host tool wiring, not only unit tests with manually supplied scope". `wiring_test.go` drives `handleRequest` with real JSON-RPC `tools/call` lines, so the scope is supplied the way a host would supply it. It asserts that a caller-supplied `user_id`/`adapter` is ignored and the bound principal answers, that an unbound server refuses every tool with "memory recall disabled" rather than returning an empty success, and that `memory_health` is actually advertised in `tools/list`. `TestHostWiringAdvertisesEveryAcceptedArgument` closes the other half of the same gap: `memory_search` read `project` and `cursor` while advertising neither, so project filtering and pagination were implemented, tested, and unreachable from a host — the model was told the arguments did not exist. The test parses `tools/list` and asserts the advertised type of every argument the handlers accept. The fixture seeds both principals with a hit for the same query, so the test cannot pass by finding nothing. This required a writer seam on `mcpServer`; production still writes to `os.Stdout`. |
 | PR 6 block compression (round-trip, UTF-8 offsets, corruption, scoped stats) | passed | `codec.go` stores a block raw or zstd per payload and records `codec`, `codec_version`, `raw_bytes`, `stored_bytes`, and a checksum over the original text. Every read path decodes through one function, so the contract is enforced in one place. `TestDecodeBlockRoundTripsExactly` covers empty, ASCII, CJK, emoji, mixed, NUL bytes, and invalid UTF-8 byte-for-byte; `TestDecodeBlockRejectsCorruption` covers unknown codec, future codec version, truncated frame, flipped byte, declared-length mismatch, declared length above the ceiling, negative length, and an empty compressed payload; `TestCompressedMessageOffsetsAreUTF8Safe` proves chunk offsets still address rune boundaries after a compress/decompress cycle; `TestCompressedMessageIsSearchable` proves the index path decodes before chunking, which is the failure that would have made compression a data-loss bug. Landing the codec also exposed five existing tests that asserted on `b.payload` directly and passed only because their fixtures sat under the 4 KiB threshold; they now decode through `blockTextForTest`, and `TestArchiveStorageFullIsNotAcknowledged` uses incompressible printable ASCII so it still reaches the capacity path. |
 | PR 6 codec cost (write and read paths) | passed | `BenchmarkCompressBlockCost` and `BenchmarkDecodeBlockCost` measure realistic text at 4 KiB, 16 KiB, 64 KiB, and 1 MiB, plus the sub-threshold and incompressible cases. Compression costs 40 µs / 222 µs / 815 µs / 6.3 ms and decoding 7.3 µs / 23 µs / 92 µs, against a 2 s capture deadline whose measured worst commit is 329 ms. The largest message the writer accepts extrapolates to ~100 ms, 5% of the deadline, so synchronous compression is defensible until repacking exists. Both benchmarks assert the codec each row must exercise, because the first version of this benchmark built its large rows by repeating one 4 KiB block and produced an inversion (4 KiB slower than 16 KiB) that was a fixture defect, not a codec property. A second inversion survived that fix and had a different cause: the encoder's first-call table allocation (299 KB, 28 allocs at 4 KiB) was charged to whichever row ran first. Both benchmarks now warm the codec before the timer starts, and per-byte throughput is deliberately non-monotonic in size because a dictionary compressor amortizes its table build over the input. |
 | PR 6 space reporting (file, WAL, free pages, FTS, artifacts, backup) | passed | `space.go` reports whole-file numbers (`FileBytes`, `WALBytes`, `SHMBytes`, `FreeBytes`, `FTSBytes`) and, in a separate group, the bound principal's logical sizes (`BlockBytes`, `ArtifactBytes`, `EmbeddingBytes`), plus `BackupBytes` for a named backup path. The two groups are never summed: every principal shares the same pages, so a per-principal share of the file would be a fiction, and the block and artifact totals are subsets of the file rather than additions to it. `FTSBytes` sums every FTS5 shadow table by name prefix, because counting only the table named in the `CREATE` statement would report a fraction of the real cost. `ArtifactBytes` deduplicates through an `IN` subquery, because two tool calls can reference the same retained output and counting it twice would report an archive larger than the disk holds. `TableBreakdownAvailable` distinguishes "this SQLite build has no `dbstat`" from "the index is empty", because a zero would read as the latter. Six tests cover the file measurement, principal scoping (asserted against the archive total, so two reports that both leaked everything cannot pass), the unscoped refusal, backup separation, FTS attribution, and artifact deduplication. Exposed as the `memory_space` MCP tool rather than as more lines in `memory_health`, because `dbstat` walks the page map and health is deliberately built from cheap indexed lookups. |
 | PR 6 scoped artifact dedupe | passed | `dedupe.go` gives a retained tool output a block ID derived from `(principal, checksum, untruncated length)`, so two calls that retained the same bytes share one block and a call whose original was a different length does not. The principal is in the identity because a global content index would turn the dedupe into a hash-existence oracle: one principal could learn that another has stored a payload by observing that its own write was shared. The untruncated length is in the identity because two calls can retain the same truncated prefix while their originals differed, and sharing would hand the second call the first call's `raw_bytes` — a number describing a different command's output. Every write reads the row back and compares the bytes, because the case that matters is the one where the digest matched and the content did not, and that case is indistinguishable from a first write without the read. Four tests cover within-principal sharing (asserting the block count, not just that the refs match, since two identical rows pointed at one of them would pass a ref-only check), cross-principal non-sharing, different-original-length non-sharing with distinct `raw_bytes`, and small repeated output collapsing through the same derived ID. The first version of the sharing test failed because its fixture was larger than `maxToolOutputBytes` and was truncated, so it compared the block against text that had been deliberately dropped; the fixture now asserts its own size is under `maxToolOutputBytes`. There is no minimum-size threshold: the `ON CONFLICT` clause applies at every size, so a small repeated output collapses through the same derived ID, and `TestSmallToolOutputIsStoredOnce` pins that. |
-| PR 6 crash-safe repacking and scoped deletion | **open** | not started. Compression is per-message and in-place, so there is nothing to repack yet; the gate applies to the block-packing work, which is not implemented. Dedupe is implemented but does not repack: it shares a block at write time and never rewrites an existing one, so it adds no new crash window. |
-| PR 6-9 | **open** | PR 6 compression, its cost gate, space reporting, and scoped artifact dedupe are implemented; block packing, crash-safe repacking, contentless FTS5, and the decoded-block cache are not started. PR 7-9 are not started. |
+| PR 6 scoped deletion | passed | `delete.go` removes one principal's archived conversation in a single transaction on the writer's queue, so it cannot interleave with capture, and every statement carries the principal predicate — there is no code path where an ID alone is enough. It covers messages, chunks, both FTS tables, index and reconcile jobs, partials, tool calls, attachments, attempts, turns, sessions, the legacy import map, and unreferenced blocks. Reachable through `cmd/memory-delete`, which requires `--adapter`, `--user`, and `--confirm`; the MCP server stays read-only, because a model must not be able to delete a user's history because a prompt asked it to. Eight library tests plus three command tests. Three decisions were wrong in the first draft and are worth recording: the selection is materialized into temporary tables before anything is deleted, because re-running the selection subquery after deleting from it silently does no work; attempts are selected per turn rather than per attempt, because a time-bounded deletion can leave a surviving message pointing at an attempt that a per-attempt predicate would have deleted; and the index generation is bumped with `MAX(updated_at+1, ?)` rather than assigned the clock, because a generation that can repeat cannot invalidate a cursor. The block sweep is by reference, not ownership, so a block shared by two tool calls survives the deletion of one of them, and a crash mid-transaction leaves the archive consistent for a later run to finish. Deletion is logical, not a secure erase; `docs/MEMORY_DELETION.md` states what survives in free pages, the WAL, and backups rather than letting an operator promise more than the software can deliver. Derived sources and facts do not exist yet, so they are not covered — they must join the same transaction when PR 7 lands. |
+| PR 6 block packing | **declined on measurement** | `packing_bench_test.go` measures both halves of the trade. Space: packing a 4 MiB conversation into 32/64/128 KiB blocks stores 1,387,319 / 1,342,727 / 1,327,512 bytes against 2,234,727 for the current per-message format — a 38–41% saving, on a corpus where 1,142 of 1,317 messages are below the compression threshold and therefore stored raw today. Read: a 20-message page fetch goes from 83 µs to 136/155/151 µs and from 43.5 KB to 98–131 KB allocated, because the decode is sized by the block rather than by the messages requested; a single 200-byte message read out of a 64 KiB block costs 92 µs against 3 ns, since the current format returns a slice and never enters the decoder. Both read numbers are three orders of magnitude below the latency budget, so the gate as written would pass. The decision to decline rests on the ratio rather than the gate: the saving is recoverable from contentless FTS5 for a read-path cost that looked negligible, and the index is the larger consumer, so packing should be revisited after that work when the remaining space is message payloads. **The FTS measurement then confirmed that reason:** contentless recovers about 36% of the archive, within a few points of packing's 40%, and the read-path cost was measured at 1.13× at 2k messages and indistinguishable at 20k, so the index work is the better first move and may remove the reason to pack at all. Two properties are pinned now so a later implementation inherits them: `TestPackedBlockOffsetsAreRuneSafe` requires whole-message packing so every `byte_offset` lands on a rune boundary, and `TestPackingSpaceSavingIsMeasured` asserts only that the measurement is self-consistent, not that packing wins — a test that failed when packing lost would be asserting a conclusion instead of measuring one. |
+| PR 6 contentless FTS5 | passed | `fts_contentless_probe_test.go` answers the three questions the plan asks. Supported: the pinned driver bundles SQLite 3.51.3 and `contentless_delete=1` accepts insert, MATCH, `bm25()`, DELETE by rowid, and UPDATE by rowid, so the deletion path is not what blocks adoption — a plain `content=''` table would reject DELETE, and the option is what makes it viable. Cost: `snippet()` and `highlight()` return empty, so the excerpt must be reconstructed from the chunk's byte range into the message text, which `searchScan` already does with `excerptWindow`. Saving: **a constant per index, not a percentage** — every configuration saves exactly one copy of the chunk text (2,736,128 bytes on a 2,000-chunk corpus), because contentless removes the stored text and keeps the postings. The percentage therefore depends on how large the postings are, and they are large for trigram: word index 86.5% (narrow vocabulary) to 76.8% (wide), trigram 50.9% to 31.3%. **The archive runs both indexes and each stores its own copy, so the saving is the sum of two rows, not one.** `fts_contentless_ratio_test.go` measures that on a conversation-shaped archive written through the real write path: the stored text is 2.24–2.26 copies of the chunk text, and removing it would take **35.9–37.4% of the archive file**. An earlier revision of this row divided a single row's saving by the combined index size and reported 15%; that was an arithmetic error, recorded rather than silently reverted because the wrong number had already been used to argue that packing was the larger remaining lever. The saving is within a few points of packing's 40%, and the read-path cost was measured at 1.13× at 2k messages and indistinguishable at 20k, so the index work is the better first move. **Adopted in schema v7.** The migration copies both indexes into contentless replacements and swaps them, rather than dropping and rebuilding: the trigram index has no backfill mechanism, so a rebuild would silently disable search until every message was re-indexed, and the word index's `word_backfill_rowid` would restart from zero. The read path now reconstructs the excerpt from `mem_v2_blocks`, and the collapse to one hit per message moved ahead of the decode, because the candidate list holds 1.27 chunks per message at 2k and decoding first would decode the same block repeatedly. `BackfillWordIndex` and the tokenizer benchmark were the two other readers of `ft.content` and both now reconstruct from the block. `FTSContentBytes` reports zero on a v7 archive, which is the migration's measurement rather than a regression, and `TestContentlessSavingOnARealisticArchive` asserts that zero on both corpus shapes so a reintroduced content column cannot pass unnoticed. |
+| PR 6 crash-safe repacking | **open** | not started, and now correctly sequenced behind packing. Compression is per-message and in-place, so there is nothing to repack; dedupe shares a block at write time and never rewrites an existing one, so it adds no new crash window; scoped deletion's block sweep removes only blocks nothing references, so a shared block survives by being referenced rather than by being rewritten. Repacking exists to make asynchronous compression and packing safe, and packing was declined on measurement, so the machinery has no caller. Building it now would be building a transaction that repoints references nothing produces. |
+| §14 version handshake (gateway/MCP binary skew) | passed | `memstore.SchemaStatus` reports the archive's version alongside the version the binary supports, and both binaries refuse to run against an archive newer than themselves. The two directions are not equally dangerous and the asymmetry is the reason the check exists: an older archive is missing tables, so every v2 query fails on its own and the operator is told to migrate; a newer archive has every table this binary knows about, so every query succeeds and the process answers from rows whose meaning it does not know. Nothing in the read path can detect that, so the check has to run before the first request. The defect this fixed was in `SupportsV2Retrieval`, which used `version >= archiveSchemaVersion` and therefore reported a version-99 archive as fully supported; it now keeps answering only the narrower "do the tables exist" question, which is a fact about the file rather than about the binary. `memory_health` prints the exact version and both numbers when they differ, instead of the word `v2`, which is true of every version from 2 upward and so cannot show a pending migration. Both binaries render the skew through `SchemaStatus.String()`, so they cannot describe the same archive differently, and the newer case names its remedy — upgrade the binary, not the archive — because guessing the direction wrong discards data. Three MCP tests cover the newer, older, and never-migrated states, and the newer-archive test asserts that `SupportsV2Retrieval` still returns true, pinning the reason the startup check cannot be replaced by a read-path check. `TestWriterRefusalNamesTheDirectionOfTheSkew` covers the gateway side in both directions, including that the older case does not borrow the newer wording. |
+| §14 memory configuration | passed | `internal/config` exposes a validated `MemoryConfig` and `cmd/gateway` passes it into `memstore.WriterOptions`; before this, `WriterOptions{}` was passed empty and every tuning value was unreachable. `TestMemoryDefaultsMatchThePlan` pins the documented defaults, `TestMemoryMillisecondSettingsAreMilliseconds` pins the unit rule (a bare `10` is 10 ms, not 10 s), `TestMemoryRejectsImpossibleBatch` covers the six rejection cases, `TestMemoryDeprecatedFieldsTrackValidatedValues` covers the compatibility bridge, and `TestWriterOptionsComeFromConfig` proves the values reach the writer rather than being dropped on the way. `TestMemoryDisabledOverridesStrictCapture` pins the precedence rule that `MEMORY_ENABLED=false` beats a stale `MEMORY_CAPTURE_MODE=strict`. `MEMORY_KNOWLEDGE_ENABLED` is now implemented and has its own row in the §14 table; `TestKnowledgeExtractionDefaultsToOff`, `TestKnowledgeExtractionRequiresStrictCapture`, and `TestKnowledgeExtractionIsAcceptedWithStrictCapture` pin its default, its rejection cases, and its positive case. Two settings remain deliberately absent because their features do not exist: `MEMORY_SEMANTIC_ENABLED` and `MEMORY_CONVERSATION_RETENTION_DAYS`. The version handshake is implemented separately and has its own row below. |
+| §7 WAL checkpoint and instance lease | passed | `maintenance.go` adds `RunMaintenance` and `Checkpoint`: a pass runs `wal_checkpoint(TRUNCATE)` only when the `-wal` file exceeds a threshold (default 64 MiB), on a 5-minute interval, and reports busy separately from failure because a checkpoint blocked by a reader is normal. `TRUNCATE` rather than `PASSIVE` because `PASSIVE` leaves the file at its high-water mark, so one burst of writes would keep it large forever. `lease.go` adds `AcquireLease` over a single row in `mem_v2_instance_lease` (schema version 6) with a 90-second TTL and a heartbeat every `TTL/3`. Acquisition is one `INSERT … ON CONFLICT DO UPDATE … WHERE expires_at <= now RETURNING holder` statement; a read followed by a write would let two processes both observe an expired lease and both claim it. The lease is a separate call rather than automatic in `OpenArchiveWriter`, because `TestArchiveConcurrentWritersAndIdentityIsolation` deliberately opens two writers on one archive to prove the writer's own conflict handling — the plan allows "an instance lease **or** tested coordination", and this keeps both. The gateway always takes the lease, names the holder in the fatal message, and releases it after the writer closes so a successor cannot start capturing mid-drain. Nine tests: WAL truncation, below-threshold skip, data survival across a truncating checkpoint (reopened from disk, not just re-read on the same connection), loop cancellation, second-holder rejection, clean handover, expiry after a crash, heartbeat renewal, and expired-row reporting. |
+| PR 7 knowledge extraction | passed | The gate has four clauses and each has its own test. **Valid provenance:** `verifyKnowledgeEvidence` checks every claimed message ID against `(id, principal_id)` inside the write transaction, so a fabricated ID and another principal's real ID fail identically; `TestSaveKnowledgeFactRejectsForeignEvidence` covers both plus the mixed case, with confidence set to 1.0 throughout to pin that certainty is not evidence. **Corrections supersede:** `superseded_by` is a column rather than a delete, so the replaced fact and its evidence survive; `TestSupersedeKnowledgeFactKeepsHistory` asserts the old row is still readable with `IncludeSuperseded`, and `TestSupersedeKnowledgeFactRefusesToFork` pins that a second correction of the same fact is rejected rather than creating two successors. **Task-local instructions stay local:** `TestKnowledgeScopeKeepsTaskLocalFactsLocal` asserts a project fact is invisible from a scope naming no project and from a different project, with a global fact in the same fixture proving the filter is a filter and not a blanket exclusion. **Extraction failure does not affect capture or search:** `TestRunFailureLeavesCaptureAndSearchIntact` indexes and searches before and after a failing extraction and asserts both still work. Two further tests cover the surfaces the gate does not name but the plan requires: `TestRunRejectsFabricatedEvidenceWithoutRetrying` pins that a rejected fact is not retried (a rejection is a verdict, not a transient error), and `TestRememberProducesARealWriteReceipt` pins that `/remember` prints the fact ID and the evidence message ID it actually wrote. **One defect was found by these tests and fixed:** session-scoped facts were written but invisible to every listing call, so `/knowledge-list` could never show one and `/forget <statement>` could never resolve one — written, never shown, never deletable. `KnowledgeListOptions.IncludeSessionFacts` now separates the review surface (which must see them) from the injection surface (which must not, because another conversation's session facts would be a leak), and `TestSessionFactsAreReviewableButNotInjectable` pins both halves. |
+| PR 6-9 | **open** | PR 6 compression, its cost gate, space reporting, scoped artifact dedupe, scoped deletion, and the contentless FTS5 migration are implemented; block packing was measured and declined; crash-safe repacking is not started and has no caller while packing is declined; the decoded-block cache is not started. **PR 7 knowledge extraction is implemented and its gate passes.** PR 8-9 are not started. The §14 version handshake is implemented and is not part of PR 6-9. |
 
 Strict capture mode and the v2 MCP tools stay experimental until the two PR 3
 external gates close. The CGO race gate is not waived: it is unexecutable here,
@@ -397,11 +434,20 @@ Required scenarios: original assistant answer recalled by a term absent from the
 Initial package gates:
 
 ```sh
-go test ./internal/memstore ./internal/opencode ./internal/config ./cmd/mcp ./cmd/gateway
+go test ./internal/memstore ./internal/opencode ./internal/config ./cmd/mcp ./cmd/gateway -timeout 40m
 go vet ./internal/memstore ./internal/opencode ./internal/config ./cmd/mcp ./cmd/gateway
 go test ./internal/adapters/...
 go build ./...
 ```
+
+`-timeout 40m` is part of the gate, not a local convenience. `go test` defaults
+to ten minutes per package, and `internal/memstore` now exceeds that: it builds
+real archives, runs the index worker over them, and measures FTS5 index sizes.
+Without the flag the package does not fail an assertion — it panics with
+`test timed out after 10m0s` while a test is still legitimately running, which
+reads like a hang and is not one. A gate that reports a timeout as a failure is
+a gate that will be ignored, so the ceiling is raised and a genuine hang still
+terminates at 40 minutes.
 
 Run race tests for touched concurrent packages on a supported toolchain/CI runner; disclose local Windows race-toolchain limitations instead of skipping silently. End-to-end tests need a fake OpenCode server and adapter events, not paid model access. Dedicated subprocess tests kill a child writer and reopen the temp DB to verify committed data.
 
@@ -1322,6 +1368,258 @@ it must exercise and fails if the fixture chooses the other one. Without that
 check a fixture that stops compressing reports the bail-out path's cost under a
 label that claims to measure compression, and nothing in the output reveals the
 swap.
+
+### Block packing is measured, and it is not worth building yet
+
+The plan asks to "benchmark per-message compression against session-local
+32-128 KiB blocks" before building packing. That benchmark now exists in
+`packing_bench_test.go`, and it answers the question in both directions.
+
+**Space: packing wins, and by more than expected.** On a 4 MiB synthetic
+conversation of 1,317 messages — 1,142 of them below the 4 KiB compression
+threshold, which is the only population packing can help — the current
+per-message format stores 2,234,727 bytes (53.3% of raw). Packing the same
+messages into blocks stores:
+
+| Block size | Blocks | Stored | vs per-message |
+| --- | --- | --- | --- |
+| 32 KiB | 139 | 1,387,319 B (33.1% of raw) | −37.9% |
+| 64 KiB | 69 | 1,342,727 B (32.0% of raw) | −39.9% |
+| 128 KiB | 34 | 1,327,512 B (31.6% of raw) | −40.6% |
+
+The saving is real and it is large: 40% of the archive, on a corpus where most
+messages are currently stored raw because they are individually too small to
+compress. The mechanism is not subtle — a 200-byte reply has no internal
+redundancy to find, but twenty of them share a vocabulary, and zstd finds it once
+the block is large enough to have a dictionary worth building.
+
+**Read cost: packing loses, and by more than the space saving is worth.** The
+honest comparison is a page fetch, not a single message, because a detail fetch
+returns a page and under packing those messages share blocks. On a 20-message
+page (`defaultScrollLimit`), at `-benchtime 200x`:
+
+| Format | Page fetch | Allocated |
+| --- | --- | --- |
+| Current per-message | 83 µs | 43.5 KB |
+| Packed, 32 KiB blocks | 136 µs | 98.3 KB |
+| Packed, 64 KiB blocks | 155 µs | 131.1 KB |
+| Packed, 128 KiB blocks | 151 µs | 122.9 KB |
+
+Packing makes a page fetch 1.6–1.9× slower and allocates 2.3–3× more, because
+the decode is sized by the block rather than by the messages the caller asked
+for. The single-message case is far worse and is reported separately: reading one
+200-byte message out of a 64 KiB block costs 92 µs against 3 ns, a factor of
+30,000, because the current format returns a slice of the stored bytes and never
+enters the decoder at all.
+
+**The decision is to not build it, and the reason is the ratio.** A 40% space
+saving against a 1.9× read-latency regression is a trade that could be argued
+either way on its own, but it is not the trade the plan describes. The plan's
+gate is "ship compression settings only if they improve total storage without
+violating agreed read/write latency gates", and the read gate is the 100 ms
+search target and the detail-fetch budget. A page fetch going from 83 µs to
+155 µs does not violate that budget — both are three orders of magnitude below
+it — so the gate as written would pass. The reason to decline anyway is that the
+saving looked available for free elsewhere: contentless FTS5 would recover the
+duplicated index text for a read-path cost that looked negligible, and the index
+is the larger of the two consumers. Packing should be revisited after the FTS
+work, when the remaining space is dominated by message payloads rather than by
+duplicated index text. **That cost was later measured rather than assumed:**
+reconstructing the excerpt from the block costs 1.13× at 2k messages and is
+indistinguishable at 20k, so "negligible" turned out to be right, but it is now
+a measurement instead of a guess.
+
+**That reason was then measured, and it held.** The FTS probe
+(`fts_contentless_probe_test.go`) shows the contentless saving is a constant per
+index — one copy of the chunk text — rather than a percentage. An intermediate
+revision of this paragraph read that as "worth about 15% of the archive rather
+than the 40% assumed here", which was an arithmetic error: the archive runs two
+indexes and each stores its own copy, so the saving is the sum of two rows.
+`fts_contentless_ratio_test.go` measures it on a conversation-shaped archive
+written through the real write path and reports **35.9–37.4% of the archive
+file**, with the stored text confirmed at 2.24–2.26 copies of the chunk text.
+That is within a few points of packing's 40%, and the read-path cost was measured
+at 1.13× at 2k messages and indistinguishable at 20k. So the two are close
+substitutes after all, and the sequencing this paragraph proposed is still right
+for a stronger reason: the index work recovers almost as much for far less risk,
+and the remaining 4-point gap does not justify a 1.6–1.9× page-fetch regression.
+Packing should be reconsidered only if a real archive's `fts_content_bytes` share
+turns out to be much smaller than these corpora suggest.
+
+**What this measurement does not settle.** It uses a synthetic corpus, and the
+size mix is an assumption: 40% short turns, 30% typical answers, 20% long
+answers, 10% tool outputs. A deployment whose conversations are dominated by
+long answers would see a much smaller saving, because those are already
+compressed individually. The corpus generator is in the test file so the
+assumption can be changed and the measurement re-run rather than re-argued.
+
+**Two properties are pinned now, before any implementation exists.** Packing
+whole messages rather than fixed-size chunks is what keeps every recorded
+`byte_offset` on a rune boundary, and `TestPackedBlockOffsetsAreRuneSafe` states
+it so a later implementation that switches to fixed-size chunking has to
+confront it. And `TestPackingSpaceSavingIsMeasured` asserts only that the
+measurement is self-consistent — that packed output is smaller than the raw
+corpus and that the corpus contains messages packing could help — not that
+packing wins. A test that failed when packing lost would be asserting a
+conclusion instead of measuring one, and the conclusion is allowed to be "no".
+
+### Contentless FTS5 is supported, saves about as much as packing, and was adopted in v7
+
+The packing decision above leaned on an assumption: that the duplicated index
+text was where the space was, and that removing it would recover the same 40%
+for a read-path cost that looked negligible. `fts_contentless_probe_test.go`,
+`fts_contentless_ratio_test.go`, and `BenchmarkSearchExcerptReconstruction` test
+that assumption. The first version of this section concluded the assumption was
+too optimistic and revised the saving down to about 15%. **That revision was
+itself wrong, by a factor of two, and the original assumption was closer to
+right.** The migration it justified is schema v7, described at the end of this
+section.
+
+**It is supported.** The pinned driver bundles SQLite 3.51.3, and
+`contentless_delete=1` accepts every operation the archive performs: insert,
+`MATCH`, `bm25()`, DELETE by rowid, and UPDATE by rowid. This matters because a
+plain contentless table (`content=''` without the option) rejects DELETE, and
+`delete.go` deletes FTS rows by rowid. The comment in `delete.go` that said a
+contentless index "would not" support that was wrong and has been corrected: the
+deletion path is not what blocks adoption.
+
+**It costs the excerpt.** `snippet()` and `highlight()` both return empty on a
+contentless table, because they need the content. The excerpt has to be
+reconstructed from the chunk's byte range into the message text, which is what
+`searchScan` already does with `excerptWindow`, so the machinery existed — but
+`searchIndex` selected `ft.content` and had to be changed to join the block and
+decode it instead.
+
+**That cost was then measured, because "costs nothing on the read path" was an
+assumption and it is not obviously true.** Today the query reads a ~1 KiB chunk
+out of the index; contentless has to fetch and decode a whole message block,
+which may be zstd. The benchmark that measured it ran the two outer fetches
+against the same inner ranking query — same `MATCH`, same `CROSS JOIN` order,
+same scope predicates, same `LIMIT` — so the expensive part of the search was
+identical in both and cancelled, and the difference was the layer cost. It
+asserted the two rows produced byte-identical excerpts before timing either,
+because a reconstruction that is faster by returning different text is not a
+cheaper read path. That benchmark has since been retired: the "current" row it
+compared against no longer exists, so it could not be kept. Its replacement,
+`BenchmarkSearchExcerptReconstruction`, measures the ordering inside the new path
+instead, which is where the remaining risk is.
+
+| Archive | `current_chunk_text` | `contentless_block_decode` | Ratio |
+| --- | --- | --- | --- |
+| 2,000 messages | 8.96 ms p50 | 10.16 ms p50 | **1.13×** |
+| 20,000 messages | 76.9 ms p50 | 76.2–78.2 ms p50 | **indistinguishable** |
+
+The 2k row is the mean of three 60-sample repetitions with no overlap between
+the groups; a first run at 20 samples reported a 0.32 ms difference, which was
+noise, and the repetition is why that is known rather than believed. The 20k row
+is the more interesting one: the difference **disappears** as the archive grows,
+because the candidate count is capped at `maxSearchCandidates` (100) while the
+ranking work grows with the archive. The decode cost is bounded by the cap, so it
+is a fixed ~1.2 ms against a search that is already 77 ms at 20k. It is a real
+cost, it is not a scaling cost, and it is 1.5% of the 100 ms target at the size
+where the target is actually at risk.
+
+**One inefficiency the measurement exposed.** `searchIndex` collapses candidates
+to one hit per message *after* fetching all of them, so a contentless
+implementation that decodes per candidate decodes the same block more than once.
+The benchmark logs the ratio: 1.27 candidates per message at 2k, 1.00 at 20k. So
+the waste is real but small and corpus-dependent, and the fix — deduplicating by
+`message_id` before decoding — was a few lines that went into the v7
+implementation rather than a follow-up.
+
+**It saves one copy of the chunk text per index, and there are two indexes.**
+Contentless removes the stored text and keeps the postings, so the saving is
+exactly one copy of the chunk text per index, no matter how that index is
+configured. On a 2,000-chunk corpus that is 2,736,128 bytes in every row of the
+table below. The percentage is therefore a statement about the postings, not
+about contentless:
+
+| Vocabulary | Tokenizer | Plain index | Contentless | Saving |
+| --- | --- | --- | --- | --- |
+| 30 words | unicode61 | 3,162,112 B (1.15× text) | 425,984 B (0.16×) | 86.5% |
+| 30 words | trigram | 5,373,952 B (1.96× text) | 2,637,824 B (0.96×) | 50.9% |
+| 20,000 words | unicode61 | 3,567,616 B (1.30× text) | 827,392 B (0.30×) | 76.8% |
+| 20,000 words | trigram | 8,740,864 B (3.19× text) | 6,004,736 B (2.19×) | 31.3% |
+
+The archive runs **both** indexes, and each one stores its own copy of the chunk
+text. The saving is therefore the sum of two rows, not one: on the 20,000-word
+corpus, 2,740,224 + 2,736,128 = 5,476,352 bytes against 12,308,480 bytes of
+index, which is **44.5% of the index**. The earlier revision took a single row's
+saving and divided it by the combined index size, which halved the answer.
+
+**The real archive agrees with the sum, not with the halved figure.**
+`fts_contentless_ratio_test.go` writes a conversation-shaped corpus through the
+real write path, indexes it with the real index worker, and reads the numbers
+back from `memory_space`. It measures two corpora, because the trigram index's
+size is driven by how much text the corpus shares and one generator cannot span
+that range:
+
+| Corpus | Archive file | Full-text index | Stored text | Copies of chunk text | Share of index | Share of file |
+| --- | --- | --- | --- | --- | --- | --- |
+| random words | 14,008,320 B | 12,734,464 B | 5,242,880 B | 2.24× | 41.2% | **37.4%** |
+| prose (Zipf) | 14,786,560 B | 11,325,440 B | 5,308,416 B | 2.26× | 46.9% | **35.9%** |
+
+The "copies of chunk text" column is the check that catches the error: the stored
+text is 2.24–2.26 times the chunk text, which is two indexes plus page rounding.
+A figure of 1.0× would mean one index, and dividing that by the combined index
+size is exactly the mistake the earlier revision made.
+
+**So the saving is about 36% of the archive, not 15%.** That is within a few
+points of packing's measured 40%, and the read-path cost of reconstructing the
+excerpt is 1.13× at 2k messages and indistinguishable at 20k, because the decode
+is bounded by the candidate cap while the ranking work is not. The original plan
+claim that contentless recovers "the same 40%" was substantially right; the
+revision that called it wrong was an arithmetic error, and it is recorded here
+rather than silently reverted because the wrong number had already been used to
+argue that packing was the larger remaining lever.
+
+**What this does not settle.** The corpus is still synthetic. The ratio depends
+on how much text the archive shares, and a real archive's number is measurable
+with `memory_space`, which now reports `fts_content_bytes` alongside `fts_bytes`
+and `logical_bytes` for exactly this purpose. The migration was adopted on the
+synthetic number because the shape is what justified it — the saving is bounded
+by two copies of the chunk text, so it cannot grow with the index, and it is
+large enough to be worth the migration. What remains open is only how large the
+real archive's saving turns out to be, which is a measurement to take rather than
+a decision to make.
+
+**It was adopted in schema v7.** The migration copies both indexes into
+contentless replacements and swaps them, rather than dropping and rebuilding.
+That choice is forced by the trigram index having no backfill mechanism: dropping
+it would leave search silently returning nothing until every message was
+re-indexed, and the word index's `word_backfill_rowid` would restart from zero.
+Copying preserves both. The migration is a one-time cost of roughly the archive's
+own size in free space, because the copy exists alongside the original until the
+swap.
+
+Three things changed on the read path, and the third is the one the measurement
+above predicted:
+
+- `searchIndex` joins `mem_v2_blocks` and decodes the block instead of selecting
+  `ft.content`, then slices `[start_byte, end_byte)` out of the decoded text.
+- The collapse to one hit per message moved **ahead** of the decode. The
+  benchmark logged 1.27 candidates per message at 2k, so decoding first would
+  decode the same block 27% more often than the answer needs.
+- `BackfillWordIndex` and the tokenizer benchmark were the other two readers of
+  `ft.content`. Both now reconstruct from the block. They were found by grepping
+  for the column name, which is the only way to find every reader of a column a
+  migration removes.
+
+`FTSContentBytes` now reports zero on a v7 archive. That zero is the migration's
+measurement rather than a regression, and `TestContentlessSavingOnARealisticArchive`
+asserts it on both corpus shapes so a content column reintroduced by a later
+schema change cannot pass unnoticed — search would keep working and the archive
+would just quietly grow by a third.
+
+**The consequence for packing.** The two are much closer substitutes than the
+earlier revision claimed. The index work recovers about 36% and touches no read
+path; packing recovers 40% and costs 1.6–1.9× on page fetches. Doing the index
+work first is clearly right, and it may remove the reason to pack at all — the
+remaining 4-point gap does not justify a read-path regression. Packing should be
+reconsidered only if the archive's real `fts_content_bytes` share turns out to be
+much smaller than these corpora suggest. Now that the index work has landed, that
+share is zero by construction, so the question packing would answer is only about
+the message payloads themselves.
 
 ## 16. Delivery sequence and rollback
 

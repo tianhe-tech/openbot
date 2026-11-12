@@ -107,3 +107,64 @@ func TestHostWiringListsHealthTool(t *testing.T) {
 		t.Fatalf("tools/list does not advertise memory_health: %s", out.String())
 	}
 }
+
+// TestHostWiringAdvertisesEveryAcceptedArgument pins that the advertised schema
+// matches what the handler reads.
+//
+// A parameter the handler accepts but the schema omits is worse than a missing
+// feature: the model is told the argument does not exist, so it never sends it,
+// and the capability is unreachable while every unit test that calls the method
+// directly still passes. memory_search read "project" and "cursor" for a while
+// without advertising either, which meant project filtering and pagination were
+// implemented, tested, and unusable.
+func TestHostWiringAdvertisesEveryAcceptedArgument(t *testing.T) {
+	server := memoryServerForTest(t, nil)
+	var out bytes.Buffer
+	server.out = &out
+	server.handleRequest(jsonrpcRequest{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "tools/list"})
+
+	var response struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				InputSchema struct {
+					Properties map[string]struct {
+						Type string `json:"type"`
+					} `json:"properties"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatalf("tools/list is not valid JSON: %v: %s", err, out.String())
+	}
+	advertised := map[string]map[string]string{}
+	for _, tool := range response.Result.Tools {
+		properties := map[string]string{}
+		for name, property := range tool.InputSchema.Properties {
+			properties[name] = property.Type
+		}
+		advertised[tool.Name] = properties
+	}
+	for _, expected := range []struct{ tool, argument, kind string }{
+		{"memory_search", "query", "string"},
+		{"memory_search", "project", "string"},
+		{"memory_search", "days", "integer"},
+		{"memory_search", "limit", "integer"},
+		{"memory_search", "cursor", "string"},
+		{"memory_get", "message_ids", "array"},
+		{"memory_get", "budget_bytes", "integer"},
+		{"memory_scroll", "session_id", "string"},
+		{"memory_scroll", "cursor", "string"},
+		{"memory_scroll", "direction", "string"},
+	} {
+		properties, ok := advertised[expected.tool]
+		if !ok {
+			t.Fatalf("tools/list does not advertise %s", expected.tool)
+		}
+		if properties[expected.argument] != expected.kind {
+			t.Fatalf("%s does not advertise %q as %s: %v",
+				expected.tool, expected.argument, expected.kind, properties)
+		}
+	}
+}

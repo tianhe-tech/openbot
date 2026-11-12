@@ -51,6 +51,23 @@ func (scope SearchScope) principal() (string, error) {
 	return archiveID("principal", scope.Adapter, scope.UserID), nil
 }
 
+// PrincipalFor returns the principal a scope resolves to, or "" when the scope
+// is incomplete.
+//
+// It exists for callers outside this package that need to build a row carrying
+// a principal — the knowledge service, for instance, which constructs facts and
+// must stamp them with the same principal the store will check them against.
+// Returning "" rather than an error is deliberate: the caller's next write will
+// fail validation with a message that names the missing field, which is a
+// better diagnostic than a second error path here.
+func PrincipalFor(scope SearchScope) string {
+	principal, err := scope.principal()
+	if err != nil {
+		return ""
+	}
+	return principal
+}
+
 // SearchFilters echoes the effective filters so a caller can tell what was
 // actually applied rather than what it hoped was applied.
 type SearchFilters struct {
@@ -130,6 +147,9 @@ func decodeSearchCursor(value string) (searchCursor, error) {
 	}
 	if err := json.Unmarshal(decoded, &cursor); err != nil {
 		return cursor, fmt.Errorf("memstore: malformed search cursor")
+	}
+	if cursor.Offset < 0 || cursor.Offset > maxSearchCandidates {
+		return cursor, fmt.Errorf("memstore: invalid search cursor offset")
 	}
 	return cursor, nil
 }
@@ -358,14 +378,14 @@ func (s *Store) searchHybrid(ctx context.Context, principal string, scope Search
 // searchFTS runs the trigram query and collapses overlapping chunks to their
 // owning message, keeping the best-scoring chunk as the evidence excerpt.
 //
-// The excerpt is read from the FTS table's own content column rather than
-// re-fetched per candidate, so a hit costs no extra round trip. It is fetched
-// only for the bounded candidate set, though: FTS5 must score every matching
-// chunk before the candidate limit applies, so selecting content in the ranked
-// query would read the full text of every match. On a broad query that is the
-// entire archive, and the cost grows faster than the archive does. The inner
-// query therefore ranks chunk ids alone, and the outer query joins back for the
-// text of at most maxSearchCandidates rows.
+// The excerpt is reconstructed from the message block, because schema v7 made
+// the index contentless: the text lives in mem_v2_blocks and nowhere else. It
+// is fetched only for the bounded candidate set, though: FTS5 must score every
+// matching chunk before the candidate limit applies, so selecting the block in
+// the ranked query would read the full text of every match. On a broad query
+// that is the entire archive, and the cost grows faster than the archive does.
+// The inner query therefore ranks chunk ids alone, and the outer query joins
+// back for the text of at most maxSearchCandidates rows.
 //
 // Scope predicates stay inside the inner query on purpose: applying them after
 // the limit would let a broad query starve a narrow scope.
@@ -410,9 +430,24 @@ func (s *Store) searchIndex(ctx context.Context, principal string, scope SearchS
 	// The FTS table must drive: MATCH is the only selective predicate here, and
 	// the joins exist to filter and decorate its output, not the other way
 	// round. The ON clauses are still honoured; only the ordering is pinned.
+	//
+	// The excerpt is reconstructed from the message block rather than read out
+	// of the index, because schema v7 made both indexes contentless. The text
+	// is still there — in mem_v2_blocks, which is where it always was — so the
+	// outer query joins the block and the caller decodes it. That is a strictly
+	// larger read per candidate than selecting ft.content was, and it was
+	// measured before the migration was adopted: 1.13x at 2k messages and
+	// indistinguishable at 20k, because the reconstruction is bounded by
+	// maxSearchCandidates while the ranking work grows with the archive.
+	//
+	// The payload is selected here rather than fetched per hit afterwards so
+	// the whole search stays one round trip. That does mean up to
+	// maxSearchCandidates message bodies are held at once, which is the price
+	// of the single query; the alternative is a second query per hit, and the
+	// candidate cap is what keeps the first bounded.
 	query := fmt.Sprintf(`SELECT c.message_id,c.start_byte,c.end_byte,
 			m.session_id,m.turn_id,m.role,m.created_at,m.seq,s.project_key,s.work_dir,
-			f.rank, ft.content
+			f.rank, b.codec,b.codec_version,b.raw_bytes,b.payload
 		FROM (
 			SELECT %[1]s.rowid AS chunk_id, bm25(%[1]s) AS rank
 			FROM %[1]s
@@ -430,7 +465,7 @@ func (s *Store) searchIndex(ctx context.Context, principal string, scope SearchS
 		JOIN mem_v2_chunks c ON c.id=f.chunk_id
 		JOIN mem_v2_messages m ON m.id=c.message_id
 		JOIN mem_v2_sessions s ON s.id=m.session_id
-		JOIN %[1]s ft ON ft.rowid=f.chunk_id
+		JOIN mem_v2_blocks b ON b.id=m.block_id
 		ORDER BY f.rank`, indexTable)
 	rows, err := s.db.QueryContext(ctx, query,
 		match, principal,
@@ -448,14 +483,18 @@ func (s *Store) searchIndex(ctx context.Context, principal string, scope SearchS
 		end       int
 		hit       SearchHit
 		rank      float64
-		content   string
+		codec     string
+		version   int
+		rawBytes  int64
+		payload   []byte
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var c candidate
 		if err := rows.Scan(&c.messageID, &c.start, &c.end,
 			&c.hit.SessionID, &c.hit.TurnID, &c.hit.Role, &c.hit.CreatedAt, &c.hit.Seq,
-			&c.hit.Project, &c.hit.WorkDir, &c.rank, &c.content); err != nil {
+			&c.hit.Project, &c.hit.WorkDir, &c.rank,
+			&c.codec, &c.version, &c.rawBytes, &c.payload); err != nil {
 			return nil, err
 		}
 		c.hit.MessageID = c.messageID
@@ -470,7 +509,12 @@ func (s *Store) searchIndex(ctx context.Context, principal string, scope SearchS
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	// Collapse to one hit per message, keeping the best-ranked chunk.
+	// Collapse to one hit per message, keeping the best-ranked chunk. This runs
+	// before any block is decoded, and the ordering matters: a message with
+	// several matching chunks appears once per chunk in the candidate list, so
+	// decoding first would decode the same block repeatedly. Measured at 2k
+	// messages the candidate list holds 1.27 chunks per message, so decoding
+	// first would do 27% more work than the answer needs.
 	best := make(map[string]int, len(candidates))
 	for i, c := range candidates {
 		if existing, ok := best[c.messageID]; !ok || c.rank < candidates[existing].rank {
@@ -480,7 +524,20 @@ func (s *Store) searchIndex(ctx context.Context, principal string, scope SearchS
 	hits := make([]SearchHit, 0, len(best))
 	for _, index := range best {
 		c := candidates[index]
-		excerpt := c.content
+		decoded, err := decodeBlock(c.codec, c.version, c.rawBytes, c.payload)
+		if err != nil {
+			return nil, fmt.Errorf("memstore: search message %s: %w", c.messageID, err)
+		}
+		text := string(decoded)
+		// The chunk range was written against this exact text, so a range that
+		// does not fit means the block and the chunk disagree. Reporting it is
+		// better than slicing out of bounds or silently returning a shorter
+		// excerpt that looks like a match.
+		if c.start < 0 || c.end > len(text) || c.start > c.end {
+			return nil, fmt.Errorf("memstore: search message %s: chunk range [%d,%d) is outside a %d-byte body",
+				c.messageID, c.start, c.end, len(text))
+		}
+		excerpt := text[c.start:c.end]
 		if len(excerpt) > maxExcerptBytes {
 			excerpt = excerpt[:alignRuneStart(excerpt, maxExcerptBytes)]
 		}

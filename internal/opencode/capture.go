@@ -360,6 +360,9 @@ func (c *Client) beginCapture(ctx context.Context, payload *MessagePayload) erro
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrCapture, err)
 	}
+	if payload.OnCaptureCommitted != nil {
+		payload.OnCaptureCommitted()
+	}
 	// A deliberate re-dispatch of the same delivery (token-overflow recovery,
 	// explicit retry) continues the existing turn with a new attempt instead of
 	// being rejected as a replay. BeginTurn already verified that the stored

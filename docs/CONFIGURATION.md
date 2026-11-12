@@ -26,6 +26,47 @@ those v2 records through the chunked lexical index described below. Legacy offli
 automatic retries are disabled in strict mode so uncertain tasks are not silently
 replayed.
 
+### Memory settings
+
+All memory settings are validated at startup. An invalid value fails the process
+rather than falling back to a default, because a capture queue that silently
+disappears is a durability failure.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `MEMORY_ENABLED` | `true` | `false` disables capture **and** recall: no archive is opened, no legacy store is opened, and no MCP entry is registered. |
+| `MEMORY_STORE_PATH` | `<OPENCODE_DIRECTORY>/mem/memory.db` | Archive path. |
+| `MEMORY_CAPTURE_MODE` | `legacy` | `legacy` or `strict`. `strict` requires a migrated archive. |
+| `MEMORY_SCOPE_MODE` | `disabled` | `disabled` or `single_owner`. Documents the deployment assumption; recall still requires the MCP `--single-owner --adapter --user` binding. |
+| `MEMORY_QUEUE_MAX_ITEMS` | `1024` | Capture queue depth. A full queue applies backpressure and returns an error; it never drops silently. |
+| `MEMORY_QUEUE_MAX_BYTES` | `16777216` | Capture queue byte budget. |
+| `MEMORY_BATCH_MAX_ITEMS` | `64` | Operations per commit batch. |
+| `MEMORY_BATCH_MAX_BYTES` | `262144` | Estimated input bytes per commit batch. |
+| `MEMORY_BATCH_MAX_DELAY_MS` | `10` | Maximum wait before committing a partial batch. |
+| `MEMORY_COMMIT_TIMEOUT_MS` | `2000` | Commit deadline. Exceeding it surfaces an error; it does not silently retry forever. |
+| `MEMORY_KNOWLEDGE_ENABLED` | `false` | Background extraction of durable facts from completed conversations. Requires `MEMORY_ENABLED=true` **and** `MEMORY_CAPTURE_MODE=strict`; the combination is rejected at startup otherwise. The `/remember`, `/forget`, `/knowledge-list` and `/knowledge-help` commands work whether or not this is on. |
+
+The two `_MS` settings take a bare number as **milliseconds**. A value with an
+explicit unit (`250ms`, `1s`) is honoured as written. This differs from the
+duration settings elsewhere in the gateway, where a bare number means seconds.
+
+`MEMORY_BATCH_MAX_ITEMS` cannot exceed `MEMORY_QUEUE_MAX_ITEMS`, and
+`MEMORY_BATCH_MAX_BYTES` cannot exceed `MEMORY_QUEUE_MAX_BYTES`: a batch larger
+than the queue can never be filled, so the writer would wait for a batch that
+cannot exist. Both are rejected at startup.
+
+`MEMORY_SEMANTIC_ENABLED` and `MEMORY_CONVERSATION_RETENTION_DAYS` are **not
+implemented**. Semantic retrieval and retention classes do not exist yet, so a
+setting for them would be a knob that does nothing. They will be added with the
+feature.
+
+`MEMORY_KNOWLEDGE_ENABLED` is off by default because extraction spends model
+calls. It is rejected unless strict capture is on, because extraction reads the
+archive that capture writes: enabling it without capture would produce a service
+that can never find evidence, and a silent no-op would look like a bug in the
+feature rather than a misconfiguration. See
+[durable knowledge](MEMORY_KNOWLEDGE.md).
+
 Internal bootstrap prompts (the synthetic "initialize session" requests that only
 materialize an upstream session for shell execution) are never archived as
 conversation turns. Token-overflow recovery and explicit retries re-dispatch the

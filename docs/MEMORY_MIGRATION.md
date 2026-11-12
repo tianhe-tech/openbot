@@ -9,14 +9,20 @@ snapshots and tool/attachment metadata. PR 4 adds archive schema version 3 with 
 chunked lexical index (`mem_v2_chunks`, `mem_v2_chunk_fts`, `mem_v2_index_state`),
 and version 4 with a word-tokenized index (`mem_v2_chunk_word_fts`) alongside it,
 version 5 with the index the bounded scan needs (`mem_v2_message_scan`),
+version 6 with the instance lease (`mem_v2_instance_lease`),
+version 7 with both full-text indexes converted to contentless,
+version 8 with the durable-knowledge tables (`mem_v2_knowledge_facts`,
+`mem_v2_knowledge_evidence`, `mem_v2_knowledge_jobs`),
 a background index worker in the gateway, and v2-backed `memory_search`,
 `memory_get`, and `memory_scroll` in the MCP server. Normal gateway startup does not
 initialize the archive; the default capture mode and MCP retrieval still use legacy
 tables until the archive is migrated and strict capture is enabled.
 
 Migration is additive: legacy records, handoffs, retry work, and skill tables are
-not deleted or rewritten. Archive bodies are currently uncompressed, so importing
-increases disk usage. Previously truncated or deleted content cannot be recovered.
+not deleted or rewritten. Archive bodies are compressed with zstd when that is
+smaller than the raw bytes, so importing no longer increases disk usage by the
+full size of the content. Previously truncated or deleted content cannot be
+recovered.
 
 ## Run the migration
 
@@ -281,7 +287,6 @@ Each committed batch emits a JSON line:
 ```json
 {"imported":64,"pending":128,"unmapped":0}
 ```
-
 `imported` counts that batch; `pending` counts remaining rows with adapter/user
 identity; `unmapped` counts rows without that identity. Unmapped originals are
 retained and the command exits nonzero after importing eligible rows. It never
@@ -314,10 +319,13 @@ to refresh their archive copies; mapping tracks completed imports, not updates.
 
 `OpenArchiveWriter` requires explicit schema initialization. Its dedicated SQLite
 connection uses WAL, `synchronous=FULL`, foreign-key enforcement, a 5-second busy
-timeout, and immediate write transactions. SQLite serializes competing writers;
-there is no process lease or application-level automatic retry loop yet. Default
-transaction context timeout is 2 seconds, but driver lock waits may affect observed
-latency. No hardware-independent latency guarantee is made.
+timeout, and immediate write transactions. SQLite serializes competing writers, so
+two processes cannot corrupt the archive, but serialization is not coordination:
+each process would still run its own capture queue and index worker against the
+same rows. The gateway therefore takes the instance lease described below before
+it starts capturing. Default transaction context timeout is 2 seconds, but driver
+lock waits may affect observed latency. No hardware-independent latency guarantee
+is made.
 
 Admission counts queued and in-flight work by items and estimated bytes. Default
 limits are 1024 operations / 16 MiB; batches target 64 operations / 256 KiB / 10 ms.
@@ -343,18 +351,346 @@ rolling partial snapshots, and tool/attachment metadata on these primitives.
 `IndexPending` and `RunIndexWorker` build the lexical index on the same writer, so
 indexing shares the writer's admission control and never opens a second connection.
 
+## Instance lease and WAL maintenance (schema version 6)
+
+Version 6 adds `mem_v2_instance_lease`, a single row that records which process is
+capturing into the archive. The gateway acquires it before it starts capturing and
+releases it after the writer drains on shutdown.
+
+The lease exists because SQLite's serialization is not coordination. Two gateways
+on one archive cannot corrupt it, but each would run its own capture queue, its own
+index worker, and its own WAL checkpoint against the same rows, and the only thing
+preventing that was that nobody had tried it. The plan requires the second instance
+to be rejected rather than silently tolerated.
+
+- The row is `(id=1, holder, acquired_at, heartbeat_at, expires_at)`. `holder` is
+  `<hostname>:<pid>` by default, so a startup failure can name the process to stop
+  instead of only reporting that the archive is busy.
+- Acquisition is one statement: `INSERT … ON CONFLICT(id) DO UPDATE … WHERE
+  expires_at <= now RETURNING holder`. A read followed by a write would let two
+  processes both observe an expired lease and both claim it, which is the exact
+  race the lease exists to prevent. No row returned means the lease is held.
+- The holder renews every `TTL/3` (default TTL 90 s). A crashed holder therefore
+  blocks a restart for at most 90 seconds, and a clean shutdown blocks it for zero.
+- The lease is opt-in at the API level: `AcquireLease` is a separate call, so
+  `TestArchiveConcurrentWritersAndIdentityIsolation` can still open two writers on
+  one archive to prove the writer's own conflict handling. The gateway always takes
+  it.
+
+WAL maintenance is the other half of the same policy. SQLite's autocheckpoint runs
+inside a write transaction, so a continuously busy writer can starve it and the
+`-wal` file then grows without bound. `RunMaintenance` checkpoints on an interval
+(default 5 minutes) but only when the WAL exceeds a threshold (default 64 MiB), and
+it uses `wal_checkpoint(TRUNCATE)` rather than `PASSIVE` because `PASSIVE` leaves
+the file at its high-water mark, so one burst of writes would keep it large
+forever. A checkpoint that cannot complete because a reader holds the WAL is
+reported as busy, not as an error: that is normal under concurrent reads.
+
+## Scoped deletion
+
+`cmd/memory-delete` removes one principal's archived conversation. It is a
+separate binary because the MCP server opens the archive read-only on purpose:
+it is the process a model talks to, and a model must not be able to delete a
+user's history because a prompt asked it to.
+
+```bash
+memory-delete --db memory.db --adapter dingtalk --user 0123456789 --confirm
+```
+
+`--adapter`, `--user`, and `--confirm` are all required. `--session`,
+`--project`, `--since`, and `--until` narrow the selection further. The command
+prints the `DeleteReport` as JSON so an operator can record what was removed.
+
+The deletion is one transaction on the writer's queue, so it cannot interleave
+with capture, and every statement carries the principal predicate — there is no
+code path where an ID alone is enough. It removes messages, chunks, both FTS
+tables, index and reconcile jobs, partials, tool calls, attachments, attempts,
+turns, sessions, the legacy import map, and blocks that nothing references any
+more. A block shared by two tool calls survives the deletion of one of them,
+because the sweep is by reference rather than ownership; that also makes the
+deletion resumable, since a crash mid-transaction leaves the archive consistent
+and a later run collects whatever became unreferenced.
+
+It is logical deletion, not a secure erase. The bytes can survive in free pages,
+in the WAL until a checkpoint truncates it, and in any backup taken beforehand.
+`docs/MEMORY_DELETION.md` states that plainly, because an operator who believes
+otherwise will make a promise to a user that the software cannot keep.
+
+A deletion changes the ranked dataset, so it bumps
+`mem_v2_index_state.updated_at` and any search cursor issued before it is
+refused with `ErrSearchRestartRequired`. The bump is monotonic
+(`MAX(updated_at+1, now)`) rather than a plain clock assignment: a generation
+that can repeat cannot invalidate a cursor, and `IndexPending` uses the same
+rule so both writers agree.
+
+## Version handshake
+
+Both binaries check the archive's schema version before they touch it, and both
+describe a mismatch the same way, through `memstore.SchemaStatus`. The check
+exists because the two directions of skew are not equally dangerous:
+
+- An **older** archive is missing tables and columns, so every v2 query fails on
+  its own. The operator is told to run `memory-migrate`.
+- A **newer** archive is the quiet case. Every table this binary knows about
+  still exists, so every query succeeds, and the process answers from rows whose
+  meaning it does not know while reporting a version it cannot interpret.
+  Nothing in the read path can detect that, which is why the check runs before
+  the first request rather than on the first failure.
+
+The message names both numbers and the direction, because the remedies are
+opposite: a version above the binary's means upgrade the binary, a version below
+means run `memory-migrate`. Guessing wrong on a newer archive means downgrading
+it, which discards whatever the newer binary wrote. A never-migrated archive
+keeps its own message, since there is no version to compare and the fix is to
+migrate rather than to change binaries.
+
+`memory_health` prints the exact version and both numbers when they differ. It
+does not print the word `v2`, which is true of every version from 2 upward and
+therefore cannot show that a migration is pending.
+
+## Block packing was measured and declined
+
+The plan asks to benchmark per-message compression against session-local 32–128
+KiB blocks before building packing. `packing_bench_test.go` does that, and the
+answer is to not build it yet.
+
+Packing saves space and the saving is large: on a 4 MiB conversation of 1,317
+messages, the current per-message format stores 2,234,727 bytes and packing into
+64 KiB blocks stores 1,342,727 — 40% less. Most of those messages are below the
+4 KiB compression threshold and are stored raw today, which is exactly the
+population packing helps: a 200-byte reply has no internal redundancy, but twenty
+of them share a vocabulary.
+
+It costs read latency, and the cost is sized by the block rather than by the
+request. A 20-message page fetch goes from 83 µs to 155 µs and from 43.5 KB to
+131 KB allocated, because the whole block is decompressed to return a page of it.
+A single 200-byte message read out of a 64 KiB block costs 92 µs against 3 ns,
+since the current format returns a slice of the stored bytes and never enters the
+decoder.
+
+Both read numbers are three orders of magnitude below the latency budget, so the
+gate as written would pass. The reason to decline is the ratio and the
+alternative: the same 40% is recoverable from contentless FTS5 without touching
+the read path at all, and the index is the larger of the two consumers. Packing
+should be revisited after that work, when the remaining space is message payloads
+rather than duplicated index text.
+
+The consequence for the plan is that crash-safe repacking has no caller. It
+exists to make asynchronous compression and packing safe, and with packing
+declined there is nothing to repack. Two properties are pinned now so a later
+implementation inherits them: packing must be whole-message rather than
+fixed-size chunks, so every recorded `byte_offset` lands on a rune boundary, and
+the space test asserts only that the measurement is self-consistent rather than
+that packing wins.
+
+## Contentless FTS5 was measured, then adopted in schema v7
+
+The archive stored each chunk's text three times: once in `mem_v2_blocks` and
+once in each of the two FTS5 indexes. Removing the index copies was the obvious
+space win, and `fts_contentless_probe_test.go` measured whether it was available.
+
+It is. The pinned driver bundles SQLite 3.51.3, and `contentless_delete=1`
+accepts every operation the archive performs — insert, `MATCH`, `bm25()`, DELETE
+by rowid, and UPDATE by rowid. A plain contentless table (`content=''` without
+the option) rejects DELETE, which is why the option matters; the comment in
+`delete.go` that said a contentless index "would not" support deletion was wrong
+and has been corrected.
+
+The cost is the excerpt. `snippet()` and `highlight()` both return empty on a
+contentless table, so the excerpt has to be reconstructed from the chunk's byte
+range into the message text. `searchScan` already did exactly that with
+`excerptWindow`, so the machinery existed, but `searchIndex` selected
+`ft.content` and had to be changed to join the block and decode it instead.
+
+The saving is a constant per index rather than a percentage, and that is the
+finding that matters. Contentless removes the stored text and keeps the
+postings, so every configuration saves exactly one copy of the chunk text —
+2,736,128 bytes on a 2,000-chunk corpus. The percentage is a statement about how
+large the postings are, and they are large for trigram:
+
+| Vocabulary | Tokenizer | Plain index | Contentless | Saving |
+| --- | --- | --- | --- | --- |
+| 30 words | unicode61 | 3,162,112 B | 425,984 B | 86.5% |
+| 30 words | trigram | 5,373,952 B | 2,637,824 B | 50.9% |
+| 20,000 words | unicode61 | 3,567,616 B | 827,392 B | 76.8% |
+| 20,000 words | trigram | 8,740,864 B | 6,004,736 B | 31.3% |
+
+**The archive runs both indexes and each stores its own copy, so the saving is
+the sum of two rows, not one.** `fts_contentless_ratio_test.go` measured that on
+a conversation-shaped archive written through the real write path and indexed by
+the real index worker, and now asserts the outcome on the same fixture:
+
+| Corpus | Archive file | Full-text index | Stored text | Copies of chunk text | Share of file |
+| --- | --- | --- | --- | --- | --- |
+| random words | 14,008,320 B | 12,734,464 B | 5,242,880 B | 2.24× | **37.4%** |
+| prose (Zipf) | 14,786,560 B | 11,325,440 B | 5,308,416 B | 2.26× | **35.9%** |
+
+The "copies of chunk text" column is the check that catches the error. An earlier
+revision of this section took a single row's saving and divided it by the
+combined index size, which halved the answer and reported 15% of the archive.
+The stored text is 2.24–2.26 times the chunk text — two indexes plus page
+rounding — so the saving is about **36% of the archive**, within a few points of
+packing's measured 40%.
+
+The read-path cost was then measured rather than assumed, because a space saving
+and a latency regression are not comparable numbers. `BenchmarkSearchExcerptReconstruction`
+found the reconstruction costs **1.13× at 2,000 messages** (8.96 → 10.16 ms p50)
+and is indistinguishable at 20,000 (76.9 vs 76.2–78.2 ms), where the excerpt is
+a rounding error against the scan. That was cheap enough to adopt, so schema v7
+does.
+
+### What the migration does
+
+`archiveMigrationV7` **copies the rows into a new contentless table and swaps**,
+rather than dropping the index and rebuilding it:
+
+```sql
+CREATE VIRTUAL TABLE mem_v2_chunk_fts_v7 USING fts5(content, content='', contentless_delete=1, tokenize='trigram');
+INSERT INTO mem_v2_chunk_fts_v7(rowid, content) SELECT rowid, content FROM mem_v2_chunk_fts;
+DROP TABLE mem_v2_chunk_fts;
+ALTER TABLE mem_v2_chunk_fts_v7 RENAME TO mem_v2_chunk_fts;
+```
+
+The copy is not laziness. The trigram index has **no backfill mechanism** — the
+word index has `word_backfill_rowid` and a resumable pass, but nothing rebuilds
+trigram postings from the blocks. Dropping the table would therefore leave every
+existing archive with a permanently empty trigram index and search silently
+degraded to the bounded scan, which is the failure mode that looks like working
+software. Copying preserves the postings and only discards the text.
+
+The word index is copied the same way, and its `word_backfill_rowid` high-water
+mark is left untouched so a partially backfilled archive resumes where it was.
+
+The cost is transient: until the swap, the archive holds the old table and the
+new one at once, so the migration needs roughly one extra copy of the index in
+free space. `memory-migrate` takes a backup first for that reason.
+
+### What changed on the read path
+
+A contentless table still accepts text at INSERT time — it just does not keep it
+— which is what makes the copy possible. It also means every reader that
+selected `ft.content` had to be found and fixed. There were three:
+
+- **`searchIndex`** now joins `mem_v2_blocks`, decodes the block, and slices the
+  chunk's `[start_byte, end_byte)` range. The collapse to one hit per message
+  moved **before** the decode, because the benchmark showed 1.27 chunks match per
+  message at 2,000 messages and decoding each of them would have paid the
+  reconstruction cost more than once per result.
+- **`BackfillWordIndex`** was the most dangerous of the three. It read
+  `ft.content` to populate the word index; on a contentless table that returns
+  NULL, so it would have inserted empty strings and **silently emptied the word
+  index on every archive upgraded to v7**. It now decodes the block too.
+- **`tokenizer_bench_test.go`** copied chunk text out of the index to build its
+  comparison corpus, and would have failed its own "the archive is empty"
+  precondition.
+
+`delete.go` needed no change: `contentless_delete=1` accepts DELETE by rowid,
+which the probe had already proven.
+
+### What an operator will see
+
+- `snippet()` and `highlight()` return empty on these tables. Nothing calls them
+  — excerpts are reconstructed — but a future caller must not expect them.
+- `memory_space` reports **`fts_content_bytes: 0`**. That zero is the migration's
+  measurement, not a regression, and `fts_contentless_ratio_test.go` now asserts
+  it: a content column reintroduced by a later schema change would keep search
+  working and would only show up as a larger archive, so nothing else in the
+  suite would notice.
+- `fts_bytes` is a subset of `logical_bytes`, **not of `file_bytes`**. `dbstat`
+  reads through the pager and counts pages still in the WAL, while `file_bytes`
+  is `os.Stat` on the main file alone. On a freshly written archive the index can
+  legitimately appear larger than the file. `logical_bytes` is reported so the
+  two can be compared correctly.
+
+## Durable knowledge (schema version 8)
+
+Version 8 adds three tables for source-backed durable knowledge:
+
+| Table | Purpose |
+| --- | --- |
+| `mem_v2_knowledge_facts` | the statements, their scope, status, confidence, origin, redaction policy, and supersession pointer |
+| `mem_v2_knowledge_evidence` | which messages support each fact |
+| `mem_v2_knowledge_jobs` | extraction work that is still pending |
+
+The migration is additive: it creates tables and indexes and touches no existing
+row. An archive that never enables `MEMORY_KNOWLEDGE_ENABLED` carries three empty
+tables and nothing else changes.
+
+Three decisions are worth recording because each one is a place a simpler design
+would have been wrong:
+
+- **Evidence is a table, not a JSON column.** Deletion has to find facts *by
+  message*. A JSON array cannot be indexed or joined, so a deletion would have to
+  scan and parse every fact — and the one thing a deletion must not do is miss a
+  row.
+- **Supersession is a column, not a delete.** A correction adds a row and points
+  the old one at it, so the history of what was believed, and the evidence for
+  it, survives. Forgetting the correction un-supersedes the original rather than
+  leaving a hole.
+- **The evidence foreign key is not `ON DELETE CASCADE`.** A cascade would make a
+  deletion that forgot to remove evidence succeed silently. Without one, it
+  aborts loudly, which is the behaviour a deletion report needs in order to stay
+  honest. `TestArchiveMigrationUpgradesVersionOneArchive` asserts the absence of
+  the cascade.
+
+`mem_v2_knowledge_jobs` is separate from `mem_v2_jobs` because that table's
+uniqueness is `(kind, source_id, source_revision)` and its source is a message,
+while a knowledge job's source is a session, a turn, or an explicit request.
+
+See [durable knowledge](MEMORY_KNOWLEDGE.md) for the extraction pipeline, the
+injection budget, and the commands.
+
 ## Verification and rollback
 
 ```powershell
-go test ./internal/memstore ./cmd/memory-migrate
+go test ./internal/memstore ./cmd/memory-migrate ./cmd/memory-delete -timeout 40m
 ```
+
+`-timeout` is required, not a convenience. `go test` defaults to ten minutes per
+package and `internal/memstore` now exceeds it: the suite builds real archives,
+runs the index worker over them, and measures FTS5 index sizes, so a full run
+takes well over ten minutes. Without the flag the package does not fail an
+assertion — it panics with `test timed out after 10m0s` while a test is still
+legitimately running, which reads like a hang and is not one. The ceiling is set
+at 40 minutes so a genuine hang still terminates.
 
 Tests cover WAL-inclusive backups, resumable imports, unmapped owners, exact bytes,
 byte-bounded batches, atomic rollback, queue pressure, shutdown, competing writers,
 database capacity failure, and killing a process after commit acknowledgment.
+Maintenance tests cover WAL truncation, the below-threshold skip, data survival
+across a truncating checkpoint, and loop cancellation; lease tests cover rejection
+of a second holder, clean handover, expiry after a crash, heartbeat renewal, and
+expired-row reporting. Deletion tests cover the scope requirement, principal
+isolation across every table, chunk and FTS removal, a block shared by two
+records, idempotence, cursor invalidation, session-scoped deletion, and the
+orphan sweep; the command tests cover the end-to-end scope pass-through, the
+confirmation requirement, and argument rejection. The handshake tests cover a
+newer archive, an older one, a never-migrated one, and the gateway's refusal
+message in both directions — including that the older case does not borrow the
+newer wording, since telling an operator to upgrade a current binary sends them
+looking for a release that does not exist. The v7 test asserts the migration by
+probing for the `_content` shadow tables rather than by reading the CREATE
+statement back: the statement is what the migration wrote, the shadow table is
+what SQLite actually built, and only the second one proves the index is
+contentless.
 Capture tests also cover pre-dispatch storage failure, duplicate deliveries,
 single-shot HTTP dispatch, late results after restart, failed callbacks, intermediate
-assistant messages, missing sources, and terminal-state classification. Retrieval
+assistant messages, missing sources, and terminal-state classification. The
+real-upstream compatibility test asserts the wire format against a live
+`opencode serve` rather than a fake server: session creation, the message and part
+JSON shape including a caller-supplied `messageID` echoed back, the `/event`
+envelope, the `/global/event` envelope with its `payload` wrapper and `sync`
+variant, and the gateway's own parsers fed real captured events. It skips unless
+`OPENCODE_ENDPOINT` is set, and every prompt uses `noReply: true` so no provider is
+invoked:
+
+```powershell
+opencode serve --port 4096 --hostname 127.0.0.1
+$env:OPENCODE_ENDPOINT = "http://127.0.0.1:4096"
+go test ./internal/opencode -run TestRealUpstream -v
+```
+
+Retrieval
 tests cover chunk boundary and offset coverage, rune-safe splitting, response-only
 terms, CJK terms, short-query scan fallback, scope isolation, project filtering
 before the candidate limit, missing terms, cursor binding and restart, index-lag

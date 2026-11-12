@@ -71,6 +71,13 @@ type WriterStats struct {
 	Batches             uint64
 }
 
+// Options returns the resolved writer settings. It exists so a caller can
+// verify that configuration reached the writer instead of being dropped
+// between the environment and the queue.
+func (writer *ArchiveWriter) Options() WriterOptions {
+	return writer.options
+}
+
 type ArchiveWriter struct {
 	store   *Store
 	options WriterOptions
@@ -80,6 +87,7 @@ type ArchiveWriter struct {
 	changed chan struct{}
 	done    chan struct{}
 	stats   WriterStats
+	lease   *Lease
 }
 
 func OpenArchiveWriter(ctx context.Context, path string, options WriterOptions) (*ArchiveWriter, error) {
@@ -225,6 +233,14 @@ func (writer *ArchiveWriter) takeBatch() []*archiveOperation {
 func (writer *ArchiveWriter) run() {
 	defer close(writer.done)
 	defer writer.store.Close()
+	defer func() {
+		writer.mu.Lock()
+		lease := writer.lease
+		writer.mu.Unlock()
+		if lease != nil {
+			_ = lease.Release()
+		}
+	}()
 	for {
 		batch := writer.takeBatch()
 		if len(batch) == 0 {
@@ -264,6 +280,19 @@ func (writer *ArchiveWriter) commit(batch []*archiveOperation) error {
 		return err
 	}
 	defer tx.Rollback()
+	writer.mu.Lock()
+	lease := writer.lease
+	writer.mu.Unlock()
+	if lease != nil {
+		var valid int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM mem_v2_instance_lease
+			WHERE id=1 AND holder=? AND acquired_at=? AND expires_at>?`, lease.holder, lease.acquired, time.Now().UnixMilli()).Scan(&valid); err != nil {
+			return err
+		}
+		if valid != 1 {
+			return ErrArchiveLeased
+		}
+	}
 	for _, operation := range batch {
 		if operation.apply != nil {
 			if err := operation.apply(ctx, tx); err != nil {

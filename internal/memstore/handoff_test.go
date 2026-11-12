@@ -1,9 +1,11 @@
 package memstore
 
 import (
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A recovery loop used to nest preambles (A → B → C …): each cycle re-embedded
@@ -107,5 +109,76 @@ func TestSanitizeHandoffContent_StripsHistoricalRecallBlock(t *testing.T) {
 	got := SanitizeHandoffContent("user", in)
 	if got != "真实的用户请求" {
 		t.Fatalf("recall block not stripped: %q", got)
+	}
+}
+
+// PurgeExpiredHandoffs had no caller and no test: it was written, never wired,
+// and session_handoff rows therefore accumulated forever. The purge boundary is
+// 2*HandoffTTL, not HandoffTTL, and that difference is the whole point of the
+// test — a row that is merely expired is still the most recent thing known
+// about its thread, so deleting it at the read cutoff would discard the only
+// record of a session that might still be resumed.
+func TestPurgeExpiredHandoffsKeepsRowsInsideTheRetentionWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	now := time.Now()
+	for _, rec := range []HandoffRecord{
+		// Past 2*TTL: the only row the purge may remove.
+		{ThreadID: "ancient", Adapter: "test", UserID: "owner", CreatedAt: now.Add(-3 * HandoffTTL)},
+		// Past the read cutoff but inside the retention window. LoadPendingHandoff
+		// will not return it, and the purge must not delete it either.
+		{ThreadID: "expired", Adapter: "test", UserID: "owner", CreatedAt: now.Add(-HandoffTTL - time.Hour)},
+		// Fresh: still injectable.
+		{ThreadID: "fresh", Adapter: "test", UserID: "owner", CreatedAt: now},
+	} {
+		if err := store.SaveHandoff(rec); err != nil {
+			t.Fatalf("save %s: %v", rec.ThreadID, err)
+		}
+	}
+
+	if err := store.PurgeExpiredHandoffs(); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	// Assert against the table rather than through LoadPendingHandoff: the read
+	// path filters by TTL, so it would report "expired" as absent whether the
+	// row was deleted or merely filtered, and the test could not tell a working
+	// purge from a purge that deleted everything.
+	for thread, want := range map[string]bool{"ancient": false, "expired": true, "fresh": true} {
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM session_handoff WHERE thread_id = ?`, thread).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", thread, err)
+		}
+		if got := count > 0; got != want {
+			t.Fatalf("thread %q present=%v, want %v", thread, got, want)
+		}
+	}
+
+	// The surviving rows must still be readable, so the purge did not leave the
+	// table in a state the read path cannot use.
+	if _, ok, err := store.LoadPendingHandoff("fresh"); err != nil || !ok {
+		t.Fatalf("fresh handoff unreadable after purge: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.LoadPendingHandoff("expired"); err != nil || ok {
+		t.Fatalf("expired handoff should be filtered at read time: ok=%v err=%v", ok, err)
+	}
+}
+
+// A purge that runs on an empty table must not fail, because the gateway calls
+// it on a timer from startup and the first tick can land before any handoff has
+// ever been saved.
+func TestPurgeExpiredHandoffsOnEmptyTable(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "memory.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.PurgeExpiredHandoffs(); err != nil {
+		t.Fatalf("purge on empty table: %v", err)
 	}
 }

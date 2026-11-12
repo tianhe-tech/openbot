@@ -101,6 +101,18 @@ type StreamingSessionHandler struct {
 	failedTurn              bool
 	cleanupDone             chan struct{}
 	cleanupDoneOnce         sync.Once
+
+	// longLived marks a handler that mirrors a session the gateway did not
+	// create (see Client.ClaimSession). Such a handler is never unregistered
+	// when a turn ends; instead it resets itself when the next turn starts.
+	// This is what lets a session adopted from the opencode TUI keep streaming
+	// into a chat across many turns.
+	longLived bool
+
+	// longLivedTurnMessageID is the assistant message ID of the turn currently
+	// being mirrored. A long-lived handler sees many turns, so this is how a
+	// new turn is told apart from trailing events of the previous one.
+	longLivedTurnMessageID string
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -325,12 +337,21 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		s.sessionID[:8])
 
 	if s.completed {
-		// 即使 completed，仍然处理权限和问题请求（skill 可能在 session.idle 后才请求权限）
-		if eventType != "permission.asked" && eventType != "question.asked" {
+		// A long-lived handler (a claimed session) is never unregistered, so a
+		// new turn has to be detected here rather than by a fresh handler being
+		// created. Resetting on turn *start* — under the lock, before the event
+		// is processed — is what makes consecutive turns reliable: resetting
+		// from onComplete would race, because fireOnComplete runs it in a
+		// goroutine and a fast next turn could arrive first and be dropped.
+		if s.longLived && s.beginLongLivedTurnLocked(event) {
+			log.Printf("opencode: claimed session %s started a new turn", s.sessionID[:min(8, len(s.sessionID))])
+		} else if eventType != "permission.asked" && eventType != "question.asked" {
+			// 即使 completed，仍然处理权限和问题请求（skill 可能在 session.idle 后才请求权限）
 			log.Printf("opencode: ignoring event for completed session %s (type=%s)", s.sessionID[:8], eventType)
 			return nil
+		} else {
+			log.Printf("opencode: processing %s event for completed session %s (skill may need permission)", eventType, s.sessionID[:8])
 		}
-		log.Printf("opencode: processing %s event for completed session %s (skill may need permission)", eventType, s.sessionID[:8])
 	}
 
 	// 仅处理与当前session相关的事件

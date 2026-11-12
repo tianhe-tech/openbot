@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -215,6 +214,7 @@ type Attachment struct {
 
 // MessagePayload collects the metadata adapters send to OpenCode.
 type MessagePayload struct {
+	OnCaptureCommitted      func()  `json:"-"`
 	DeliveryID              string  `json:"delivery_id,omitempty"`
 	OriginalContent         *string `json:"original_content,omitempty"`
 	capture                 *TurnRef
@@ -450,13 +450,13 @@ type Client struct {
 	toolCallCount    sync.Map     // map[sessionID]int tracks completed tool calls per session
 	tokenCount       sync.Map     // map[sessionID]int tracks estimated tokens per session
 	sessionSummary   sync.Map     // map[sessionID]string stores session summaries
+	sessionPreviews  sync.Map     // map[sessionID]string caches the derived /sessions preview
 	modelConfig      sync.Map     // map[sessionID]*ModelConfig caches model config per session
 	requestCache     sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
 	runningSessions  sync.Map     // map[sessionID]bool 跟踪正在运行的session
 	pendingQuestions sync.Map     // map[questionID]*Question 待回答的问题
 	todoCache        sync.Map     // map[sessionID][]TodoItem
 	diffCache        sync.Map     // map[sessionID][]FileDiff
-	userMemory       sync.Map     // map[channel:userID][]UserMemoryFact
 	directory        string
 	timeout          time.Duration // 默认超时时间
 	retryConfig      RetryConfig   // 重试配置
@@ -518,6 +518,42 @@ type Client struct {
 	// attempts, last event, content-sent) without touching the SSE hot path.
 	activeHandlers sync.Map // map[sessionID]*StreamingSessionHandler
 
+	// claimedSessions tracks sessions adopted from the opencode TUI via
+	// ClaimSession. key: sessionID, value: claimedSession. A claimed session
+	// keeps its forwarding handler registered across turns, so this map is what
+	// SendMessageToSession consults to find the delivery target.
+	claimedSessions sync.Map // map[sessionID]claimedSession
+	claimedSender   ClaimedSessionSender
+	claimedSenderMu sync.RWMutex
+	claimedHook     ClaimedSessionHook
+	claimedHookMu   sync.RWMutex
+	// claimedUserResolver resolves a channel-only claim ("[feishu] my work") to
+	// the adapter's sole user. Nil means channel-only claims are ignored.
+	claimedUserResolver   ClaimUserResolver
+	claimedUserResolverMu sync.RWMutex
+	// claimedChannelChecker validates a /transfer target channel against the
+	// host's adapter registry. Nil means any channel name is accepted.
+	claimedChannelChecker   ClaimChannelChecker
+	claimedChannelCheckerMu sync.RWMutex
+
+	// suspendedClaims holds claimed sessions whose forwarding handler has been
+	// detached by /switch. key: sessionID, value: struct{}.
+	//
+	// A suspended session keeps its claim record and its title prefix — it still
+	// belongs to the user and must stay in /sessions — but its output is no
+	// longer mirrored into the chat. This is deliberately NOT a release: a
+	// release strips the prefix, which would remove the session from the very
+	// listing the user is switching with.
+	suspendedClaims  sync.Map // map[sessionID]struct{}
+	claimTransitions sync.Map
+
+	// syncClaimProbes throttles the GetSession probe that a /global/event sync
+	// envelope triggers. key: sessionID, value: time.Time of the last probe.
+	// The sync envelope carries no title, so learning whether a rename happened
+	// costs an HTTP round-trip; session.updated.1 fires on every session record
+	// change, so a busy session can emit dozens per minute.
+	syncClaimProbes sync.Map // map[sessionID]time.Time
+
 	// shellSessionID caches a dedicated session used exclusively for /cmd shell
 	// execution. When a user's conversation session is busy running an AI task,
 	// the shell endpoint returns 409 SessionBusyError; running shell in this
@@ -543,6 +579,16 @@ type Client struct {
 	// the request with its reply. nil-safe.
 	commandInterceptors []CommandInterceptor
 
+	// knowledgeCandidateHook, when non-nil, is invoked at a session boundary so
+	// the knowledge service can decide whether to extract durable facts. It is
+	// separate from skillCandidateHook because the two mine different things
+	// from the same event and either can be enabled without the other. nil-safe.
+	knowledgeCandidateHook KnowledgeCandidateHook
+
+	// knowledgeIndex, when non-nil, supplies the bounded knowledge block
+	// prepended to the first message of a session. nil-safe.
+	knowledgeIndex KnowledgeIndexStore
+
 	// childSessions tracks subagent sessions spawned by "task" tool calls.
 	// Key: parent sessionID, Value: []ChildSessionInfo. The mutex protects
 	// slice reads and writes performed concurrently by the SSE listener and
@@ -563,13 +609,6 @@ type Client struct {
 type Option func(*Client)
 
 const defaultDevCorePrompt = "你是 Dev Core。请按用户偏好输出，回答清晰、可执行、可验证。"
-
-// UserMemoryFact is the adapter-facing memory record format.
-type UserMemoryFact struct {
-	Text       string `json:"text"`
-	Category   string `json:"category"`
-	Importance int    `json:"importance"`
-}
 
 // WithDirectory sets the working directory for sessions.
 func WithDirectory(dir string) Option {
@@ -682,6 +721,56 @@ type SkillCandidateHook interface {
 // server. Returns ("", false) when the message is not a recognized command.
 type CommandInterceptor interface {
 	HandleCommand(adapter, userID, message string) (reply string, handled bool)
+}
+
+// KnowledgeCandidateTrigger names the event that made a conversation worth
+// extracting durable facts from.
+//
+// There is deliberately no "every message" trigger. The plan requires that
+// extraction is not run for every message, and a trigger that fires per message
+// would be exactly that. A handoff is a session boundary — the natural point at
+// which a unit of work is finished — and an explicit remember is the user
+// asking for it.
+type KnowledgeCandidateTrigger string
+
+const (
+	// KnowledgeTriggerHandoff fires when a stuck session is handed off.
+	KnowledgeTriggerHandoff KnowledgeCandidateTrigger = "on_handoff"
+	// KnowledgeTriggerExplicit fires when the user asks to remember something.
+	KnowledgeTriggerExplicit KnowledgeCandidateTrigger = "on_explicit"
+)
+
+// KnowledgeCandidateEvent is the signal handed to a KnowledgeCandidateHook.
+// Fields are plain strings so the opencode package does not need to import the
+// knowledge package.
+type KnowledgeCandidateEvent struct {
+	Trigger   KnowledgeCandidateTrigger
+	ThreadID  string
+	SessionID string
+	Adapter   string
+	UserID    string
+	// TurnCount and ToolCallCount are advisory: the hook decides whether the
+	// conversation is substantial enough to be worth a model call.
+	TurnCount     int
+	ToolCallCount int
+}
+
+// KnowledgeCandidateHook is invoked (best-effort, non-blocking from the
+// Client's perspective — implementations must return quickly or enqueue their
+// own async work) when the Client observes a conversation worth extracting
+// durable facts from.
+type KnowledgeCandidateHook interface {
+	OnKnowledgeCandidate(event KnowledgeCandidateEvent)
+}
+
+// KnowledgeIndexStore supplies the bounded knowledge block injected at session
+// start. It is a separate interface from MemStoreRecorder so a store that can
+// record but not index simply does not implement it.
+type KnowledgeIndexStore interface {
+	// LoadKnowledgeIndex returns the rendered block for the scope, or "" when
+	// there is nothing to inject. It must be bounded and must not block for
+	// long: it runs on the request path.
+	LoadKnowledgeIndex(adapter, userID, project string) string
 }
 
 // WithMemStore attaches an optional memory store that records every successful
@@ -885,12 +974,17 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
 	}
+	if err := c.checkExplicitSessionOwnership(payload); err != nil {
+		return Response{}, err
+	}
 	if err := c.beginCapture(ctx, &payload); err != nil {
 		return Response{}, err
 	}
 
 	// ========== 会话接续注入（上一会话因 opencode 服务端死锁中断时自动恢复）==========
 	c.maybeInjectHandoff(&payload)
+	// ========== 会话起始知识注入（有界，仅在新会话首条消息时生效）==========
+	c.maybeInjectKnowledge(&payload)
 
 	// ========== 健康检查：确保OpenCode server已启动 ==========
 	if err := c.CheckHealth(ctx); err != nil {
@@ -933,21 +1027,13 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		payload.Channel, payload.UserID, payload.ThreadID, sessionID)
 
 	if sessionID == "" && payload.ThreadID != "" {
-		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
-			foundSessionID := sid.(string)
-
+		if found, ok := c.resolveThreadSession(payload.ThreadID, payload.Channel, payload.UserID); ok {
 			// 🔍 诊断日志：检查 session 是否属于当前用户
-			// 通过查询 adapter 的映射来验证（如果可用）
 			log.Printf("opencode: found cached session %s for threadID %s (requested by %s user %s)",
-				foundSessionID[:8], payload.ThreadID, payload.Channel, payload.UserID)
-
-			// 警告：可能存在 session 混用
-			log.Printf("opencode: ⚠️ WARNING - ThreadID %s is mapped to session %s, but cannot verify ownership!",
-				payload.ThreadID, foundSessionID[:8])
-
-			sessionID = foundSessionID
+				found[:8], payload.ThreadID, payload.Channel, payload.UserID)
+			sessionID = found
 		} else {
-			log.Printf("opencode: no cached session for threadID %s, will create new", payload.ThreadID)
+			log.Printf("opencode: no usable cached session for threadID %s, will create new", payload.ThreadID)
 		}
 	}
 
@@ -2044,9 +2130,51 @@ func (c *Client) executeShellViaHTTP(ctx context.Context, sessionID, command, ag
 	return &opencode.AssistantMessage{}, nil
 }
 
-// ListSessions retrieves all sessions.
-func (c *Client) ListSessions(ctx context.Context) ([]opencode.Session, error) {
-	result, err := c.sdk.Session.List(ctx, opencode.SessionListParams{})
+// sessionListLimit is the page size requested from GET /session.
+//
+// The upstream default is 100, and SessionListParams exposes no limit field, so
+// without this the gateway only ever sees the 100 most recently updated
+// sessions of the project. On a busy deployment that window is filled entirely
+// by cron-generated and internal sessions, which makes every user's /sessions
+// listing look empty even though their sessions still exist. 5000 covers the
+// largest deployment seen so far (3657 sessions) with headroom; the upstream
+// clamps to whatever actually exists.
+const sessionListLimit = 5000
+
+// listSessions fetches sessions from the upstream, optionally narrowed by a
+// title search term.
+//
+// Two upstream defaults have to be overridden here:
+//   - GET /session returns only the 100 most recently updated sessions unless
+//     limit is set. SessionListParams has no field for it, so it is injected as
+//     a raw query parameter.
+//   - GET /session spans the whole project (the serve process's working
+//     directory plus its subdirectories) unless directory is set. Passing the
+//     configured directory keeps the listing to the workspace the gateway
+//     actually writes to.
+//
+// search is a case-insensitive substring match on the title. It is only a
+// pre-filter: a substring match also accepts a title that merely contains the
+// term, so callers that need prefix semantics must still verify it. If the
+// upstream does not support search the parameter is ignored and this degrades
+// to a full scan, which is still correct.
+func (c *Client) listSessions(ctx context.Context, search string) ([]opencode.Session, error) {
+	params := opencode.SessionListParams{}
+	opts := []option.RequestOption{
+		option.WithQuery("limit", strconv.Itoa(sessionListLimit)),
+	}
+	if search != "" {
+		opts = append(opts, option.WithQuery("search", search))
+	}
+	// "." is the unset default. It resolves against the serve process's working
+	// directory, which is the same project the unfiltered listing already
+	// covers, so sending it would only narrow the result to that exact directory
+	// and drop sessions created in subdirectories.
+	if dir := strings.TrimSpace(c.directory); dir != "" && dir != "." {
+		params.Directory = opencode.F(dir)
+	}
+
+	result, err := c.sdk.Session.List(ctx, params, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2054,6 +2182,333 @@ func (c *Client) ListSessions(ctx context.Context) ([]opencode.Session, error) {
 		return []opencode.Session{}, nil
 	}
 	return *result, nil
+}
+
+// ListSessions retrieves all sessions of the configured project.
+func (c *Client) ListSessions(ctx context.Context) ([]opencode.Session, error) {
+	return c.listSessions(ctx, "")
+}
+
+// UserSession is one row of a /sessions listing: a session owned by a channel
+// user, with the ownership prefix stripped from the title.
+type UserSession struct {
+	ID        string
+	Title     string // title with the "[channel:userID] " prefix removed
+	Directory string
+	Created   time.Time
+	Updated   time.Time
+	ParentID  string
+	// Preview is a one-line excerpt of what the conversation was about, derived
+	// from the first real user message. It is empty until FillSessionPreviews
+	// runs, and stays empty when the session has no readable history.
+	//
+	// It exists because Title is not usable for choosing a session: the gateway
+	// mints titles as "[channel:userID] <threadID>", so stripping the ownership
+	// prefix leaves an opaque chat/room identifier.
+	Preview string
+}
+
+// sessionTitlePrefix is the ownership marker minted when a session is created
+// for a channel user. SendMessage and SendMessageStreamingWithEvents both use
+// this exact format, and every ownership check relies on it.
+func sessionTitlePrefix(channel, userID string) string {
+	return fmt.Sprintf("[%s:%s]", channel, userID)
+}
+
+// ListSessionsForUser returns the sessions owned by channel/userID, newest
+// first.
+//
+// Ownership is encoded in the session title, so the authoritative check is a
+// client-side prefix filter: SessionListParams carries only Directory, with no
+// server-side filter field. A listing that skipped this filter would show one
+// user the titles and working directories of every other user's conversations.
+//
+// The upstream search parameter is used as a pre-filter so the scan is not
+// limited to the newest page of sessions, but it is a substring match and
+// therefore cannot replace the prefix check below.
+func (c *Client) ListSessionsForUser(ctx context.Context, channel, userID string) ([]UserSession, error) {
+	if channel == "" || userID == "" {
+		return nil, fmt.Errorf("opencode: list sessions for user: channel and userID are required")
+	}
+	prefix := sessionTitlePrefix(channel, userID)
+
+	sessions, err := c.listSessions(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	owned := make([]UserSession, 0, len(sessions))
+	for _, s := range sessions {
+		title := strings.TrimSpace(s.Title)
+		if !strings.HasPrefix(title, prefix) {
+			continue
+		}
+		owned = append(owned, UserSession{
+			ID:        s.ID,
+			Title:     displaySessionTitle(title, prefix),
+			Directory: s.Directory,
+			Created:   time.UnixMilli(int64(s.Time.Created)),
+			Updated:   time.UnixMilli(int64(s.Time.Updated)),
+			ParentID:  s.ParentID,
+		})
+	}
+
+	sort.SliceStable(owned, func(i, j int) bool {
+		return owned[i].Updated.After(owned[j].Updated)
+	})
+	return owned, nil
+}
+
+// displaySessionTitle strips the ownership prefix. A session created with only
+// the prefix (an empty thread ID) keeps its raw title rather than rendering as
+// a blank row.
+func displaySessionTitle(title, prefix string) string {
+	rest := strings.TrimSpace(strings.TrimPrefix(title, prefix))
+	if rest == "" {
+		return title
+	}
+	return rest
+}
+
+// Bounds for the derived /sessions preview.
+const (
+	// sessionPreviewMaxRunes caps the preview. It has to share one line of a
+	// chat message with the row index and the timestamp, and it is only a hint
+	// for picking a session — the full text is one /switch away.
+	sessionPreviewMaxRunes = 48
+	// sessionPreviewWorkers bounds how many histories are fetched at once.
+	// SessionMessagesParams carries no limit, so every preview costs one
+	// full-history fetch; running ten of them serially makes /sessions feel
+	// broken on a slow upstream.
+	sessionPreviewWorkers = 4
+	// sessionPreviewTimeout bounds a single preview fetch. A session whose
+	// history is slow to load degrades to "no preview" instead of stalling the
+	// whole listing.
+	sessionPreviewTimeout = 5 * time.Second
+)
+
+// FillSessionPreviews derives a one-line preview for the first limit entries of
+// sessions, in place.
+//
+// A session title is "[channel:userID] <threadID>", so once the ownership
+// prefix is stripped what remains is an opaque chat/room identifier. That is
+// enough to prove ownership and nothing else: a user reading /sessions cannot
+// tell which conversation is which, which makes the listing useless for
+// deciding what to /switch to. The only semantic content the upstream exposes
+// is the message history, so the preview is the first real user message.
+//
+// This costs one full-history fetch per session: SessionMessagesParams carries
+// only Directory, with no limit or offset field. Two things keep it affordable —
+// only the rows that will actually be rendered are fetched, and results are
+// cached per session ID (a session's first message never changes).
+//
+// Failures are silent by design. A session that cannot be read still appears in
+// the listing, just without a preview; losing the excerpt must never cost the
+// user the ability to see and resume their sessions.
+func (c *Client) FillSessionPreviews(ctx context.Context, sessions []UserSession, limit int) {
+	if limit <= 0 || limit > len(sessions) {
+		limit = len(sessions)
+	}
+	if limit == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, sessionPreviewWorkers)
+	for i := 0; i < limit; i++ {
+		if cached, ok := c.sessionPreviews.Load(sessions[i].ID); ok {
+			sessions[i].Preview = cached.(string)
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		// Each goroutine writes only its own slice element, so no two goroutines
+		// touch the same memory and no lock is needed around the slice.
+		go func(index int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			preview := c.deriveSessionPreview(ctx, sessions[index].ID)
+			if preview == "" {
+				return
+			}
+			c.sessionPreviews.Store(sessions[index].ID, preview)
+			sessions[index].Preview = preview
+		}(i)
+	}
+	wg.Wait()
+}
+
+// deriveSessionPreview returns the first real user message of a session,
+// reduced to one line, or "" when the session has no usable text.
+func (c *Client) deriveSessionPreview(ctx context.Context, sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, sessionPreviewTimeout)
+	defer cancel()
+
+	messages, err := c.sdk.Session.Messages(fetchCtx, sessionID, opencode.SessionMessagesParams{})
+	if err != nil || messages == nil {
+		return ""
+	}
+	for _, message := range *messages {
+		if _, ok := message.Info.AsUnion().(opencode.UserMessage); !ok {
+			continue
+		}
+		for _, part := range message.Parts {
+			text, ok := part.AsUnion().(opencode.TextPart)
+			// Synthetic parts are upstream-generated scaffolding, not something
+			// the user typed, so they describe nothing about the conversation.
+			if !ok || text.Synthetic {
+				continue
+			}
+			if preview := sessionPreviewText(text.Text); preview != "" {
+				return preview
+			}
+		}
+	}
+	// No user text at all: fall back to the compaction summary, which is the
+	// only other prose the upstream keeps about a session.
+	return sessionPreviewText(extractSummaryFromSession(*messages))
+}
+
+// sessionPreviewText reduces one raw message body to a single-line preview.
+//
+// The gateway prepends its own blocks to the first user message of a session — a
+// handoff preamble after a stuck-session recovery, a durable-knowledge index, a
+// recall block — so the raw text frequently starts with gateway scaffolding
+// rather than anything the user typed. Those blocks are stripped here: a preview
+// reading "【会话接续·自动恢复】" tells the user nothing about the session.
+func sessionPreviewText(raw string) string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return ""
+	}
+	// Handoff preamble. BuildHandoffPreamble ends the scaffolding with the
+	// "【当前用户消息】" marker and puts the real message after it; the "---"
+	// line above the marker is only a visual separator, so it cannot be used as
+	// the delimiter. Take the LAST marker: repeated recoveries nest preambles,
+	// and only the innermost one holds the text the user actually typed.
+	if strings.HasPrefix(text, "【会话接续") {
+		const marker = "【当前用户消息】"
+		switch index := strings.LastIndex(text, marker); {
+		case index >= 0:
+			text = strings.TrimSpace(text[index+len(marker):])
+		default:
+			// Defensive: a preamble truncated before the marker still has the
+			// separator, and dropping the scaffolding beats showing it.
+			if index := strings.LastIndex(text, "\n---\n"); index >= 0 {
+				text = strings.TrimSpace(text[index+len("\n---\n"):])
+			} else {
+				// Nothing but scaffolding: there is no user text to show.
+				return ""
+			}
+		}
+	}
+	// Recall block: the real user message follows the last "---" line. The
+	// memstore sanitizer accepts a bare "---" too, because the block is
+	// truncated at a character budget and can lose its trailing newline.
+	if strings.HasPrefix(text, "【历史工作记忆】") {
+		if index := strings.LastIndex(text, "\n---\n"); index >= 0 {
+			text = strings.TrimSpace(text[index+len("\n---\n"):])
+		} else if index := strings.LastIndex(text, "---"); index > 0 && index < len(text)-3 {
+			text = strings.TrimSpace(text[index+3:])
+		} else {
+			// Nothing but the recall block: there is no user text to show.
+			return ""
+		}
+	}
+	// Collapse every whitespace run, newlines included, so the preview stays on
+	// one line in every chat client.
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return ""
+	}
+	return truncateString(text, sessionPreviewMaxRunes)
+}
+
+// BindSessionToThread points a thread at an existing session so the next
+// message continues that conversation instead of creating a new one.
+//
+// Two maps hold the user→session mapping, and they are consulted in this order:
+//
+//  1. payload.SessionID, which every adapter fills from its own
+//     BidirectionalAdapter.userSessions map;
+//  2. this client's sessions map, keyed by threadID, used only when
+//     payload.SessionID is empty.
+//
+// So the adapter's map is the one that normally decides, and this map is the
+// fallback. A /switch must update both: updating only this one leaves the
+// adapter passing the old session ID, which wins; updating only the adapter
+// leaves the fallback pointing at the old session for any caller that omits
+// SessionID.
+//
+// The per-session counters are deliberately NOT cleared: they are keyed by
+// session ID, so they already describe the session being resumed. Clearing
+// them would only discard what this gateway knows about it.
+func (c *Client) BindSessionToThread(threadID, sessionID string) {
+	threadID = strings.TrimSpace(threadID)
+	sessionID = strings.TrimSpace(sessionID)
+	if threadID == "" || sessionID == "" {
+		return
+	}
+	c.sessions.Store(threadID, sessionID)
+	log.Printf("opencode: bound thread %s to session %s (/switch)",
+		threadID, sessionID[:min(8, len(sessionID))])
+}
+
+// ErrSessionNotOwned is returned when a /switch selector names a session that
+// does not belong to the requesting user. It is deliberately indistinguishable
+// from "no such session": telling a user that someone else's session exists is
+// itself a disclosure.
+var ErrSessionNotOwned = errors.New("opencode: no such session for this user")
+
+// ResolveUserSession maps a /switch selector to one of the user's own sessions.
+//
+// selector is either a 1-based index into the list produced by
+// ListSessionsForUser (newest first) or an ID prefix. Both forms are resolved
+// against a freshly fetched owned list, so a selector can never reach a session
+// the caller does not own — the ownership filter runs before the match.
+func (c *Client) ResolveUserSession(ctx context.Context, channel, userID, selector string) (UserSession, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return UserSession{}, fmt.Errorf("opencode: resolve session: empty selector")
+	}
+
+	owned, err := c.ListSessionsForUser(ctx, channel, userID)
+	if err != nil {
+		return UserSession{}, err
+	}
+	if len(owned) == 0 {
+		return UserSession{}, ErrSessionNotOwned
+	}
+
+	if index, convErr := strconv.Atoi(selector); convErr == nil {
+		if index < 1 || index > len(owned) {
+			return UserSession{}, fmt.Errorf("opencode: resolve session: index %d out of range (1-%d)", index, len(owned))
+		}
+		return owned[index-1], nil
+	}
+
+	// ID prefix. Require an exact match or a unique prefix so a short selector
+	// cannot silently pick one of several sessions.
+	var matches []UserSession
+	for _, s := range owned {
+		if s.ID == selector {
+			return s, nil
+		}
+		if strings.HasPrefix(s.ID, selector) {
+			matches = append(matches, s)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return UserSession{}, ErrSessionNotOwned
+	case 1:
+		return matches[0], nil
+	default:
+		return UserSession{}, fmt.Errorf("opencode: resolve session: prefix %q matches %d sessions, use more characters", selector, len(matches))
+	}
 }
 
 // AbortSession aborts a running session.
@@ -2080,6 +2535,7 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	c.toolCallCount.Delete(sessionID)
 	c.tokenCount.Delete(sessionID)
 	c.sessionSummary.Delete(sessionID)
+	c.sessionPreviews.Delete(sessionID)
 	c.modelConfig.Delete(sessionID)
 	c.modelOverride.Delete(sessionID)
 	c.runningSessions.Delete(sessionID)
@@ -2283,6 +2739,18 @@ func (c *Client) SetSkillCandidateHook(h SkillCandidateHook) {
 	c.skillCandidateHook = h
 }
 
+// SetKnowledgeCandidateHook registers the durable-knowledge extraction hook.
+// Nil detaches.
+func (c *Client) SetKnowledgeCandidateHook(h KnowledgeCandidateHook) {
+	c.knowledgeCandidateHook = h
+}
+
+// SetKnowledgeIndex attaches the store that supplies the session-start
+// knowledge block. Nil detaches.
+func (c *Client) SetKnowledgeIndex(store KnowledgeIndexStore) {
+	c.knowledgeIndex = store
+}
+
 // AddCommandInterceptor appends an interceptor for synthetic slash commands.
 // Interceptors are consulted in the order they are added.
 func (c *Client) AddCommandInterceptor(ci CommandInterceptor) {
@@ -2311,8 +2779,9 @@ func (c *Client) dispatchInterceptors(payload MessagePayload) (Response, bool) {
 // SessionTurn is a simplified role-tagged utterance used by external callers
 // (skillgen, handoff mining) that don't need the full SDK Message type.
 type SessionTurn struct {
-	Role string // "user" or "assistant"
-	Text string
+	Role      string // "user" or "assistant"
+	Text      string
+	Completed bool
 }
 
 // FetchSessionTurns retrieves the session's conversation as a flat list of
@@ -2343,7 +2812,11 @@ func (c *Client) FetchSessionTurns(ctx context.Context, sessionID string) ([]Ses
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		out = append(out, SessionTurn{Role: role, Text: text})
+		completed := role == "user"
+		if info, ok := msg.Info.AsUnion().(opencode.AssistantMessage); ok {
+			completed = info.Time.Completed > 0 && info.Error.Name == ""
+		}
+		out = append(out, SessionTurn{Role: role, Text: text, Completed: completed})
 	}
 	return out, nil
 }
@@ -4004,13 +4477,52 @@ func (c *Client) HasActiveStreamingSessions() bool {
 
 var _ MessageSender = (*Client)(nil)
 
-// SendMessageToSession 通过adapter主动推送消息给会话关联的用户
-// 注意：这个方法目前只是记录日志，实际的消息推送通过streaming callback完成
-// 未来可以扩展支持通过adapter的双向通信机制主动推送
+// SendMessageToSession pushes content to the channel user who owns a session.
+//
+// It is the delivery path for claimed sessions: a session adopted from the TUI
+// has no adapter callback of its own, so its output has to be routed by looking
+// up the claim record. Sessions created by SendMessage do not go through here —
+// their adapter callback is invoked directly by the streaming handler.
+//
+// When no sender is installed (SetClaimedSessionSender was never called) or the
+// session was never claimed, the content is only logged. That keeps the
+// MessageSender contract satisfiable in tests and in gateway builds that do not
+// wire the adapter registry.
 func (c *Client) SendMessageToSession(ctx context.Context, sessionID, content string) error {
-	log.Printf("opencode: SendMessageToSession for session %s (len=%d chars)", sessionID[:8], len(content))
-	// 当前实现：依赖streaming callback机制，这里只是接口占位
-	// 未来可以添加通过adapter反向推送的逻辑
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+
+	value, ok := c.claimedSessions.Load(sessionID)
+	if !ok {
+		log.Printf("opencode: SendMessageToSession: session %s is not claimed, dropping %d chars",
+			sessionID[:min(8, len(sessionID))], len(content))
+		return nil
+	}
+	// A suspended claim was paused by /switch: the user moved to another
+	// session in the same chat, so this one must stay silent until they switch
+	// back. The forwarder is normally detached already; this is the belt to that
+	// braces, because a flush racing the suspend would otherwise still deliver.
+	if _, suspended := c.suspendedClaims.Load(sessionID); suspended {
+		log.Printf("opencode: SendMessageToSession: session %s is suspended, dropping %d chars",
+			sessionID[:min(8, len(sessionID))], len(content))
+		return nil
+	}
+	claimed, ok := value.(claimedSession)
+	if !ok {
+		return nil
+	}
+
+	sender := c.claimedSessionSender()
+	if sender == nil {
+		log.Printf("opencode: SendMessageToSession: no claimed-session sender installed, dropping %d chars for %s",
+			len(content), sessionID[:min(8, len(sessionID))])
+		return nil
+	}
+
+	if err := sender(ctx, sessionID, claimed.Channel, claimed.UserID, content); err != nil {
+		return fmt.Errorf("opencode: send to claimed session %s: %w", sessionID[:min(8, len(sessionID))], err)
+	}
 	return nil
 }
 
@@ -4098,14 +4610,14 @@ func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
 	// 无论能否提取文本，标记该 session 已完成压缩以防止重复调用
 	c.sessionSummary.Store(sessionID, "compacted")
 
-	// 获取session详情以获取总结
-	session, err := c.GetSession(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("opencode: get session after summarize: %w", err)
+	// 提取总结内容。压缩摘要不在 session 对象上——Session.Summary 只有 Diffs，
+	// 正文挂在触发压缩的那条 user message 的 Summary.Body 里。
+	summary := ""
+	if messages, err := c.sdk.Session.Messages(ctx, sessionID, opencode.SessionMessagesParams{}); err == nil && messages != nil {
+		summary = extractSummaryFromSession(*messages)
+	} else if err != nil {
+		log.Printf("opencode: summarize: fetch messages failed for session %s: %v", sessionID[:min(8, len(sessionID))], err)
 	}
-
-	// 提取总结内容（从session的messages中查找summary类型的消息）
-	summary := extractSummaryFromSession(session)
 	if summary != "" {
 		c.sessionSummary.Store(sessionID, summary)
 		log.Printf("opencode: session %s summarized successfully", sessionID)
@@ -4116,14 +4628,23 @@ func (c *Client) SummarizeSession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-// extractSummaryFromSession 从session中提取总结信息
-func extractSummaryFromSession(session *opencode.Session) string {
-	if session == nil {
-		return ""
+// extractSummaryFromSession 从 session 的消息里提取压缩摘要正文。
+//
+// 旧实现接收 *opencode.Session 并直接 return ""，所以每次调用都打印
+// "no extractable text"，即使上游确实产出了摘要。session 对象上只有
+// SessionSummary.Diffs，没有正文；正文在触发压缩的那条 user message 上。
+// 从后往前找，因为一次会话可能被压缩多次，最后一条才是当前有效的摘要。
+func extractSummaryFromSession(messages []opencode.SessionMessagesResponse) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		user, ok := messages[i].Info.AsUnion().(opencode.UserMessage)
+		if !ok {
+			continue
+		}
+		if body := strings.TrimSpace(user.Summary.Body); body != "" {
+			return body
+		}
 	}
-	// TODO: 根据实际的session结构提取总结
-	// 可能需要获取messages并查找summary类型的消息
-	return "" // 暂时返回空，需要根据SDK实际结构实现
+	return ""
 }
 
 // ClearSessionSummary 清除会话的已总结标记，允许再次调用 SummarizeSession。
@@ -4573,8 +5094,9 @@ func (c *Client) GetSessionInfo(ctx context.Context, sessionID string) (*Session
 		return nil, err
 	}
 
-	// Convert Unix timestamp to time string
-	createdTime := time.Unix(int64(session.Time.Updated), 0).Format("2006-01-02 15:04:05")
+	// time.created is an epoch millisecond value, not a second value: passing it
+	// to time.Unix would render every session as 1970.
+	createdTime := time.UnixMilli(int64(session.Time.Created)).Format("2006-01-02 15:04:05")
 
 	info := &SessionInfo{
 		SessionID:    sessionID,
@@ -4645,7 +5167,7 @@ func (c *Client) FindLatestSessionForUser(ctx context.Context, channel, userID s
 	}
 	prefix := fmt.Sprintf("[%s:%s]", channel, userID)
 
-	sessions, err := c.ListSessions(ctx)
+	sessions, err := c.listSessions(ctx, prefix)
 	if err != nil {
 		log.Printf("opencode: FindLatestSessionForUser: list sessions failed: %v", err)
 		return "", false
@@ -4807,18 +5329,22 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	if strings.TrimSpace(payload.Content) == "" {
 		return Response{}, ErrEmptyPayload
 	}
+	if err := c.checkExplicitSessionOwnership(payload); err != nil {
+		return Response{}, err
+	}
 	if err := c.beginCapture(ctx, &payload); err != nil {
 		return Response{}, err
 	}
 	c.maybeInjectHandoff(&payload)
+	c.maybeInjectKnowledge(&payload)
 
 	// 1. 先确定sessionID（可能需要创建新session）
 	threadLock := c.getThreadLock(payload.ThreadID)
 	threadLock.Lock()
 	sessionID := payload.SessionID
 	if sessionID == "" && payload.ThreadID != "" {
-		if sid, ok := c.sessions.Load(payload.ThreadID); ok {
-			sessionID = sid.(string)
+		if found, ok := c.resolveThreadSession(payload.ThreadID, payload.Channel, payload.UserID); ok {
+			sessionID = found
 
 			// 验证 session 是否仍然有效
 			checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -4919,6 +5445,12 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		c.probeSnapshots.Delete(sessionID)
 		c.activeHandlers.Delete(sessionID)
 		c.UnregisterSessionHandler(sessionID)
+		// A claimed session (adopted from the TUI) keeps a long-lived forwarding
+		// handler. This per-turn handler has just replaced it and then removed
+		// itself, so without restoring the claimed one the mirror would die
+		// permanently after the user's first reply from the chat: every later
+		// TUI turn would be dropped with "no session handler found".
+		c.restoreClaimedHandler(sessionID)
 		// Keep child-session tracking after local completion. A context deadline
 		// can clear this handler while the opencode server still reports the
 		// parent/child session as busy; /status must retain that relationship to
@@ -5484,6 +6016,53 @@ func (c *Client) maybeInjectHandoff(payload *MessagePayload) {
 	hs.MarkHandoffConsumed(payload.ThreadID)
 }
 
+// maybeInjectKnowledge prepends the bounded durable-knowledge block to the
+// first message of a session.
+//
+// It runs only at session start, which is what the plan asks for ("load only a
+// small scoped knowledge index at session start"). Injecting on every turn
+// would spend the same prompt bytes on every request to tell the model
+// something it already read, so the condition is deliberately narrow: no
+// session is resolved yet for this thread, and the payload does not name one.
+//
+// It must run after maybeInjectHandoff, because a handoff clears SessionID to
+// force a fresh session — and a fresh session is exactly when the index is
+// wanted. Running before would skip the injection on the one turn that needs it.
+//
+// Safe no-op when no index store is attached, when the scope has no facts, or
+// when the message is itself a background drafting prompt.
+func (c *Client) maybeInjectKnowledge(payload *MessagePayload) {
+	if payload == nil || c.knowledgeIndex == nil {
+		return
+	}
+	// Background drafting sessions must never receive the user's knowledge
+	// block: it would be injected into a prompt whose reply is parsed as
+	// structured output, and it would leak facts into a session the user never
+	// sees.
+	if payload.Channel == "skillgen" || payload.Channel == "knowledge" {
+		return
+	}
+	if strings.HasPrefix(payload.ThreadID, "skillgen-draft-") || strings.HasPrefix(payload.ThreadID, "knowledge-draft-") {
+		return
+	}
+	// Session start only: an explicit SessionID means the caller already has a
+	// conversation going, and a cached thread mapping means the same.
+	if strings.TrimSpace(payload.SessionID) != "" {
+		return
+	}
+	if payload.ThreadID != "" {
+		if _, ok := c.sessions.Load(payload.ThreadID); ok {
+			return
+		}
+	}
+	block := c.knowledgeIndex.LoadKnowledgeIndex(payload.Channel, payload.UserID, c.directory)
+	if strings.TrimSpace(block) == "" {
+		return
+	}
+	log.Printf("opencode: knowledge index injection for thread %s (%d bytes)", payload.ThreadID, len(block))
+	payload.Content = block + "\n" + payload.Content
+}
+
 // SaveHandoffAndReset is the manual equivalent of triggerSessionHandoff. It is
 // called when the user explicitly runs /new and wants to carry the current
 // session context into the next session.
@@ -5637,6 +6216,28 @@ func (c *Client) triggerSessionHandoff(payload MessagePayload, sessionID string)
 				Adapter:       payload.Channel,
 				UserID:        payload.UserID,
 				LastUserMsg:   lastUserMsg,
+				TurnCount:     len(roles),
+				ToolCallCount: toolCalls,
+			})
+		}
+
+		// Fire the knowledge hook on the same boundary. A handoff is the point
+		// at which a unit of work is finished, which is exactly when durable
+		// facts are worth extracting — and it is a boundary, not a per-message
+		// event, so extraction cannot run on every turn.
+		if hook := c.knowledgeCandidateHook; hook != nil {
+			toolCalls := 0
+			if v, ok := c.toolCallCount.Load(sessionID); ok {
+				if n, ok2 := v.(int); ok2 {
+					toolCalls = n
+				}
+			}
+			hook.OnKnowledgeCandidate(KnowledgeCandidateEvent{
+				Trigger:       KnowledgeTriggerHandoff,
+				ThreadID:      payload.ThreadID,
+				SessionID:     sessionID,
+				Adapter:       payload.Channel,
+				UserID:        payload.UserID,
 				TurnCount:     len(roles),
 				ToolCallCount: toolCalls,
 			})
@@ -6904,154 +7505,6 @@ func (c *Client) AnswerQuestion(ctx context.Context, questionID string, answer s
 	}
 
 	return c.answerNormalQuestion(ctx, q, answer)
-}
-
-func userMemoryKey(channel, userID string) string {
-	return strings.TrimSpace(channel) + ":" + strings.TrimSpace(userID)
-}
-
-func (c *Client) ListUserMemory(channel, userID string, limit int) []UserMemoryFact {
-	key := userMemoryKey(channel, userID)
-	v, ok := c.userMemory.Load(key)
-	if !ok {
-		return nil
-	}
-	facts := append([]UserMemoryFact(nil), v.([]UserMemoryFact)...)
-	sort.SliceStable(facts, func(i, j int) bool {
-		if facts[i].Importance == facts[j].Importance {
-			return i < j
-		}
-		return facts[i].Importance > facts[j].Importance
-	})
-	if limit > 0 && len(facts) > limit {
-		facts = facts[:limit]
-	}
-	return facts
-}
-
-func (c *Client) ClearUserMemory(channel, userID string) error {
-	c.userMemory.Delete(userMemoryKey(channel, userID))
-	return nil
-}
-
-func (c *Client) CompactUserMemory(channel, userID string) (int, error) {
-	key := userMemoryKey(channel, userID)
-	v, ok := c.userMemory.Load(key)
-	if !ok {
-		return 0, nil
-	}
-	items := v.([]UserMemoryFact)
-	seen := make(map[string]struct{}, len(items))
-	compacted := make([]UserMemoryFact, 0, len(items))
-	for _, it := range items {
-		sig := strings.ToLower(strings.TrimSpace(it.Category)) + "|" + strings.TrimSpace(it.Text)
-		if _, exists := seen[sig]; exists {
-			continue
-		}
-		seen[sig] = struct{}{}
-		compacted = append(compacted, it)
-	}
-	removed := len(items) - len(compacted)
-	c.userMemory.Store(key, compacted)
-	return removed, nil
-}
-
-func (c *Client) PinUserMemory(channel, userID, text, category string) error {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return fmt.Errorf("empty memory text")
-	}
-	if strings.TrimSpace(category) == "" {
-		category = "preference"
-	}
-	key := userMemoryKey(channel, userID)
-	var items []UserMemoryFact
-	if v, ok := c.userMemory.Load(key); ok {
-		items = append(items, v.([]UserMemoryFact)...)
-	}
-	items = append(items, UserMemoryFact{Text: text, Category: strings.ToLower(strings.TrimSpace(category)), Importance: 5})
-	c.userMemory.Store(key, items)
-	return nil
-}
-
-func (c *Client) RemoveUserMemoryByRank(channel, userID string, rank int) (bool, error) {
-	if rank <= 0 {
-		return false, nil
-	}
-	key := userMemoryKey(channel, userID)
-	v, ok := c.userMemory.Load(key)
-	if !ok {
-		return false, nil
-	}
-	items := append([]UserMemoryFact(nil), v.([]UserMemoryFact)...)
-	if rank > len(items) {
-		return false, nil
-	}
-	idx := rank - 1
-	items = append(items[:idx], items[idx+1:]...)
-	c.userMemory.Store(key, items)
-	return true, nil
-}
-
-func (c *Client) UnpinUserMemory(channel, userID, keyword string) (int, error) {
-	key := userMemoryKey(channel, userID)
-	v, ok := c.userMemory.Load(key)
-	if !ok {
-		return 0, nil
-	}
-	kw := strings.ToLower(strings.TrimSpace(keyword))
-	items := v.([]UserMemoryFact)
-	filtered := make([]UserMemoryFact, 0, len(items))
-	removed := 0
-	for _, it := range items {
-		if kw != "" && strings.Contains(strings.ToLower(it.Text), kw) {
-			removed++
-			continue
-		}
-		filtered = append(filtered, it)
-	}
-	c.userMemory.Store(key, filtered)
-	return removed, nil
-}
-
-func (c *Client) ExportUserMemory(channel, userID string) (string, error) {
-	facts := c.ListUserMemory(channel, userID, 0)
-	b, err := json.Marshal(facts)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(b), nil
-}
-
-func (c *Client) ImportUserMemory(channel, userID, payload string) (int, error) {
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(payload))
-	if err != nil {
-		return 0, err
-	}
-	var facts []UserMemoryFact
-	if err := json.Unmarshal(raw, &facts); err != nil {
-		return 0, err
-	}
-	c.userMemory.Store(userMemoryKey(channel, userID), facts)
-	return len(facts), nil
-}
-
-func (c *Client) MergeImportUserMemory(channel, userID, payload string) (int, error) {
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(payload))
-	if err != nil {
-		return 0, err
-	}
-	var incoming []UserMemoryFact
-	if err := json.Unmarshal(raw, &incoming); err != nil {
-		return 0, err
-	}
-	key := userMemoryKey(channel, userID)
-	merged := c.ListUserMemory(channel, userID, 0)
-	merged = append(merged, incoming...)
-	c.userMemory.Store(key, merged)
-	_, _ = c.CompactUserMemory(channel, userID)
-	final := c.ListUserMemory(channel, userID, 0)
-	return len(final), nil
 }
 
 // RespondToPermission answers a permission request using the canonical English response.

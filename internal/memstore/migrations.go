@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const archiveSchemaVersion = 5
+const archiveSchemaVersion = 8
 
 // archiveMigrationSteps maps a target schema version to the statements that
 // upgrade the archive from version-1 to that version. Steps are applied in
@@ -20,6 +20,9 @@ var archiveMigrationSteps = map[int][]string{
 	3: archiveMigrationV3,
 	4: archiveMigrationV4,
 	5: archiveMigrationV5,
+	6: archiveMigrationV6,
+	7: archiveMigrationV7,
+	8: archiveMigrationV8,
 }
 
 // UpgradeArchive applies any pending archive migrations to an existing
@@ -186,9 +189,14 @@ var archiveMigrationV2 = []string{
 // archiveMigrationV3 adds the lexical index used by scoped search. Chunk rows
 // live in mem_v2_chunks (created by v1) and their text is mirrored into a
 // standalone FTS5 table keyed by the chunk rowid, so a chunk and its index
-// entry are always addressed by the same integer. The layout deliberately
-// duplicates chunk text: contentless FTS is a space optimization deferred to
-// the compression phase, and correctness comes first.
+// entry are always addressed by the same integer.
+//
+// The layout originally duplicated chunk text, on the reasoning that contentless
+// FTS was a space optimization to be taken later and correctness came first.
+// That deferral was paid off in v7, which converts this table and the word index
+// to contentless. The CREATE below is left exactly as it shipped, because a
+// migration step is a historical record: an archive that stopped at v6 must look
+// the way v3 through v6 built it, and only v7 is allowed to change it.
 var archiveMigrationV3 = []string{
 	`CREATE VIRTUAL TABLE mem_v2_chunk_fts USING fts5(content, tokenize='trigram')`,
 	`CREATE TABLE mem_v2_index_state (
@@ -286,23 +294,196 @@ var archiveMigrationV5 = []string{
 	`CREATE INDEX mem_v2_message_scan ON mem_v2_messages(principal_id, created_at DESC, seq DESC)`,
 }
 
+// archiveMigrationV6 adds the instance lease.
+//
+// The plan requires that "a second gateway targeting the same store must be
+// rejected by an instance lease or supported by tested coordination; do not
+// rely on single-process assumptions silently". Until this table existed the
+// gateway relied on that assumption silently: two processes could open the same
+// archive, each with its own writer queue, and the only thing keeping them
+// apart was that nobody had tried it. SQLite serializes the writes, so the
+// damage would not be corruption; it would be two independent capture
+// pipelines racing to record the same turn, each seeing the other's rows as
+// conflicts, and a WAL checkpointed by whichever process happened to run one.
+//
+// The lease is a single row. A row rather than a lock file because the archive
+// is already the shared resource: a lock file next to it can be deleted, copied
+// with the database, or left behind by a crash, and then the operator has to
+// reason about two sources of truth. A row expires, so a crashed holder does
+// not require manual cleanup.
+var archiveMigrationV6 = []string{
+	`CREATE TABLE mem_v2_instance_lease (
+		id INTEGER PRIMARY KEY CHECK(id = 1),
+		holder TEXT NOT NULL,
+		acquired_at INTEGER NOT NULL,
+		heartbeat_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL)`,
+}
+
+// archiveMigrationV7 makes both full-text indexes contentless.
+//
+// Until this migration the archive stored every message three times: once in
+// mem_v2_blocks, and once in each of the two FTS5 indexes. The v3 comment
+// called that duplication a deliberate deferral — "contentless FTS is a space
+// optimization deferred to the compression phase, and correctness comes first"
+// — and this is that phase.
+//
+// The saving was measured before it was adopted, because the plan asserted for
+// a while that contentless "costs nothing on the read path" and that was never
+// checked. `fts_contentless_ratio_test.go` puts the stored text at 2.24-2.26
+// copies of the chunk text on a conversation-shaped archive, so removing it
+// takes 35.9-37.4% of the archive file. `BenchmarkSearchExcerptReconstruction`
+// puts the read-path cost at 1.13x at 2k messages (8.96 -> 10.16 ms p50) and
+// indistinguishable at 20k (76.9 vs 76.2-78.2 ms), because the reconstruction
+// is bounded by maxSearchCandidates while the ranking work grows with the
+// archive. A fixed ~1.2 ms against a 100 ms target is worth 36% of the file.
+//
+// The rows are copied rather than rebuilt, and that is the decision this
+// migration turns on. Rebuilding would mean dropping both indexes and letting
+// the background backfill refill them, which works for the word index — it
+// already has a resumable backfill and a high-water mark — but not for the
+// trigram index, which has no backfill because until now it was always written
+// synchronously by indexMessage. Dropping it would leave search returning
+// nothing until some new mechanism refilled it, and a migration that silently
+// disables search is worse than one that takes a while. Copying is possible
+// because a contentless table still accepts text at INSERT time; it just does
+// not keep it. So the text is read out of the old table and written into the
+// new one, and the index is complete the moment the transaction commits.
+//
+// The cost is that the transaction holds both copies at once, so upgrading a
+// large archive needs roughly one extra index's worth of free space and WAL.
+// That is a one-time upgrade cost, and it is the price of not having a window
+// where search is broken.
+//
+// The word index is copied as-is rather than reset. It may be partially
+// backfilled, and word_backfill_rowid records how far that got; copying the
+// rows that exist and leaving the mark alone means the backfill resumes exactly
+// where it stopped instead of redoing work it had already finished.
+//
+// What this breaks, and where: `snippet()` and `highlight()` return empty on a
+// contentless table, so the excerpt is reconstructed from the chunk's byte
+// range into the decoded message block. `searchIndex` and `BackfillWordIndex`
+// both used to read `ft.content` and now decode instead. `SpaceReport`'s
+// FTSContentBytes drops to zero, which is the measurement of this migration
+// rather than a regression.
+var archiveMigrationV7 = []string{
+	`CREATE VIRTUAL TABLE mem_v2_chunk_fts_v7 USING fts5(content, content='', contentless_delete=1, tokenize='trigram')`,
+	`INSERT INTO mem_v2_chunk_fts_v7(rowid, content) SELECT rowid, content FROM mem_v2_chunk_fts`,
+	`DROP TABLE mem_v2_chunk_fts`,
+	`ALTER TABLE mem_v2_chunk_fts_v7 RENAME TO mem_v2_chunk_fts`,
+	`CREATE VIRTUAL TABLE mem_v2_chunk_word_fts_v7 USING fts5(content, content='', contentless_delete=1, tokenize='unicode61')`,
+	`INSERT INTO mem_v2_chunk_word_fts_v7(rowid, content) SELECT rowid, content FROM mem_v2_chunk_word_fts`,
+	`DROP TABLE mem_v2_chunk_word_fts`,
+	`ALTER TABLE mem_v2_chunk_word_fts_v7 RENAME TO mem_v2_chunk_word_fts`,
+}
+
+// archiveMigrationV8 adds source-backed durable knowledge.
+//
+// The plan's Phase 5 asks for facts that are derived from captured messages and
+// that can be corrected, forgotten, and audited. Three tables, because the
+// three questions are different and answering them from one table would mean
+// either duplicating evidence or losing it:
+//
+//   - mem_v2_knowledge_facts holds the claim: what kind of statement it is,
+//     the statement itself, its lifecycle status, and which fact superseded it.
+//   - mem_v2_knowledge_evidence holds the provenance: one row per supporting
+//     message. It is a separate table rather than a JSON column on the fact
+//     because deletion has to find facts by message, and a JSON array cannot be
+//     indexed or joined. It also carries principal_id so the "evidence belongs
+//     to the source principal" check is a single-table predicate instead of a
+//     join that a future caller could forget.
+//   - mem_v2_knowledge_jobs holds the extraction queue. It is a separate table
+//     from mem_v2_jobs because that table's uniqueness is (kind, source_id,
+//     source_revision) and its source is a message; a knowledge job's source is
+//     a session or a turn, and reusing the table would mean inventing a kind
+//     whose source_id namespace collides with the index jobs'.
+//
+// Supersession is a column, not a delete. The plan requires that "user
+// corrections supersede old facts" and that corrections are stored "as
+// supersession rather than overwriting historical evidence", so a corrected
+// fact keeps its row, its evidence, and its original statement, and gains a
+// superseded_by pointer. A reader that wants current knowledge filters on
+// superseded_by IS NULL; a reader that wants history does not.
+//
+// The evidence foreign key is deliberately not ON DELETE CASCADE. Scoped
+// deletion removes knowledge rows inside the same transaction that removes the
+// messages (see deleteScopeTx), and a cascade would make that step invisible:
+// the deletion report would count messages and silently drop facts, so an
+// operator could not tell whether the knowledge rows were removed by the
+// deletion or by a cascade they did not know about. An explicit delete also
+// fails loudly if a future code path forgets the ordering, because the writer's
+// connection enables foreign_keys and a violation aborts the transaction
+// instead of quietly succeeding.
+var archiveMigrationV8 = []string{
+	`CREATE TABLE mem_v2_knowledge_facts (
+			id TEXT PRIMARY KEY, principal_id TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK(kind IN ('preference','fact','procedure','constraint','decision')),
+			statement TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('observed','proposed','completed','verified')),
+			scope TEXT NOT NULL CHECK(scope IN ('global','project','session')),
+			project_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0 CHECK(confidence >= 0 AND confidence <= 1),
+			origin TEXT NOT NULL DEFAULT '',
+			redaction_policy TEXT NOT NULL DEFAULT 'none',
+			superseded_by TEXT,
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+			UNIQUE(id, principal_id),
+			FOREIGN KEY(superseded_by, principal_id) REFERENCES mem_v2_knowledge_facts(id, principal_id))`,
+	`CREATE INDEX mem_v2_knowledge_scope ON mem_v2_knowledge_facts(principal_id, scope, project_key, created_at DESC)`,
+	`CREATE INDEX mem_v2_knowledge_current ON mem_v2_knowledge_facts(principal_id, superseded_by, created_at DESC)`,
+	`CREATE TABLE mem_v2_knowledge_evidence (
+			fact_id TEXT NOT NULL, principal_id TEXT NOT NULL, message_id TEXT NOT NULL,
+			ordinal INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(fact_id, message_id),
+			FOREIGN KEY(fact_id, principal_id) REFERENCES mem_v2_knowledge_facts(id, principal_id),
+			FOREIGN KEY(message_id) REFERENCES mem_v2_messages(id))`,
+	`CREATE INDEX mem_v2_knowledge_evidence_message ON mem_v2_knowledge_evidence(message_id)`,
+	`CREATE TABLE mem_v2_knowledge_jobs (
+			id TEXT PRIMARY KEY, principal_id TEXT NOT NULL,
+			source_kind TEXT NOT NULL CHECK(source_kind IN ('session','turn','explicit')),
+			source_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0, lease_until INTEGER NOT NULL DEFAULT 0,
+			next_run_at INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			UNIQUE(principal_id, source_kind, source_id))`,
+	`CREATE INDEX mem_v2_knowledge_jobs_due ON mem_v2_knowledge_jobs(status, next_run_at, lease_until)`,
+}
+
 func checkArchiveSchema(ctx context.Context, db *sql.DB) error {
-	var version int
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM mem_v2_schema`).Scan(&version); err != nil {
+	version, err := archiveSchemaVersionOf(ctx, db)
+	if err != nil {
 		return fmt.Errorf("memstore: archive not initialized; run memory-migrate first: %w", err)
 	}
+	if version == 0 {
+		// Version 0 is the never-migrated archive, which is a different problem
+		// from a version mismatch and has a different remedy, so it keeps its
+		// own message rather than being folded into the skew report below.
+		return fmt.Errorf("memstore: archive not initialized; run memory-migrate first")
+	}
 	if version != archiveSchemaVersion {
-		return fmt.Errorf("memstore: unsupported archive schema %d (want %d)", version, archiveSchemaVersion)
+		// The message names both numbers and the direction, because the two
+		// directions need opposite remedies and the old message ("unsupported
+		// archive schema 7 (want 6)") left the operator to work out which one
+		// they were looking at. A newer archive is the case worth spelling out:
+		// the fix is to upgrade this binary, and downgrading the archive to
+		// satisfy it would discard data the newer binary wrote.
+		status := SchemaStatus{Version: version, Supported: archiveSchemaVersion}
+		if status.Newer() {
+			return fmt.Errorf("memstore: archive schema %s; upgrade this binary instead of downgrading the archive", status)
+		}
+		return fmt.Errorf("memstore: archive schema %s", status)
 	}
 	return nil
 }
 
-// ArchiveSchemaVersion reports the archive schema version of the open database,
-// or 0 when the v2 archive has never been initialized. Callers use it to decide
-// whether v2 retrieval is available before falling back to legacy recall.
-func (s *Store) ArchiveSchemaVersion(ctx context.Context) (int, error) {
+// archiveSchemaVersionOf reads the recorded schema version from a raw
+// connection. It exists so the writer's pre-open check and the Store method
+// below cannot drift apart: both need the same "a missing table means never
+// migrated" rule, and a second copy of that rule is a second place to get it
+// wrong.
+func archiveSchemaVersionOf(ctx context.Context, db *sql.DB) (int, error) {
 	var version int
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM mem_v2_schema`).Scan(&version)
+	err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM mem_v2_schema`).Scan(&version)
 	if err != nil {
 		// A missing table means the archive was never migrated, which is a
 		// normal state for a legacy-only store, not an error.
@@ -314,9 +495,81 @@ func (s *Store) ArchiveSchemaVersion(ctx context.Context) (int, error) {
 	return version, nil
 }
 
+// ArchiveSchemaVersion reports the archive schema version of the open database,
+// or 0 when the v2 archive has never been initialized. Callers use it to decide
+// whether v2 retrieval is available before falling back to legacy recall.
+func (s *Store) ArchiveSchemaVersion(ctx context.Context) (int, error) {
+	return archiveSchemaVersionOf(ctx, s.db)
+}
+
 // SupportsV2Retrieval reports whether the open archive has the tables that
 // scoped search, detail, and scroll depend on.
+//
+// It answers "do the tables exist", not "does this binary understand them". A
+// newer archive still has the tables, so this returns true for it; callers that
+// need to know whether the rows can be trusted must consult SchemaStatus, which
+// is what the MCP server does at startup. Keeping the two questions separate
+// matters because the answer to the first is a fact about the file and the
+// answer to the second is a fact about the binary.
 func (s *Store) SupportsV2Retrieval(ctx context.Context) bool {
 	version, err := s.ArchiveSchemaVersion(ctx)
 	return err == nil && version >= archiveSchemaVersion
+}
+
+// SchemaStatus describes how the open archive's schema relates to the version
+// this binary was built against.
+//
+// It exists because the two can disagree in both directions and the directions
+// are not equally dangerous. An older archive is missing tables and columns, so
+// a query fails loudly and the operator is told to run memory-migrate. A newer
+// archive is the quiet case: every table this binary knows about is still
+// there, so every query succeeds, and the binary then reports a schema it does
+// not actually understand. That is the skew the plan asks for a handshake to
+// catch, and it cannot be caught by a query failing.
+type SchemaStatus struct {
+	// Version is the version recorded in the archive, or 0 when the v2 archive
+	// has never been initialized.
+	Version int
+	// Supported is the version this binary writes and reads.
+	Supported int
+}
+
+// Newer reports that the archive was written by a later binary. Reading it is
+// not safe: a column this binary ignores may have changed meaning, and a
+// constraint it does not know about may already have been violated.
+func (status SchemaStatus) Newer() bool { return status.Version > status.Supported }
+
+// Older reports that the archive predates this binary and needs an explicit
+// upgrade before the writer will open it.
+func (status SchemaStatus) Older() bool {
+	return status.Version > 0 && status.Version < status.Supported
+}
+
+// Exact reports that the archive matches this binary.
+func (status SchemaStatus) Exact() bool { return status.Version == status.Supported }
+
+// String renders the status for a log line or a health report. It names both
+// numbers because "schema: v2" is true of every version from 2 upward and
+// therefore tells an operator nothing about skew.
+func (status SchemaStatus) String() string {
+	switch {
+	case status.Version == 0:
+		return fmt.Sprintf("not migrated (this binary supports version %d)", status.Supported)
+	case status.Newer():
+		return fmt.Sprintf("version %d, newer than this binary's %d", status.Version, status.Supported)
+	case status.Older():
+		return fmt.Sprintf("version %d, older than this binary's %d (run memory-migrate)", status.Version, status.Supported)
+	default:
+		return fmt.Sprintf("version %d", status.Version)
+	}
+}
+
+// SchemaStatus reports the archive's schema version alongside the version this
+// binary supports.
+func (s *Store) SchemaStatus(ctx context.Context) (SchemaStatus, error) {
+	version, err := s.ArchiveSchemaVersion(ctx)
+	if err != nil {
+		return SchemaStatus{}, err
+	}
+	return SchemaStatus{Version: version, Supported: archiveSchemaVersion}, nil
 }

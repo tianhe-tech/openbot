@@ -2,6 +2,7 @@ package memstore
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,25 @@ import (
 )
 
 var _ opencode.ConversationRecorder = (*ArchiveWriter)(nil)
+
+func (writer *ArchiveWriter) RememberKnowledgeFact(ctx context.Context, scope SearchScope, statement string) (KnowledgeFact, error) {
+	principal, err := scope.principal()
+	if err != nil {
+		return KnowledgeFact{}, err
+	}
+	ref, err := writer.BeginTurn(ctx, opencode.TurnInput{
+		Adapter: scope.Adapter, UserID: scope.UserID, ThreadID: "knowledge-control",
+		DeliveryID: "remember:" + rand.Text(), Content: "/remember " + statement,
+	})
+	if err != nil {
+		return KnowledgeFact{}, err
+	}
+	return writer.SaveKnowledgeFact(ctx, KnowledgeFact{
+		PrincipalID: principal, Kind: KnowledgeKindPreference, Statement: statement,
+		Status: KnowledgeStatusVerified, Scope: KnowledgeScopeGlobal, Confidence: 1,
+		Origin: "user", Evidence: []string{archiveID("input", ref.ID)},
+	})
+}
 
 func attemptUserMessageID(attemptID string) string {
 	if strings.HasPrefix(attemptID, "attempt_msg_") {

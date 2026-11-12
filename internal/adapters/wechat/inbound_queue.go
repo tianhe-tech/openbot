@@ -137,6 +137,10 @@ func (q *inboundQueue) Delete(deliveryIDs []string) error {
 
 // List returns persisted messages in arrival order, oldest first.
 func (q *inboundQueue) List(limit int) ([]inboundQueueEntry, error) {
+	return q.listAfter(0, limit)
+}
+
+func (q *inboundQueue) listAfter(after int64, limit int) ([]inboundQueueEntry, error) {
 	if q == nil {
 		return nil, nil
 	}
@@ -145,8 +149,8 @@ func (q *inboundQueue) List(limit int) ([]inboundQueueEntry, error) {
 	}
 	rows, err := q.db.Query(`
 		SELECT id, user_id, chat_id, delivery_id, content, context_token, created_at
-		FROM wechat_inbound_queue ORDER BY id ASC LIMIT ?
-	`, limit)
+		FROM wechat_inbound_queue WHERE id > ? ORDER BY id ASC LIMIT ?
+	`, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("wechat: inbound queue list: %w", err)
 	}
@@ -247,14 +251,22 @@ func replayInboundQueue(ctx context.Context, q *inboundQueue, dispatch func(cont
 	} else if pruned > 0 {
 		log.Printf("wechat: inbound queue pruned %d stale message(s) older than %s", pruned, maxInboundReplayAge)
 	}
-	entries, err := q.List(200)
-	if err != nil {
-		log.Printf("wechat: inbound queue replay list failed: %v", err)
-		return
+	var after int64
+	for ctx.Err() == nil {
+		entries, err := q.listAfter(after, 200)
+		if err != nil {
+			log.Printf("wechat: inbound queue replay list failed: %v", err)
+			return
+		}
+		if len(entries) == 0 {
+			return
+		}
+		after = entries[len(entries)-1].ID
+		replayInboundEntries(ctx, q, entries, dispatch)
 	}
-	if len(entries) == 0 {
-		return
-	}
+}
+
+func replayInboundEntries(ctx context.Context, q *inboundQueue, entries []inboundQueueEntry, dispatch func(context.Context, *WeixinMessage) error) {
 
 	type group struct {
 		userID, chatID, contextToken string
@@ -292,6 +304,9 @@ func replayInboundQueue(ctx context.Context, q *inboundQueue, dispatch func(cont
 		}
 		setMessageText(msg, strings.Join(g.parts, "\n"))
 		if err := dispatch(ctx, msg); err != nil {
+			if errors.Is(err, errInboundDeferred) {
+				continue
+			}
 			log.Printf("wechat: inbound queue replay dispatch failed user=%s: %v (kept for next restart)", g.userID, err)
 			continue
 		}

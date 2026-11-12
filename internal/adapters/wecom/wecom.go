@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -250,6 +251,23 @@ func (h *Handler) dispatch(ctx context.Context, env callbackEnvelope, msg wecomI
 	}
 	if msg.MsgType == "text" && (content == "/status" || content == "状态") {
 		return h.handleStatus(userID)
+	}
+	if msg.MsgType == "text" && (content == "/sessions" || content == "/list") {
+		return h.handleSessions(ctx, userID)
+	}
+	if msg.MsgType == "text" && (content == "/switch" || strings.HasPrefix(content, "/switch ")) {
+		selector := strings.TrimSpace(strings.TrimPrefix(content, "/switch"))
+		return h.handleSwitch(ctx, userID, threadID, selector)
+	}
+	if msg.MsgType == "text" && (content == "/release" || content == "/unclaim" ||
+		strings.HasPrefix(content, "/release ") || strings.HasPrefix(content, "/unclaim ")) {
+		selector := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(content, "/release"), "/unclaim"))
+		return h.handleRelease(ctx, userID, selector)
+	}
+
+	if msg.MsgType == "text" && (content == "/transfer" || strings.HasPrefix(content, "/transfer ")) {
+		args := strings.TrimSpace(strings.TrimPrefix(content, "/transfer"))
+		return h.handleTransfer(ctx, userID, args)
 	}
 	if msg.MsgType == "text" && (content == "/summary" || content == "压缩" || content == "总结") {
 		return h.handleSummary(userID)
@@ -1029,6 +1047,10 @@ func (h *Handler) handleHelp() (string, error) {
 /diff 或 变更      - 查看本次会话的文件变更摘要
 /abort 或 停止     - 中止正在运行的任务
 /status 或 状态    - 查看当前会话状态
+/sessions 或 /list - 列出我的会话
+/switch <序号>     - 切换到指定会话继续
+/release           - 解除 TUI 会话认领（之后可在 TUI 里 /rename）
+/transfer <渠道>   - 把 TUI 会话直接转交到别的渠道（不用回 TUI）
 /summary 或 压缩   - 压缩会话上下文（释放token空间）
 /devcore           - 查看 Dev Core 状态
 /devcore <自然语言偏好> - 直接设置并开启 Dev Core
@@ -1187,6 +1209,222 @@ func (h *Handler) handleStatus(userID string) (string, error) {
 		status += "\n\n— 实时诊断 —\n" + diag
 	}
 	return status, nil
+}
+
+// handleSessions lists the sessions owned by this user and tells them how to
+// resume one. Ownership is filtered by the "[channel:userID]" title prefix, so
+// one user never sees another user's conversations.
+//
+// Each row leads with a derived preview rather than the stored title: the title
+// is "[channel:userID] <threadID>", so what survives prefix stripping is an
+// opaque chat identifier that tells the user nothing about the conversation.
+func (h *Handler) handleSessions(ctx context.Context, userID string) (string, error) {
+	sessions, err := h.client.ListSessionsForUser(ctx, "wecom", userID)
+	if err != nil {
+		return fmt.Sprintf("❌ 获取会话列表失败: %v", err), err
+	}
+
+	if len(sessions) == 0 {
+		return "📝 暂无会话\n\n发送消息即可创建第一个会话", nil
+	}
+
+	// Only the rows that will be rendered need a preview; each one costs a
+	// history fetch, so the bound is applied before deriving them.
+	h.client.FillSessionPreviews(ctx, sessions, base.MaxSessionListRows)
+
+	current, _ := h.adapter.GetSessionForUser(userID)
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString(fmt.Sprintf("📝 我的会话 (%d个，按更新时间排序):\n\n", len(sessions)))
+
+	shown := sessions
+	if len(shown) > base.MaxSessionListRows {
+		shown = shown[:base.MaxSessionListRows]
+	}
+
+	for i, session := range shown {
+		marker := "  "
+		if session.ID == current {
+			marker = "▶ "
+		}
+		label := session.Title
+		if session.Preview != "" {
+			label = session.Preview
+		}
+		msgBuilder.WriteString(fmt.Sprintf("%s%d. %s\n", marker, i+1, label))
+		msgBuilder.WriteString(fmt.Sprintf("     ID: %s\n", session.ID[:min(8, len(session.ID))]))
+		msgBuilder.WriteString(fmt.Sprintf("     更新: %s\n", session.Updated.Format("2006-01-02 15:04")))
+		msgBuilder.WriteString("\n")
+	}
+
+	if len(sessions) > len(shown) {
+		msgBuilder.WriteString(fmt.Sprintf("\n💡 只显示最近%d个会话", len(shown)))
+	}
+	msgBuilder.WriteString("\n💡 发送 /switch <序号> 继续某个会话")
+
+	return msgBuilder.String(), nil
+}
+
+// handleSwitch resumes one of the user's own sessions.
+//
+// It must update both session maps. The adapter's userSessions is what fills
+// MessagePayload.SessionID on the next message, and that field takes precedence
+// over the client's thread→session map, so updating only the client would leave
+// the next message on the old session. Updating only the adapter would leave
+// the client's fallback stale for any caller that omits SessionID.
+func (h *Handler) handleSwitch(ctx context.Context, userID, threadID, selector string) (string, error) {
+	if strings.TrimSpace(selector) == "" {
+		return "❌ 用法: /switch <序号|会话ID前缀>\n\n先发送 /sessions 查看可选的会话", nil
+	}
+
+	targetSession, err := h.client.ResolveUserSession(ctx, "wecom", userID, selector)
+	if err != nil {
+		if errors.Is(err, opencode.ErrSessionNotOwned) {
+			return fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector), nil
+		}
+		return fmt.Sprintf("❌ 切换会话失败: %v", err), err
+	}
+
+	if threadID == "" {
+		threadID = userID
+	}
+	h.client.BindSessionToThread(threadID, targetSession.ID)
+	h.adapter.SwitchUserSession(userID, targetSession.ID)
+
+	// Pause every other claimed session this chat is mirroring, then resume the
+	// target if an earlier /switch paused it. Without the pause, two TUI
+	// sessions adopted into the same chat would keep writing into it at once
+	// and their answers would interleave.
+	suspended := h.client.SuspendClaimedSessionsForUser("wecom", userID, targetSession.ID)
+	resumed := h.client.ResumeClaimedSession(targetSession.ID)
+
+	log.Printf("wecom: /switch user=%s thread=%s -> session=%s", userID, threadID, targetSession.ID[:min(8, len(targetSession.ID))])
+	note := ""
+	if resumed {
+		note += "\n\n▶ 已恢复该会话的 TUI 转发"
+	}
+	if len(suspended) > 0 {
+		note += fmt.Sprintf("\n⏸ 已暂停 %d 个其他认领会话的转发（/switch 切回即可恢复）", len(suspended))
+	}
+	return fmt.Sprintf("✅ 已切换到会话: %s\n\nID: %s\n更新: %s\n\n💡 直接发送消息即可继续该会话的上下文%s",
+		targetSession.Title, targetSession.ID[:min(8, len(targetSession.ID))],
+		targetSession.Updated.Format("2006-01-02 15:04"), note), nil
+}
+
+// handleRelease stops mirroring a claimed TUI session into this chat and strips
+// its "[channel:userID]" title prefix.
+//
+// Stripping the prefix is what makes the release stick. AutoClaimFromTitle keys
+// on that prefix, so leaving it in place would let the next session.updated
+// event re-claim the session immediately. It is also what lets the user /rename
+// the session to a different channel afterwards.
+//
+// A session the gateway created itself is refused: it carries the same prefix
+// but is not in claimedSessions, and stripping its prefix would remove it from
+// ListSessionsForUser — the user would lose it from /sessions.
+func (h *Handler) handleRelease(ctx context.Context, userID, selector string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if strings.TrimSpace(selector) != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "wecom", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				return fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector), nil
+			}
+			return fmt.Sprintf("❌ 解除认领失败: %v", err), err
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		return "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话", nil
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		return fmt.Sprintf("ℹ️ 会话 %s 不是从 TUI 认领的，无需解除\n\n（网关自己创建的会话不能解除，否则会从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))]), nil
+	}
+
+	title, err := h.client.UnclaimSession(ctx, sessionID)
+	if err != nil {
+		return fmt.Sprintf("❌ 解除认领失败: %v", err), err
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that is no longer mirrored here.
+	if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+		h.adapter.ClearSessionForUser(userID)
+	}
+
+	log.Printf("wecom: /release user=%s session=%s", userID, sessionID[:min(8, len(sessionID))])
+	return fmt.Sprintf("✅ 已解除认领\n\nID: %s\n标题: %s\n\n💡 现在可以在 TUI 里 /rename 成别的渠道，例如 [feishu] 原标题",
+		sessionID[:min(8, len(sessionID))], title), nil
+}
+
+// handleTransfer moves a claimed TUI session to another chat channel without
+// going back to the TUI.
+//
+// It is the chat-side equivalent of /rename: the session keeps its history and
+// its ID, only the ownership prefix changes. The heavy lifting (release, title
+// rewrite, re-claim) lives in Client.TransferSession so all four adapters share
+// one implementation.
+//
+// The target user must have sent at least one message to that channel's bot,
+// otherwise the platform has no delivery target for them. That precondition is
+// the same one /rename has, and it cannot be checked from here.
+func (h *Handler) handleTransfer(ctx context.Context, userID, args string) (string, error) {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return "用法: /transfer <渠道>[:<用户ID>] [序号|会话ID前缀]\n\n" +
+			"例如:\n/transfer feishu\n/transfer dingtalk:manager123\n/transfer wechat 2", nil
+	}
+
+	channel, targetUser, _ := strings.Cut(fields[0], ":")
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	targetUser = strings.TrimSpace(targetUser)
+	selector := ""
+	if len(fields) > 1 {
+		selector = fields[1]
+	}
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if selector != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "wecom", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				return fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector), nil
+			}
+			return fmt.Sprintf("❌ 转交失败: %v", err), err
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		return "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话", nil
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		return fmt.Sprintf(
+			"ℹ️ 会话 %s 不是从 TUI 认领的，不能转交\n\n（网关自己创建的会话已经绑定在本渠道，转交会让它从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))]), nil
+	}
+
+	title, err := h.client.TransferSession(ctx, sessionID, channel, targetUser)
+	if err != nil {
+		return fmt.Sprintf("❌ 转交失败: %v", err), err
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that now belongs to another channel.
+	if !h.client.IsClaimedSessionFor(sessionID, "wecom", userID) {
+		if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+			h.adapter.ClearSessionForUser(userID)
+		}
+	}
+
+	log.Printf("wecom: /transfer user=%s session=%s -> %s/%s",
+		userID, sessionID[:min(8, len(sessionID))], channel, targetUser)
+	return fmt.Sprintf("✅ 已转交到 %s\n\nID: %s\n标题: %s\n\n💡 目标用户需要先给 %s 的 bot 发过至少一条消息，否则那边收不到输出",
+		channel, sessionID[:min(8, len(sessionID))], title, channel), nil
 }
 
 func (h *Handler) handleSummary(userID string) (string, error) {

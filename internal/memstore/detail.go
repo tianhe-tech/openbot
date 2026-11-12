@@ -2,12 +2,14 @@ package memstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // Detail and scroll budgets. The budget bounds the response, never the stored
@@ -43,6 +45,18 @@ type DetailResult struct {
 	Truncated  bool            `json:"truncated"`
 	NextCursor string          `json:"next_cursor,omitempty"`
 	Notice     string          `json:"notice,omitempty"`
+}
+
+type detailCursor struct {
+	IDs    []string `json:"ids"`
+	Offset int      `json:"offset"`
+	Scope  string   `json:"scope"`
+	Digest string   `json:"digest,omitempty"`
+}
+
+func encodeDetailCursor(cursor detailCursor) string {
+	encoded, _ := json.Marshal(cursor)
+	return "detail:" + base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 // ScrollResult is one page of adjacent messages.
@@ -87,6 +101,14 @@ func (s *Store) GetMessages(ctx context.Context, scope SearchScope, ids []string
 	if err != nil {
 		return DetailResult{}, err
 	}
+	var continuation detailCursor
+	if len(ids) == 1 && strings.HasPrefix(ids[0], "detail:") {
+		decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(ids[0], "detail:"))
+		if err != nil || json.Unmarshal(decoded, &continuation) != nil || continuation.Offset < 0 || continuation.Scope != scopeFingerprint(scope) {
+			return DetailResult{}, fmt.Errorf("memstore: invalid detail cursor")
+		}
+		ids = continuation.IDs
+	}
 	if len(ids) == 0 {
 		return DetailResult{}, fmt.Errorf("memstore: at least one message ID is required")
 	}
@@ -112,16 +134,29 @@ func (s *Store) GetMessages(ctx context.Context, scope SearchScope, ids []string
 		if err != nil {
 			return DetailResult{}, err
 		}
+		digest := fmt.Sprintf("%x", sha256.Sum256([]byte(detail.Text)))
+		offset := 0
+		if index == 0 {
+			offset = continuation.Offset
+			if offset > len(detail.Text) || (offset < len(detail.Text) && !utf8.RuneStart(detail.Text[offset])) || (offset > 0 && continuation.Digest != digest) {
+				return DetailResult{}, fmt.Errorf("memstore: detail cursor no longer matches message")
+			}
+		}
+		detail.Text = detail.Text[offset:]
 		if remaining <= 0 {
 			result.Truncated = true
-			result.NextCursor = strings.Join(ids[index:], ",")
+			result.NextCursor = encodeDetailCursor(detailCursor{IDs: ids[index:], Scope: scopeFingerprint(scope)})
 			break
 		}
 		if len(detail.Text) > remaining {
-			detail.Text = detail.Text[:alignRuneStart(detail.Text, remaining)]
+			length := alignRuneStart(detail.Text, remaining)
+			if length == 0 && len(result.Messages) == 0 {
+				return DetailResult{}, fmt.Errorf("memstore: detail budget too small for one character")
+			}
+			detail.Text = detail.Text[:length]
 			detail.Truncated = true
 			result.Truncated = true
-			result.NextCursor = strings.Join(ids[index:], ",")
+			result.NextCursor = encodeDetailCursor(detailCursor{IDs: ids[index:], Offset: offset + length, Scope: scopeFingerprint(scope), Digest: digest})
 			result.Messages = append(result.Messages, detail)
 			break
 		}
