@@ -377,6 +377,14 @@ func main() {
 			LongSessionMinTurns: cfg.SkillAutogen.LongSessionMinTurns,
 			CandidateDir:        cfg.SkillAutogen.CandidateDir,
 			InstallDir:          cfg.SkillAutogen.InstallDir,
+			ReferenceSkillPath:  cfg.SkillAutogen.ReferenceSkillPath,
+			ResolveRecipient: func(channel string) (string, bool) {
+				adapter, ok := adapterRegistry.Get(channel)
+				if !ok {
+					return "", false
+				}
+				return adapter.SoleUser()
+			},
 			ApprovalRequired:    cfg.SkillAutogen.ApprovalRequired,
 			MinConfidence:       cfg.SkillAutogen.MinConfidence,
 			MinToolCalls:        cfg.SkillAutogen.MinToolCalls,
@@ -384,15 +392,20 @@ func main() {
 			MaxConsecutiveFails: cfg.SkillAutogen.MaxConsecutiveFails,
 			Cooldown:            cfg.SkillAutogen.Cooldown,
 		}
-		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath, cfg.SkillAutogen.InstallDir)
-		notifier := skillgen.NewRegistryNotifier(adapterRegistry)
-		skillSvc := skillgen.NewService(skillCfg, memDB, ocClient, asyncQueue, drafter, notifier)
-		ocClient.SetSkillCandidateHook(skillSvc)
-		ocClient.AddCommandInterceptor(skillSvc)
-		log.Printf("main: skill autogen enabled (draftModel=%s alternates=%v selfSelect=%t approvalRequired=%t maxPerDay=%d minConfidence=%.2f onHandoff=%t onLongSession=%t longSessionMinTurns=%d)",
-			skillCfg.DraftModel, skillCfg.AlternateModels, skillCfg.ModelSelfSelect,
-			skillCfg.ApprovalRequired, skillCfg.MaxPerDay, skillCfg.MinConfidence,
-			skillCfg.OnHandoff, skillCfg.OnLongSession, skillCfg.LongSessionMinTurns)
+		skillCfg, pathErr := skillgen.ResolveConfig(skillCfg)
+		if pathErr != nil {
+			log.Printf("main: skill autogen disabled: invalid paths: %v", pathErr)
+		} else {
+			drafter := skillgen.NewOpencodeDrafter(ocClient, skillCfg.ReferenceSkillPath, skillCfg.InstallDir)
+			notifier := skillgen.NewRegistryNotifier(adapterRegistry)
+			skillSvc := skillgen.NewService(skillCfg, memDB, ocClient, asyncQueue, drafter, notifier)
+			ocClient.SetSkillCandidateHook(skillSvc)
+			ocClient.AddCommandInterceptor(skillSvc)
+			log.Printf("main: skill autogen enabled (draftModel=%s alternates=%v selfSelect=%t approvalRequired=%t maxPerDay=%d minConfidence=%.2f onHandoff=%t onLongSession=%t longSessionMinTurns=%d)",
+				skillCfg.DraftModel, skillCfg.AlternateModels, skillCfg.ModelSelfSelect,
+				skillCfg.ApprovalRequired, skillCfg.MaxPerDay, skillCfg.MinConfidence,
+				skillCfg.OnHandoff, skillCfg.OnLongSession, skillCfg.LongSessionMinTurns)
+		}
 	} else if cfg.SkillAutogen.Enabled && memDB == nil {
 		log.Printf("main: skill autogen disabled: memory store unavailable")
 	}
@@ -656,6 +669,13 @@ func main() {
 		_, ok := adapterRegistry.Get(channel)
 		return ok
 	})
+	ocClient.SetCronSessionChecker(taskScheduler.IsCronSession)
+
+	// /switch is transactional: the shared logic in internal/opencode decides
+	// what the target needs, and this bridge is the only part that knows how a
+	// channel stores its delivery context. It is injected rather than imported
+	// because internal/opencode must not depend on the adapters.
+	ocClient.SetSessionSwitchRouting(registrySessionRouting{registry: adapterRegistry})
 
 	// Register event handler for OpenCode -> Adapter communication
 	ocClient.RegisterEventHandler(func(ctx context.Context, event *opencodesdk.EventListResponse) error {

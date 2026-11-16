@@ -447,7 +447,7 @@ func TestStreamingFallbackChainReusesSession(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer cancel()
-			_, err := client.SendMessageStreamingWithEvents(ctx, MessagePayload{
+			response, err := client.SendMessageStreamingWithEvents(ctx, MessagePayload{
 				SessionID: sessionID, ThreadID: "thread-chain", Content: "hello", Streaming: true,
 			}, func(string) error { return nil }, func(event StreamEvent) error {
 				if event.Kind == StreamEventError {
@@ -457,6 +457,9 @@ func TestStreamingFallbackChainReusesSession(t *testing.T) {
 			})
 			if err != nil {
 				t.Fatalf("streaming request: %v", err)
+			}
+			if !response.Deferred {
+				t.Fatal("dispatched fallback was reported as a final response")
 			}
 			select {
 			case <-finished:

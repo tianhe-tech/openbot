@@ -219,6 +219,7 @@ func TestNLScheduleServiceUpdateChangesCronAndKeepsIdentity(t *testing.T) {
 		Enabled:     true,
 		AdapterType: "dingtalk",
 		Channel:     "c1",
+		UserID:      "u4",
 		Content:     "检查系统状态",
 	}
 	if err := cron.AddScheduledTask(existing); err != nil {

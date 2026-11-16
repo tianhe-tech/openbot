@@ -155,6 +155,9 @@ func (c *Client) claimSession(ctx context.Context, sessionID, channel, userID, c
 	if session == nil {
 		return "", fmt.Errorf("opencode: claim session: session %s not found", sessionID)
 	}
+	if c.isCronSession(sessionID, session.Title) {
+		return "", fmt.Errorf("opencode: claim session: cron session %s cannot be claimed", sessionID)
+	}
 	if requireTitle {
 		currentChannel, currentUser, valid := parseSessionTitlePrefix(session.Title)
 		if !valid || currentChannel != channel || (currentUser != "" && currentUser != userID) {
@@ -367,6 +370,9 @@ func (c *Client) autoClaimFromSessionUpdated(ctx context.Context, event *opencod
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(probe.Properties.SessionID)
 	}
+	if c.isCronSession(sessionID, probe.Properties.Info.Title) {
+		return false, nil
+	}
 	channel, userID, ok := parseSessionTitlePrefix(probe.Properties.Info.Title)
 	if !ok {
 		return false, nil
@@ -458,6 +464,9 @@ func (c *Client) ClaimSessionFromTitle(ctx context.Context, sessionID string) (b
 		return false, err
 	}
 	if session == nil {
+		return false, nil
+	}
+	if c.isCronSession(sessionID, session.Title) {
 		return false, nil
 	}
 	channel, userID, ok := parseSessionTitlePrefix(session.Title)
@@ -628,6 +637,9 @@ func (c *Client) TransferSession(ctx context.Context, sessionID, channel, userID
 	}
 	if session == nil {
 		return "", fmt.Errorf("opencode: transfer session: session %s not found", sessionID)
+	}
+	if c.isCronSession(sessionID, session.Title) {
+		return "", fmt.Errorf("opencode: transfer session: cron session %s cannot be transferred", sessionID)
 	}
 
 	// Keep the original title text, minus any existing ownership prefix, so a

@@ -70,6 +70,80 @@ func (a *BidirectionalAdapter) GetSessionData(sessionID, key string) (string, bo
 	return "", false
 }
 
+// SessionData returns a copy of a session's platform delivery metadata.
+//
+// The copy matters: the stored map is mutated in place by MapSessionData, so
+// handing out the live map would let a later write silently change a snapshot
+// that a failed /switch is about to restore.
+func (a *BidirectionalAdapter) SessionData(sessionID string) map[string]string {
+	val, ok := a.sessionData.Load(sessionID)
+	if !ok {
+		return nil
+	}
+	data, ok := val.(map[string]string)
+	if !ok || len(data) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(data))
+	for k, v := range data {
+		out[k] = v
+	}
+	return out
+}
+
+// RestoreSessionData replaces a session's delivery metadata with a copy of data.
+// A nil or empty map removes the entry entirely, which is how a snapshot taken
+// before the session had any metadata is put back.
+func (a *BidirectionalAdapter) RestoreSessionData(sessionID string, data map[string]string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	if len(data) == 0 {
+		a.sessionData.Delete(sessionID)
+		return
+	}
+	out := make(map[string]string, len(data))
+	for k, v := range data {
+		out[k] = v
+	}
+	a.sessionData.Store(sessionID, out)
+}
+
+// RestoreUserSession points a user back at a session without touching any
+// per-session data. An empty sessionID clears the user's mapping.
+//
+// This is the compensation half of SwitchUserSession, which deletes the
+// previous session's reverse mapping and metadata. Restoring the user mapping
+// alone is not enough — the caller must also restore the reverse mapping and
+// the metadata — but it must not go through SwitchUserSession to do it, because
+// that would delete the target's data on the way back.
+func (a *BidirectionalAdapter) RestoreUserSession(userID, sessionID string) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		a.userSessions.Delete(userID)
+		return
+	}
+	a.userSessions.Store(userID, sessionID)
+}
+
+// RestoreSessionUser restores the reverse mapping sessionID → userID. An empty
+// userID removes it.
+func (a *BidirectionalAdapter) RestoreSessionUser(sessionID, userID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	if strings.TrimSpace(userID) == "" {
+		a.sessionUsers.Delete(sessionID)
+		return
+	}
+	a.sessionUsers.Store(sessionID, userID)
+}
+
 // GetSessionForUser retrieves the session ID for a user.
 func (a *BidirectionalAdapter) GetSessionForUser(userID string) (string, bool) {
 	if sessionID, ok := a.userSessions.Load(userID); ok {

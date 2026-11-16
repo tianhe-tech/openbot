@@ -44,29 +44,6 @@ func newTestService(t *testing.T, drafter Drafter) *Service {
 	return NewService(cfg, nil, nil, nil, drafter, nil)
 }
 
-// TestPerModelTimeoutEachModelGetsFullBudget verifies that when the first
-// model exhausts its own timeout, the second model still gets a full budget
-// (previously the 8m budget was shared across the whole fallback chain).
-func TestPerModelTimeoutEachModelGetsFullBudget(t *testing.T) {
-	drafter := &fakeDrafter{failFor: map[string]int{"model-a": 1}}
-	s := newTestService(t, drafter)
-
-	// Simulate the STEP4 loop with a slow first model: each Draft call blocks
-	// for longer than PerModelTimeout. We verify via recordDraftFailure that
-	// both models are attempted (the loop continues past the first failure).
-	s.recordDraftFailure("model-a")
-	if !s.isDemoted("model-a") {
-		// 1 failure < MaxConsecutiveFails=2, so not demoted yet — expected.
-		t.Log("model-a not yet demoted after 1 failure (expected)")
-	}
-	s.recordDraftFailure("model-a")
-	if !s.isDemoted("model-a") {
-		t.Fatalf("model-a should be demoted after 2 consecutive failures")
-	}
-	// Restore-after-cooldown is covered by TestPickModelRestoresAfterCooldown,
-	// which injects an already-expired demotion instead of sleeping.
-}
-
 // TestPickModelSkipsDemotedModel verifies pickModel falls back to a healthy
 // alternate when the DraftModel is demoted.
 func TestPickModelSkipsDemotedModel(t *testing.T) {

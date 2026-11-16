@@ -214,7 +214,7 @@ func (s *NLScheduleService) executeIntent(ctx context.Context, req NLScheduleReq
 			AdapterType: req.AdapterType,
 			Channel:     req.Channel,
 			UserID:      req.UserID,
-			ThreadID:    req.Channel,
+			ThreadID:    nonEmpty(req.Channel, req.UserID),
 			Content:     intent.Content,
 			Agent:       intent.Agent,
 			Metadata: map[string]interface{}{

@@ -62,7 +62,8 @@ type Handler struct {
 
 	// outbound is the durable async text queue for streaming event delivery.
 	// It owns pacing, retries, and (via parked entries) offline recovery.
-	outbound *outboundTextQueue
+	outbound        *outboundTextQueue
+	outboundInitErr error
 
 	// inbound is the durable pre-admission buffer for inbound text. It closes
 	// the crash window between iLink acceptance and OpenCode client admission:
@@ -150,7 +151,8 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	statsLogInterval := parseDurationEnv("WECHAT_OUTBOUND_STATS_LOG_SECONDS", defaultStatsLogInterval)
 	outbound, err := newOutboundTextQueue(outboundPath, outboundInterval, outboundMaxLen, h.sendQueuedText)
 	if err != nil {
-		log.Printf("wechat: outbound queue init failed, async streaming will fallback to inline send: %v", err)
+		h.outboundInitErr = err
+		log.Printf("wechat: outbound queue initialization/recovery failed: %v", err)
 	} else {
 		outbound.setStatsLogInterval(statsLogInterval)
 		cfg := outbound.config()
@@ -315,6 +317,9 @@ func (h *Handler) Start(parentCtx context.Context) error {
 		log.Println("wechat: no credentials configured (WECHAT_BOT_TOKEN / WECHAT_BASE_URL), adapter disabled")
 		return nil
 	}
+	if h.outboundInitErr != nil {
+		return fmt.Errorf("wechat: cannot start with unsafe outbound queue state: %w", h.outboundInitErr)
+	}
 
 	if err := h.store.Init(); err != nil {
 		return fmt.Errorf("wechat: init store: %w", err)
@@ -343,6 +348,13 @@ func (h *Handler) Start(parentCtx context.Context) error {
 	ctx, cancel := context.WithCancel(parentCtx)
 	h.cancel = cancel
 	if h.outbound != nil {
+		refreshCtx, refreshCancel := context.WithTimeout(ctx, 15*time.Second)
+		_, err := h.refreshParkedPrompts(refreshCtx, "", "")
+		refreshCancel()
+		if err != nil {
+			// Old notices are already parked; valid bodies can still drain.
+			log.Printf("wechat: pending prompt refresh failed; old prompts remain parked: %v", err)
+		}
 		h.outbound.Start()
 	}
 
@@ -881,10 +893,10 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 		return h.handlePending(userID), true
 	}
 
-	// /recover [session-id-prefix] — re-queue abandoned messages
+	// /recover [session-id-prefix] — recover bodies and refresh actual prompts
 	if text == "/recover" || strings.HasPrefix(text, "/recover ") {
 		sessionFilter := strings.TrimSpace(strings.TrimPrefix(text, "/recover"))
-		return h.handleRecover(userID, sessionFilter), true
+		return h.handleRecover(ctx, userID, sessionFilter), true
 	}
 
 	// /model [provider/model]
@@ -972,7 +984,6 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	var fullReplyMu sync.Mutex
 	var fullReply strings.Builder
 	lastSentLength := 0
-	sessionMapped := sessionID != "" // if we pre-mapped, skip the callback-based mapping
 
 	enqueueBufferedTail := func(eventType string, critical bool) error {
 		fullReplyMu.Lock()
@@ -1011,13 +1022,10 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		// Session mapping. Always intercept ses_* chunks (they are the
 		// session ID sent by client.go's callback) so they never leak into
 		// the accumulated text buffer and get delivered to the user.
-		// If we already mapped proactively (Fix 1), just suppress the chunk.
+		// A background recovery can notify a replacement session here.
 		if strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
-			if !sessionMapped {
-				h.adapter.MapUserToSession(userID, chunk)
-				log.Printf("wechat: mapped user %s to session %s", userID, chunk[:min(8, len(chunk))])
-				sessionMapped = true
-			}
+			h.adapter.MapUserToSession(userID, chunk)
+			log.Printf("wechat: mapped user %s to session %s", userID, chunk)
 			return nil
 		}
 
@@ -1171,16 +1179,14 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 			log.Printf("wechat: ⚠️ final enqueue failed user=%s: %v", userID, sendErr)
 		}
 	} else if len(accumulatedContent) == 0 {
-		// No content was streamed; use the synchronous reply if available.
-		if strings.TrimSpace(response.Reply) != "" {
-			if sendErr := h.enqueueAsyncText(userID, sessionID, ctxToken, "sync_reply", stripDSMLMarkup(response.Reply), true); sendErr != nil {
-				log.Printf("wechat: ⚠️ sync-reply enqueue failed user=%s: %v", userID, sendErr)
-			}
-		} else if len(mediaPaths) == 0 {
-			_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "done", "✅ 处理完成", true)
+		if sendErr := h.enqueueUnstreamedResponse(userID, sessionID, ctxToken, response, len(mediaPaths) > 0); sendErr != nil {
+			log.Printf("wechat: response enqueue failed user=%s: %v", userID, sendErr)
 		}
 	} else {
 		log.Printf("wechat: all content already sent (%d bytes)", len(accumulatedContent))
+	}
+	if response.Deferred {
+		log.Printf("wechat: delivery deferred to background retry user=%s session=%s", userID, response.SessionID)
 	}
 
 	// Send media files detected via MEDIA: directives
@@ -1448,12 +1454,22 @@ func (h *Handler) sendCommandReply(userID, text, ctxToken string) {
 	}
 }
 
+func (h *Handler) enqueueUnstreamedResponse(userID, sessionID, ctxToken string, response opencode.Response, hasMedia bool) error {
+	if strings.TrimSpace(response.Reply) != "" {
+		return h.enqueueAsyncText(userID, sessionID, ctxToken, "sync_reply", stripDSMLMarkup(response.Reply), true)
+	}
+	if !response.Deferred && !hasMedia {
+		return h.enqueueAsyncText(userID, sessionID, ctxToken, "done", "✅ 处理完成", true)
+	}
+	return nil
+}
+
 func (h *Handler) enqueueAsyncText(userID, sessionID, ctxToken, eventType, text string, critical bool) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	if h.outbound == nil {
-		// Queue not available (rare: init failed at startup) — send directly.
+		// Direct delivery is retained for callers without a durable queue.
 		h.trackSentText(userID, text)
 		return h.weClient.SendText(userID, text, ctxToken)
 	}
@@ -1583,7 +1599,10 @@ func (h *Handler) handlePending(userID string) string {
 	if h.outbound == nil {
 		return "ℹ️ 队列未启用"
 	}
-	entries := h.outbound.ListParked(userID)
+	entries, err := h.outbound.ListParked(userID)
+	if err != nil {
+		return fmt.Sprintf("❌ 查询失败: %v", err)
+	}
 	if len(entries) == 0 {
 		return "ℹ️ 没有未送达的旧会话回复"
 	}
@@ -1594,34 +1613,113 @@ func (h *Handler) handlePending(userID string) string {
 		if len(sid) > 8 {
 			sid = sid[:8]
 		}
-		preview := e.Content
+		preview := []rune(e.Content)
 		if len(preview) > 60 {
-			preview = preview[:60] + "..."
+			preview = append(preview[:60], []rune("...")...)
 		}
-		b.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, sid, preview))
+		status := "可恢复正文"
+		if !isRecoverableBody(e.EventType) {
+			status = "旧通知，不重放"
+		}
+		b.WriteString(fmt.Sprintf("%d. [%s] [%s] %s\n", i+1, sid, status, string(preview)))
 	}
-	b.WriteString("\n发送 /recover 重新送达全部，或 /recover <session-id前缀> 送达指定会话的回复")
+	b.WriteString("\n发送 /recover 恢复正文，或 /recover <session-id前缀> 恢复指定会话正文。旧完成/系统通知不重放；确认提示从服务端当前待回答状态重新生成。")
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (h *Handler) handleRecover(userID, sessionFilter string) string {
+func (h *Handler) handleRecover(ctx context.Context, userID, sessionFilter string) string {
 	if h.outbound == nil {
 		return "ℹ️ 队列未启用"
 	}
-	n, err := h.outbound.RecoverParked(userID, sessionFilter)
+	result, err := h.outbound.RecoverParked(userID, sessionFilter)
 	if err != nil {
 		return fmt.Sprintf("❌ 恢复失败: %v", err)
 	}
-	if n == 0 {
-		return "ℹ️ 没有找到可恢复的回复"
+	reply := fmt.Sprintf("✅ 已恢复 %d 条正文，投递窗口为 24 小时。\n已排除：旧完成提示 %d 条、旧确认提示 %d 条、其他系统/进度通知 %d 条。",
+		result.Recovered, result.SkippedDone, result.SkippedPrompts, result.SkippedOther)
+	refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	refreshed, err := h.refreshParkedPrompts(refreshCtx, userID, sessionFilter)
+	if err != nil {
+		return reply + fmt.Sprintf("\n⚠️ 当前确认提示核验失败，旧提示保持停放：%v", err)
 	}
-	return fmt.Sprintf("✅ 已恢复 %d 条回复，正在通过队列送达...", n)
+	return reply + fmt.Sprintf("\n已根据服务端当前待回答状态重新生成 %d 条确认提示。", refreshed)
+}
+
+func isRecoverableBody(eventType string) bool {
+	switch eventType {
+	case "final", "flush", "error_partial", "sync_reply":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) refreshParkedPrompts(ctx context.Context, userFilter, sessionFilter string) (int, error) {
+	targets, err := h.outbound.parkedPromptTargets(userFilter, sessionFilter)
+	if err != nil || len(targets) == 0 {
+		return 0, err
+	}
+	verified := make([]outboundPromptTarget, 0, len(targets))
+	sessionIDs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		session, err := h.client.ResolveUserSession(ctx, "wechat", target.UserID, target.SessionID)
+		if errors.Is(err, opencode.ErrSessionNotOwned) {
+			log.Printf("wechat: skipped old prompt for session no longer owned by recipient user=%s session=%s",
+				target.UserID, target.SessionID)
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("wechat: verify prompt recipient user=%s session=%s: %w", target.UserID, target.SessionID, err)
+		}
+		if session.ID != target.SessionID {
+			return 0, fmt.Errorf("wechat: prompt recipient requires an exact session match: %s", target.SessionID)
+		}
+		verified = append(verified, target)
+		sessionIDs = append(sessionIDs, target.SessionID)
+	}
+	if len(verified) == 0 {
+		return 0, nil
+	}
+	prompts, err := h.client.RefreshPendingPrompts(ctx, sessionIDs)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, target := range verified {
+		var next *opencode.Question
+		for _, prompt := range prompts {
+			if prompt.SessionID == target.SessionID {
+				if next == nil || prompt.CreatedAt.Before(next.CreatedAt) {
+					next = prompt
+				}
+			}
+		}
+		if next == nil {
+			continue
+		}
+		msg := formatQuestionPrompt(next)
+		if next.IsPermission {
+			msg = formatPermissionPrompt(next)
+		}
+		// Never silently change the user's current session to an old one.
+		if current, ok := h.adapter.GetSessionForUser(target.UserID); !ok || current != target.SessionID {
+			msg = fmt.Sprintf("会话 %s 有待回答请求，请先发送 /switch %s 再回复。\n\n%s",
+				target.SessionID, target.SessionID, msg)
+		}
+		if err := h.enqueueAsyncText(target.UserID, target.SessionID, target.ContextToken, "question", msg, true); err != nil {
+			return count, fmt.Errorf("wechat: enqueue current prompt user=%s session=%s request=%s: %w",
+				target.UserID, target.SessionID, next.ID, err)
+		}
+		count++
+	}
+	return count, nil
 }
 
 func (h *Handler) handleNewSession(ctx context.Context, userID, chatID string) string {
 	// Clear pending outbound messages from the previous session.
 	// PriorityNormal entries (AI replies, todo progress) are marked parked=1
-	// so the user can recover them via /pending /recover. PriorityHigh
+	// for inspection via /pending and body recovery via /recover. PriorityHigh
 	// (question/permission) and PriorityLow (skippable progress) are discarded.
 	if h.outbound != nil {
 		h.outbound.ClearForUser(userID)
@@ -1840,48 +1938,30 @@ func (h *Handler) handleSessions(ctx context.Context, userID string) string {
 
 // handleSwitch resumes one of the user's own sessions.
 //
-// It must update both session maps. The adapter's userSessions is what fills
-// MessagePayload.SessionID on the next message, and that field takes precedence
-// over the client's thread→session map, so updating only the client would leave
-// the next message on the old session. Updating only the adapter would leave
-// the client's fallback stale for any caller that omits SessionID.
+// The switch itself is transactional and shared with the other channels
+// (opencode.Client.SwitchSession): it updates both session maps, pauses the
+// other claims this chat is mirroring, and restores a claim when the target was
+// adopted from the TUI. Doing that here by hand is what used to leave a failed
+// switch reporting success while the chat pointed at a session whose delivery
+// metadata had already been deleted.
+//
+// WeChat stores no per-session delivery context — SendMessage only needs the
+// user ID — so ChannelData is empty.
 func (h *Handler) handleSwitch(ctx context.Context, userID, chatID, selector string) string {
 	if strings.TrimSpace(selector) == "" {
 		return "❌ 用法: /switch <序号|会话ID前缀>\n\n先发送 /sessions 查看可选的会话"
 	}
 
-	target, err := h.client.ResolveUserSession(ctx, "wechat", userID, selector)
+	result, err := h.client.SwitchSession(ctx, opencode.SessionSwitchRequest{
+		Channel:  "wechat",
+		UserID:   userID,
+		ThreadID: chatID,
+		Selector: selector,
+	})
 	if err != nil {
-		if errors.Is(err, opencode.ErrSessionNotOwned) {
-			return fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector)
-		}
-		return fmt.Sprintf("❌ 切换会话失败: %v", err)
+		return opencode.SwitchFailureMessage(selector, err)
 	}
-
-	threadID := chatID
-	if threadID == "" {
-		threadID = userID
-	}
-	h.client.BindSessionToThread(threadID, target.ID)
-	h.adapter.SwitchUserSession(userID, target.ID)
-
-	// Pause every other claimed session this chat is mirroring, then resume the
-	// target if an earlier /switch paused it. Without the pause, two TUI
-	// sessions adopted into the same chat would keep writing into it at once
-	// and their answers would interleave.
-	suspended := h.client.SuspendClaimedSessionsForUser("wechat", userID, target.ID)
-	resumed := h.client.ResumeClaimedSession(target.ID)
-
-	log.Printf("wechat: /switch user=%s thread=%s -> session=%s", userID, threadID, target.ID[:min(8, len(target.ID))])
-	note := ""
-	if resumed {
-		note += "\n\n▶ 已恢复该会话的 TUI 转发"
-	}
-	if len(suspended) > 0 {
-		note += fmt.Sprintf("\n⏸ 已暂停 %d 个其他认领会话的转发（/switch 切回即可恢复）", len(suspended))
-	}
-	return fmt.Sprintf("✅ 已切换到会话: %s\n\nID: %s\n更新: %s\n\n💡 直接发送消息即可继续该会话的上下文%s",
-		target.Title, target.ID[:min(8, len(target.ID))], target.Updated.Format("2006-01-02 15:04"), note)
+	return result.Message()
 }
 
 // handleRelease stops mirroring a claimed TUI session into this chat and strips

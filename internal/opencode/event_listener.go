@@ -99,6 +99,7 @@ type StreamingSessionHandler struct {
 	fallbackRetryAttempted  bool
 	fallbackRetryDispatched bool
 	failedTurn              bool
+	terminalErr             error
 	cleanupDone             chan struct{}
 	cleanupDoneOnce         sync.Once
 
@@ -424,7 +425,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				// 每次都发一个 type=="retry" 的 part。这类 part 永远不会触发
 				// session.idle，若不拦截会导致会话一直"正在处理中"。
 				if partMeta2.Properties.Part.Type == "retry" {
+					s.mu.Unlock()
 					s.handleRetryPart(jsonData)
+					s.mu.Lock()
+					return nil
 				}
 				if partMeta2.Properties.Part.Type == "tool" {
 					s.toolObserved = true
@@ -501,6 +505,19 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
 	case "question.asked", "permission.asked":
+		if s.payload.ForegroundOnly {
+			question, msg := s.extractQuestionFromEvent(event)
+			s.terminalErr = fmt.Errorf("%w: session=%s event=%s", ErrForegroundInteractionRequired, s.sessionID, eventType)
+			s.failedTurn = true
+			s.completed = true
+			kind := StreamEventQuestionAsked
+			if eventType == "permission.asked" {
+				kind = StreamEventPermissionAsked
+			}
+			s.emitEvent(kind, msg, question, nil, nil, eventType)
+			s.notifyCompletion()
+			return nil
+		}
 		// OpenCode 需要用户确认（build 模式或权限请求）
 		// ⚠️ 不再设置 waitingForResponse，以免阻止后续事件处理
 		// s.waitingForResponse = true // 注释掉，让事件继续流动
@@ -616,6 +633,13 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		rawJSON := event.JSON.RawJSON()
 		log.Printf("opencode: 🔴 session.error RAW JSON: %s", rawJSON)
 		errorMsg := s.extractSessionError(event)
+		if s.payload.ForegroundOnly {
+			s.terminalErr = fmt.Errorf("opencode: foreground session %s failed: %s", s.sessionID, errorMsg)
+			s.completed = true
+			s.emitEvent(StreamEventError, errorMsg, nil, nil, nil, eventType)
+			s.notifyCompletion()
+			return nil
+		}
 		log.Printf("opencode: 🔴 session.error extracted message: %q", errorMsg)
 		if model := missingModelFromError(errorMsg); model != nil {
 			s.lastModelUsed = model
@@ -1784,6 +1808,15 @@ func (s *StreamingSessionHandler) handleRetryPart(rawJSON string) {
 	if reachedLimit && !alreadySurfaced {
 		s.retrySurfaced = true
 		s.failedTurn = true
+	}
+	if s.payload.ForegroundOnly && reachedLimit && !alreadySurfaced {
+		s.terminalErr = fmt.Errorf("opencode: foreground provider retry limit reached: session=%s attempts=%d: %s",
+			s.sessionID, curAttempt, curMsg)
+		s.completed = true
+		s.emitEvent(StreamEventError, curMsg, nil, nil, nil, "retry")
+		s.notifyCompletion()
+		s.mu.Unlock()
+		return
 	}
 	s.mu.Unlock()
 

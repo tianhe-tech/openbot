@@ -607,6 +607,12 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// 使用独立的 context，避免被飞书 SDK 的事件处理超时影响
 	sendCtx, sendCancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer sendCancel()
+	sendStreamText := func(text string) error {
+		deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(sendCtx), time.Minute)
+		defer cancel()
+		return h.sendTextChunks(deliveryCtx, target, text)
+	}
+	var deliveryMu sync.Mutex
 
 	// 中间更新追踪（与 DingTalk 适配器保持一致，流式发送避免最终消息丢失）
 	var lastSentLength int
@@ -633,6 +639,8 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	retryMetadata := map[string]string{}
 
 	callback := func(chunk string) error {
+		deliveryMu.Lock()
+		defer deliveryMu.Unlock()
 		raw := chunk
 		trimmed := strings.TrimSpace(chunk)
 		if h.isTokenOverflowErrorText(trimmed) {
@@ -657,15 +665,15 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			switch h.getTokenOverflowPolicy(msg.UserID) {
 			case feishuOverflowPolicySummary:
 				h.storeTokenOverflowPending(msg.UserID, state)
-				_ = h.sendTextChunks(sendCtx, target, "⚠️ 检测到上下文超限，已按偏好自动执行“压缩并继续”，请稍候...")
+				_ = sendStreamText("⚠️ 检测到上下文超限，已按偏好自动执行“压缩并继续”，请稍候...")
 				go h.executeTokenOverflowDecision(context.Background(), msg.UserID, "summary")
 			case feishuOverflowPolicyNew:
 				h.storeTokenOverflowPending(msg.UserID, state)
-				_ = h.sendTextChunks(sendCtx, target, "⚠️ 检测到上下文超限，已按偏好自动执行“新会话并继续”，请稍候...")
+				_ = sendStreamText("⚠️ 检测到上下文超限，已按偏好自动执行“新会话并继续”，请稍候...")
 				go h.executeTokenOverflowDecision(context.Background(), msg.UserID, "new")
 			default:
 				h.storeTokenOverflowPending(msg.UserID, state)
-				_ = h.sendTextChunks(sendCtx, target, h.buildTokenOverflowPrompt())
+				_ = sendStreamText(h.buildTokenOverflowPrompt())
 			}
 			return nil
 		}
@@ -687,7 +695,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if toolMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, toolMsg); err != nil {
+			if err := sendStreamText(toolMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send tool message: %v", err)
 				return err
 			}
@@ -699,7 +707,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if stepMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, stepMsg); err != nil {
+			if err := sendStreamText(stepMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send step message: %v", err)
 				return err
 			}
@@ -711,7 +719,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if todoMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, todoMsg); err != nil {
+			if err := sendStreamText(todoMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send todo progress: %v", err)
 				return err
 			}
@@ -722,7 +730,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if qMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, qMsg); err != nil {
+			if err := sendStreamText(qMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send question/permission message: %v", err)
 				return err
 			}
@@ -740,7 +748,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 			if thinkingMsg != "" {
 				log.Printf("feishu: 📤 flush signal: sending thinking block (%d bytes)", len(thinkingMsg))
-				if err := h.sendTextChunks(sendCtx, target, thinkingMsg); err != nil {
+				if err := sendStreamText(thinkingMsg); err != nil {
 					log.Printf("feishu: ⚠️ flush thinking send failed: %v", err)
 				} else {
 					fullReplyMu.Lock()
@@ -755,7 +763,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			fullReplyMu.Unlock()
 			if len(toSend) > 0 {
 				log.Printf("feishu: 📤 flush signal: sending final %d bytes", len(toSend))
-				if err := h.sendTextChunks(sendCtx, target, toSend); err != nil {
+				if err := sendStreamText(toSend); err != nil {
 					log.Printf("feishu: ⚠️ flush send failed: %v", err)
 					// don't update lastSentLength; safety-net final send will retry
 				} else {
@@ -773,11 +781,13 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		}
 		if strings.HasPrefix(trimmed, "ses_") && len(trimmed) < 100 {
 			h.adapter.MapUserToSession(msg.UserID, trimmed)
+			h.adapter.MapSessionData(trimmed, "receive_id", target.receiveID)
+			h.adapter.MapSessionData(trimmed, "receive_id_type", target.receiveIDType)
 			return nil
 		}
 		if isImmediateChunk(trimmed) {
 			log.Printf("feishu: 📤 sending immediate message: %s", trimmed[:min(50, len(trimmed))])
-			if err := h.sendTextChunks(sendCtx, target, raw); err != nil {
+			if err := sendStreamText(raw); err != nil {
 				log.Printf("feishu: ⚠️ failed to send immediate message: %v", err)
 				// 发送失败时的处理：
 				// - 对于"正在处理中"提示：只返回error保持waiting timer活跃，不加入fullReply（避免污染最终内容）
@@ -812,7 +822,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 		if shouldSend {
 			log.Printf("feishu: 📤 sending intermediate update (%d new chars, interval: %s)", newContentLen, timeSinceLastUpdate)
-			if err := h.sendTextChunks(sendCtx, target, toSend); err != nil {
+			if err := sendStreamText(toSend); err != nil {
 				log.Printf("feishu: ⚠️ failed to send intermediate update: %v", err)
 				// 发送失败不中断流，下次会重试（包含这部分内容）
 			} else {
@@ -904,13 +914,15 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		}
 	}
 
+	deliveryMu.Lock()
+	defer deliveryMu.Unlock()
 	if err != nil {
 		errMsg := fmt.Sprintf("❌ 处理失败: %v", err)
 		_ = h.sendTextChunks(sendCtx, target, errMsg)
 		return "", err
 	}
 
-	if response.SessionID != "" {
+	if response.SessionID != "" && !response.Deferred {
 		h.adapter.MapUserToSession(msg.UserID, response.SessionID)
 		h.adapter.MapSessionData(response.SessionID, "receive_id", target.receiveID)
 		h.adapter.MapSessionData(response.SessionID, "receive_id_type", target.receiveIDType)
@@ -967,6 +979,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			}
 			log.Printf("feishu: ✅ sent final message to user %s (%d bytes total, %d new)",
 				userLabel, len(accumulatedContent), len(unsentContent))
+			fullReplyMu.Lock()
+			lastSentLength = len(accumulatedContent)
+			fullReplyMu.Unlock()
+		} else if response.Deferred {
+			log.Printf("feishu: delivery deferred to background retry user=%s session=%s", msg.UserID, response.SessionID)
 		} else if len(accumulatedContent) == 0 {
 			// No accumulated content (might be interactive task like permission request)
 			log.Printf("feishu: async mode completed for user %s with no accumulated content", userLabel)
@@ -980,7 +997,10 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	if response.Reply != "" {
 		return response.Reply, nil
 	}
-	return fullReply.String(), nil
+	fullReplyMu.Lock()
+	sentContent := fullReply.String()
+	fullReplyMu.Unlock()
+	return sentContent, nil
 }
 
 func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
@@ -2133,6 +2153,24 @@ type chatTarget struct {
 	receiveIDType string
 }
 
+// sessionData renders the target as the per-session delivery metadata Feishu
+// stores elsewhere in this file ("receive_id"/"receive_id_type").
+//
+// It exists so /switch records the same keys the inbound path records. Passing
+// the chat target as a single opaque string is what previously made the claimed
+// session sender hand Feishu an adapter name where it expected a
+// receive_id_type.
+func (t chatTarget) sessionData() map[string]string {
+	data := make(map[string]string, 2)
+	if t.receiveID != "" {
+		data["receive_id"] = t.receiveID
+	}
+	if t.receiveIDType != "" {
+		data["receive_id_type"] = t.receiveIDType
+	}
+	return data
+}
+
 type incomingMessage struct {
 	UserID         string
 	ChatID         string
@@ -2781,52 +2819,37 @@ func (h *Handler) handleListSessions(ctx context.Context, target chatTarget, use
 
 // handleSwitch resumes one of the user's own sessions.
 //
-// It must update both session maps. The adapter's userSessions is what fills
-// MessagePayload.SessionID on the next message, and that field takes precedence
-// over the client's thread→session map, so updating only the client would leave
-// the next message on the old session. Updating only the adapter would leave
-// the client's fallback stale for any caller that omits SessionID.
+// The switch itself is transactional and shared with the other channels
+// (opencode.Client.SwitchSession): it updates both session maps, pauses the
+// other claims this chat is mirroring, and restores a claim when the target was
+// adopted from the TUI. Doing that here by hand is what used to leave a failed
+// switch reporting success while the chat pointed at a session whose delivery
+// metadata had already been deleted.
+//
+// Feishu's delivery context is the receive_id/receive_id_type pair of the
+// message that asked for the switch, so a restored claim can reply into the
+// same chat instead of guessing from per-user state.
 func (h *Handler) handleSwitch(ctx context.Context, target chatTarget, userID, threadID, selector string) (string, error) {
 	if strings.TrimSpace(selector) == "" {
 		_ = h.sendTextChunks(ctx, target, "❌ 用法: /switch <序号|会话ID前缀>\n\n先发送 /sessions 查看可选的会话")
 		return "handled", nil
 	}
 
-	targetSession, err := h.client.ResolveUserSession(ctx, "feishu", userID, selector)
+	result, err := h.client.SwitchSession(ctx, opencode.SessionSwitchRequest{
+		Channel:     "feishu",
+		UserID:      userID,
+		ThreadID:    threadID,
+		Selector:    selector,
+		ChannelData: target.sessionData(),
+	})
 	if err != nil {
-		if errors.Is(err, opencode.ErrSessionNotOwned) {
-			_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector))
+		_ = h.sendTextChunks(ctx, target, opencode.SwitchFailureMessage(selector, err))
+		if errors.Is(err, opencode.ErrSessionNotOwned) || errors.Is(err, opencode.ErrSessionBusy) {
 			return "handled", nil
 		}
-		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 切换会话失败: %v", err))
 		return "", err
 	}
-
-	if threadID == "" {
-		threadID = userID
-	}
-	h.client.BindSessionToThread(threadID, targetSession.ID)
-	h.adapter.SwitchUserSession(userID, targetSession.ID)
-
-	// Pause every other claimed session this chat is mirroring, then resume the
-	// target if an earlier /switch paused it. Without the pause, two TUI
-	// sessions adopted into the same chat would keep writing into it at once
-	// and their answers would interleave.
-	suspended := h.client.SuspendClaimedSessionsForUser("feishu", userID, targetSession.ID)
-	resumed := h.client.ResumeClaimedSession(targetSession.ID)
-
-	log.Printf("feishu: /switch user=%s thread=%s -> session=%s", userID, threadID, targetSession.ID[:min(8, len(targetSession.ID))])
-	note := ""
-	if resumed {
-		note += "\n\n▶ 已恢复该会话的 TUI 转发"
-	}
-	if len(suspended) > 0 {
-		note += fmt.Sprintf("\n⏸ 已暂停 %d 个其他认领会话的转发（/switch 切回即可恢复）", len(suspended))
-	}
-	_ = h.sendTextChunks(ctx, target, fmt.Sprintf(
-		"✅ 已切换到会话: %s\n\nID: %s\n更新: %s\n\n💡 直接发送消息即可继续该会话的上下文%s",
-		targetSession.Title, targetSession.ID[:min(8, len(targetSession.ID))],
-		targetSession.Updated.Format("2006-01-02 15:04"), note))
+	_ = h.sendTextChunks(ctx, target, result.Message())
 	return "handled", nil
 }
 
@@ -3961,6 +3984,7 @@ func (h *Handler) handleCronTaskAdd(ctx context.Context, target chatTarget, user
 		AdapterType: "feishu",
 		UserID:      userID,
 		ThreadID:    target.receiveID,
+		Channel:     target.receiveID,
 		Content:     taskContent,
 		Agent:       agent,
 		Metadata: map[string]interface{}{

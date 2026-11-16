@@ -198,6 +198,7 @@ func parseIntEnv(key string, def int) int {
 
 // Response represents the minimal data we expect back from OpenCode.
 type Response struct {
+	Deferred  bool                   `json:"deferred,omitempty"`
 	Reply     string                 `json:"reply"`
 	Trace     string                 `json:"trace_id"`
 	SessionID string                 `json:"session_id"`
@@ -214,9 +215,10 @@ type Attachment struct {
 
 // MessagePayload collects the metadata adapters send to OpenCode.
 type MessagePayload struct {
-	OnCaptureCommitted      func()  `json:"-"`
-	DeliveryID              string  `json:"delivery_id,omitempty"`
-	OriginalContent         *string `json:"original_content,omitempty"`
+	OnSessionResolved       func(context.Context, string) error `json:"-"`
+	OnCaptureCommitted      func()                              `json:"-"`
+	DeliveryID              string                              `json:"delivery_id,omitempty"`
+	OriginalContent         *string                             `json:"original_content,omitempty"`
 	capture                 *TurnRef
 	captureState            *captureTurnState
 	Internal                bool              `json:"internal,omitempty"`
@@ -228,11 +230,13 @@ type MessagePayload struct {
 	Content                 string            `json:"content"`
 	Agent                   string            `json:"agent,omitempty"`     // 可选：指定使用的agent/skill名称
 	Streaming               bool              `json:"streaming,omitempty"` // 是否使用流式返回
+	ForegroundOnly          bool              `json:"-"`
 	Attachments             []Attachment      `json:"attachments,omitempty"`
 	Metadata                map[string]string `json:"metadata,omitempty"`
 	Model                   string            `json:"model,omitempty"` // 可选：指定模型 (格式 provider/model，如 tianhe-ai/GLM-5.2)，留空则由 selectModelOverride 决定
 	fallbackAttemptedModels map[string]struct{}
 	fallbackReady           <-chan struct{}
+	resolvedSessionID       string
 }
 
 // StreamCallback defines a callback for streaming responses.
@@ -432,47 +436,52 @@ func (q *Question) IsValidAnswer(input string) bool {
 
 // Client knows how to talk to the remote OpenCode service using the official SDK.
 type Client struct {
-	sdk              *opencode.Client
-	endpoint         string
-	apiKey           string
-	httpClient       *http.Client
-	sseClient        *http.Client // 专用于 SSE 长连接，不设超时（http.Client.Timeout 对流式响应是总时长限制）
-	eventHandlers    []EventHandler
-	eventListenerMu  sync.RWMutex
-	sessionHandlers  sync.Map     // map[sessionID]EventHandler for fast lookup
-	messageToSession sync.Map     // map[messageID]sessionID for events with only messageID
-	messageRoles     sync.Map     // map[messageID]role("user"/"assistant")
-	sessionMu        sync.RWMutex // 用于保护 session 相关操作
-	sessions         sync.Map     // map[threadID]sessionID
-	sessionLocks     sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
-	sessionsMu       sync.RWMutex // 保护 sessions 的读写
-	messageCount     sync.Map     // map[sessionID]int tracks messages per session
-	toolCallCount    sync.Map     // map[sessionID]int tracks completed tool calls per session
-	tokenCount       sync.Map     // map[sessionID]int tracks estimated tokens per session
-	sessionSummary   sync.Map     // map[sessionID]string stores session summaries
-	sessionPreviews  sync.Map     // map[sessionID]string caches the derived /sessions preview
-	modelConfig      sync.Map     // map[sessionID]*ModelConfig caches model config per session
-	requestCache     sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
-	runningSessions  sync.Map     // map[sessionID]bool 跟踪正在运行的session
-	pendingQuestions sync.Map     // map[questionID]*Question 待回答的问题
-	todoCache        sync.Map     // map[sessionID][]TodoItem
-	diffCache        sync.Map     // map[sessionID][]FileDiff
-	directory        string
-	timeout          time.Duration // 默认超时时间
-	retryConfig      RetryConfig   // 重试配置
-	devCoreEnabled   bool          // 是否启用开发助手内核提示词注入
-	devCorePrompt    string        // 开发助手内核提示词
-	enableSkillHint  bool          // 是否在消息中添加skill提示
-	skillHintCache   []string      // 缓存的可用skill列表
-	skillCacheMu     sync.RWMutex
-	showThinking     bool
-	finalOnly        bool
-	showSteps        bool
-	modeMu           sync.RWMutex
-	lastHealthCheck  time.Time    // 最后一次健康检查时间
-	isHealthy        bool         // OpenCode server是否健康
-	healthCheckMu    sync.RWMutex // 保护健康状态
-	modelOverride    sync.Map     // map[sessionID]opencode.SessionPromptParamsModel
+	sdk                      *opencode.Client
+	endpoint                 string
+	apiKey                   string
+	httpClient               *http.Client
+	sseClient                *http.Client // 专用于 SSE 长连接，不设超时（http.Client.Timeout 对流式响应是总时长限制）
+	eventHandlers            []EventHandler
+	eventListenerMu          sync.RWMutex
+	sessionHandlers          sync.Map // map[sessionID]EventHandler for fast lookup
+	sessionHandlersMu        sync.Mutex
+	sessionHandlerSerial     uint64
+	sessionHandlerTokens     map[string]uint64
+	messageToSession         sync.Map     // map[messageID]sessionID for events with only messageID
+	messageRoles             sync.Map     // map[messageID]role("user"/"assistant")
+	sessionMu                sync.RWMutex // 用于保护 session 相关操作
+	sessions                 sync.Map     // map[threadID]sessionID
+	sessionLocks             sync.Map     // map[threadID]*sync.Mutex for preventing concurrent session operations
+	sessionsMu               sync.RWMutex // 保护 sessions 的读写
+	messageCount             sync.Map     // map[sessionID]int tracks messages per session
+	toolCallCount            sync.Map     // map[sessionID]int tracks completed tool calls per session
+	tokenCount               sync.Map     // map[sessionID]int tracks estimated tokens per session
+	sessionSummary           sync.Map     // map[sessionID]string stores session summaries
+	sessionPreviews          sync.Map     // map[sessionID]string caches the derived /sessions preview
+	modelConfig              sync.Map     // map[sessionID]*ModelConfig caches model config per session
+	requestCache             sync.Map     // map[requestHash]*RequestRecord 请求去重缓存
+	runningSessions          sync.Map     // map[sessionID]bool 跟踪正在运行的session
+	pendingQuestions         sync.Map     // map[questionID]*Question 待回答的问题
+	pendingQuestionsMu       sync.Mutex
+	pendingQuestionsRevision uint64
+	todoCache                sync.Map // map[sessionID][]TodoItem
+	diffCache                sync.Map // map[sessionID][]FileDiff
+	directory                string
+	timeout                  time.Duration // 默认超时时间
+	retryConfig              RetryConfig   // 重试配置
+	devCoreEnabled           bool          // 是否启用开发助手内核提示词注入
+	devCorePrompt            string        // 开发助手内核提示词
+	enableSkillHint          bool          // 是否在消息中添加skill提示
+	skillHintCache           []string      // 缓存的可用skill列表
+	skillCacheMu             sync.RWMutex
+	showThinking             bool
+	finalOnly                bool
+	showSteps                bool
+	modeMu                   sync.RWMutex
+	lastHealthCheck          time.Time    // 最后一次健康检查时间
+	isHealthy                bool         // OpenCode server是否健康
+	healthCheckMu            sync.RWMutex // 保护健康状态
+	modelOverride            sync.Map     // map[sessionID]opencode.SessionPromptParamsModel
 	// pendingOverride carries a user's /model override across a fallback
 	// session handoff. When attemptFallbackRetry keeps the override (because
 	// the failed model differs from the user's choice), it stores it here
@@ -535,6 +544,14 @@ type Client struct {
 	// host's adapter registry. Nil means any channel name is accepted.
 	claimedChannelChecker   ClaimChannelChecker
 	claimedChannelCheckerMu sync.RWMutex
+	cronSessionChecker      func(string) bool
+	cronSessionCheckerMu    sync.RWMutex
+	// sessionSwitchRouting is the adapter-side half of a transactional
+	// /switch: it owns the user→session map and the per-session platform
+	// delivery metadata. Nil means /switch only moves the client-side thread
+	// mapping, which is what a host without adapters (tests) needs.
+	sessionSwitchRouting   SessionSwitchRouting
+	sessionSwitchRoutingMu sync.RWMutex
 
 	// suspendedClaims holds claimed sessions whose forwarding handler has been
 	// detached by /switch. key: sessionID, value: struct{}.
@@ -1013,136 +1030,31 @@ func (c *Client) SendMessage(ctx context.Context, payload MessagePayload) (Respo
 		}
 	}()
 
-	// 使用独立的context用于session创建，避免被外部context取消影响
-	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer sessionCancel()
-
-	// Get or create session with lock to prevent concurrent session creation
-	threadLock := c.getThreadLock(payload.ThreadID)
-	threadLock.Lock()
-	sessionID := payload.SessionID
-
-	// 🔍 诊断日志：记录 session 查找请求
-	log.Printf("opencode: session lookup - channel=%s, userID=%s, threadID=%s, requestingSessionID=%s",
-		payload.Channel, payload.UserID, payload.ThreadID, sessionID)
-
-	if sessionID == "" && payload.ThreadID != "" {
-		if found, ok := c.resolveThreadSession(payload.ThreadID, payload.Channel, payload.UserID); ok {
-			// 🔍 诊断日志：检查 session 是否属于当前用户
-			log.Printf("opencode: found cached session %s for threadID %s (requested by %s user %s)",
-				found[:8], payload.ThreadID, payload.Channel, payload.UserID)
-			sessionID = found
-		} else {
-			log.Printf("opencode: no usable cached session for threadID %s, will create new", payload.ThreadID)
-		}
-	}
-
-	// Create new session if needed
-	if sessionID == "" {
-		// 🔍 诊断日志：创建新 session
-		log.Printf("opencode: creating new session - channel=%s, userID=%s, threadID=%s",
-			payload.Channel, payload.UserID, payload.ThreadID)
-
-		// 将 adapter 和 user 信息编码到 Title 中，格式: [adapter:userId] threadId
-		sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
-
-		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
-			Title: opencode.F(sessionTitle),
-		})
+	sessionID := payload.resolvedSessionID
+	if sessionID == "" || sessionID != payload.SessionID {
+		sessionCtx, sessionCancel := context.WithTimeout(ctx, 30*time.Second)
+		resolved, err := c.ResolveOrCreateSession(sessionCtx, payload)
+		sessionCancel()
 		if err != nil {
-			threadLock.Unlock()
 			c.failRequest(requestHash)
-			return Response{}, fmt.Errorf("opencode: create session: %w", err)
+			return Response{SessionID: resolved}, err
 		}
-		sessionID = session.ID
-		if payload.ThreadID != "" {
-			c.sessions.Store(payload.ThreadID, sessionID)
-			// 🔍 诊断日志：记录 session 映射
-			log.Printf("opencode: mapped threadID %s -> sessionID %s (for %s user %s)",
-				payload.ThreadID, sessionID[:8], payload.Channel, payload.UserID)
-		}
-		c.messageCount.Store(sessionID, 0)
-		c.toolCallCount.Store(sessionID, 0)
-		c.tokenCount.Store(sessionID, 0)
-
-		// 获取模型配置
-		go c.fetchAndCacheModelConfig(context.Background(), sessionID)
-
-		log.Printf("opencode: created new session %s for thread %s", sessionID[:8], payload.ThreadID)
-	} else {
-		// 🔍 诊断日志：复用现有 session
-		log.Printf("opencode: reusing existing sessionID %s for %s user %s (threadID %s)",
-			sessionID[:8], payload.Channel, payload.UserID, payload.ThreadID)
-
-		// 验证 session 是否仍然有效（OpenCode Server 重启后 session 可能失效）
-		checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, checkErr := c.GetSession(checkCtx, sessionID)
-		checkCancel()
-		if checkErr != nil {
-			log.Printf("opencode: ⚠️ session %s is stale (err: %v), creating new session",
-				sessionID[:8], checkErr)
-
-			// 清除旧映射
-			if payload.ThreadID != "" {
-				c.sessions.Delete(payload.ThreadID)
-			}
-			c.messageCount.Delete(sessionID)
-			c.toolCallCount.Delete(sessionID)
-			c.tokenCount.Delete(sessionID)
-			c.modelConfig.Delete(sessionID)
-			c.modelOverride.Delete(sessionID)
-
-			// 创建新 session
-			sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
-			newSession, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
-				Title: opencode.F(sessionTitle),
-			})
-			if err != nil {
-				threadLock.Unlock()
-				c.failRequest(requestHash)
-				return Response{}, fmt.Errorf("opencode: create replacement session: %w", err)
-			}
-			sessionID = newSession.ID
-			if payload.ThreadID != "" {
-				c.sessions.Store(payload.ThreadID, sessionID)
-				log.Printf("opencode: 🔄 remapped threadID %s -> new sessionID %s (replaced stale session)",
-					payload.ThreadID, sessionID[:8])
-			}
-			c.messageCount.Store(sessionID, 0)
-			c.toolCallCount.Store(sessionID, 0)
-			c.tokenCount.Store(sessionID, 0)
-			go c.fetchAndCacheModelConfig(context.Background(), sessionID)
-			// 跳过后续的 token 检查，直接使用新 session
-			threadLock.Unlock()
-			log.Printf("opencode: stale session replaced, continue to send message with new session %s", sessionID[:min(8, len(sessionID))])
-			goto sendMessage
-		}
-
-		// 上下文使用率监控（仅日志）：压缩由 opencode server 在 prompt loop 中
-		// 自动处理（compaction.isOverflow），gateway 通过 session.compacted 事件
-		// 感知并重置 tokenCount。不再主动调用 SummarizeSession，避免同步阻塞。
+		sessionID = resolved
+	}
+	{
 		count, _ := c.messageCount.LoadOrStore(sessionID, 0)
-		msgCount := count.(int)
 		tokens, _ := c.tokenCount.LoadOrStore(sessionID, 0)
-		currentTokens := tokens.(int)
-
 		estimatedMsgTokens := estimateTokens(payload.Content)
-		projectedTokens := currentTokens + estimatedMsgTokens
-
 		maxContextTokens := c.getMaxContextLength(sessionID)
-		contextUsage := float64(projectedTokens) / float64(maxContextTokens)
-
+		contextUsage := float64(tokens.(int)+estimatedMsgTokens) / float64(maxContextTokens)
 		log.Printf("opencode: session %s - messages: %d, tokens: %d/%d (%.1f%%), estimated msg tokens: %d",
-			sessionID[:8], msgCount, currentTokens, maxContextTokens, contextUsage*100, estimatedMsgTokens)
-
+			sessionID, count.(int), tokens.(int), maxContextTokens, contextUsage*100, estimatedMsgTokens)
 		if contextUsage >= ContextUsageThreshold {
 			log.Printf("opencode: session %s context usage %.1f%% >= threshold %.1f%%, server will auto-compact in prompt loop",
-				sessionID[:8], contextUsage*100, ContextUsageThreshold*100)
+				sessionID, contextUsage*100, ContextUsageThreshold*100)
 		}
 	}
-	threadLock.Unlock()
 
-sendMessage:
 	// ========== 增强消息内容 ==========
 	// 添加skill提示（仅在session开始时）
 	enhancedContent := c.enhanceContentWithSkillHint(payload.Content, sessionID)
@@ -1208,6 +1120,12 @@ sendMessage:
 		modelOverride = modelFromRef(pid, mid)
 		modelReason = "payload.Model (caller-specified)"
 		log.Printf("opencode: using caller-specified model %s/%s for session %s", pid, mid, sessionID[:8])
+	} else if payload.ForegroundOnly {
+		if c.defaultModelHint != nil {
+			model := *c.defaultModelHint
+			modelOverride = &model
+			modelReason = "foreground default model"
+		}
 	} else {
 		modelOverride, modelReason = c.selectModelOverride(ctx, sessionID, payload)
 	}
@@ -2487,7 +2405,7 @@ func (c *Client) ResolveUserSession(ctx context.Context, channel, userID, select
 		if index < 1 || index > len(owned) {
 			return UserSession{}, fmt.Errorf("opencode: resolve session: index %d out of range (1-%d)", index, len(owned))
 		}
-		return owned[index-1], nil
+		return c.selectableSession(owned[index-1])
 	}
 
 	// ID prefix. Require an exact match or a unique prefix so a short selector
@@ -2495,7 +2413,7 @@ func (c *Client) ResolveUserSession(ctx context.Context, channel, userID, select
 	var matches []UserSession
 	for _, s := range owned {
 		if s.ID == selector {
-			return s, nil
+			return c.selectableSession(s)
 		}
 		if strings.HasPrefix(s.ID, selector) {
 			matches = append(matches, s)
@@ -2505,7 +2423,7 @@ func (c *Client) ResolveUserSession(ctx context.Context, channel, userID, select
 	case 0:
 		return UserSession{}, ErrSessionNotOwned
 	case 1:
-		return matches[0], nil
+		return c.selectableSession(matches[0])
 	default:
 		return UserSession{}, fmt.Errorf("opencode: resolve session: prefix %q matches %d sessions, use more characters", selector, len(matches))
 	}
@@ -2694,7 +2612,7 @@ func (c *Client) ClearSkillgenSession(threadID, sessionID string) {
 	c.modelConfig.Delete(sessionID)
 	c.modelOverride.Delete(sessionID)
 	if threadID != "" {
-		c.sessions.Delete(threadID)
+		c.sessions.CompareAndDelete(threadID, sessionID)
 	}
 	log.Printf("opencode: 🧹 cleared skillgen session state (thread=%s session=%s)",
 		threadID, sessionID[:min(8, len(sessionID))])
@@ -2935,7 +2853,12 @@ func (c *Client) eventListenerLoop(ctx context.Context) {
 						log.Printf("opencode: session handler error for %s: %v", sessionID[:8], err)
 					}
 				} else {
-					log.Printf("opencode: no session handler found for %s", sessionID[:8])
+					if event.Type == "session.error" {
+						detail := (&StreamingSessionHandler{}).extractSessionError(&event)
+						log.Printf("opencode: no session handler found session=%s event=session.error detail=%.300s", sessionID, detail)
+					} else {
+						log.Printf("opencode: no session handler found for %s", sessionID)
+					}
 				}
 			}
 
@@ -4211,6 +4134,12 @@ func (c *Client) attemptFallbackRetry(oldSessionID string, payload MessagePayloa
 			select {
 			case <-payload.fallbackReady:
 			case <-retryCtx.Done():
+				log.Printf("opencode: fallback retry startup timed out session=%s: %v", oldSessionID, retryCtx.Err())
+				if callback != nil {
+					if err := callback(QuestionSignalPrefix + "⚠️ 自动切换模型未能开始：等待上一轮清理超时，请稍后重试。"); err != nil {
+						log.Printf("opencode: fallback startup failure notification failed session=%s: %v", oldSessionID, err)
+					}
+				}
 				return
 			}
 		}
@@ -4456,11 +4385,26 @@ func (c *Client) RegisterEventHandler(handler EventHandler) {
 // RegisterSessionHandler registers an event handler tied to a specific session.
 // This allows fast lookup and prevents unnecessary processing of unrelated events.
 func (c *Client) RegisterSessionHandler(sessionID string, handler EventHandler) {
+	c.registerSessionHandler(sessionID, handler)
+}
+
+func (c *Client) registerSessionHandler(sessionID string, handler EventHandler) uint64 {
+	c.sessionHandlersMu.Lock()
+	defer c.sessionHandlersMu.Unlock()
+	if c.sessionHandlerTokens == nil {
+		c.sessionHandlerTokens = make(map[string]uint64)
+	}
+	c.sessionHandlerSerial++
+	c.sessionHandlerTokens[sessionID] = c.sessionHandlerSerial
 	c.sessionHandlers.Store(sessionID, handler)
+	return c.sessionHandlerSerial
 }
 
 // UnregisterSessionHandler removes an event handler for a specific session.
 func (c *Client) UnregisterSessionHandler(sessionID string) {
+	c.sessionHandlersMu.Lock()
+	defer c.sessionHandlersMu.Unlock()
+	delete(c.sessionHandlerTokens, sessionID)
 	c.sessionHandlers.Delete(sessionID)
 }
 
@@ -5180,6 +5124,9 @@ func (c *Client) FindLatestSessionForUser(ctx context.Context, channel, userID s
 		if !strings.HasPrefix(strings.TrimSpace(s.Title), prefix) {
 			continue
 		}
+		if c.isCronSession(s.ID, s.Title) {
+			continue
+		}
 		if s.Time.Updated > bestUpdated {
 			bestUpdated = s.Time.Updated
 			bestID = s.ID
@@ -5306,7 +5253,9 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 		return Response{}, err
 	}
 	defer c.leaveCaptureProducer()
-	fmt.Println("payload is ", payload)
+	if payload.ForegroundOnly {
+		return c.sendMessageForeground(ctx, payload, callback, eventCallback)
+	}
 	// Intercept synthetic slash commands before anything else.
 	if resp, handled := c.dispatchInterceptors(payload); handled {
 		if callback != nil {
@@ -5338,51 +5287,15 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 	c.maybeInjectHandoff(&payload)
 	c.maybeInjectKnowledge(&payload)
 
-	// 1. 先确定sessionID（可能需要创建新session）
-	threadLock := c.getThreadLock(payload.ThreadID)
-	threadLock.Lock()
-	sessionID := payload.SessionID
-	if sessionID == "" && payload.ThreadID != "" {
-		if found, ok := c.resolveThreadSession(payload.ThreadID, payload.Channel, payload.UserID); ok {
-			sessionID = found
-
-			// 验证 session 是否仍然有效
-			checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, checkErr := c.GetSession(checkCtx, sessionID)
-			checkCancel()
-			if checkErr != nil {
-				log.Printf("opencode: ⚠️ streaming session %s is stale (err: %v), will create new",
-					sessionID[:min(8, len(sessionID))], checkErr)
-				c.sessions.Delete(payload.ThreadID)
-				c.messageCount.Delete(sessionID)
-				c.tokenCount.Delete(sessionID)
-				sessionID = "" // 强制创建新 session
-			}
-		}
+	sessionCtx, sessionCancel := context.WithTimeout(ctx, 30*time.Second)
+	sessionID, err := c.ResolveOrCreateSession(sessionCtx, payload)
+	sessionCancel()
+	if err != nil {
+		return Response{SessionID: sessionID}, err
 	}
-
-	// 如果还是没有sessionID，我们需要先创建session
-	if sessionID == "" {
-		sessionCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		// 将 adapter 和 user 信息编码到 Title 中，格式: [adapter:userId] threadId
-		sessionTitle := fmt.Sprintf("[%s:%s] %s", payload.Channel, payload.UserID, payload.ThreadID)
-		session, err := c.sdk.Session.New(sessionCtx, opencode.SessionNewParams{
-			Title: opencode.F(sessionTitle),
-		})
-		cancel()
-		if err != nil {
-			threadLock.Unlock()
-			return Response{}, fmt.Errorf("opencode: create session for streaming: %w", err)
-		}
-		sessionID = session.ID
-		if payload.ThreadID != "" {
-			c.sessions.Store(payload.ThreadID, sessionID)
-		}
-		c.messageCount.Store(sessionID, 0)
-		c.tokenCount.Store(sessionID, 0)
-		log.Printf("opencode: created new session %s for streaming", sessionID)
-	}
-	threadLock.Unlock()
+	// Keep the handler and the actual prompt on the same resolved session.
+	payload.SessionID = sessionID
+	payload.resolvedSessionID = sessionID
 
 	// Apply a pending model override carried across a fallback handoff. When
 	// attemptFallbackRetry preserved the user's /model choice (because the
@@ -5571,6 +5484,9 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 			return Response{Reply: notice, Trace: sessionID}, nil
 
 		case err := <-errorChan:
+			if handler.FallbackRetryDispatched() {
+				return Response{SessionID: sessionID, Trace: sessionID, Deferred: true}, nil
+			}
 			return Response{}, err
 
 		case response := <-responseChan:
@@ -5830,7 +5746,12 @@ func (c *Client) SendMessageStreamingWithEvents(ctx context.Context, payload Mes
 						continue
 					}
 					if busy {
-						if c.recoverSilentModelHang(payload, sessionID, handler, callback, eventCallback) {
+						switch c.recoverSilentModelHang(payload, sessionID, handler, callback, eventCallback) {
+						case silentHangRetryDispatched:
+							asyncResponse.Deferred = true
+							return asyncResponse, nil
+						case silentHangStopped:
+							asyncResponse.Reply = silentHangStoppedNotice
 							return asyncResponse, nil
 						}
 						consecutiveNotBusy = 0
@@ -6266,14 +6187,24 @@ func (c *Client) triggerSessionHandoff(payload MessagePayload, sessionID string)
 		"已保存本次会话摘要，下一条消息会自动开启新会话并带上上下文，你可以继续。"
 }
 
+type silentHangRecovery uint8
+
+const (
+	silentHangNotRecovered silentHangRecovery = iota
+	silentHangRetryDispatched
+	silentHangStopped
+)
+
+const silentHangStoppedNotice = "⚠️ 本轮模型未产生任何输出，且近期已多次自动重建会话，已暂停自动重建以避免死循环。请稍后重新发送你的消息。"
+
 // recoverSilentModelHang recovers only the narrow failure mode where an async
 // prompt was accepted but the model never produced an assistant message,
 // retry, question, or tool event. Long-running tools intentionally do not
 // qualify. The replacement turn uses the default healthy model selection and
 // receives a handoff containing the interrupted request.
-func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string, handler *StreamingSessionHandler, callback StreamCallback, eventCallback StreamEventCallback) bool {
+func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string, handler *StreamingSessionHandler, callback StreamCallback, eventCallback StreamEventCallback) silentHangRecovery {
 	if handler == nil || !handler.IsSilentModelHangCandidate() || strings.TrimSpace(payload.ThreadID) == "" {
-		return false
+		return silentHangNotRecovered
 	}
 
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -6283,7 +6214,7 @@ func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string
 		if err != nil {
 			log.Printf("opencode: silent-hang verification failed for session %s: %v", sessionID[:min(8, len(sessionID))], err)
 		}
-		return false
+		return silentHangNotRecovered
 	}
 
 	// Recovery circuit breaker. A silent hang tends to repeat: the retry
@@ -6298,15 +6229,19 @@ func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string
 		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if abortErr := c.AbortSession(abortCtx, sessionID); abortErr != nil {
 			log.Printf("opencode: silent-hang breaker could not abort session %s: %v", sessionID[:min(8, len(sessionID))], abortErr)
+			abortCancel()
+			return silentHangNotRecovered
 		}
 		abortCancel()
 		handler.CompleteForRecovery()
 		log.Printf("opencode: decision=silent_model_hang_suppressed session=%s thread=%s recent_recoveries=%d — auto-recovery paused",
 			sessionID[:min(8, len(sessionID))], payload.ThreadID, recent)
 		if callback != nil {
-			_ = callback(WaitHintSignalPrefix + "⚠️ 本轮模型未产生任何输出，且近期已多次自动重建会话，已暂停自动重建以避免死循环。请稍后重新发送你的消息。")
+			if err := callback(silentHangStoppedNotice); err != nil {
+				log.Printf("opencode: silent-hang stopped notice failed session=%s: %v", sessionID, err)
+			}
 		}
-		return true
+		return silentHangStopped
 	}
 
 	abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -6314,7 +6249,7 @@ func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string
 	abortCancel()
 	if abortErr != nil {
 		log.Printf("opencode: silent-hang recovery could not abort session %s: %v", sessionID[:min(8, len(sessionID))], abortErr)
-		return false
+		return silentHangNotRecovered
 	}
 	handler.CompleteForRecovery()
 
@@ -6328,6 +6263,7 @@ func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string
 	// default/alternate model rather than repeating the model that never started.
 	c.modelOverride.Delete(sessionID)
 	payload.Model = ""
+	payload.SessionID = ""
 	// Strip any handoff preamble that a previous recovery already injected into
 	// this payload before re-dispatching it. Otherwise each cycle wraps the
 	// previous preamble in a new one and the prompt grows without bound (the
@@ -6357,7 +6293,7 @@ func (c *Client) recoverSilentModelHang(payload MessagePayload, sessionID string
 			}
 		}
 	}()
-	return true
+	return silentHangRetryDispatched
 }
 
 func hasNoAssistantAfterLastUser(messages []opencode.SessionMessagesResponse) bool {
@@ -6393,6 +6329,7 @@ func (c *Client) finalizeAsyncStreamingResponse(payload MessagePayload, sessionI
 		if handler.FallbackRetryDispatched() {
 			// The fallback turn owns delivery from this point. Do not classify the
 			// old failed session and send a second, conflicting provider error.
+			response.Deferred = true
 			return response
 		}
 	}
@@ -7296,7 +7233,10 @@ func (c *Client) failRequest(hash string) {
 
 // StorePendingQuestion stores a question for later answering
 func (c *Client) StorePendingQuestion(q *Question) {
+	c.pendingQuestionsMu.Lock()
+	defer c.pendingQuestionsMu.Unlock()
 	c.pendingQuestions.Store(q.ID, q)
+	c.pendingQuestionsRevision++
 }
 
 // GetPendingQuestion retrieves a pending question
@@ -7485,7 +7425,10 @@ func (c *Client) CountPendingPrompts(sessionID string) int {
 
 // DeletePendingQuestion removes a pending question
 func (c *Client) DeletePendingQuestion(questionID string) {
+	c.pendingQuestionsMu.Lock()
+	defer c.pendingQuestionsMu.Unlock()
 	c.pendingQuestions.Delete(questionID)
+	c.pendingQuestionsRevision++
 }
 
 // AnswerQuestion submits an answer to a pending question or permission request

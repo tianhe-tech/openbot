@@ -114,6 +114,24 @@ func TestClaimSessionRewritesTitle(t *testing.T) {
 	}
 }
 
+func TestClaimRejectsCronSessionBeforeRouting(t *testing.T) {
+	rec := &claimRecorder{title: "[feishu:alice] cron-task-one"}
+	server := claimServer(t, rec)
+	defer server.Close()
+	client := NewClient(server.URL, "")
+	hooked := false
+	client.SetClaimedSessionHook(func(context.Context, string, string, string, string) error {
+		hooked = true
+		return nil
+	})
+	if _, err := client.ClaimSession(context.Background(), "ses_claim", "feishu", "alice", ""); err == nil {
+		t.Fatal("cron session was accepted as a chat session")
+	}
+	if hooked || client.IsClaimedSession("ses_claim") || len(rec.patchBodies()) != 0 {
+		t.Fatal("rejected cron claim changed routing, title or handlers")
+	}
+}
+
 func TestTransferFailurePreservesSource(t *testing.T) {
 	recorder := &claimRecorder{title: "[wechat:alice] work", patchErr: http.StatusBadRequest}
 	server := claimServer(t, recorder)

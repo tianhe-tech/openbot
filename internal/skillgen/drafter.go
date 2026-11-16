@@ -3,12 +3,14 @@ package skillgen
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/opencode-gateway/internal/opencode"
@@ -17,8 +19,13 @@ import (
 // OpencodeDrafter uses a fresh temporary opencode session to generate the SKILL.md.
 // It is the default Drafter wired in main.go; custom Drafter implementations can
 // replace it (e.g., for tests) by passing their own implementation to NewService.
+type draftClient interface {
+	SendMessageStreamingWithEvents(context.Context, opencode.MessagePayload, opencode.StreamCallback, opencode.StreamEventCallback) (opencode.Response, error)
+	ClearSkillgenSession(threadID, sessionID string)
+}
+
 type OpencodeDrafter struct {
-	Client *opencode.Client
+	Client draftClient
 	// ReferenceSkillPath points at an exemplar SKILL.md the drafter uses as a
 	// style/anatomy guide. Resolved from InstallDir in NewOpencodeDrafter.
 	ReferenceSkillPath string
@@ -34,7 +41,11 @@ func NewOpencodeDrafter(c *opencode.Client, referenceSkillPath, installDir strin
 		}
 		referenceSkillPath = filepath.Join(base, "skill-creator", "SKILL.md")
 	}
-	return &OpencodeDrafter{Client: c, ReferenceSkillPath: referenceSkillPath}
+	drafter := &OpencodeDrafter{ReferenceSkillPath: referenceSkillPath}
+	if c != nil {
+		drafter.Client = c
+	}
+	return drafter
 }
 
 // Draft asks the opencode server to convert a conversation into a SKILL.md.
@@ -51,43 +62,65 @@ func (d *OpencodeDrafter) Draft(ctx context.Context, in DraftInput) (DraftOutput
 	} else {
 		log.Printf("skillgen: drafter loaded reference skill (%d chars) from %s", len(exemplar), d.ReferenceSkillPath)
 	}
-	prompt := buildDraftPrompt(in, exemplar)
-	log.Printf("skillgen: drafter prompt built (len=%d) for thread=%s model=%s turns=%d", len(prompt), in.ThreadID, in.ModelID, len(in.Conversation))
-	// Cap the conversation and prompt size: a 300+ turn conversation produces
-	// a 350k+ char prompt the model cannot answer within the draft timeout.
 	in.Conversation = capConversation(in.Conversation)
-	prompt = truncatePrompt(prompt)
+	prompt := truncatePrompt(buildDraftPrompt(in, exemplar))
 
 	// Use an isolated thread so the drafting work doesn't pollute user threads.
-	threadID := fmt.Sprintf("skillgen-draft-%s", in.ThreadID)
+	threadID := fmt.Sprintf("skillgen-draft-%s-%d", in.ThreadID, time.Now().UnixNano())
 	payload := opencode.MessagePayload{
-		Channel:   "skillgen",
-		UserID:    in.UserID,
-		ThreadID:  threadID,
-		Content:   prompt,
-		Model:     in.ModelID, // pass selected model to opencode so it actually uses it
-		Streaming: true,       // use prompt_async to avoid sync API 500 errors
+		Channel:        "skillgen",
+		UserID:         in.UserID,
+		ThreadID:       threadID,
+		Content:        prompt,
+		Model:          in.ModelID, // pass selected model to opencode so it actually uses it
+		Streaming:      true,       // use prompt_async to avoid sync API 500 errors
+		ForegroundOnly: true,
+		Internal:       true,
 	}
 	log.Printf("skillgen: drafter sending prompt to opencode (model=%s thread=%s streaming=true)", in.ModelID, threadID)
-	resp, err := d.Client.SendMessage(ctx, payload)
+	var mu sync.Mutex
+	var text strings.Builder
+	var sessionID string
+	resp, err := d.Client.SendMessageStreamingWithEvents(ctx, payload, func(string) error { return nil },
+		func(event opencode.StreamEvent) error {
+			mu.Lock()
+			defer mu.Unlock()
+			switch event.Kind {
+			case opencode.StreamEventSessionReady:
+				sessionID = event.SessionID
+			case opencode.StreamEventTextDelta:
+				text.WriteString(event.Content)
+			}
+			return nil
+		})
+	mu.Lock()
+	if sessionID == "" {
+		sessionID = resp.SessionID
+	}
+	reply := text.String()
+	mu.Unlock()
+	if err == nil && resp.Deferred {
+		err = &opencode.RemoteStopUnconfirmedError{SessionID: sessionID, Cause: fmt.Errorf("skillgen: foreground draft unexpectedly deferred")}
+	}
+	var uncertain *opencode.RemoteStopUnconfirmedError
+	if sessionID != "" && !errors.As(err, &uncertain) {
+		d.Client.ClearSkillgenSession(threadID, sessionID)
+	}
 	if err != nil {
-		log.Printf("skillgen: drafter SendMessage failed (model=%s thread=%s): %v", in.ModelID, threadID, err)
 		return DraftOutput{}, err
 	}
-
-	// With streaming=true, SendMessage returns immediately with an empty Reply.
-	// The model generates content asynchronously; we poll FetchSessionTurns
-	// until the assistant reply appears, then extract it.
-	reply := resp.Reply
-	if strings.TrimSpace(reply) == "" && resp.SessionID != "" {
-		reply, err = d.waitForAssistantReply(ctx, resp.SessionID)
-		// Clear all session state so model fallback creates a fresh session
-		// instead of reusing this one (which may contain a failed/error reply).
-		d.Client.ClearSkillgenSession(threadID, resp.SessionID)
-		if err != nil {
-			log.Printf("skillgen: drafter waitForAssistantReply failed (model=%s thread=%s session=%s): %v", in.ModelID, threadID, resp.SessionID, err)
-			return DraftOutput{}, err
-		}
+	if strings.TrimSpace(reply) == "" {
+		reply = resp.Reply
+	}
+	if strings.TrimSpace(reply) == "" {
+		return DraftOutput{}, fmt.Errorf("skillgen: completed draft has no body: session=%s", sessionID)
+	}
+	var decision struct {
+		Accept *bool `json:"accept"`
+	}
+	if json.Unmarshal([]byte(extractJSONObject(reply)), &decision) == nil && decision.Accept != nil && !*decision.Accept {
+		log.Printf("skillgen: drafter declined evidence thread=%s session=%s", in.ThreadID, sessionID)
+		return DraftOutput{}, nil
 	}
 	log.Printf("skillgen: drafter received reply (len=%d) from model=%s thread=%s", len(reply), in.ModelID, threadID)
 	title, body, score, action, patchTarget := parseDraftReply(reply)
@@ -106,58 +139,13 @@ func (d *OpencodeDrafter) Draft(ctx context.Context, in DraftInput) (DraftOutput
 	}, nil
 }
 
-// waitForAssistantReply polls FetchSessionTurns until the assistant's reply
-// appears, then returns it. This is used with streaming=true (prompt_async)
-// because the async API returns immediately without the reply content.
-//
-// Polling strategy: check every 3s, with a total timeout bounded by ctx.
-// We detect completion by seeing the assistant turn count increase beyond
-// what it was at send time (which is 0 for a fresh skillgen session).
-func (d *OpencodeDrafter) waitForAssistantReply(ctx context.Context, sessionID string) (string, error) {
-	if sessionID == "" {
-		return "", fmt.Errorf("skillgen: empty sessionID for waitForAssistantReply")
-	}
-	const pollInterval = 3 * time.Second
-	const maxWait = 7 * time.Minute // bounded by the 8m draft timeout in service.go
-
-	deadline := time.Now().Add(maxWait)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
-	}
-
-	pollCtx, pollCancel := context.WithDeadline(context.Background(), deadline)
-	defer pollCancel()
-
-	for {
-		turns, err := d.Client.FetchSessionTurns(pollCtx, sessionID)
-		if err != nil {
-			log.Printf("skillgen: poll FetchSessionTurns error session=%s: %v", sessionID, err)
-		} else {
-			// Find the last assistant turn — that's the drafter's reply.
-			for i := len(turns) - 1; i >= 0; i-- {
-				if turns[i].Role == "assistant" && strings.TrimSpace(turns[i].Text) != "" {
-					text := turns[i].Text
-					log.Printf("skillgen: poll found assistant reply (len=%d) for session=%s after %s",
-						len(text), sessionID, time.Since(deadline.Add(-maxWait)).Round(time.Second))
-					return text, nil
-				}
-			}
-		}
-
-		select {
-		case <-pollCtx.Done():
-			return "", fmt.Errorf("skillgen: timed out waiting for assistant reply (session=%s)", sessionID)
-		case <-time.After(pollInterval):
-		}
-	}
-}
-
 func (d *OpencodeDrafter) loadReference() string {
 	if d.ReferenceSkillPath == "" {
 		return ""
 	}
 	b, err := os.ReadFile(d.ReferenceSkillPath)
 	if err != nil {
+		log.Printf("skillgen: reference read failed path=%s: %v", d.ReferenceSkillPath, err)
 		return ""
 	}
 	// Truncate to keep the prompt sane.

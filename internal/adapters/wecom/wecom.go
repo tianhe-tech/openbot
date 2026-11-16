@@ -1267,48 +1267,33 @@ func (h *Handler) handleSessions(ctx context.Context, userID string) (string, er
 
 // handleSwitch resumes one of the user's own sessions.
 //
-// It must update both session maps. The adapter's userSessions is what fills
-// MessagePayload.SessionID on the next message, and that field takes precedence
-// over the client's thread→session map, so updating only the client would leave
-// the next message on the old session. Updating only the adapter would leave
-// the client's fallback stale for any caller that omits SessionID.
+// The switch itself is transactional and shared with the other channels
+// (opencode.Client.SwitchSession): it updates both session maps, pauses the
+// other claims this chat is mirroring, and restores a claim when the target was
+// adopted from the TUI. Doing that here by hand is what used to leave a failed
+// switch reporting success while the chat pointed at a session whose delivery
+// metadata had already been deleted.
+//
+// WeCom stores no per-session delivery context — SendMessage resolves the app
+// chat from the user — so ChannelData is empty.
 func (h *Handler) handleSwitch(ctx context.Context, userID, threadID, selector string) (string, error) {
 	if strings.TrimSpace(selector) == "" {
 		return "❌ 用法: /switch <序号|会话ID前缀>\n\n先发送 /sessions 查看可选的会话", nil
 	}
 
-	targetSession, err := h.client.ResolveUserSession(ctx, "wecom", userID, selector)
+	result, err := h.client.SwitchSession(ctx, opencode.SessionSwitchRequest{
+		Channel:  "wecom",
+		UserID:   userID,
+		ThreadID: threadID,
+		Selector: selector,
+	})
 	if err != nil {
-		if errors.Is(err, opencode.ErrSessionNotOwned) {
-			return fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector), nil
+		if errors.Is(err, opencode.ErrSessionNotOwned) || errors.Is(err, opencode.ErrSessionBusy) {
+			return opencode.SwitchFailureMessage(selector, err), nil
 		}
-		return fmt.Sprintf("❌ 切换会话失败: %v", err), err
+		return opencode.SwitchFailureMessage(selector, err), err
 	}
-
-	if threadID == "" {
-		threadID = userID
-	}
-	h.client.BindSessionToThread(threadID, targetSession.ID)
-	h.adapter.SwitchUserSession(userID, targetSession.ID)
-
-	// Pause every other claimed session this chat is mirroring, then resume the
-	// target if an earlier /switch paused it. Without the pause, two TUI
-	// sessions adopted into the same chat would keep writing into it at once
-	// and their answers would interleave.
-	suspended := h.client.SuspendClaimedSessionsForUser("wecom", userID, targetSession.ID)
-	resumed := h.client.ResumeClaimedSession(targetSession.ID)
-
-	log.Printf("wecom: /switch user=%s thread=%s -> session=%s", userID, threadID, targetSession.ID[:min(8, len(targetSession.ID))])
-	note := ""
-	if resumed {
-		note += "\n\n▶ 已恢复该会话的 TUI 转发"
-	}
-	if len(suspended) > 0 {
-		note += fmt.Sprintf("\n⏸ 已暂停 %d 个其他认领会话的转发（/switch 切回即可恢复）", len(suspended))
-	}
-	return fmt.Sprintf("✅ 已切换到会话: %s\n\nID: %s\n更新: %s\n\n💡 直接发送消息即可继续该会话的上下文%s",
-		targetSession.Title, targetSession.ID[:min(8, len(targetSession.ID))],
-		targetSession.Updated.Format("2006-01-02 15:04"), note), nil
+	return result.Message(), nil
 }
 
 // handleRelease stops mirroring a claimed TUI session into this chat and strips

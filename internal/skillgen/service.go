@@ -18,8 +18,8 @@
 //	     │ 2. pick model (epsilon-greedy)      │
 //	     │ 3. drafter.Draft → SKILL.md text    │
 //	     │    (dedicated session, no idle-wait) │
-//	     │ 4. persist as pending_review        │
-//	     │ 5. installer.WriteDraft → file      │
+//	     │ 4. write draft + persist candidate  │
+//	     │ 5. install if auto-approved         │
 //	     │ 6. notifier.Notify → adapter        │
 //	     └─────────────────────────────────────┘
 //
@@ -29,6 +29,7 @@ package skillgen
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -74,15 +75,16 @@ type Config struct {
 	CandidateDir string
 	// InstallDir is where approved skills are moved to.
 	// Defaults to "skills" under CWD.
-	InstallDir string
+	InstallDir         string
+	ReferenceSkillPath string
+	ResolveRecipient   func(adapter string) (userID string, ok bool)
 	// ApprovalRequired: if false, drafts are auto-approved and installed directly.
 	ApprovalRequired bool
 	// MinConfidence gates drafts below this heuristic score (0..1). 0 accepts all.
 	MinConfidence float64
 	// PerModelTimeout is the drafting timeout budget for EACH model in the
-	// fallback chain (not shared). 0 defaults to 8m. This guarantees the
-	// second/third model gets a full budget instead of the leftover of the
-	// first model's budget.
+	// fallback chain. 0 defaults to 8m. Each child budget is still bounded by
+	// the remaining total job budget.
 	PerModelTimeout time.Duration
 	// MaxConsecutiveFails: after this many consecutive draft failures
 	// (timeout / send error / unparseable reply) a model is temporarily
@@ -155,6 +157,7 @@ type DraftOutput struct {
 // skill candidate is awaiting review.
 type Notifier interface {
 	NotifyCandidate(adapter, userID, candidateID, title string, approvalRequired bool) error
+	NotifyFailure(adapter, userID, stage, reason string) error
 }
 
 // Service orchestrates candidate mining on a background queue.
@@ -171,9 +174,10 @@ type Service struct {
 
 	// modelFails tracks consecutive draft failures per model so a persistently
 	// broken model can be temporarily demoted out of rotation. Guarded by mu.
-	mu         sync.Mutex
-	modelFails map[string]int       // modelID → consecutive failures
-	demotedAt  map[string]time.Time // modelID → when it was demoted
+	mu             sync.Mutex
+	modelFails     map[string]int       // modelID → consecutive failures
+	demotedAt      map[string]time.Time // modelID → when it was demoted
+	failureNotices map[[2]string][]time.Time
 }
 
 // NewService wires dependencies. queue and drafter MUST be non-nil when cfg.Enabled is true.
@@ -194,14 +198,15 @@ func NewService(cfg Config, store *memstore.Store, client *opencode.Client, queu
 		cfg.Cooldown = 30 * time.Minute
 	}
 	return &Service{
-		cfg:        cfg,
-		store:      store,
-		client:     client,
-		queue:      queue,
-		drafter:    drafter,
-		notifier:   notifier,
-		modelFails: map[string]int{},
-		demotedAt:  map[string]time.Time{},
+		cfg:            cfg,
+		store:          store,
+		client:         client,
+		queue:          queue,
+		drafter:        drafter,
+		notifier:       notifier,
+		modelFails:     map[string]int{},
+		demotedAt:      map[string]time.Time{},
+		failureNotices: map[[2]string][]time.Time{},
 	}
 }
 
@@ -219,8 +224,24 @@ func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
 	if s == nil || !s.cfg.Enabled || s.queue == nil || s.drafter == nil {
 		return
 	}
+	event.Adapter = strings.TrimSpace(event.Adapter)
+	event.UserID = strings.TrimSpace(event.UserID)
 	// Never mine candidates from skillgen's own drafting sessions.
-	if event.Adapter == "skillgen" || strings.HasPrefix(event.ThreadID, "skillgen-draft-") {
+	if event.Adapter == "skillgen" || strings.HasPrefix(event.ThreadID, "skillgen-draft-") ||
+		strings.HasPrefix(event.ThreadID, opencode.CronThreadPrefix) {
+		return
+	}
+	if strings.TrimSpace(event.Adapter) == "" {
+		log.Printf("skillgen: skipping undeliverable event thread=%s: missing adapter", event.ThreadID)
+		return
+	}
+	if strings.TrimSpace(event.UserID) == "" && s.cfg.ResolveRecipient != nil {
+		if userID, ok := s.cfg.ResolveRecipient(event.Adapter); ok {
+			event.UserID = strings.TrimSpace(userID)
+		}
+	}
+	if strings.TrimSpace(event.UserID) == "" {
+		log.Printf("skillgen: skipping undeliverable event adapter=%s thread=%s: no unique recipient", event.Adapter, event.ThreadID)
 		return
 	}
 	// Per-trigger gating.
@@ -250,7 +271,7 @@ func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
 	// new segment) within 30 min → skip. This avoids re-mining the same task on
 	// each tick while still allowing re-trigger when the session moves into a
 	// meaningfully different phase (10+ more tool calls completed).
-	dedupKey := fmt.Sprintf("%s:%d", event.ThreadID, event.ToolCallCount/10)
+	dedupKey := fmt.Sprintf("%s:%s:%s:%d", event.Adapter, event.UserID, event.ThreadID, event.ToolCallCount/10)
 	if prev, ok := s.recent.Load(dedupKey); ok {
 		if t, ok2 := prev.(time.Time); ok2 && time.Since(t) < 30*time.Minute {
 			return
@@ -260,24 +281,53 @@ func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
 
 	// Daily cap: check cheaply before we enqueue.
 	if s.cfg.MaxPerDay > 0 && s.store != nil {
-		if n, err := s.store.CountSkillCandidatesSince(time.Now().Add(-24 * time.Hour)); err == nil && n >= s.cfg.MaxPerDay {
+		n, err := s.store.CountSkillCandidatesSince(time.Now().Add(-24 * time.Hour))
+		if err != nil {
+			log.Printf("skillgen: daily cap lookup failed adapter=%s user=%s thread=%s: %v; pipeline will validate persistence", event.Adapter, event.UserID, event.ThreadID, err)
+		} else if n >= s.cfg.MaxPerDay {
 			log.Printf("skillgen: daily cap reached (%d), skipping %s for thread %s", n, event.Trigger, event.ThreadID)
 			return
 		}
 	}
 
 	ev := event // capture
-	s.queue.Enqueue(asyncwork.JobFunc{
+	if !s.queue.Enqueue(asyncwork.JobFunc{
 		Label: fmt.Sprintf("skillgen:%s:%s", ev.Trigger, ev.ThreadID),
 		Fn: func(ctx context.Context) error {
 			return s.run(ctx, ev)
 		},
 		Dur: 10 * time.Minute, // drafter uses a dedicated session; give it more headroom
-	})
+	}) {
+		s.recent.Delete(dedupKey)
+		log.Printf("skillgen: enqueue failed adapter=%s user=%s thread=%s", ev.Adapter, ev.UserID, ev.ThreadID)
+		go func() {
+			if err := s.notifyFailure(ev, "queue"); err != nil {
+				log.Printf("skillgen: queue failure notification failed: %v", err)
+			}
+		}()
+	}
 }
 
 // run is the full mining pipeline: fetch turns → draft → persist → install → notify.
-func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) error {
+func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) (runErr error) {
+	stage := "fetch"
+	defer func() {
+		if runErr != nil {
+			log.Printf("skillgen: pipeline failed stage=%s adapter=%s user=%s thread=%s session=%s error=%v",
+				stage, ev.Adapter, ev.UserID, ev.ThreadID, ev.SessionID, runErr)
+			if err := s.notifyFailure(ev, stage); err != nil {
+				log.Printf("skillgen: failure notification failed stage=%s adapter=%s user=%s error=%v", stage, ev.Adapter, ev.UserID, err)
+				runErr = errors.Join(runErr, err)
+			}
+		}
+	}()
+	if ev.Adapter == "" || ev.UserID == "" {
+		return fmt.Errorf("skillgen: invalid recipient snapshot")
+	}
+	if err := ctx.Err(); err != nil {
+		stage = "budget"
+		return err
+	}
 	// Drafter uses a dedicated session (thread "skillgen-draft-<threadID>"),
 	// so it does not interfere with the user's active Q&A. No idle-wait needed.
 	log.Printf("skillgen: pipeline start — trigger=%s thread=%s session=%s adapter=%s user=%s",
@@ -305,6 +355,9 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 	// Build the fallback chain: start with the picked model, then all other
 	// models from the pool that haven't been tried yet.
 	fallbackModels := s.buildFallbackChain(model)
+	if len(fallbackModels) == 0 {
+		fallbackModels = []string{""}
+	}
 
 	// 3. Read existing installed skills from disk (zero LLM cost) so the drafter
 	// can decide to PATCH an existing skill instead of creating a duplicate.
@@ -324,13 +377,17 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 
 	// 4. Draft — try the picked model first, then fall back to alternates
 	// if the send fails (e.g. model unavailable, 500 from server).
-	// Each model gets its OWN timeout budget (PerModelTimeout) so the second
-	// model is not left with the leftover of the first model's budget.
+	// Each model gets a fresh child timeout, bounded by the remaining total budget.
 	var out DraftOutput
 	var draftErr error
 	triedModels := map[string]bool{}
+	stage = "draft"
 
 	for _, tryModel := range fallbackModels {
+		if err := ctx.Err(); err != nil {
+			stage = "budget"
+			return err
+		}
 		if triedModels[tryModel] {
 			continue
 		}
@@ -346,6 +403,9 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 			ModelID:             tryModel,
 			ExistingSkillTitles: existingSkills,
 		})
+		if draftErr == nil {
+			draftErr = draftCtx.Err()
+		}
 		draftCancel()
 		if draftErr == nil {
 			s.recordDraftSuccess(tryModel)
@@ -353,12 +413,20 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		}
 		s.recordDraftFailure(tryModel)
 		log.Printf("skillgen: STEP4 draft failed (model=%s thread=%s): %v", tryModel, ev.ThreadID, draftErr)
+		var uncertain *opencode.RemoteStopUnconfirmedError
+		if errors.As(draftErr, &uncertain) {
+			stage = "stop_unconfirmed"
+			break
+		}
 		// If there are more models to try, continue; otherwise give up.
 		if len(fallbackModels) > 1 {
 			log.Printf("skillgen: STEP4 falling back to next model...")
 		}
 	}
 	if draftErr != nil {
+		if ctx.Err() != nil && stage != "stop_unconfirmed" {
+			stage = "budget"
+		}
 		return draftErr
 	}
 	log.Printf("skillgen: STEP4 draft completed (title=%s score=%.2f action=%s)", out.Title, out.Score, out.Action)
@@ -371,10 +439,10 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		return nil
 	}
 
-	// 5. Persist candidate row.
+	// 5. Prepare candidate row.
 	status := memstore.SkillStatusPendingReview
 	if !s.cfg.ApprovalRequired {
-		status = memstore.SkillStatusApproved
+		status = memstore.SkillStatusDraft
 	}
 	c := memstore.SkillCandidate{
 		ID:        memstore.NewSkillCandidateID(),
@@ -390,29 +458,37 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 		SkillMD:   out.SkillMD,
 	}
 
-	// 6. Write to disk: when ApprovalRequired is true, always write to
-	// CandidateDir for review (even for patch actions). When auto-approving,
-	// write directly to InstallDir.
+	// 6. Stage and persist the draft before any automatic installation.
 	targetDir := s.cfg.CandidateDir
-	if !s.cfg.ApprovalRequired {
-		targetDir = s.cfg.InstallDir
-	}
+	stage = "draft_file"
 	log.Printf("skillgen: STEP5 writing skill file — targetDir=%s title=%s action=%s", targetDir, out.Title, out.Action)
 	path, werr := writeSkillFile(targetDir, out.Title, out.SkillMD)
 	if werr != nil {
 		log.Printf("skillgen: STEP5 write skill file failed: %v", werr)
-		// Still persist the candidate so user can retrieve via /skill-view.
+		return werr
 	} else {
 		c.DraftPath = path
 		log.Printf("skillgen: STEP5 skill file written to %s", path)
 	}
 
-	if s.store != nil {
-		if err := s.store.SaveSkillCandidate(c); err != nil {
-			log.Printf("skillgen: STEP5 save candidate failed: %v", err)
+	stage = "storage"
+	if s.store == nil {
+		return fmt.Errorf("skillgen: candidate store unavailable")
+	}
+	if err := s.store.SaveSkillCandidate(c); err != nil {
+		return err
+	}
+	if !s.cfg.ApprovalRequired {
+		stage = "install"
+		path, err := moveSkillFile(&c, s.cfg.InstallDir)
+		if err != nil {
 			return err
 		}
-		log.Printf("skillgen: STEP5 candidate persisted id=%s status=%s", c.ID, c.Status)
+		c.DraftPath, c.Status = path, memstore.SkillStatusApproved
+		stage = "storage"
+		if err := s.store.SaveSkillCandidate(c); err != nil {
+			return err
+		}
 	}
 
 	// When auto-approving, record a positive outcome so model stats accumulate.
@@ -421,11 +497,14 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 	}
 
 	// 7. Notify.
-	if s.notifier != nil && ev.Adapter != "" && ev.UserID != "" {
+	stage = "notify"
+	if s.notifier != nil {
 		log.Printf("skillgen: STEP6 notifying user (adapter=%s user=%s candidate=%s)", ev.Adapter, ev.UserID, c.ID)
 		if err := s.notifier.NotifyCandidate(ev.Adapter, ev.UserID, c.ID, c.Title, s.cfg.ApprovalRequired); err != nil {
-			log.Printf("skillgen: STEP6 notifier failed (adapter=%s user=%s): %v", ev.Adapter, ev.UserID, err)
+			return fmt.Errorf("skillgen: candidate notification: %w", err)
 		}
+	} else {
+		return fmt.Errorf("skillgen: candidate notifier unavailable")
 	}
 
 	log.Printf("skillgen: ✅ pipeline done — candidate %s created (title=%q status=%s score=%.2f model=%s path=%s)",
@@ -433,11 +512,59 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) erro
 	return nil
 }
 
+func (s *Service) notifyFailure(ev opencode.SkillCandidateEvent, stage string) error {
+	if ev.Adapter == "" || ev.UserID == "" || s.notifier == nil {
+		return fmt.Errorf("skillgen: cannot deliver failure notification adapter=%q user=%q", ev.Adapter, ev.UserID)
+	}
+	now := time.Now()
+	s.mu.Lock()
+	if s.failureNotices == nil {
+		s.failureNotices = make(map[[2]string][]time.Time)
+	}
+	for recipient, times := range s.failureNotices {
+		valid := times[:0]
+		for _, at := range times {
+			if now.Sub(at) < 24*time.Hour {
+				valid = append(valid, at)
+			}
+		}
+		if len(valid) == 0 {
+			delete(s.failureNotices, recipient)
+		} else {
+			s.failureNotices[recipient] = valid
+		}
+	}
+	key := [2]string{ev.Adapter, ev.UserID}
+	if len(s.failureNotices[key]) >= 3 {
+		s.mu.Unlock()
+		log.Printf("skillgen: failure notification rate limited adapter=%s user=%s stage=%s", ev.Adapter, ev.UserID, stage)
+		return nil
+	}
+	s.failureNotices[key] = append(s.failureNotices[key], now)
+	s.mu.Unlock()
+	reason := "技能草稿生成未能完成，请稍后重试。"
+	switch stage {
+	case "budget":
+		reason = "本次技能生成的时间预算已耗尽。"
+	case "stop_unconfirmed":
+		reason = "远端草稿任务尚未确认停止，已暂停切换模型，请检查网关日志。"
+	case "draft_file", "storage":
+		reason = "技能草稿保存失败，未发送可审批或已安装通知。"
+	case "install":
+		reason = "技能安装失败，请检查安装目录和网关日志。"
+	case "notify":
+		reason = "候选已经保存，但通知发送失败，可用 /skill-list 查看。"
+	case "queue":
+		reason = "技能生成队列暂时不可用，本次未开始生成。"
+	}
+	return s.notifier.NotifyFailure(ev.Adapter, ev.UserID, stage, reason)
+}
+
 // fetchTurns retrieves the session message history via the opencode client.
 // Uses the already-exposed client helper (added below via export).
 func (s *Service) fetchTurns(ctx context.Context, sessionID string) ([]Turn, error) {
 	if s.client == nil || sessionID == "" {
-		return nil, nil
+		return nil, fmt.Errorf("skillgen: conversation lookup requires a client and session ID")
 	}
 	raw, err := s.client.FetchSessionTurns(ctx, sessionID)
 	if err != nil {

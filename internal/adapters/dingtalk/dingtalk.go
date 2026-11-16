@@ -1315,10 +1315,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	sendReply := func(msg string) error {
+		deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(sendCtx), time.Minute)
+		defer cancel()
 		if !preferAICardForAllReplies {
-			return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+			return h.sendReplyBySource(deliveryCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
 		}
-		return h.sendReplyWithAICardFallback(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+		return h.sendReplyWithAICardFallback(deliveryCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
 	}
 	sendFinalReply := func(msg string) error {
 		return sendReply(msg)
@@ -1356,6 +1358,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	retryContent := sendContent
 	retryMetadata := cloneStringMap(metadata)
 
+	var deliveryMu sync.Mutex
 	response, err := h.client.SendMessageStreamingWithEvents(sendCtx, opencode.MessagePayload{
 		DeliveryID:      msgID,
 		OriginalContent: &content,
@@ -1369,6 +1372,8 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		Attachments:     attachments,
 		Metadata:        metadata,
 	}, func(chunk string) error {
+		deliveryMu.Lock()
+		defer deliveryMu.Unlock()
 		// 🔍 诊断：记录第一个 callback
 		if !callbackCalled {
 			callbackCalled = true
@@ -1596,10 +1601,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return nil
 	})
 
+	deliveryMu.Lock()
+	defer deliveryMu.Unlock()
 	// 🔍 诊断日志：streaming完成时的状态
 	accumulatedContent := fullReply.String()
-	log.Printf("dingtalk stream: 🔍 SendMessageStreaming returned - userID=%s, err=%v, reply_len=%d, accumulated_len=%d",
-		userID, err, len(response.Reply), len(accumulatedContent))
+	log.Printf("dingtalk stream: SendMessageStreaming returned - userID=%s, session=%s, deferred=%t, err=%v, reply_len=%d, accumulated_len=%d",
+		userID, response.SessionID, response.Deferred, err, len(response.Reply), len(accumulatedContent))
 
 	// Enqueue for off-peak retry when deadline exceeded with zero content.
 	if !h.client.DurableCaptureEnabled() && retryworker.IsDeadlineErr(err) && len(accumulatedContent) == 0 && len(response.Reply) == 0 {
@@ -1669,7 +1676,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	// Map user to session (whether new or existing)
-	if response.SessionID != "" {
+	if response.SessionID != "" && !response.Deferred {
 		h.adapter.MapUserToSession(userID, response.SessionID)
 		// Store the session webhook for later use
 		h.adapter.MapSessionData(response.SessionID, "channel", data.SessionWebhook)
@@ -1729,6 +1736,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 					log.Printf("dingtalk stream: ❌ failed to send final message: %v", err)
 					// 不返回错误，避免影响session映射
 				} else {
+					lastSentLength = len(accumulatedContent)
 					log.Printf("dingtalk stream: ✅ sent final message to user %s (%d chars total, %d new)",
 						userID, len(accumulatedContent), unsentLength)
 				}
@@ -1736,6 +1744,8 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				log.Printf("dingtalk stream: ✓ all content already sent via intermediate updates (%d chars)",
 					len(accumulatedContent))
 			}
+		} else if response.Deferred {
+			log.Printf("dingtalk stream: delivery deferred to background retry user=%s session=%s", userID, response.SessionID)
 		} else {
 			// 没有内容累积（可能是权限请求之类的交互式任务，或者全都是特殊消息）
 			log.Printf("dingtalk stream: ℹ️ async mode completed with no accumulated content "+
@@ -4317,11 +4327,15 @@ func (h *Handler) handleListSessions(ctx context.Context, data *chatbot.BotCallb
 
 // handleSwitch resumes one of the user's own sessions.
 //
-// It must update both session maps. The adapter's userSessions is what fills
-// MessagePayload.SessionID on the next message, and that field takes precedence
-// over the client's thread→session map, so updating only the client would leave
-// the next message on the old session. Updating only the adapter would leave
-// the client's fallback stale for any caller that omits SessionID.
+// The switch itself is transactional and shared with the other channels
+// (opencode.Client.SwitchSession): it updates both session maps, pauses the
+// other claims this chat is mirroring, and restores a claim when the target was
+// adopted from the TUI. Doing that here by hand is what used to leave a failed
+// switch reporting success while the chat pointed at a session whose delivery
+// metadata had already been deleted.
+//
+// DingTalk's delivery context is the session webhook of the message that asked
+// for the switch, stored under the same "channel" key the inbound path uses.
 func (h *Handler) handleSwitch(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, threadID, selector string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
 
@@ -4330,41 +4344,27 @@ func (h *Handler) handleSwitch(ctx context.Context, data *chatbot.BotCallbackDat
 		return nil, nil
 	}
 
-	targetSession, err := h.client.ResolveUserSession(ctx, "dingtalk", userID, selector)
+	channelData := map[string]string{}
+	if webhook := strings.TrimSpace(data.SessionWebhook); webhook != "" {
+		channelData["channel"] = webhook
+	}
+
+	result, err := h.client.SwitchSession(ctx, opencode.SessionSwitchRequest{
+		Channel:     "dingtalk",
+		UserID:      userID,
+		ThreadID:    threadID,
+		Selector:    selector,
+		ChannelData: channelData,
+	})
 	if err != nil {
-		if errors.Is(err, opencode.ErrSessionNotOwned) {
-			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector)))
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(opencode.SwitchFailureMessage(selector, err)))
+		if errors.Is(err, opencode.ErrSessionNotOwned) || errors.Is(err, opencode.ErrSessionBusy) {
 			return nil, nil
 		}
-		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 切换会话失败: %v", err)))
 		return nil, err
 	}
 
-	if threadID == "" {
-		threadID = userID
-	}
-	h.client.BindSessionToThread(threadID, targetSession.ID)
-	h.adapter.SwitchUserSession(userID, targetSession.ID)
-
-	// Pause every other claimed session this chat is mirroring, then resume the
-	// target if an earlier /switch paused it. Without the pause, two TUI
-	// sessions adopted into the same chat would keep writing into it at once
-	// and their answers would interleave.
-	suspended := h.client.SuspendClaimedSessionsForUser("dingtalk", userID, targetSession.ID)
-	resumed := h.client.ResumeClaimedSession(targetSession.ID)
-
-	log.Printf("dingtalk: /switch user=%s thread=%s -> session=%s", userID, threadID, targetSession.ID[:min(8, len(targetSession.ID))])
-	note := ""
-	if resumed {
-		note += "\n\n▶ 已恢复该会话的 TUI 转发"
-	}
-	if len(suspended) > 0 {
-		note += fmt.Sprintf("\n⏸ 已暂停 %d 个其他认领会话的转发（/switch 切回即可恢复）", len(suspended))
-	}
-	msg := fmt.Sprintf("✅ 已切换到会话: %s\n\nID: %s\n更新: %s\n\n💡 直接发送消息即可继续该会话的上下文%s",
-		targetSession.Title, targetSession.ID[:min(8, len(targetSession.ID))],
-		targetSession.Updated.Format("2006-01-02 15:04"), note)
-	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(result.Message())); err != nil {
 		log.Printf("dingtalk: failed to send switch confirmation: %v", err)
 		return nil, err
 	}

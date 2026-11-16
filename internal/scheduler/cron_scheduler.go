@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"github.com/user/opencode-gateway/internal/opencode"
 )
 
 // CronScheduler 定时任务调度器
@@ -25,6 +29,8 @@ type CronScheduler struct {
 	cancel         context.CancelFunc
 	parser         cron.Parser // cron表达式解析器
 	storagePath    string      // 持久化存储路径
+	persistenceMu  sync.Mutex
+	inFlight       map[string]bool
 }
 
 // NewCronScheduler 创建定时任务调度器
@@ -43,6 +49,7 @@ func NewCronScheduler(taskScheduler *TaskScheduler) *CronScheduler {
 		cancel:         cancel,
 		parser:         parser,
 		storagePath:    "", // 默认不持久化，需要通过 SetStoragePath 设置
+		inFlight:       make(map[string]bool),
 	}
 }
 
@@ -63,7 +70,7 @@ func (cs *CronScheduler) Start() error {
 	// 加载持久化的任务
 	if cs.storagePath != "" {
 		if err := cs.loadTasks(); err != nil {
-			log.Printf("cron-scheduler: failed to load tasks: %v", err)
+			return fmt.Errorf("cron-scheduler: load tasks: %w", err)
 		}
 	}
 
@@ -76,16 +83,12 @@ func (cs *CronScheduler) Start() error {
 func (cs *CronScheduler) Stop() error {
 	log.Println("cron-scheduler: stopping cron scheduler")
 
-	// 保存任务到持久化存储
-	if cs.storagePath != "" {
-		if err := cs.saveTasks(); err != nil {
-			log.Printf("cron-scheduler: failed to save tasks: %v", err)
-		}
-	}
-
 	cs.cancel()
 	ctx := cs.cron.Stop()
 	<-ctx.Done()
+	if err := cs.saveTasks(); err != nil {
+		return fmt.Errorf("cron-scheduler: save tasks on stop: %w", err)
+	}
 	log.Println("cron-scheduler: cron scheduler stopped")
 	return nil
 }
@@ -107,14 +110,18 @@ func (cs *CronScheduler) AddSystemJob(cronExpr string, fn func()) error {
 
 // saveTasks 保存任务到文件
 func (cs *CronScheduler) saveTasks() error {
+	cs.persistenceMu.Lock()
+	defer cs.persistenceMu.Unlock()
+	if cs.storagePath == "" {
+		return nil
+	}
 	cs.tasksMu.RLock()
 	tasks := make([]*ScheduledTask, 0, len(cs.scheduledTasks))
 	for _, task := range cs.scheduledTasks {
 		tasks = append(tasks, task)
 	}
-	cs.tasksMu.RUnlock()
-
 	data, err := json.MarshalIndent(tasks, "", "  ")
+	cs.tasksMu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("marshal tasks: %w", err)
 	}
@@ -125,7 +132,15 @@ func (cs *CronScheduler) saveTasks() error {
 		return fmt.Errorf("write tasks file: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, cs.storagePath); err != nil {
+	err = os.Rename(tmpPath, cs.storagePath)
+	// Windows can briefly retain handles on a replaced file. Never delete the
+	// last committed snapshot to work around a sharing/permission failure.
+	for attempt := 0; err != nil && runtime.GOOS == "windows" && os.IsPermission(err) && attempt < 4; attempt++ {
+		log.Printf("cron-scheduler: retrying tasks file replacement: %v", err)
+		time.Sleep(time.Duration(1<<attempt) * 10 * time.Millisecond)
+		err = os.Rename(tmpPath, cs.storagePath)
+	}
+	if err != nil {
 		return fmt.Errorf("rename tasks file: %w", err)
 	}
 
@@ -151,6 +166,15 @@ func (cs *CronScheduler) loadTasks() error {
 
 	loadedCount := 0
 	for _, task := range tasks {
+		if task == nil {
+			return fmt.Errorf("tasks file contains a null task")
+		}
+		if err := normalizeScheduledOwner(task); err != nil {
+			task.Enabled = false
+			task.LastRunStatus = TaskStatusFailed
+			task.LastRunResult = err.Error()
+			log.Printf("cron-scheduler: disabled legacy task %s: %v", task.ID, err)
+		}
 		// 重新计算下次运行时间
 		schedule, err := cs.parser.Parse(task.CronExpr)
 		if err != nil {
@@ -159,9 +183,35 @@ func (cs *CronScheduler) loadTasks() error {
 		}
 		nextRun := schedule.Next(time.Now())
 		task.NextRunTime = &nextRun
+		verifiedSessionID := ""
+		if task.SessionID != "" && cs.taskScheduler != nil && cs.taskScheduler.opencodeClient != nil {
+			ctx, cancel := context.WithTimeout(cs.ctx, 5*time.Second)
+			resolved, resolveErr := cs.taskScheduler.opencodeClient.ResolveOrCreateSession(ctx, opencode.MessagePayload{
+				Channel: task.AdapterType, UserID: task.UserID,
+				ThreadID: opencode.CronThreadPrefix + task.ID, SessionID: task.SessionID,
+			})
+			cancel()
+			if resolveErr != nil {
+				task.Enabled = false
+				task.LastRunStatus = TaskStatusFailed
+				task.LastRunResult = resolveErr.Error()
+				log.Printf("cron-scheduler: disabled task %s with unverified session %s: %v", task.ID, task.SessionID, resolveErr)
+			} else {
+				task.SessionID = resolved
+				verifiedSessionID = resolved
+			}
+		}
 
 		// 保存到内存
-		cs.scheduledTasks[task.ID] = task
+		cs.tasksMu.Lock()
+		cs.scheduledTasks[task.ID] = cloneScheduledTask(task)
+		cs.tasksMu.Unlock()
+		if verifiedSessionID != "" {
+			cs.taskScheduler.registerCronSession(&Task{
+				ID: task.ID, Type: TaskTypeCron, AdapterType: task.AdapterType,
+				UserID: task.UserID, Metadata: task.Metadata,
+			}, verifiedSessionID)
+		}
 
 		// 如果任务启用，添加到cron调度器
 		if task.Enabled {
@@ -173,11 +223,17 @@ func (cs *CronScheduler) loadTasks() error {
 	}
 
 	log.Printf("cron-scheduler: loaded %d tasks from %s", loadedCount, cs.storagePath)
-	return nil
+	return cs.saveTasks()
 }
 
 // AddScheduledTask 添加定时任务
 func (cs *CronScheduler) AddScheduledTask(task *ScheduledTask) error {
+	if task == nil {
+		return fmt.Errorf("scheduled task is required")
+	}
+	if err := normalizeScheduledOwner(task); err != nil {
+		return err
+	}
 	if task.ID == "" {
 		task.ID = fmt.Sprintf("cron-%d", time.Now().UnixNano())
 	}
@@ -198,7 +254,11 @@ func (cs *CronScheduler) AddScheduledTask(task *ScheduledTask) error {
 
 	// 保存任务
 	cs.tasksMu.Lock()
-	cs.scheduledTasks[task.ID] = task
+	if _, exists := cs.scheduledTasks[task.ID]; exists {
+		cs.tasksMu.Unlock()
+		return fmt.Errorf("task already exists: %s", task.ID)
+	}
+	cs.scheduledTasks[task.ID] = cloneScheduledTask(task)
 	cs.tasksMu.Unlock()
 
 	// 如果启用，添加到cron
@@ -225,6 +285,10 @@ func (cs *CronScheduler) RemoveScheduledTask(taskID string) error {
 		cs.tasksMu.Unlock()
 		return fmt.Errorf("task not found: %s", taskID)
 	}
+	if cs.inFlight[taskID] {
+		cs.tasksMu.Unlock()
+		return fmt.Errorf("task is running: %s", taskID)
+	}
 	delete(cs.scheduledTasks, taskID)
 	cs.tasksMu.Unlock()
 
@@ -246,21 +310,29 @@ func (cs *CronScheduler) RemoveScheduledTask(taskID string) error {
 
 // UpdateScheduledTask 更新定时任务
 func (cs *CronScheduler) UpdateScheduledTask(task *ScheduledTask) error {
-	cs.tasksMu.RLock()
+	if task == nil {
+		return fmt.Errorf("scheduled task is required")
+	}
+	if err := normalizeScheduledOwner(task); err != nil {
+		return err
+	}
+	if _, err := cs.parser.Parse(task.CronExpr); err != nil {
+		return fmt.Errorf("invalid cron expression: %w", err)
+	}
+	cs.tasksMu.Lock()
 	oldTask, ok := cs.scheduledTasks[task.ID]
-	cs.tasksMu.RUnlock()
-
 	if !ok {
+		cs.tasksMu.Unlock()
 		return fmt.Errorf("task not found: %s", task.ID)
 	}
-
-	// 如果cron表达式变化，需要重新调度
+	if cs.inFlight[task.ID] {
+		cs.tasksMu.Unlock()
+		return fmt.Errorf("task is running: %s", task.ID)
+	}
 	needsReschedule := oldTask.CronExpr != task.CronExpr || oldTask.Enabled != task.Enabled
-
-	// 更新任务
+	task.SessionID = oldTask.SessionID
 	task.UpdatedAt = time.Now()
-	cs.tasksMu.Lock()
-	cs.scheduledTasks[task.ID] = task
+	cs.scheduledTasks[task.ID] = cloneScheduledTask(task)
 	cs.tasksMu.Unlock()
 
 	if needsReschedule {
@@ -290,6 +362,10 @@ func (cs *CronScheduler) EnableTask(taskID string) error {
 	if !ok {
 		cs.tasksMu.Unlock()
 		return fmt.Errorf("task not found: %s", taskID)
+	}
+	if err := normalizeScheduledOwner(task); err != nil {
+		cs.tasksMu.Unlock()
+		return err
 	}
 	task.Enabled = true
 	task.UpdatedAt = time.Now()
@@ -322,12 +398,12 @@ func (cs *CronScheduler) DisableTask(taskID string) error {
 
 // enableTask 启用任务（内部方法）
 func (cs *CronScheduler) enableTask(taskID string) error {
-	cs.tasksMu.RLock()
-	task, ok := cs.scheduledTasks[taskID]
-	cs.tasksMu.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("task not found: %s", taskID)
+	task, err := cs.GetScheduledTask(taskID)
+	if err != nil {
+		return err
+	}
+	if err := normalizeScheduledOwner(task); err != nil {
+		return err
 	}
 
 	// 创建任务执行函数
@@ -336,14 +412,17 @@ func (cs *CronScheduler) enableTask(taskID string) error {
 	}
 
 	// 添加到cron
+	cs.cronIDsMu.Lock()
+	defer cs.cronIDsMu.Unlock()
+	if _, exists := cs.cronIDs[taskID]; exists {
+		return nil
+	}
 	entryID, err := cs.cron.AddFunc(task.CronExpr, job)
 	if err != nil {
 		return fmt.Errorf("failed to add cron job: %w", err)
 	}
 
-	cs.cronIDsMu.Lock()
 	cs.cronIDs[taskID] = entryID
-	cs.cronIDsMu.Unlock()
 
 	log.Printf("cron-scheduler: enabled task '%s' (cron: %s)", task.Name, task.CronExpr)
 	return nil
@@ -363,30 +442,35 @@ func (cs *CronScheduler) disableTask(taskID string) {
 
 // executeScheduledTask 执行定时任务
 func (cs *CronScheduler) executeScheduledTask(taskID string) {
-	cs.tasksMu.Lock()
-	scheduledTask, ok := cs.scheduledTasks[taskID]
-	if !ok {
-		cs.tasksMu.Unlock()
-		log.Printf("cron-scheduler: task %s not found during execution", taskID)
+	if cs.ctx.Err() != nil {
 		return
 	}
-
-	// 更新运行信息
+	cs.tasksMu.Lock()
+	scheduledTask, ok := cs.scheduledTasks[taskID]
+	if !ok || !scheduledTask.Enabled {
+		cs.tasksMu.Unlock()
+		return
+	}
+	if cs.inFlight[taskID] {
+		cs.tasksMu.Unlock()
+		log.Printf("cron-scheduler: task %s skipped: already_running", taskID)
+		return
+	}
+	if err := normalizeScheduledOwner(scheduledTask); err != nil {
+		cs.tasksMu.Unlock()
+		log.Printf("cron-scheduler: invalid task %s: %v", taskID, err)
+		return
+	}
+	cs.inFlight[taskID] = true
 	now := time.Now()
 	scheduledTask.LastRunTime = &now
 	scheduledTask.RunCount++
-
+	scheduledTask = cloneScheduledTask(scheduledTask)
 	cs.tasksMu.Unlock()
 
 	log.Printf("cron-scheduler: executing scheduled task '%s' (type: %s, run count: %d)",
 		scheduledTask.Name, scheduledTask.Type, scheduledTask.RunCount)
 
-	// 创建执行任务
-	//
-	// UserID/ThreadID 必须透传：SendMessage 用它们拼 session 标题
-	// "[channel:userID] threadID"，而 /sessions 的所有权过滤依赖这个前缀。
-	// 漏传会让每次定时执行都新建一个标题为 "[dingtalk:] " 的孤儿 session，
-	// 既不属于任何用户，又会把真正属于用户的 session 挤出列表。
 	task := &Task{
 		ID:          fmt.Sprintf("%s-run-%d", scheduledTask.ID, scheduledTask.RunCount),
 		Type:        TaskTypeCron, // 标记为定时任务类型
@@ -395,7 +479,8 @@ func (cs *CronScheduler) executeScheduledTask(taskID string) {
 		AdapterType: scheduledTask.AdapterType,
 		UserID:      scheduledTask.UserID,
 		Channel:     scheduledTask.Channel,
-		ThreadID:    scheduledTask.ThreadID,
+		ThreadID:    opencode.CronThreadPrefix + scheduledTask.ID,
+		SessionID:   scheduledTask.SessionID,
 		Content:     scheduledTask.Content,
 		Agent:       scheduledTask.Agent,
 		ScriptPath:  scheduledTask.ScriptPath,
@@ -411,30 +496,63 @@ func (cs *CronScheduler) executeScheduledTask(taskID string) {
 	task.Metadata["name"] = scheduledTask.Name // 确保任务名称在metadata中
 	task.Metadata["scheduled_task_id"] = scheduledTask.ID
 
-	// 提交任务到调度器
-	if err := cs.taskScheduler.SubmitTask(task); err != nil {
-		log.Printf("cron-scheduler: failed to submit task for '%s': %v", scheduledTask.Name, err)
-		cs.updateTaskStatus(taskID, TaskStatusFailed, err.Error())
+	if cs.taskScheduler == nil || cs.taskScheduler.opencodeClient == nil {
+		cs.updateTaskStatus(taskID, TaskStatusFailed, "opencode task scheduler is not configured")
 		return
 	}
-
-	// 注册回调以更新状态
 	cs.taskScheduler.RegisterCallback(task.ID, func(ctx context.Context, result *TaskResult) error {
-		cs.updateTaskStatus(taskID, result.Status, result.Result)
+		body := result.Result
+		if result.Error != "" {
+			body = result.Error
+		}
+		cs.updateTaskStatus(taskID, result.Status, body)
 		return nil
 	})
+	task.OnSessionResolved = func(ctx context.Context, sessionID string) error {
+		task.SessionID = sessionID
+		cs.tasksMu.Lock()
+		current, exists := cs.scheduledTasks[taskID]
+		if exists {
+			current.SessionID = sessionID
+			current.UpdatedAt = time.Now()
+		}
+		cs.tasksMu.Unlock()
+		if !exists {
+			return fmt.Errorf("scheduled task %s was removed", taskID)
+		}
+		if err := cs.saveTasks(); err != nil {
+			return err
+		}
+		cs.taskScheduler.registerCronSession(task, sessionID)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(cs.ctx, 30*time.Second)
+	_, err := cs.taskScheduler.opencodeClient.ResolveOrCreateSession(ctx, opencode.MessagePayload{
+		Channel: task.AdapterType, UserID: task.UserID, ThreadID: task.ThreadID,
+		SessionID: task.SessionID, OnSessionResolved: task.OnSessionResolved,
+	})
+	cancel()
+	if err == nil {
+		err = cs.taskScheduler.SubmitTask(task)
+	}
+	if err != nil {
+		log.Printf("cron-scheduler: task %s preparation/submission failed: %v", taskID, err)
+		task.Status, task.Error = TaskStatusFailed, err.Error()
+		cs.taskScheduler.finishTask(task)
+	}
 }
 
 // updateTaskStatus 更新定时任务状态
 func (cs *CronScheduler) updateTaskStatus(taskID string, status TaskStatus, result string) {
 	cs.tasksMu.Lock()
-	defer cs.tasksMu.Unlock()
-
+	delete(cs.inFlight, taskID)
 	if task, ok := cs.scheduledTasks[taskID]; ok {
 		task.LastRunStatus = status
 		task.LastRunResult = result
 		task.UpdatedAt = time.Now()
 	}
+	cs.tasksMu.Unlock()
+	cs.autoSave()
 }
 
 // GetScheduledTask 获取定时任务
@@ -447,7 +565,7 @@ func (cs *CronScheduler) GetScheduledTask(taskID string) (*ScheduledTask, error)
 		return nil, fmt.Errorf("task not found: %s", taskID)
 	}
 
-	return task, nil
+	return cloneScheduledTask(task), nil
 }
 
 // ListScheduledTasks 列出所有定时任务
@@ -457,7 +575,7 @@ func (cs *CronScheduler) ListScheduledTasks() []*ScheduledTask {
 
 	tasks := make([]*ScheduledTask, 0, len(cs.scheduledTasks))
 	for _, task := range cs.scheduledTasks {
-		tasks = append(tasks, task)
+		tasks = append(tasks, cloneScheduledTask(task))
 	}
 
 	return tasks
@@ -471,7 +589,7 @@ func (cs *CronScheduler) GetScheduledTasksByAdapter(adapterType string) []*Sched
 	tasks := make([]*ScheduledTask, 0)
 	for _, task := range cs.scheduledTasks {
 		if task.AdapterType == adapterType {
-			tasks = append(tasks, task)
+			tasks = append(tasks, cloneScheduledTask(task))
 		}
 	}
 
@@ -506,4 +624,26 @@ func (cs *CronScheduler) autoSave() {
 	if err := cs.saveTasks(); err != nil {
 		log.Printf("cron-scheduler: auto-save failed: %v", err)
 	}
+}
+
+func normalizeScheduledOwner(task *ScheduledTask) error {
+	task.UserID = strings.TrimSpace(task.UserID)
+	if task.UserID == "" {
+		if creator, ok := task.Metadata["created_by"].(string); ok {
+			task.UserID = strings.TrimSpace(creator)
+		}
+	}
+	if strings.TrimSpace(task.AdapterType) == "" || task.UserID == "" {
+		return fmt.Errorf("cron task %s requires an adapter and an unambiguous owner", task.ID)
+	}
+	if task.Channel == "" && task.AdapterType == "feishu" {
+		task.Channel, _ = task.Metadata["receive_id"].(string)
+	}
+	return nil
+}
+
+func cloneScheduledTask(task *ScheduledTask) *ScheduledTask {
+	copy := *task
+	copy.Metadata = maps.Clone(task.Metadata)
+	return &copy
 }

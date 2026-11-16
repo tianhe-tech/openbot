@@ -41,8 +41,8 @@ func TestOutboundQueueParksAfterSessionExpired(t *testing.T) {
 		}
 	}
 
-	if parked := q.ListParked("u1"); len(parked) != 1 {
-		t.Fatalf("expected session-expired chunk to be parked, got %d parked entries", len(parked))
+	if parked, err := q.ListParked("u1"); err != nil || len(parked) != 1 {
+		t.Fatalf("expected session-expired chunk to be parked, got %d parked entries, err=%v", len(parked), err)
 	}
 	if did, derr := q.dispatchOne(); derr != nil || did {
 		t.Fatalf("parked chunk must not be dispatched again (did=%v err=%v)", did, derr)
