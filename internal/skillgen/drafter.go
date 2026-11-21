@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -115,28 +114,18 @@ func (d *OpencodeDrafter) Draft(ctx context.Context, in DraftInput) (DraftOutput
 	if strings.TrimSpace(reply) == "" {
 		return DraftOutput{}, fmt.Errorf("skillgen: completed draft has no body: session=%s", sessionID)
 	}
-	var decision struct {
-		Accept *bool `json:"accept"`
-	}
-	if json.Unmarshal([]byte(extractJSONObject(reply)), &decision) == nil && decision.Accept != nil && !*decision.Accept {
+	log.Printf("skillgen: drafter received reply (len=%d) from model=%s thread=%s", len(reply), in.ModelID, threadID)
+	out, declined, perr := parseDraftReply(reply)
+	if declined {
 		log.Printf("skillgen: drafter declined evidence thread=%s session=%s", in.ThreadID, sessionID)
 		return DraftOutput{}, nil
 	}
-	log.Printf("skillgen: drafter received reply (len=%d) from model=%s thread=%s", len(reply), in.ModelID, threadID)
-	title, body, score, action, patchTarget := parseDraftReply(reply)
-	if title == "" || body == "" {
-		log.Printf("skillgen: drafter reply unparseable (len=%d, first 200 chars=%.200s)", len(reply), reply)
-		return DraftOutput{}, fmt.Errorf("skillgen: drafter returned unparseable reply (len=%d)", len(reply))
+	if perr != nil {
+		return DraftOutput{}, perr
 	}
-	log.Printf("skillgen: drafter parsed OK (title=%s score=%.2f action=%s patchTarget=%s)", title, score, action, patchTarget)
-	return DraftOutput{
-		Title:       title,
-		SkillMD:     body,
-		Score:       score,
-		ModelID:     in.ModelID,
-		Action:      action,
-		PatchTarget: patchTarget,
-	}, nil
+	out.ModelID = in.ModelID
+	log.Printf("skillgen: drafter parsed OK (title=%s score=%.2f action=%s patchTarget=%s)", out.Title, out.Score, out.Action, out.PatchTarget)
+	return out, nil
 }
 
 func (d *OpencodeDrafter) loadReference() string {
@@ -256,15 +245,16 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// parseDraftReply extracts the JSON object from the model's reply. Tolerates
-// surrounding code fences and whitespace. Returns title, full SKILL.md, score,
-// action ("create"/"patch"), and patch_target slug.
-// On parse failure or accept=false, returns empties.
-func parseDraftReply(reply string) (title string, body string, score float64, action string, patchTarget string) {
+// parseDraftReply extracts the decision JSON from the model's reply.
+//
+// declined reports a deliberate accept=false answer, which is a valid outcome
+// (the evidence thread was not reusable) and must not be treated as a failure.
+// err is only returned when no usable decision could be recovered.
+func parseDraftReply(reply string) (out DraftOutput, declined bool, err error) {
 	raw := extractJSONObject(reply)
 	if raw == "" {
 		log.Printf("skillgen: parseDraftReply — no JSON object found in reply (len=%d, first 300 chars=%.300s)", len(reply), reply)
-		return
+		return DraftOutput{}, false, fmt.Errorf("skillgen: drafter returned unparseable reply (len=%d)", len(reply))
 	}
 	var obj struct {
 		Accept      bool    `json:"accept"`
@@ -275,47 +265,94 @@ func parseDraftReply(reply string) (title string, body string, score float64, ac
 		SkillMD     string  `json:"skill_md"`
 		Reason      string  `json:"reason"`
 	}
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		log.Printf("skillgen: parseDraftReply — JSON unmarshal failed: %v (raw len=%d, first 300 chars=%.300s)", err, len(raw), raw)
-		return
+	if uerr := json.Unmarshal([]byte(raw), &obj); uerr != nil {
+		log.Printf("skillgen: parseDraftReply — JSON unmarshal failed: %v (raw len=%d, first 300 chars=%.300s)", uerr, len(raw), raw)
+		return DraftOutput{}, false, fmt.Errorf("skillgen: drafter returned unparseable reply (len=%d)", len(reply))
 	}
 	if !obj.Accept {
-		return
+		return DraftOutput{}, true, nil
 	}
 	t := strings.TrimSpace(obj.Title)
 	md := strings.TrimSpace(obj.SkillMD)
 	if t == "" || md == "" {
-		return
+		log.Printf("skillgen: parseDraftReply — accepted reply missing title or skill_md (raw len=%d)", len(raw))
+		return DraftOutput{}, false, fmt.Errorf("skillgen: drafter reply missing title or skill_md (len=%d)", len(reply))
 	}
 	act := obj.Action
 	if act == "" {
 		act = "create"
 	}
-	return t, md, obj.Confidence, act, strings.TrimSpace(obj.PatchTarget)
+	return DraftOutput{
+		Title:       t,
+		SkillMD:     md,
+		Score:       obj.Confidence,
+		Action:      act,
+		PatchTarget: strings.TrimSpace(obj.PatchTarget),
+	}, false, nil
 }
 
-var jsonObjRe = regexp.MustCompile(`(?s)\{.*\}`)
-
-// extractJSONObject pulls out the last {...} block from text, stripping
-// code fences. Some models prepend thinking/reasoning text before the JSON;
-// we find the widest JSON object by searching for the last `{` that starts
-// a valid-looking object. If the text starts with `{` (no thinking), the
-// simple regex match suffices.
+// extractJSONObject returns the first JSON object embedded in s that carries an
+// "accept" key. Models routinely wrap the decision in reasoning prose, code
+// fences, or even quote unrelated JSON fragments (an image payload, a tool
+// result) before the real answer, so a single greedy `\{.*\}` match is not
+// enough — we scan every `{` and keep the first object that decodes.
+//
+// Objects without an "accept" key are ignored on purpose: returning one would
+// unmarshal into a zero-valued decision and be misread as a deliberate decline.
 func extractJSONObject(s string) string {
-	s = strings.TrimSpace(s)
-	// strip ```json ... ``` or ``` ... ``` fences
-	if strings.HasPrefix(s, "```") {
-		s = strings.TrimPrefix(s, "```json")
-		s = strings.TrimPrefix(s, "```")
-		s = strings.TrimSuffix(s, "```")
-		s = strings.TrimSpace(s)
+	s = stripCodeFences(s)
+	// Bound the scan: each attempt decodes up to len(s) bytes, so a reply full
+	// of braces would otherwise cost O(n²).
+	const maxAttempts = 256
+	attempts := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' {
+			continue
+		}
+		if attempts++; attempts > maxAttempts {
+			break
+		}
+		raw, ok := decodeObjectAt(s[i:])
+		if !ok {
+			continue
+		}
+		if hasAcceptKey(raw) {
+			return raw
+		}
 	}
-	// If the entire string is a JSON object (no thinking prefix), use it directly.
-	if strings.HasPrefix(s, "{") {
+	return ""
+}
+
+// decodeObjectAt decodes one JSON object starting at the beginning of s and
+// returns its exact source text.
+func decodeObjectAt(s string) (string, bool) {
+	var raw json.RawMessage
+	if err := json.NewDecoder(strings.NewReader(s)).Decode(&raw); err != nil {
+		return "", false
+	}
+	if len(raw) == 0 || raw[0] != '{' {
+		return "", false
+	}
+	return string(raw), true
+}
+
+func hasAcceptKey(raw string) bool {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil {
+		return false
+	}
+	_, ok := probe["accept"]
+	return ok
+}
+
+// stripCodeFences removes a leading/trailing ```json ... ``` wrapper.
+func stripCodeFences(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "```") {
 		return s
 	}
-	// Otherwise, find the last {...} block — the model may have prepended
-	// thinking/reasoning text before the JSON output.
-	m := jsonObjRe.FindString(s)
-	return strings.TrimSpace(m)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
 }

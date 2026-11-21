@@ -31,6 +31,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
@@ -296,7 +297,7 @@ func (s *Service) OnSkillCandidate(event opencode.SkillCandidateEvent) {
 		Fn: func(ctx context.Context) error {
 			return s.run(ctx, ev)
 		},
-		Dur: 10 * time.Minute, // drafter uses a dedicated session; give it more headroom
+		Dur: s.jobBudget(),
 	}) {
 		s.recent.Delete(dedupKey)
 		log.Printf("skillgen: enqueue failed adapter=%s user=%s thread=%s", ev.Adapter, ev.UserID, ev.ThreadID)
@@ -392,7 +393,16 @@ func (s *Service) run(ctx context.Context, ev opencode.SkillCandidateEvent) (run
 			continue
 		}
 		triedModels[tryModel] = true
-		log.Printf("skillgen: STEP4 drafting (model=%s, timeout=%v)...", tryModel, s.cfg.PerModelTimeout)
+		// context.WithTimeout clamps the child deadline to the parent's, so a
+		// multi-model chain can never outlive the job budget. jobBudget() sizes
+		// the parent so every model in the chain still gets a full attempt.
+		modelBudget := s.cfg.PerModelTimeout
+		if dl, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(dl); remaining < modelBudget {
+				modelBudget = remaining
+			}
+		}
+		log.Printf("skillgen: STEP4 drafting (model=%s, timeout=%v)...", tryModel, modelBudget)
 		draftCtx, draftCancel := context.WithTimeout(ctx, s.cfg.PerModelTimeout)
 		out, draftErr = s.drafter.Draft(draftCtx, DraftInput{
 			Trigger:             string(ev.Trigger),
@@ -601,6 +611,9 @@ func (s *Service) pickModel() string {
 	// Picked model is demoted: fall back to the first healthy model in the pool.
 	log.Printf("skillgen: picked model %s is demoted (consecutive fails), selecting healthy alternate", picked)
 	for _, m := range s.buildFallbackChain(picked) {
+		if m == picked {
+			continue
+		}
 		if !s.isDemoted(m) {
 			return m
 		}
@@ -690,6 +703,22 @@ func (s *Service) buildFallbackChain(picked string) []string {
 	return chain
 }
 
+// jobBudget is the total time the async job is allowed to run. It must cover a
+// full fallback chain (each model gets PerModelTimeout) plus fetch/persist/
+// notify overhead; otherwise the job context expires mid-chain and the last
+// model is always truncated.
+func (s *Service) jobBudget() time.Duration {
+	models := len(s.buildFallbackChain(s.cfg.DraftModel))
+	if models < 1 {
+		models = 1
+	}
+	budget := s.cfg.PerModelTimeout*time.Duration(models) + 2*time.Minute
+	if budget < 10*time.Minute {
+		budget = 10 * time.Minute
+	}
+	return budget
+}
+
 // writeSkillFile writes SKILL.md under <root>/<slug>/SKILL.md and returns the path.
 func writeSkillFile(root, title, content string) (string, error) {
 	slug := slugify(title)
@@ -707,9 +736,13 @@ func writeSkillFile(root, title, content string) (string, error) {
 	return path, nil
 }
 
-// slugify converts a title to a kebab-case directory name.
+// slugify converts a title to a kebab-case directory name. Titles are often
+// Chinese (the drafter prompt asks for Chinese content), which yields no ASCII
+// alphanumerics at all — in that case we fall back to a stable hash-based slug
+// so the candidate still gets a deterministic, filesystem-safe directory.
 func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
+	original := strings.TrimSpace(s)
+	s = strings.ToLower(original)
 	var b strings.Builder
 	prevDash := false
 	for _, r := range s {
@@ -725,6 +758,14 @@ func slugify(s string) string {
 		}
 	}
 	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		if original == "" {
+			return ""
+		}
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(original))
+		return fmt.Sprintf("skill-%08x", h.Sum32())
+	}
 	if len(out) > 60 {
 		out = out[:60]
 	}
