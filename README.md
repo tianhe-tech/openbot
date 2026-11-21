@@ -62,10 +62,12 @@
 
 ### 💾 记忆系统
 
-- **SQLite + FTS5** — 纯 Go 驱动（`modernc.org/sqlite`），trigram 分词支持中文
-- **情景回忆** — 对话记录自动存储，BM25 搜索召回
-- **遗忘曲线** — 每小时衰减强度，模拟艾宾浩斯遗忘曲线
+- **SQLite + FTS5** — 纯 Go 驱动（`modernc.org/sqlite`），双索引：trigram 分词支持中文与任意子串，unicode61 词索引让 ASCII 词查询快 15.9 倍；schema v7 起两个索引都是 contentless，索引里不再有第二份正文副本
+- **情景回忆** — 对话记录自动存储，BM25 搜索召回，返回记录 ID 与原文摘录
 - **会话 Handoff** — 卡死会话摘要保存，下次同线程自动注入
+- **单实例租约** — 90 秒 TTL 的归档租约 + 定期续期，两个进程无法同时向同一归档捕获
+- **持久知识**（可选）— 从已完成对话抽取带证据校验的事实，按作用域限定，新会话注入有界知识索引；修正以 supersession 记录而非覆盖历史
+- **运维可见** — `memory_health` 报告索引滞后与完整性，`memory_space` 报告归档空间去向；`openbot-memory-delete` 按 principal 删除归档数据
 
 ### 🔒 安全代理隧道
 
@@ -75,7 +77,7 @@
 
 ### 📦 其他特性
 
-- **MCP 服务器** — 将记忆库暴露为 LLM 工具（`memory_search` / `memory_list_projects` / `memory_recent`）
+- **MCP 服务器** — 将记忆库暴露为 LLM 工具（`memory_search` / `memory_get` / `memory_scroll` / `memory_list_projects` / `memory_recent` / `memory_health` / `memory_space`）
 - **离线重试** — 消息发送失败 5 次后进入离线队列，`/recover` 恢复
 - **语音输入** — 阿里云 NLS 语音转文字（钉钉 + 飞书）
 - **技能/Agent 路由** — `@agent_name` 前缀转发到指定 OpenCode 技能
@@ -120,6 +122,20 @@ make run
 | `bin/openbot-mcp` | MCP stdio 服务器（记忆工具） |
 | `bin/openbot-attach` | `opencode attach` 本地 TCP→Hub 桥接 |
 | `bin/openbot-wechat` | 微信 QR 登录 + 凭证管理 |
+| `bin/openbot-memory-migrate` | 运维工具：迁移归档 schema 并导入历史记录 |
+| `bin/openbot-memory-delete` | 运维工具：按 principal 删除归档会话数据 |
+
+后两个是**运维工具**，不属于网关部署的一部分：它们不在网关进程里，也不通过 MCP 暴露，必须由运维人员在服务器上显式执行。`make build` 会一并构建，也可以用 `make build-memory-migrate` / `make build-memory-delete` 单独构建。
+
+```bash
+# 迁移归档（先备份，再事务性应用 schema）
+bin/openbot-memory-migrate --db mem/memory.db --backup mem/memory.before-v2.db
+
+# 按 principal 删除（不可撤销，必须显式 --confirm）
+bin/openbot-memory-delete --db mem/memory.db --adapter dingtalk --user 0123456789 --confirm
+```
+
+详见 [归档迁移](docs/MEMORY_MIGRATION.md) 与 [按 principal 删除](docs/MEMORY_DELETION.md)。
 
 ### 最小配置示例（钉钉 Stream 模式）
 
@@ -165,12 +181,13 @@ DINGTALK_OWNER_USERID=1601434517956472
 - **入站批处理**：自动合并快速连续的消息（粘贴/转发拆分），可调延迟
 - **用户级序列化**：同一用户的消息 FIFO 处理，第二个消息排队等待第一个完成
 - **持久化出站队列**：SQLite 3 级优先级系统
-  - `PriorityHigh`（2）：权限/问题确认 — 跳过限流冷却
+  - `PriorityHigh`（2）：权限/问题确认 — 最高派发优先级，冷却结束后最先发送
   - `PriorityNormal`（1）：最终结果、todo、错误通知
   - `PriorityLow`（0）：进度更新 — 拥堵时可 TTL 丢弃
-- **离线队列**：5 次热重试失败后进入离线队列，`/pending` `/recover` 恢复
+- **关键消息永不丢弃**：关键内容（最终结果/todo/权限/错误通知）不限重试次数，指数退避（上限 5 分钟），跨重启持久；非关键内容 5 次尝试后丢弃
 - **顺序权限确认**：多个权限请求逐个显示，回答当前才能看到下一个
-- **限流自适应**：30s→60s→120s 递增冷却，成功后自动清除
+- **限流冷却**：触发后固定 60s 冷却（暂停该用户所有发送，含 `PriorityHigh`），到期自动解除
+- **离线队列**：`/new` `/reset` 时未送达的 `PriorityNormal` 消息标记 parked 保留，`/pending` 查看、`/recover` 恢复
 
 ---
 
@@ -190,7 +207,8 @@ DINGTALK_OWNER_USERID=1601434517956472
 | 命令 | 说明 |
 |------|------|
 | `/status` / `状态` | 会话 ID、token 用量、诊断信息 |
-| `/new` / `/reset` / `新会话` | 清除旧会话，下次消息创建新会话 |
+| `/new` / `新会话` | 开启新会话（保存上下文摘要，下一条消息自动携带） |
+| `/reset` / `重置` | 硬重置会话（丢弃上下文，干净开始） |
 | `/clear` / `清除` | 删除当前会话及历史 |
 | `/fork` | 派生当前会话 |
 | `/undo` / `/redo` | 撤销/重做上次操作 |
@@ -201,7 +219,7 @@ DINGTALK_OWNER_USERID=1601434517956472
 
 | 命令 | 说明 |
 |------|------|
-| `/models` | 列出所有可用模型 |
+| `/model` | 列出所有可用模型 |
 | `/model <provider>/<model>` | 设置会话模型 |
 | `/thinking on\|off` | 切换思考过程输出 |
 | `/final on\|off` | 仅返回最终结果（WeChat 内置开启） |
@@ -245,12 +263,14 @@ DINGTALK_OWNER_USERID=1601434517956472
 | `/skill-reject <id> [原因]` | 拒绝技能 |
 | `/skill-stats` | 模型生成/批准统计 |
 
-### 微信离线队列
+### 微信专属
 
 | 命令 | 说明 |
 |------|------|
 | `/pending` | 查看待处理的离线消息 |
-| `/recover` | 恢复离线消息 |
+| `/recover [session-id前缀]` | 恢复离线消息 |
+| `/retry [消息]` | 撤销上次回复并重新发送 |
+| `/devcore [on\|off\|set\|reset\|<偏好>]` | 管理 Dev Core 偏好注入 |
 
 ### Agent 路由
 
@@ -272,10 +292,19 @@ DINGTALK_OWNER_USERID=1601434517956472
 
 1. **触发条件**：会话完成且工具调用 ≥3 次（`SKILLGEN_MIN_TOOL_CALLS`），或会话 handoff 时
 2. **模型选择**：epsilon-greedy 策略在 `SKILLGEN_DRAFT_MODEL` + `SKILLGEN_ALTERNATE_MODELS` 中选择
-3. **草稿生成**：专用 opencode 会话，加载参考技能，输出 JSON 格式的 SKILL.md
-4. **模型 Fallback**：主模型失败时自动切换备选模型重试
-5. **人工审核**：草稿写入 `skills-candidates/`，通知用户审核
-6. **安装**：`/skill-approve` 后移动到 `skills/` 目录
+3. **草稿生成**：专用 opencode 会话等待明确完成，只解析正文；权限、提问、错误、超时或静默挂起均作为失败处理，不等待无人回答的确认
+4. **模型 Fallback**：仅由 Skillgen 切换备选模型；每模型预算受总任务 10 分钟预算约束。失败后有界中止，远端未确认停止时不启动下一模型
+5. **人工审核**：草稿写入 `skills-candidates/` 并保存候选后通知原渠道用户；收件人在入队前确定，不能唯一解析时跳过生成，cron 和草稿自身不会触发生成
+6. **安装**：仅候选所属渠道用户可查看、批准或拒绝；`/skill-approve` 安装到配置目录。自动批准模式也先保存候选，安装和状态保存成功后才通知
+
+失败会给原收件人发送简短、脱敏的阶段提示，每个渠道/用户滚动 24 小时最多 3 条，
+独立于候选数量限额；主动放弃或低置信度不属于故障。旧候选若缺失归属信息，
+不会猜测收件人或允许任意用户审批。
+
+候选/安装目录在启动时按 CWD 解析为绝对路径并创建，失败则明确禁用 Skillgen。
+相对参考文件先查 CWD，仅不存在时再查可执行文件目录下的同一路径；
+绝对路径不改写。参考文件缺失、为空或不可读会告警并降级，不阻止无参考生成。
+安装目录必须位于 OpenCode 实际技能发现范围，文件写入成功不等于已被发现。
 
 ### 配置
 
@@ -333,19 +362,26 @@ SKILLGEN_INSTALL_DIR=/root/.config/opencode/skills
 ### 架构
 
 - **存储**：SQLite（`modernc.org/sqlite`，纯 Go，WAL 模式）
-- **全文搜索**：FTS5 虚拟表，trigram 分词器（支持中文）
+- **全文搜索**：FTS5 虚拟表，双索引 —— trigram 分词器（支持中文与任意子串）+ unicode61 词索引（ASCII 词快 15.9 倍），按查询词形态自动路由
+- **压缩**：消息正文按块存储，zstd 压缩只在比原文更小时启用，因此导入不会让磁盘占用按正文全量增长
+- **索引不存正文**：schema v7 起两个全文索引都是 contentless（`content=''` + `contentless_delete=1`），摘录由分块的字节区间回填到解码后的正文重建，索引里不再有第二份正文副本
 - **路径**：`MEMORY_STORE_PATH`（默认 `<OPENCODE_DIRECTORY>/mem/memory.db`）
 
 ### 功能
 
-- **情景回忆**：对话记录自动存储（请求、响应摘要、项目、工作目录、操作类型、标签）
-- **BM25 搜索**：通过 MCP 工具或 API 搜索历史对话
-- **遗忘曲线**：每小时衰减强度，模拟艾宾浩斯遗忘曲线
-- **会话 Handoff**：卡死会话的摘要保存，下次同线程自动注入为新会话的前言
+- **情景回忆**：保存收到的请求和完整响应文本、项目、工作目录、操作类型和标签，不再截断为 600 字节
+- **BM25 搜索**：索引请求和响应；返回记录 ID 与原文摘录，不按项目/日期合并不同对话
+- **历史保留**：不再按历史关键词自动删除记录，不再按记忆强度排除旧记录或每小时衰减
+- **会话 Handoff**：卡死会话的摘要保存，下次同线程自动注入为新会话的前言；读取时按 TTL 过滤，过期行由网关每 6 小时清理一次（保留窗口是 TTL 的两倍，因为刚过期的行仍是该线程最新的记录）
+- **单实例租约**：网关在 `mem_v2_instance_lease` 上持有 90 秒 TTL 的租约并每 `TTL/3` 续期，两个进程无法同时向同一归档捕获
+- **WAL 维护**：`-wal` 文件超过阈值时执行 `wal_checkpoint(TRUNCATE)`，避免持续写入把 WAL 撑到永不回收
+- **持久知识**（可选，`MEMORY_KNOWLEDGE_ENABLED`）：从已完成的对话中抽取带证据的、按作用域限定的事实，新会话开始时注入一小段有界的知识索引。事实不是证据：每条事实引用的消息 ID 都会在写入事务内校验存在且属于同一 principal，无依据的声明直接拒绝而不是以低置信度存下。修正以 supersession 记录而不是覆盖历史，`/remember` `/forget` `/knowledge-list` `/knowledge-help` 提供显式控制。详见 [持久知识](docs/MEMORY_KNOWLEDGE.md)
 
 ### 自动 MCP 注册
 
-网关启动时自动在 `opencode.json` 中注册 `gateway-memory` MCP 工具，AI 可主动搜索记忆。
+网关启动时在 `opencode.json` 中注册默认禁用的 `gateway-memory` MCP 工具。只有隔离的单用户实例才能配置固定 adapter/user 后启用；共享实例暂不支持安全的历史召回。已有配置不会被覆盖，但新版 MCP 缺少显式绑定时会拒绝启动。
+
+升级时先备份数据库，再启动新版网关：它会事务性重建一次搜索索引，包含现存响应。MCP 只读打开，不创建或迁移数据库。已经删除或截断的历史无法凭空恢复。详见 [MCP 配置与升级](docs/MCP_MEMORY_TOOL.md)。
 
 ---
 
@@ -355,24 +391,31 @@ SKILLGEN_INSTALL_DIR=/root/.config/opencode/skills
 
 | 工具 | 说明 |
 |------|------|
-| `memory_search` | FTS + 模糊搜索（query 必填，可选 project/days/limit） |
+| `memory_search` | 作用域内词法搜索。归档已迁移到 v2 时搜索原始消息正文，返回证据字节偏移、项目/时间过滤、游标分页和索引覆盖状态；未迁移时回退到 Phase 0 的 FTS 召回（query 必填，可选 days/limit/project/cursor；limit 默认 10、最大 50） |
+| `memory_get` | 按消息 ID 取回原始正文（最多 100 条，可选 budget_bytes，默认 32 KiB、最大 256 KiB）。需要已迁移的 v2 归档 |
+| `memory_scroll` | 按 seq 顺序翻页浏览单个会话（session_id 必填，可选 cursor/direction/limit；limit 默认 20、最大 100）。需要已迁移的 v2 归档 |
 | `memory_list_projects` | 项目列表（含计数和最后活跃时间） |
-| `memory_recent` | 最近对话（days 默认 7，limit 默认 20） |
+| `memory_recent` | 最近对话（days 默认 7，0 表示全部；limit 默认 10、最大 50） |
+| `memory_health` | 运维状态：作用域模式、归档 schema、分词器版本、待处理/失败的索引任务、词索引完整性与滞后、索引更新时间、消息总数、索引滞后、分块数、存储统计（块数、已压缩块数、原始字节、实际存储字节、节省字节）。不接受参数。不返回消息正文、凭据或任何按用户区分的标签，因此可以安全地暴露给模型。未迁移的归档会报告 `schema: legacy` 并说明索引在 `memory-migrate` 之前不适用，而不是返回一堆看起来像"健康的空索引"的零。存储行分别报告原始字节与实际存储字节，这样压缩是否生效是可见的而不是假设的：只报告存储字节的话，压缩生效和被静默关闭看起来完全一样 |
+| `memory_space` | 归档空间去向：整库数字（数据库文件、WAL、SHM、空闲页、逻辑大小、全文索引页、索引中存储的正文）与当前 principal 的逻辑大小（块字节、工件字节、嵌入字节）分组报告，两组永不相加——所有 principal 共享同一批页，按 principal 分摊文件大小是虚构的，而块和工件是文件的子集而不是增量。可选 `backup_path` 单独报告备份文件大小。比 `memory_health` 慢，因为全文索引开销用 `dbstat` 遍历页表测得，所以是独立工具而不是塞进健康报告。SQLite 构建没有 `dbstat` 时 `fts_bytes` 报告为 unknown 而不是 0，因为 0 会被读成"索引是空的"。`fts_bytes` 是 `logical_bytes` 的子集而不是 `file_bytes` 的子集：`dbstat` 通过 pager 读取，会把仍在 WAL 中的页算进去，而 `file_bytes` 只是主文件，所以刚写入过的归档里索引可以合法地大于文件。schema v7 把两个索引都改成 contentless，因此 `fts_content_bytes` 在 v7 归档上为 0；非 0 说明归档早于 v7，或后续改动又加回了正文列。不返回消息正文或按用户区分的标签 |
+
+v2 搜索在索引任务尚未处理完时返回 `Coverage: PARTIAL`，不会把"还没索引"伪装成"没有匹配"。结果里的 `mode` 说明是哪个索引回答的：`word`（纯 ASCII 词，走词索引，最快）、`fts`（含中文或 `.` `/` 等分隔符，走 trigram 索引）、`hybrid`（两种词混合，两个索引都查后合并）、`scan`（全部短于 3 个字符，两个索引都无法匹配，退化为有界扫描）。`scan` 只检查最新的 2000 条消息，一旦因此提前停止就返回 `TooBroad` 并在 `notice` 里说明"只扫描了最新 N 条"，因为"最新 2000 条里的匹配"和"全部匹配"是两个不同的答案。schema v4 升级后词索引由后台回填，未完成时 `word`/`hybrid` 查询会额外报告 `Word index: PARTIAL` —— 这与 `Coverage: PARTIAL` 不同：消息已索引，只是不在该查询使用的索引里。`memory_get` / `memory_scroll` 在未迁移的归档上直接报错，而不是返回空结果。
 
 ### 配置
 
 ```json
-// opencode.json
 {
   "mcp": {
     "gateway-memory": {
       "type": "local",
-      "command": ["./bin/openbot-mcp", "--db", "./tmp/memory.db"],
+      "command": ["./bin/openbot-mcp", "--db", "./mem/memory.db", "--single-owner", "--adapter", "wechat", "--user", "YOUR_USER_ID"],
       "enabled": true
     }
   }
 }
 ```
+
+以上启用示例仅适用于其他用户无法访问的单用户 OpenCode/MCP 实例。绑定用户不是共享进程的身份认证；请替换实际 channel/user ID，并使用与网关一致的绝对数据库路径。Windows 二进制名需要 `.exe`。
 
 ---
 
@@ -416,9 +459,8 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `OPENCODE_API_KEY` | — | Bearer / X-API-Key 认证 |
-| `OPENCODE_SERVER_PASSWORD` | — | HTTP Basic Auth 密码 |
-| `OPENCODE_SERVER_USERNAME` | `opencode` | Basic Auth 用户名 |
+| `OPENCODE_API_KEY` | — | API Key（`Authorization: Bearer` 认证） |
+| `OPENCODE_SERVER_PASSWORD` | — | API Key 回退（未设置 `OPENCODE_API_KEY` 时使用） |
 | `OPENCODE_ENDPOINT` | `http://localhost:4096` | OpenCode 服务器地址 |
 | `OPENCODE_DIRECTORY` | `.` | 工作目录 |
 | `OPENCODE_MANAGE_SERVE` | `true` | 网关管理 opencode 子进程 |
@@ -428,6 +470,22 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `OPENCODE_STREAM_IDLE_TIMEOUT_SECONDS` | `600` | 无内容空闲超时 |
 | `OPENCODE_STREAM_IDLE_TIMEOUT_HASSENT_SECONDS` | `120` | 有内容空闲超时 |
 | `OPENCODE_STREAM_BUSY_PROBE_EXTEND` | `true` | 活跃时延长超时 |
+| `OPENCODE_DEV_CORE_ENABLED` | `false` | Dev Core 偏好注入开关 |
+| `OPENCODE_DEV_CORE_PROMPT` | — | Dev Core 偏好提示词 |
+
+### 熔断器（Circuit Breaker）
+
+按模型维度的 provider 熔断：连续失败后暂时跳过该模型，冷却结束后半开探测，反复失败则指数退避。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `OPENCODE_CIRCUIT_BREAKER_ENABLED` | `true` | 总开关 |
+| `OPENCODE_CB_FAILURE_THRESHOLD` | `2` | 连续失败次数阈值 |
+| `OPENCODE_CB_COOLDOWN_SECONDS` | `60s` | 初始熔断时长 |
+| `OPENCODE_CB_MAX_COOLDOWN_SECONDS` | `30m` | 熔断时长上限 |
+| `OPENCODE_CB_TRIP_KEYWORDS` | 见下 | 触发熔断的错误关键字（逗号分隔） |
+
+默认关键字：`No available client,No available channel,Insufficient Balance,provider unavailable,Access denied,Arrearage,Model not found`。留空表示所有 `session.error` 事件都触发。
 
 ### 日志与 HTTP
 
@@ -444,7 +502,19 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `MEMORY_ENABLED` | `true` | 记忆系统总开关 |
 | `MEMORY_STORE_PATH` | `<OPENCODE_DIRECTORY>/mem/memory.db` | SQLite 路径（空=禁用） |
+| `MEMORY_CAPTURE_MODE` | `legacy` | 捕获模式：`legacy` 或 `strict`（v2 归档） |
+| `MEMORY_SCOPE_MODE` | `disabled` | 作用域模式：`disabled` 或 `single_owner` |
+| `MEMORY_KNOWLEDGE_ENABLED` | `false` | 持久知识抽取；要求 `MEMORY_ENABLED=true` 且 `MEMORY_CAPTURE_MODE=strict` |
+| `MEMORY_QUEUE_MAX_ITEMS` | `1024` | 写入队列最大条数 |
+| `MEMORY_QUEUE_MAX_BYTES` | `16777216` | 写入队列最大字节数（16 MiB） |
+| `MEMORY_BATCH_MAX_ITEMS` | `64` | 单批最大条数，不得超过 `MEMORY_QUEUE_MAX_ITEMS` |
+| `MEMORY_BATCH_MAX_BYTES` | `262144` | 单批最大字节数（256 KiB），不得超过 `MEMORY_QUEUE_MAX_BYTES` |
+| `MEMORY_BATCH_MAX_DELAY_MS` | `10` | 凑不满一批时的最长等待 |
+| `MEMORY_COMMIT_TIMEOUT_MS` | `2000` | 单次提交超时 |
+
+`MEMORY_SEMANTIC_ENABLED` 与 `MEMORY_CONVERSATION_RETENTION_DAYS` 刻意未实现：语义检索与保留分级尚未落地，先加开关只会得到一个不起作用的旋钮。
 
 ### 钉钉
 
@@ -491,6 +561,7 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `WECHAT_CDN_BASE_URL` | `https://ilinkai.weixin.qq.com` | CDN 地址 |
 | `WECHAT_TEXT_BATCH_DELAY_SECONDS` | `3` | 入站批处理延迟 |
 | `WECHAT_TEXT_BATCH_SPLIT_DELAY_SECONDS` | `5` | 拆分检测延迟 |
+| `WECHAT_INBOUND_DB_PATH` | `<stateDir>/inbound_queue.db` | 入站持久化缓冲 SQLite（崩溃后重放） |
 | `WECHAT_OUTBOUND_DB_PATH` | `<stateDir>/outbound_queue.db` | 出站队列 SQLite |
 | `WECHAT_OUTBOUND_TICK_MS` | `3000` | 出站 ticker 间隔 |
 | `WECHAT_OUTBOUND_MAX_TEXT_LEN` | `4000` | 最大文本块长度 |
@@ -510,7 +581,7 @@ PROXY_LOCAL_OPENCODE_ADDR=127.0.0.1:4096
 | `PROXY_HUB_WS_URL` | — | 中继 Hub WS URL |
 | `PROXY_KEY_FILE` | `.opencode-gateway-proxy.json` | 密钥文件 |
 | `PROXY_LOCAL_OPENCODE_ADDR` | `127.0.0.1:4096` | 本地 OpenCode 地址 |
-| `PROXY_RECONNECT_DELAY` | `5s` | 重连延迟 |
+| `PROXY_RECONNECT_DELAY` | `180s` | 重连延迟 |
 
 ### 技能自动生成
 
@@ -610,7 +681,9 @@ opencode-gateway/
 │   ├── gateway/main.go             # 主网关 openbot
 │   ├── mcp/main.go                 # MCP 服务器 openbot-mcp
 │   ├── attach/main.go              # attach 桥接 openbot-attach
-│   └── wechat-login/main.go        # 微信登录 openbot-wechat
+│   ├── wechat-login/main.go        # 微信登录 openbot-wechat
+│   ├── memory-migrate/main.go      # 归档迁移 openbot-memory-migrate
+│   └── memory-delete/main.go       # 按 principal 删除归档 openbot-memory-delete
 ├── internal/
 │   ├── adapters/                   # 平台适配器
 │   │   ├── base/                   # 双向适配器基类 + 注册表
@@ -620,7 +693,9 @@ opencode-gateway/
 │   │   └── wecom/                  # 企业微信
 │   ├── asyncwork/                  # 异步任务队列（handoff/skillgen）
 │   ├── config/                     # 环境变量配置
-│   ├── memstore/                   # SQLite 记忆库（FTS5 + 遗忘曲线）
+│   ├── knowledge/                  # 持久知识抽取 + `/remember` `/forget` 命令
+│   ├── logging/                    # 日志级别
+│   ├── memstore/                   # SQLite 记忆库（FTS5 + 遗忘曲线 + 归档租约）
 │   ├── opencode/                   # OpenCode SDK 封装 + SSE 事件监听
 │   ├── opencodesvc/                # opencode 子进程管理 + 自动重启
 │   ├── proxy/                      # WS 隧道 + UI RPC
@@ -651,6 +726,8 @@ make build-gateway      # 仅构建 openbot
 make build-mcp          # 仅构建 openbot-mcp
 make build-attach       # 仅构建 openbot-attach
 make build-wechat       # 仅构建 openbot-wechat
+make build-memory-migrate # 仅构建 openbot-memory-migrate
+make build-memory-delete  # 仅构建 openbot-memory-delete
 make build-linux        # 交叉编译 linux/amd64
 make build-darwin       # 交叉编译 macOS/amd64
 make build-darwin-arm64 # 交叉编译 macOS/Apple Silicon
@@ -660,7 +737,7 @@ make install            # 安装到 $GOPATH/bin
 make run                # 构建并运行
 make run-env            # 加载 .env 并运行
 make init-env           # 从模板生成 .env
-make test               # 运行测试
+make test               # 运行测试（固定 -timeout 40m，见下）
 make vet                # go vet
 make lint               # golangci-lint
 make docker-build       # Docker 构建
@@ -668,6 +745,8 @@ make docker-run         # Docker 运行
 make clean              # 清理构建产物
 make help               # 显示帮助
 ```
+
+`make test` 的 `-timeout 40m` 不是可选项。`go test` 默认每包 10 分钟，而 `internal/memstore` 会构建真实归档并运行索引 worker，单包耗时已超过该默认值（实测 `ok 852.833s`）。缺这个参数时它不会断言失败，而是在测试仍正常运行时 panic `test timed out after 10m0s`，看起来像卡死但并不是。上限设成 40m 是为了让真正的卡死仍然能被终止。
 
 ---
 
@@ -677,15 +756,23 @@ make help               # 显示帮助
 |------|------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计、组件概览、适配器开发指南 |
 | [docs/API.md](docs/API.md) | HTTP REST API 完整参考 |
-| [docs/COMMANDS.md](docs/COMMANDS.md) | 聊天命令完整参考 |
+| [docs/COMMANDS.md](docs/COMMANDS.md) | 聊天命令（含 `/remember` `/forget` 等记忆命令）与记忆归档运维工具参考 |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 会话管理配置与场景预设 |
 | [docs/CRONTASK_COMMAND.md](docs/CRONTASK_COMMAND.md) | 定时任务命令参考 |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | 部署指南（Docker/systemd/Nginx） |
 | [docs/MCP_MEMORY_TOOL.md](docs/MCP_MEMORY_TOOL.md) | MCP 记忆工具配置 |
+| [docs/MEMORY_DELETION.md](docs/MEMORY_DELETION.md) | 按 principal 删除归档数据：范围、顺序、以及为什么它不是安全擦除 |
+| [docs/MEMORY_IMPLEMENTATION_PLAN.md](docs/MEMORY_IMPLEMENTATION_PLAN.md) | 记忆系统实现计划与权威的门禁状态表 |
+| [docs/MEMORY_MIGRATION.md](docs/MEMORY_MIGRATION.md) | v2 归档迁移（schema v1→v8）与实验性 strict 捕获 |
+| [docs/MEMORY_KNOWLEDGE.md](docs/MEMORY_KNOWLEDGE.md) | 持久知识：证据校验、作用域、抽取流水线、注入预算与 `/remember` `/forget` 命令 |
 | [docs/MEDIA_MESSAGE_SUPPORT.md](docs/MEDIA_MESSAGE_SUPPORT.md) | 多媒体消息支持 |
 | [docs/PROXY_TUNNEL.md](docs/PROXY_TUNNEL.md) | 代理隧道架构与配置 |
 | [docs/QUICK_START_CRONTASK.md](docs/QUICK_START_CRONTASK.md) | 定时任务快速上手 |
 | [docs/SCHEDULER_GUIDE.md](docs/SCHEDULER_GUIDE.md) | 调度器架构与 API |
+| [docs/FIX_PLAN_WECHAT_ISSUES.md](docs/FIX_PLAN_WECHAT_ISSUES.md) | 个人微信适配器问题修复计划 |
+| [docs/CODE_REVIEW_MEMORY_SESSION_2026-11-12.md](docs/CODE_REVIEW_MEMORY_SESSION_2026-11-12.md) | 记忆系统与 Session 迁移代码评审索引（含两份子报告） |
+| [docs/CODE_REVIEW_MEMORY_2026-11-12.md](docs/CODE_REVIEW_MEMORY_2026-11-12.md) | 记忆系统代码评审：缺陷、修复与回归测试 |
+| [docs/CODE_REVIEW_SESSION_2026-11-12.md](docs/CODE_REVIEW_SESSION_2026-11-12.md) | Session 迁移代码评审：缺陷、修复与回归测试 |
 
 ---
 
@@ -715,14 +802,14 @@ tail -f /var/log/openbot.log | grep -E "error|fail|refuse"
 ### 微信限流频繁
 
 - 微信 iLink API 有严格的速率限制
-- 网关已内置自适应冷却（30s→60s→120s）
+- 网关已内置固定 60s 冷却（触发后暂停该用户所有发送，到期自动解除）
 - 默认只发送最终结果和 todo 更新，不发送中间进度
 - 检查出站队列状态：日志中搜索 `outbound queue stats`
 
 ### 技能生成失败
 
 - 确认 `SKILLGEN_ENABLED=true`
-- 确认模型在 OpenCode 中可用：`/models`
+- 确认模型在 OpenCode 中可用：`/model`
 - 检查 `SKILLGEN_INSTALL_DIR` 路径存在且可写
 - 查看日志：`grep skillgen /var/log/openbot.log`
 
@@ -730,7 +817,8 @@ tail -f /var/log/openbot.log | grep -E "error|fail|refuse"
 
 - 发送 `/status` 查看会话状态
 - 发送 `/abort` 中止当前任务
-- 发送 `/new` 创建新会话
+- 发送 `/new` 开启新会话（保存上下文摘要）
+- 上下文污染时发送 `/reset` 硬重置（丢弃上下文）
 - 严重时发送 `/clear` 清除会话
 
 ---

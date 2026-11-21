@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,8 +24,8 @@ const (
 
 	// maxRetryAttempts is the number of send attempts a NON-critical chunk
 	// gets before being dropped. Critical content (final results, todo
-	// progress, question/permission prompts) keeps retrying forever with an
-	// escalating backoff — it is never dropped and never parked.
+	// progress, question/permission prompts) retries until its delivery window
+	// ends or repeated session-expiry errors cause it to be parked.
 	maxRetryAttempts = 5
 
 	// defaultOutboundMinGap is the minimum interval between two consecutive
@@ -40,7 +41,43 @@ const (
 	// direct-send behaviour (no escalation), while still preventing retry
 	// storms.
 	defaultCooldownDuration = 60 * time.Second
+
+	// maxSessionExpiredAttempts is how many times a chunk may fail with
+	// ErrSessionExpired (stale iLink context_token / ret=-2 "prepare failed")
+	// before it is parked instead of retried again. Session expiry is
+	// effectively terminal for that recipient — retrying cannot fix it — and
+	// retrying forever is what wedged the queue in production (171 identical
+	// notices accumulated 18k failed sends and starved every real reply).
+	// Parked bodies remain recoverable via /pending and /recover.
+	maxSessionExpiredAttempts = 5
+
+	// dedupWindow collapses identical informational messages enqueued for the
+	// same user inside a short window: a loop that emits the same notice every
+	// few minutes must not accumulate hundreds of rows the sender will never
+	// accept.
+	dedupWindow = 5 * time.Minute
+
+	// maxHighStreakPerUser bounds how many PriorityHigh sends may be dispatched
+	// back-to-back for one user while lower-priority content is waiting. A large
+	// or looping backlog of prompts must never starve the actual replies.
+	maxHighStreakPerUser = 3
+
+	// maxQueuedItemAge parks any chunk older than this so an undeliverable
+	// message cannot retry forever. Bodies remain explicitly recoverable.
+	// Explicit recovery starts a separate bounded delivery window.
+	maxQueuedItemAge = 24 * time.Hour
 )
+
+// dedupEventTypes lists the event types whose duplicates are collapsed by
+// EnqueueTextWithPriority. These are system/informational notices for which a
+// repeat inside dedupWindow carries no new information. Conversation content
+// ("final", "flush", "sync_reply", "todo", …) is never deduped: the user may
+// legitimately receive the same text twice.
+var dedupEventTypes = map[string]bool{
+	"question":     true,
+	"skippable":    true,
+	"error_notice": true,
+}
 
 // Priority levels for outbound messages. Higher value = higher priority.
 // Within the same priority level, strict FIFO is maintained (by id ASC).
@@ -85,11 +122,17 @@ func priorityFromEventType(eventType string) int {
 
 type outboundQueueStats struct {
 	Pending          int
+	Parked           int
+	Due              int
+	Waiting          int
+	Failed           int
 	SentOK           uint64
 	SendFailed       uint64
 	RetryScheduled   uint64
 	DroppedTTL       uint64
 	DroppedExhausted uint64
+	Deduped          uint64
+	ParkedGiveUp     uint64
 }
 
 type outboundQueueConfig struct {
@@ -101,22 +144,23 @@ type outboundQueueConfig struct {
 }
 
 type queuedOutboundText struct {
-	ID           int64
-	UserID       string
-	SessionID    string
-	ContextToken string
-	EventType    string
-	BatchID      string
-	Seq          int
-	Total        int
-	Content      string
-	ClientID     string
-	Attempts     int
-	Critical     bool
-	Priority     int
-	Parked       bool
-	CreatedAt    int64
-	ExpiresAt    int64
+	ID            int64
+	UserID        string
+	SessionID     string
+	ContextToken  string
+	EventType     string
+	BatchID       string
+	Seq           int
+	Total         int
+	Content       string
+	ClientID      string
+	Attempts      int
+	Critical      bool
+	Priority      int
+	Parked        bool
+	CreatedAt     int64
+	ExpiresAt     int64
+	RecoveryUntil int64
 }
 
 type outboundTextQueue struct {
@@ -141,6 +185,14 @@ type outboundTextQueue struct {
 	retryScheduled   atomic.Uint64
 	droppedTTL       atomic.Uint64
 	droppedExhausted atomic.Uint64
+	deduped          atomic.Uint64
+	parkedGiveUp     atomic.Uint64
+
+	// highStreak counts consecutive PriorityHigh dispatches per user. It backs
+	// the fairness guard in dispatchOne: once a user has seen
+	// maxHighStreakPerUser high-priority sends in a row, the next dispatch slot
+	// goes to their waiting PriorityNormal content instead.
+	highStreak sync.Map // map[userID]*atomic.Int64
 
 	// userCooldowns tracks per-user rate-limit cooldown state. When iLink
 	// returns ret=-2, ALL sends for that user are paused — not just the one
@@ -170,6 +222,9 @@ func newOutboundTextQueue(dbPath string, interval time.Duration, maxLen int, sen
 	if interval <= 0 {
 		interval = defaultOutboundTickInterval
 	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
+		return nil, fmt.Errorf("wechat: create outbound queue directory: %w", err)
+	}
 	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000", filepath.ToSlash(dbPath))
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -190,6 +245,10 @@ func newOutboundTextQueue(dbPath string, interval time.Duration, maxLen int, sen
 		doneCh:           make(chan struct{}),
 	}
 	if err := q.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := q.classifyStartup(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -275,15 +334,50 @@ func (q *outboundTextQueue) migrate() error {
 	}
 	// Add parked column (idempotent). parked=1 marks entries preserved by
 	// /new /reset for the previous session; they are NOT auto-dispatched and
-	// are recoverable only via /pending /recover.
+	// are visible via /pending; only bodies can be recovered via /recover.
 	if _, err := q.db.Exec(`ALTER TABLE wechat_outbound_queue ADD COLUMN parked INTEGER NOT NULL DEFAULT 0`); err != nil {
 		if !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("wechat: migrate outbound queue (add parked): %w", err)
 		}
 	}
+	if _, err := q.db.Exec(`ALTER TABLE wechat_outbound_queue ADD COLUMN recovery_until INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("wechat: migrate outbound queue (add recovery window): %w", err)
+		}
+	}
 	// Index for priority-aware dispatch.
 	if _, err := q.db.Exec(`CREATE INDEX IF NOT EXISTS idx_wechat_outbound_priority ON wechat_outbound_queue(user_id, priority DESC, id ASC)`); err != nil {
 		return fmt.Errorf("wechat: migrate outbound queue (priority index): %w", err)
+	}
+	return nil
+}
+
+// classifyStartup runs before callers can enqueue new events or start dispatch.
+// Legacy prompts have no request identity, so their wording cannot be trusted.
+func (q *outboundTextQueue) classifyStartup() error {
+	tx, err := q.db.Begin()
+	if err != nil {
+		return fmt.Errorf("wechat: begin outbound startup recovery: %w", err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UnixMilli()
+	if _, err := tx.Exec(`UPDATE wechat_outbound_queue SET parked = 1
+		WHERE event_type IN ('done', 'question')`); err != nil {
+		return fmt.Errorf("wechat: park obsolete outbound notices: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM wechat_outbound_queue
+		WHERE parked = 0 AND critical = 0 AND expires_at > 0 AND expires_at <= ?
+		  AND recovery_until = 0`, now); err != nil {
+		return fmt.Errorf("wechat: expire outbound progress: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE wechat_outbound_queue SET parked = 1 WHERE parked = 0 AND
+		((recovery_until > 0 AND recovery_until <= ?) OR
+		 (recovery_until = 0 AND created_at > 0 AND created_at < ?))`,
+		now, now-maxQueuedItemAge.Milliseconds()); err != nil {
+		return fmt.Errorf("wechat: park stale outbound content: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("wechat: commit outbound startup recovery: %w", err)
 	}
 	return nil
 }
@@ -306,14 +400,22 @@ func (q *outboundTextQueue) Stop() {
 		return
 	}
 	q.stopped = true
+	started := q.started
 	close(q.stopCh)
 	timeout := q.stopDrainTimeout
 	q.mu.Unlock()
 
-	select {
-	case <-q.doneCh:
-	case <-time.After(timeout):
-		log.Printf("wechat: outbound queue stop drain timeout after %s", timeout)
+	// A queue that never started has no drain goroutine, so doneCh will never
+	// close. Waiting on it would block shutdown for the full drain timeout
+	// (10s by default) on every path that constructs a queue but fails before
+	// Start — including the restart test below and any startup error after
+	// construction.
+	if started {
+		select {
+		case <-q.doneCh:
+		case <-time.After(timeout):
+			log.Printf("wechat: outbound queue stop drain timeout after %s", timeout)
+		}
 	}
 
 	_ = q.db.Close()
@@ -340,6 +442,26 @@ func (q *outboundTextQueue) EnqueueTextWithPriority(userID, sessionID, ctxToken,
 	}
 
 	now := time.Now().UnixMilli()
+
+	// Collapse repeated informational notices. A single pathological sender loop
+	// used to enqueue the same sentence hundreds of times, and because such
+	// notices are critical/PriorityHigh they were then retried forever at the
+	// head of the user's queue, starving the replies the user actually wanted.
+	// The check runs before the insert transaction because the pool holds a
+	// single connection (a query inside the tx would block on itself).
+	if len(chunks) == 1 && dedupEventTypes[eventType] {
+		dup, dupErr := q.hasRecentDuplicate(userID, eventType, chunks[0], now)
+		if dupErr != nil {
+			return dupErr
+		}
+		if dup {
+			q.deduped.Add(1)
+			log.Printf("wechat: outbound queue deduped %s notice for user=%s (identical content queued within %s)",
+				eventType, userID, dedupWindow)
+			return nil
+		}
+	}
+
 	expiresAt := int64(0)
 	if !critical {
 		expiresAt = time.Now().Add(q.nonCriticalTTL).UnixMilli()
@@ -448,12 +570,41 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 		return false, nil
 	}
 
-	if item.ExpiresAt > 0 && now > item.ExpiresAt {
+	// ★ Fairness: a PriorityHigh backlog (permission prompts, or a sender loop
+	// that keeps re-enqueueing the same notice) must not starve the user's real
+	// replies. After maxHighStreakPerUser consecutive high-priority sends for
+	// this user, hand the slot to their oldest due PriorityNormal chunk if one
+	// is waiting. The high-priority item is left untouched (still due, still
+	// highest priority) so nothing is lost or reordered within its own level.
+	if item.Priority >= PriorityHigh && q.highStreakCount(item.UserID) >= maxHighStreakPerUser {
+		normal, found, pickErr := q.pickDueNormalForUser(item.UserID, now)
+		if pickErr != nil {
+			return true, pickErr
+		}
+		if found {
+			log.Printf("wechat: outbound queue yielding dispatch slot to lower-priority item id=%d event=%s for user=%s after %d consecutive high-priority sends",
+				normal.ID, normal.EventType, item.UserID, maxHighStreakPerUser)
+			item = normal
+		}
+	}
+
+	// Check the final fairness selection too. Explicit recovery grants a
+	// separate window without changing the original creation/expiry evidence.
+	if item.RecoveryUntil == 0 && item.ExpiresAt > 0 && now >= item.ExpiresAt {
 		if err := q.ackDelete(item.ID); err != nil {
 			return true, err
 		}
 		q.droppedTTL.Add(1)
-		log.Printf("wechat: outbound queue dropped expired item id=%d user=%s event=%s", item.ID, item.UserID, item.EventType)
+		return true, nil
+	}
+	if (item.RecoveryUntil > 0 && now >= item.RecoveryUntil) ||
+		(item.RecoveryUntil == 0 && item.CreatedAt > 0 && now-item.CreatedAt > maxQueuedItemAge.Milliseconds()) {
+		if err := q.parkItem(item.ID); err != nil {
+			return true, err
+		}
+		q.parkedGiveUp.Add(1)
+		log.Printf("wechat: outbound queue parked stale item id=%d user=%s session=%s event=%s",
+			item.ID, item.UserID, item.SessionID, item.EventType)
 		return true, nil
 	}
 
@@ -484,6 +635,14 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 		time.Sleep(gap)
 	}
 
+	// Track the dispatch streak for the fairness guard above: consecutive
+	// high-priority sends accumulate, anything at Normal level or below resets.
+	if item.Priority >= PriorityHigh {
+		q.bumpHighStreak(item.UserID)
+	} else {
+		q.resetHighStreak(item.UserID)
+	}
+
 	err = q.sendFunc(item)
 	if err == nil {
 		// Success → record the pacing timestamp (minGap). The cooldown is not
@@ -502,13 +661,29 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 		q.SetUserCooldown(item.UserID)
 	}
 
+	// Session expiry (stale context_token / "prepare failed") is effectively
+	// terminal for this recipient: the conversation can no longer be prepared
+	// for the send, so retrying only burns the queue's pacing budget and blocks
+	// everything behind it. Park after a few attempts instead of retrying
+	// forever — parked rows remain visible via /pending.
+	if errors.Is(err, ErrSessionExpired) && item.Attempts+1 >= maxSessionExpiredAttempts {
+		if parkErr := q.parkItem(item.ID); parkErr != nil {
+			return true, parkErr
+		}
+		q.parkedGiveUp.Add(1)
+		log.Printf("wechat: outbound queue parked session-expired item id=%d user=%s session=%s event=%s after %d attempts (inspect via /pending)",
+			item.ID, item.UserID, item.SessionID, item.EventType, item.Attempts+1)
+		return true, nil
+	}
+
 	// ★ Exhausted retries. Critical content (final results, todo progress,
 	// permission/question prompts, error notices) must eventually be
 	// delivered, so it keeps retrying with the escalating backoff (capped at
-	// 5min) forever — it stays durable in SQLite across restarts and is never
-	// parked or dropped. Non-critical content (skippable progress) is dropped:
-	// it is already subject to TTL expiry and is explicitly allowed to be
-	// lost.
+	// 5min) — it stays durable in SQLite across restarts and is never dropped.
+	// A day-old item is parked by the stale-age guard at the top of this
+	// function, so "retry forever" is bounded by maxQueuedItemAge rather than
+	// unbounded. Non-critical content (skippable progress) is dropped: it is
+	// already subject to TTL expiry and is explicitly allowed to be lost.
 	if item.Attempts+1 >= maxRetryAttempts {
 		if item.Critical || item.Priority >= PriorityHigh {
 			nextAt := q.nextAttemptAt(item.Attempts+1, err)
@@ -516,8 +691,8 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 				return true, fmt.Errorf("sendErr=%v nackErr=%w", err, nackErr)
 			}
 			q.retryScheduled.Add(1)
-			log.Printf("wechat: outbound queue critical continuing retry id=%d user=%s event=%s attempts=%d nextIn=%s err=%v",
-				item.ID, item.UserID, item.EventType, item.Attempts+1, time.Until(time.UnixMilli(nextAt)).Round(time.Second), err)
+			log.Printf("wechat: outbound queue critical continuing retry id=%d user=%s session=%s event=%s attempts=%d nextIn=%s err=%v",
+				item.ID, item.UserID, item.SessionID, item.EventType, item.Attempts+1, time.Until(time.UnixMilli(nextAt)).Round(time.Second), err)
 			return true, nil
 		}
 		log.Printf("wechat: 🗑️ chunk id=%d user=%s event=%s exhausted %d attempts, dropping non-critical content",
@@ -534,8 +709,8 @@ func (q *outboundTextQueue) dispatchOne() (bool, error) {
 		return true, fmt.Errorf("sendErr=%v nackErr=%w", err, nackErr)
 	}
 	q.retryScheduled.Add(1)
-	log.Printf("wechat: outbound queue send failed id=%d user=%s event=%s attempts=%d nextIn=%s err=%v",
-		item.ID, item.UserID, item.EventType, item.Attempts+1, time.Until(time.UnixMilli(nextAt)).Round(time.Second), err)
+	log.Printf("wechat: outbound queue send failed id=%d user=%s session=%s event=%s attempts=%d nextIn=%s err=%v",
+		item.ID, item.UserID, item.SessionID, item.EventType, item.Attempts+1, time.Until(time.UnixMilli(nextAt)).Round(time.Second), err)
 	return true, nil
 }
 
@@ -552,7 +727,7 @@ func (q *outboundTextQueue) pickNextDueHead(nowMillis int64) (*queuedOutboundTex
 		SELECT
 			q.id, q.user_id, q.session_id, q.context_token, q.event_type,
 			q.batch_id, q.seq, q.total, q.content, q.client_id, q.attempts,
-			q.critical, q.created_at, q.expires_at, q.priority, q.parked
+			q.critical, q.created_at, q.expires_at, q.priority, q.parked, q.recovery_until
 		FROM wechat_outbound_queue q
 		WHERE q.next_attempt_at <= ?
 		  AND q.parked = 0
@@ -568,7 +743,49 @@ func (q *outboundTextQueue) pickNextDueHead(nowMillis int64) (*queuedOutboundTex
 		ORDER BY q.priority DESC, q.id ASC
 		LIMIT 1
 	`
-	row := q.db.QueryRow(query, nowMillis, nowMillis)
+	return scanQueuedOutbound(q.db.QueryRow(query, nowMillis, nowMillis), "next")
+}
+
+// pickDueNormalForUser returns the oldest due chunk for one user whose priority
+// is at most PriorityNormal. It backs the fairness guard in dispatchOne, which
+// needs a way to let real replies through when a PriorityHigh backlog keeps
+// winning the global pick. Ordering by id ASC preserves FIFO (and therefore
+// batch/seq order) within that user's lower-priority content.
+//
+// Note the deliberately relaxed ordering guard: only earlier rows at
+// PriorityNormal or below can block this pick. Blocking on due PriorityHigh
+// rows — which is what the global picker does — would defeat the whole point of
+// the fairness yield, since that is exactly the backlog being yielded to.
+func (q *outboundTextQueue) pickDueNormalForUser(userID string, nowMillis int64) (*queuedOutboundText, bool, error) {
+	const query = `
+		SELECT
+			q.id, q.user_id, q.session_id, q.context_token, q.event_type,
+			q.batch_id, q.seq, q.total, q.content, q.client_id, q.attempts,
+			q.critical, q.created_at, q.expires_at, q.priority, q.parked, q.recovery_until
+		FROM wechat_outbound_queue q
+		WHERE q.user_id = ?
+		  AND q.priority <= ?
+		  AND q.next_attempt_at <= ?
+		  AND q.parked = 0
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM wechat_outbound_queue p
+			WHERE p.user_id = q.user_id
+			  AND p.id < q.id
+			  AND p.priority >= q.priority
+			  AND p.priority <= ?
+			  AND p.parked = 0
+			  AND p.next_attempt_at <= ?
+		  )
+		ORDER BY q.id ASC
+		LIMIT 1
+	`
+	return scanQueuedOutbound(q.db.QueryRow(query, userID, PriorityNormal, nowMillis, PriorityNormal, nowMillis), "normal-for-user")
+}
+
+// scanQueuedOutbound materializes one queue row. label only appears in error
+// messages so callers can tell the two picker queries apart.
+func scanQueuedOutbound(row *sql.Row, label string) (*queuedOutboundText, bool, error) {
 	item := &queuedOutboundText{}
 	var criticalInt int
 	var parkedInt int
@@ -589,16 +806,73 @@ func (q *outboundTextQueue) pickNextDueHead(nowMillis int64) (*queuedOutboundTex
 		&item.ExpiresAt,
 		&item.Priority,
 		&parkedInt,
+		&item.RecoveryUntil,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
 		}
-		return nil, false, fmt.Errorf("wechat: outbound queue query next: %w", err)
+		return nil, false, fmt.Errorf("wechat: outbound queue query %s: %w", label, err)
 	}
 	item.Critical = criticalInt == 1
 	item.Parked = parkedInt == 1
 	return item, true, nil
+}
+
+// parkItem marks a chunk as parked. Parked chunks are excluded from dispatch but
+// kept for inspection via /pending and body recovery via /recover
+// — the alternative (retrying forever) is what starved the queue in production.
+func (q *outboundTextQueue) parkItem(id int64) error {
+	if _, err := q.db.Exec(`UPDATE wechat_outbound_queue SET parked = 1 WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("wechat: outbound queue park item: %w", err)
+	}
+	return nil
+}
+
+// hasRecentDuplicate reports whether an identical, still-active notice is
+// already queued for this user (see dedupEventTypes / dedupWindow).
+func (q *outboundTextQueue) hasRecentDuplicate(userID, eventType, content string, nowMillis int64) (bool, error) {
+	cutoff := nowMillis - dedupWindow.Milliseconds()
+	row := q.db.QueryRow(`
+		SELECT 1
+		FROM wechat_outbound_queue
+		WHERE user_id = ? AND event_type = ? AND content = ? AND parked = 0 AND created_at >= ?
+		LIMIT 1
+	`, userID, eventType, content, cutoff)
+	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("wechat: outbound queue dedup query: %w", err)
+	}
+	return true, nil
+}
+
+// highStreakCount returns how many high-priority sends have gone out for userID
+// in a row.
+func (q *outboundTextQueue) highStreakCount(userID string) int64 {
+	if v, ok := q.highStreak.Load(userID); ok {
+		if n, ok2 := v.(*atomic.Int64); ok2 {
+			return n.Load()
+		}
+	}
+	return 0
+}
+
+func (q *outboundTextQueue) bumpHighStreak(userID string) {
+	v, _ := q.highStreak.LoadOrStore(userID, &atomic.Int64{})
+	if n, ok := v.(*atomic.Int64); ok {
+		n.Add(1)
+	}
+}
+
+func (q *outboundTextQueue) resetHighStreak(userID string) {
+	if v, ok := q.highStreak.Load(userID); ok {
+		if n, ok2 := v.(*atomic.Int64); ok2 {
+			n.Store(0)
+		}
+	}
 }
 
 func (q *outboundTextQueue) ackDelete(id int64) error {
@@ -773,19 +1047,19 @@ func (q *outboundTextQueue) CooldownRemaining(userID string) time.Duration {
 // PriorityHigh (question/permission) and PriorityLow (skippable progress)
 // entries are deleted outright — they are session-specific and meaningless in a
 // new session. PriorityNormal entries (final AI replies, error notices, todo
-// progress) are marked parked=1, so the user can recover them later via
-// /pending /recover. Parked entries are excluded from auto-dispatch.
+// progress) are marked parked=1 for inspection via /pending and body recovery
+// via /recover. Parked entries are excluded from auto-dispatch.
 //
 // Returns the number of entries deleted (parked entries are retained).
 func (q *outboundTextQueue) ClearForUser(userID string) (int64, error) {
 	if q == nil {
 		return 0, nil
 	}
-	// Park PriorityNormal entries first (recoverable via /pending /recover).
+	// Retain PriorityNormal entries for inspection and eligible body recovery.
 	if res, err := q.db.Exec(`UPDATE wechat_outbound_queue SET parked = 1 WHERE user_id = ? AND priority = ?`, userID, PriorityNormal); err != nil {
 		return 0, fmt.Errorf("wechat: outbound queue park for user: %w", err)
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		log.Printf("wechat: outbound queue parked %d entries for user %s (recoverable via /pending /recover)", n, userID)
+		log.Printf("wechat: outbound queue parked %d entries for user %s (inspect via /pending)", n, userID)
 	}
 	// Delete everything not parked (PriorityHigh / PriorityLow).
 	res, err := q.db.Exec(`DELETE FROM wechat_outbound_queue WHERE user_id = ? AND parked = 0`, userID)
@@ -819,86 +1093,150 @@ func (q *outboundTextQueue) DropLowPriorityForUser(userID string) (int64, error)
 	return n, nil
 }
 
-// ParkedEntry is a parked (recoverable) outbound entry surfaced by /pending.
+// ParkedEntry is a retained outbound entry surfaced by /pending.
 type ParkedEntry struct {
 	SessionID string
 	Content   string
+	EventType string
 	CreatedAt time.Time
 }
 
 // ListParked returns all parked entries for a user, ordered oldest-first.
-func (q *outboundTextQueue) ListParked(userID string) []ParkedEntry {
-	if q == nil {
-		return nil
-	}
+func (q *outboundTextQueue) ListParked(userID string) ([]ParkedEntry, error) {
 	rows, err := q.db.Query(
-		`SELECT session_id, content, created_at FROM wechat_outbound_queue
+		`SELECT session_id, content, event_type, created_at FROM wechat_outbound_queue
 		 WHERE user_id = ? AND parked = 1 ORDER BY created_at ASC, id ASC`,
 		userID)
 	if err != nil {
-		log.Printf("wechat: outbound queue list parked failed: %v", err)
-		return nil
+		return nil, fmt.Errorf("wechat: list parked outbound entries: %w", err)
 	}
 	defer rows.Close()
 	var out []ParkedEntry
 	for rows.Next() {
 		var e ParkedEntry
 		var created int64
-		if err := rows.Scan(&e.SessionID, &e.Content, &created); err == nil {
-			e.CreatedAt = time.UnixMilli(created)
-			out = append(out, e)
+		if err := rows.Scan(&e.SessionID, &e.Content, &e.EventType, &created); err != nil {
+			return nil, fmt.Errorf("wechat: read parked outbound entry: %w", err)
+		}
+		e.CreatedAt = time.UnixMilli(created)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("wechat: iterate parked outbound entries: %w", err)
+	}
+	return out, nil
+}
+
+type outboundPromptTarget struct {
+	UserID       string
+	SessionID    string
+	ContextToken string
+}
+
+func (q *outboundTextQueue) parkedPromptTargets(userFilter, sessionFilter string) ([]outboundPromptTarget, error) {
+	rows, err := q.db.Query(`SELECT user_id, session_id, context_token FROM wechat_outbound_queue
+		WHERE parked = 1 AND event_type = 'question' AND session_id <> ''
+		  AND (? = '' OR user_id = ?) AND substr(session_id, 1, length(?)) = ?
+		ORDER BY id DESC`, userFilter, userFilter, sessionFilter, sessionFilter)
+	if err != nil {
+		return nil, fmt.Errorf("wechat: list parked prompt targets: %w", err)
+	}
+	defer rows.Close()
+	var targets []outboundPromptTarget
+	seen := make(map[[2]string]bool)
+	for rows.Next() {
+		var target outboundPromptTarget
+		if err := rows.Scan(&target.UserID, &target.SessionID, &target.ContextToken); err != nil {
+			return nil, fmt.Errorf("wechat: read parked prompt target: %w", err)
+		}
+		key := [2]string{target.UserID, target.SessionID}
+		if !seen[key] {
+			targets = append(targets, target)
+			seen[key] = true
 		}
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("wechat: iterate parked prompt targets: %w", err)
+	}
+	return targets, nil
 }
 
-// RecoverParked un-parks entries for a user and resets their retry state so
-// they are dispatched again. When sessionFilter is non-empty, only entries
-// whose session_id starts with sessionFilter are recovered (matches the
-// "/recover <session-id前缀>" UI contract). Returns the number recovered.
-func (q *outboundTextQueue) RecoverParked(userID, sessionFilter string) (int, error) {
-	if q == nil {
-		return 0, nil
+type outboundRecoveryResult struct {
+	Recovered      int
+	SkippedDone    int
+	SkippedPrompts int
+	SkippedOther   int
+}
+
+// Only conversation bodies can be explicitly recovered. Other notices do not
+// become true again just because the user requested offline content.
+const recoverableBodySQL = `event_type IN ('final', 'flush', 'error_partial', 'sync_reply')`
+
+func (q *outboundTextQueue) RecoverParked(userID, sessionFilter string) (outboundRecoveryResult, error) {
+	var result outboundRecoveryResult
+	tx, err := q.db.Begin()
+	if err != nil {
+		return result, fmt.Errorf("wechat: begin outbound recovery: %w", err)
+	}
+	defer tx.Rollback()
+	filter := `user_id = ? AND parked = 1 AND substr(session_id, 1, length(?)) = ?`
+	args := []interface{}{userID, sessionFilter, sessionFilter}
+	if err := tx.QueryRow(`SELECT
+		COUNT(CASE WHEN event_type = 'done' THEN 1 END),
+		COUNT(CASE WHEN event_type = 'question' THEN 1 END),
+		COUNT(CASE WHEN event_type NOT IN ('done', 'question') AND NOT (`+recoverableBodySQL+`) THEN 1 END)
+		FROM wechat_outbound_queue WHERE `+filter, args...).Scan(
+		&result.SkippedDone, &result.SkippedPrompts, &result.SkippedOther); err != nil {
+		return outboundRecoveryResult{}, fmt.Errorf("wechat: count excluded outbound notices: %w", err)
 	}
 	now := time.Now().UnixMilli()
-	var res sql.Result
-	var err error
-	if sessionFilter == "" {
-		res, err = q.db.Exec(
-			`UPDATE wechat_outbound_queue SET parked = 0, attempts = 0, next_attempt_at = ? WHERE user_id = ? AND parked = 1`,
-			now, userID)
-	} else {
-		res, err = q.db.Exec(
-			`UPDATE wechat_outbound_queue SET parked = 0, attempts = 0, next_attempt_at = ? WHERE user_id = ? AND parked = 1 AND session_id LIKE ?`,
-			now, userID, sessionFilter+"%")
-	}
+	updateArgs := append([]interface{}{now, now + maxQueuedItemAge.Milliseconds()}, args...)
+	res, err := tx.Exec(`UPDATE wechat_outbound_queue
+		SET parked = 0, attempts = 0, next_attempt_at = ?, recovery_until = ?
+		WHERE `+filter+` AND `+recoverableBodySQL, updateArgs...)
 	if err != nil {
-		return 0, fmt.Errorf("wechat: outbound queue recover parked: %w", err)
+		return outboundRecoveryResult{}, fmt.Errorf("wechat: outbound queue recover parked: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	if n > 0 {
-		log.Printf("wechat: outbound queue recovered %d parked entries for user %s (session=%q)", n, userID, sessionFilter)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return outboundRecoveryResult{}, fmt.Errorf("wechat: count recovered outbound entries: %w", err)
 	}
-	return int(n), nil
+	if err := tx.Commit(); err != nil {
+		return outboundRecoveryResult{}, fmt.Errorf("wechat: commit outbound recovery: %w", err)
+	}
+	result.Recovered = int(n)
+	return result, nil
 }
 
-func (q *outboundTextQueue) snapshotStats() outboundQueueStats {
-	pending, err := q.pendingCount()
-	if err != nil {
-		log.Printf("wechat: outbound queue stats pendingCount failed: %v", err)
-	}
-	return outboundQueueStats{
-		Pending:          pending,
+func (q *outboundTextQueue) snapshotStats() (outboundQueueStats, error) {
+	s := outboundQueueStats{
 		SentOK:           q.sentOK.Load(),
 		SendFailed:       q.sendFailed.Load(),
 		RetryScheduled:   q.retryScheduled.Load(),
 		DroppedTTL:       q.droppedTTL.Load(),
 		DroppedExhausted: q.droppedExhausted.Load(),
+		Deduped:          q.deduped.Load(),
+		ParkedGiveUp:     q.parkedGiveUp.Load(),
 	}
+	now := time.Now().UnixMilli()
+	if err := q.db.QueryRow(`SELECT
+		COUNT(CASE WHEN parked = 0 THEN 1 END),
+		COUNT(CASE WHEN parked = 1 THEN 1 END),
+		COUNT(CASE WHEN parked = 0 AND next_attempt_at <= ? THEN 1 END),
+		COUNT(CASE WHEN parked = 0 AND next_attempt_at > ? THEN 1 END),
+		COUNT(CASE WHEN attempts > 0 THEN 1 END)
+		FROM wechat_outbound_queue`, now, now).Scan(&s.Pending, &s.Parked, &s.Due, &s.Waiting, &s.Failed); err != nil {
+		return outboundQueueStats{}, fmt.Errorf("wechat: query outbound queue stats: %w", err)
+	}
+	return s, nil
 }
 
 func (q *outboundTextQueue) logStats() {
-	s := q.snapshotStats()
-	log.Printf("wechat: outbound queue stats pending=%d sent_ok=%d send_failed=%d retry_scheduled=%d dropped_ttl=%d dropped_exhausted=%d",
-		s.Pending, s.SentOK, s.SendFailed, s.RetryScheduled, s.DroppedTTL, s.DroppedExhausted)
+	s, err := q.snapshotStats()
+	if err != nil {
+		log.Printf("wechat: outbound queue stats failed: %v", err)
+		return
+	}
+	log.Printf("wechat: outbound queue stats active_pending=%d parked=%d due=%d waiting_backoff=%d failed_entries=%d sent_ok=%d send_failed=%d retry_scheduled=%d dropped_ttl=%d dropped_exhausted=%d deduped=%d parked_giveup=%d",
+		s.Pending, s.Parked, s.Due, s.Waiting, s.Failed, s.SentOK, s.SendFailed, s.RetryScheduled, s.DroppedTTL, s.DroppedExhausted, s.Deduped, s.ParkedGiveUp)
 }

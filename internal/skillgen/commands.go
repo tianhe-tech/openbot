@@ -44,13 +44,13 @@ func (s *Service) HandleCommand(adapter, userID, message string) (string, bool) 
 	case "/skill-help":
 		return s.cmdHelp(), true
 	case "/skill-list":
-		return s.cmdList(args), true
+		return s.cmdList(adapter, userID, args), true
 	case "/skill-view":
-		return s.cmdView(args), true
+		return s.cmdView(adapter, userID, args), true
 	case "/skill-approve":
-		return s.cmdApprove(args), true
+		return s.cmdApprove(adapter, userID, args), true
 	case "/skill-reject":
-		return s.cmdReject(args), true
+		return s.cmdReject(adapter, userID, args), true
 	case "/skill-stats":
 		return s.cmdStats(), true
 	}
@@ -67,7 +67,7 @@ func (s *Service) cmdHelp() string {
 		"/skill-help                                  显示本帮助"
 }
 
-func (s *Service) cmdList(args []string) string {
+func (s *Service) cmdList(adapter, userID string, args []string) string {
 	status := memstore.SkillStatusPendingReview
 	if len(args) > 0 {
 		switch strings.ToLower(args[0]) {
@@ -83,7 +83,7 @@ func (s *Service) cmdList(args []string) string {
 			status = ""
 		}
 	}
-	list, err := s.store.ListSkillCandidatesByStatus(status, 20)
+	list, err := s.store.ListSkillCandidatesForUser(adapter, userID, status, 20)
 	if err != nil {
 		return fmt.Sprintf("❌ 查询失败：%v", err)
 	}
@@ -100,11 +100,23 @@ func (s *Service) cmdList(args []string) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (s *Service) cmdView(args []string) string {
+func (s *Service) ownedCandidate(adapter, userID, id string) (*memstore.SkillCandidate, error) {
+	c, err := s.store.GetSkillCandidate(id)
+	if err != nil {
+		log.Printf("skillgen: candidate lookup failed id=%s: %v", id, err)
+		return nil, err
+	}
+	if adapter == "" || userID == "" || c.Adapter != adapter || c.UserID != userID {
+		return nil, fmt.Errorf("skillgen: candidate not owned by recipient")
+	}
+	return c, nil
+}
+
+func (s *Service) cmdView(adapter, userID string, args []string) string {
 	if len(args) == 0 {
 		return "用法：/skill-view <id>"
 	}
-	c, err := s.store.GetSkillCandidate(args[0])
+	c, err := s.ownedCandidate(adapter, userID, args[0])
 	if err != nil || c == nil {
 		return fmt.Sprintf("❌ 未找到候选 %s", args[0])
 	}
@@ -112,11 +124,11 @@ func (s *Service) cmdView(args []string) string {
 		c.Title, c.ID, c.Status, c.Score, c.ModelID, c.DraftPath, c.SkillMD)
 }
 
-func (s *Service) cmdApprove(args []string) string {
+func (s *Service) cmdApprove(adapter, userID string, args []string) string {
 	if len(args) == 0 {
 		return "用法：/skill-approve <id>"
 	}
-	c, err := s.store.GetSkillCandidate(args[0])
+	c, err := s.ownedCandidate(adapter, userID, args[0])
 	if err != nil || c == nil {
 		return fmt.Sprintf("❌ 未找到候选 %s", args[0])
 	}
@@ -144,11 +156,11 @@ func (s *Service) cmdApprove(args []string) string {
 	return fmt.Sprintf("✅ 已批准并安装：%s\n路径：%s", c.Title, installedPath)
 }
 
-func (s *Service) cmdReject(args []string) string {
+func (s *Service) cmdReject(adapter, userID string, args []string) string {
 	if len(args) == 0 {
 		return "用法：/skill-reject <id> [原因]"
 	}
-	c, err := s.store.GetSkillCandidate(args[0])
+	c, err := s.ownedCandidate(adapter, userID, args[0])
 	if err != nil || c == nil {
 		return fmt.Sprintf("❌ 未找到候选 %s", args[0])
 	}

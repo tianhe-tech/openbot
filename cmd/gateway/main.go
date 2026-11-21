@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -14,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +29,7 @@ import (
 	"github.com/user/opencode-gateway/internal/adapters/wecom"
 	"github.com/user/opencode-gateway/internal/asyncwork"
 	"github.com/user/opencode-gateway/internal/config"
+	"github.com/user/opencode-gateway/internal/knowledge"
 	"github.com/user/opencode-gateway/internal/logging"
 	"github.com/user/opencode-gateway/internal/memstore"
 	"github.com/user/opencode-gateway/internal/opencode"
@@ -96,6 +97,14 @@ func main() {
 				endpointSource = "auto"
 				autoSelectedEndpoint = true
 				log.Printf("opencode: OPENCODE_ENDPOINT not set, auto-selected managed endpoint %s", opencodeEndpoint)
+				// The managed serve is killed on shutdown (see the deferred
+				// serveManager.Stop below) and a fresh random port is picked on
+				// the next start. Any TUI attached to the old port is orphaned
+				// and silently stops feeding this gateway, which looks exactly
+				// like "the handoff feature is broken". Say so out loud.
+				log.Printf("opencode: WARNING: the managed serve port is random and changes on every restart; " +
+					"a TUI attached to the previous port will be orphaned. " +
+					"Set OPENCODE_ENDPOINT=http://127.0.0.1:<port> to pin it.")
 			}
 		} else {
 			endpointSource = "env"
@@ -153,42 +162,196 @@ func main() {
 	}
 
 	// ========== Memory Store (optional) ==========
-	memStorePath := cfg.MemStorePath
+	memStorePath := cfg.Memory.StorePath
 	if memStorePath == "" {
-		// Default: <OPENCODE_DIRECTORY>/tmp/memory.db
+		// Default: <OPENCODE_DIRECTORY>/mem/memory.db
 		memStorePath = filepath.Join(cfg.OpenCodeDirectory, "mem", "memory.db")
 	}
-	memDB, memErr := memstore.Open(memStorePath)
-	if memErr != nil {
-		log.Printf("main: memory store unavailable (%s), continuing without memory: %v", memStorePath, memErr)
+	// Declared outside the branch because the rest of startup keys off them:
+	// the index worker, the capture drain, skill autogen and the retry queue
+	// all check for nil to decide whether memory is available.
+	var archiveWriter *memstore.ArchiveWriter
+	var archiveLease *memstore.Lease
+	var memDB *memstore.Store
+	// memAdapter is kept because it is the type that implements the optional
+	// capabilities (handoff store, knowledge index) on top of the plain store.
+	// The store itself deliberately does not implement them: a capability the
+	// client checks for must be a distinct type, or every store would appear to
+	// have it.
+	var memAdapter *memstore.GatewayAdapter
+	var archiveErr error
+	var leaseErr error
+	var memErr error
+	if !cfg.Memory.Enabled {
+		// MEMORY_ENABLED=false must stop capture and recall, not just capture.
+		// Opening the legacy store anyway would keep writing mem_records and
+		// keep the MCP tool registered, which is the opposite of what the
+		// operator asked for.
+		log.Printf("main: MEMORY_ENABLED=false; memory capture and recall are disabled")
 	} else {
-		log.Printf("main: memory store opened at %s", memStorePath)
-		ocOptions = append(ocOptions, opencode.WithMemStore(memstore.NewGatewayAdapter(memDB)))
-		// Auto-register the MCP memory tool so the LLM can search memory proactively.
-		ensureMCPMemoryTool(cfg.OpenCodeDirectory, memStorePath)
-		// Periodic forgetting curve decay (every hour)
-		go func() {
-			ticker := time.NewTicker(time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if err := memDB.DecayAll(); err != nil {
-						log.Printf("memstore: decay error: %v", err)
+		archiveWriter, archiveErr = openCaptureArchive(ctx, memStorePath, cfg.Memory)
+		if archiveErr != nil {
+			log.Fatalf("main: memory capture startup failed: %v", archiveErr)
+		}
+		if archiveWriter != nil {
+			// The lease is what stops a second gateway from capturing into the
+			// same archive. Without it two processes each run their own writer
+			// queue and index worker against one database, and the only thing
+			// keeping them apart is that nobody tried. It is acquired here
+			// rather than inside openCaptureArchive so the failure can name the
+			// holder, which is the difference between an operator knowing which
+			// process to stop and having to guess.
+			archiveLease, leaseErr = archiveWriter.AcquireLease(ctx, memstore.LeaseOptions{})
+			if leaseErr != nil {
+				if errors.Is(leaseErr, memstore.ErrArchiveLeased) {
+					holder, _ := archiveWriter.LeaseHolder(ctx)
+					log.Fatalf("main: archive %s is already leased by %s; stop that instance or wait for its lease to expire", memStorePath, holder)
+				}
+				log.Fatalf("main: memory capture startup failed: %v", leaseErr)
+			}
+			log.Printf("main: archive lease held by %s", archiveLease.Holder())
+			ocOptions = append(ocOptions, opencode.WithConversationRecorder(archiveWriter))
+			log.Printf("main: strict v2 capture enabled; the lexical index worker indexes archived messages for MCP search")
+		}
+		memDB, memErr = memstore.Open(memStorePath)
+		if memErr != nil {
+			log.Printf("main: memory store unavailable (%s), continuing without memory: %v", memStorePath, memErr)
+		} else {
+			log.Printf("main: memory store opened at %s", memStorePath)
+			memAdapter = memstore.NewGatewayAdapter(memDB)
+			ocOptions = append(ocOptions, opencode.WithMemStore(memAdapter))
+			// Auto-register the MCP memory tool so the LLM can search memory
+			// proactively. The entry is written disabled and without a scope
+			// binding, so it cannot recall anything until an operator adds
+			// --single-owner --adapter --user on an isolated instance. That is
+			// the same rule MEMORY_SCOPE_MODE documents; the setting exists so
+			// the deployment assumption is stated rather than implied.
+			ensureMCPMemoryTool(cfg.OpenCodeDirectory, memStorePath)
+			if cfg.Memory.ScopeMode != "single_owner" {
+				log.Printf("main: MEMORY_SCOPE_MODE=disabled; the registered gateway-memory tool stays disabled until an isolated single-owner instance is configured")
+			}
+			// Periodic purge of expired session handoffs. LoadPendingHandoff
+			// already filters by HandoffTTL at read time, so an expired row is
+			// never injected; without this loop the rows simply accumulate
+			// forever, because SaveHandoff upserts per thread and a thread that
+			// is never used again is never overwritten. The purge removes rows
+			// older than 2*TTL, which is deliberately twice the read cutoff: a
+			// row that is merely expired is still the most recent thing known
+			// about that thread, and deleting it at the read boundary would
+			// throw away the only record of a session that might still be
+			// resumed. This is independent of the retry queue, which has its
+			// own purge and is only enabled when strict capture is off.
+			//
+			// The loop gets its own cancel rather than watching ctx directly.
+			// Deferred calls run LIFO and the signal handler's stop() is
+			// deferred at the top of main, so it runs after this function's
+			// defers: waiting on ctx here would always time out, because ctx is
+			// still live when the store is closed.
+			purgeCtx, stopPurge := context.WithCancel(ctx)
+			handoffPurgeDone := make(chan struct{})
+			go func() {
+				defer close(handoffPurgeDone)
+				ticker := time.NewTicker(6 * time.Hour)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-purgeCtx.Done():
+						return
+					case <-ticker.C:
+						if err := memDB.PurgeExpiredHandoffs(); err != nil {
+							log.Printf("memstore: handoff purge error: %v", err)
+						}
 					}
 				}
-			}
-		}()
-		defer func() {
-			if err := memDB.Close(); err != nil {
-				log.Printf("memstore: close error: %v", err)
-			}
-		}()
+			}()
+			defer func() {
+				// Stop the loop and wait for it before closing the store. The
+				// loop runs on the same *sql.DB, so a purge that is mid-statement
+				// when Close runs would fail against a closed handle. The timeout
+				// is a backstop, not the expected path: the loop returns as soon
+				// as its context is cancelled.
+				stopPurge()
+				select {
+				case <-handoffPurgeDone:
+				case <-time.After(5 * time.Second):
+					log.Printf("memstore: handoff purge loop did not stop in time")
+				}
+				if err := memDB.Close(); err != nil {
+					log.Printf("memstore: close error: %v", err)
+				}
+			}()
+		}
 	}
 
 	ocClient := opencode.NewClient(opencodeEndpoint, cfg.OpenCodeAPIKey, ocOptions...)
+	if archiveWriter != nil {
+		recoveryCtx, stopRecovery := context.WithCancel(ctx)
+		recoveryDone := make(chan struct{})
+		go func() { defer close(recoveryDone); ocClient.RunCaptureRecovery(recoveryCtx) }()
+		// The lexical index is what makes archived messages searchable. It runs
+		// in the background so capture latency never depends on indexing, and it
+		// is stopped before the writer closes so no pass races the drain.
+		indexCtx, stopIndex := context.WithCancel(ctx)
+		indexDone := make(chan struct{})
+		go func() {
+			defer close(indexDone)
+			archiveWriter.RunIndexWorker(indexCtx, memstore.IndexWorkerOptions{
+				OnError: func(err error) {
+					log.Printf("main: memory index pass failed: %v", err)
+				},
+			})
+		}()
+		// WAL maintenance. SQLite's own autocheckpoint runs inside a write
+		// transaction, so a continuously busy writer can starve it and the -wal
+		// file then grows without bound. This loop is the explicit policy the
+		// plan asks for: it checkpoints only when the WAL is worth truncating,
+		// and it stops before the writer closes so no pass races the drain.
+		maintenanceCtx, stopMaintenance := context.WithCancel(ctx)
+		maintenanceDone := make(chan struct{})
+		go func() {
+			defer close(maintenanceDone)
+			archiveWriter.RunMaintenance(maintenanceCtx, memstore.MaintenanceOptions{
+				OnError: func(err error) {
+					log.Printf("main: memory maintenance pass failed: %v", err)
+				},
+			})
+		}()
+		defer func() {
+			shutdown, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := ocClient.StopCapture(shutdown); err != nil {
+				log.Printf("main: capture producer drain incomplete: %v", err)
+			}
+			stopRecovery()
+			select {
+			case <-recoveryDone:
+			case <-shutdown.Done():
+				log.Printf("main: capture recovery drain incomplete")
+			}
+			stopIndex()
+			select {
+			case <-indexDone:
+			case <-shutdown.Done():
+				log.Printf("main: memory index drain incomplete")
+			}
+			stopMaintenance()
+			select {
+			case <-maintenanceDone:
+			case <-shutdown.Done():
+				log.Printf("main: memory maintenance drain incomplete")
+			}
+			closeCtx, cancelClose := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelClose()
+			if err := archiveWriter.Close(closeCtx); err != nil {
+				log.Printf("main: capture writer drain incomplete: %v", err)
+			}
+			if archiveLease != nil {
+				if err := archiveLease.Release(); err != nil {
+					log.Printf("main: archive lease release failed: %v", err)
+				}
+			}
+		}()
+	}
 
 	// ========== Async work queue (handoff save, skill mining) ==========
 	asyncQueue := asyncwork.New(cfg.SkillAutogen.QueueCapacity)
@@ -214,6 +377,14 @@ func main() {
 			LongSessionMinTurns: cfg.SkillAutogen.LongSessionMinTurns,
 			CandidateDir:        cfg.SkillAutogen.CandidateDir,
 			InstallDir:          cfg.SkillAutogen.InstallDir,
+			ReferenceSkillPath:  cfg.SkillAutogen.ReferenceSkillPath,
+			ResolveRecipient: func(channel string) (string, bool) {
+				adapter, ok := adapterRegistry.Get(channel)
+				if !ok {
+					return "", false
+				}
+				return adapter.SoleUser()
+			},
 			ApprovalRequired:    cfg.SkillAutogen.ApprovalRequired,
 			MinConfidence:       cfg.SkillAutogen.MinConfidence,
 			MinToolCalls:        cfg.SkillAutogen.MinToolCalls,
@@ -221,17 +392,66 @@ func main() {
 			MaxConsecutiveFails: cfg.SkillAutogen.MaxConsecutiveFails,
 			Cooldown:            cfg.SkillAutogen.Cooldown,
 		}
-		drafter := skillgen.NewOpencodeDrafter(ocClient, cfg.SkillAutogen.ReferenceSkillPath, cfg.SkillAutogen.InstallDir)
-		notifier := skillgen.NewRegistryNotifier(adapterRegistry)
-		skillSvc := skillgen.NewService(skillCfg, memDB, ocClient, asyncQueue, drafter, notifier)
-		ocClient.SetSkillCandidateHook(skillSvc)
-		ocClient.AddCommandInterceptor(skillSvc)
-		log.Printf("main: skill autogen enabled (draftModel=%s alternates=%v selfSelect=%t approvalRequired=%t maxPerDay=%d minConfidence=%.2f onHandoff=%t onLongSession=%t longSessionMinTurns=%d)",
-			skillCfg.DraftModel, skillCfg.AlternateModels, skillCfg.ModelSelfSelect,
-			skillCfg.ApprovalRequired, skillCfg.MaxPerDay, skillCfg.MinConfidence,
-			skillCfg.OnHandoff, skillCfg.OnLongSession, skillCfg.LongSessionMinTurns)
+		skillCfg, pathErr := skillgen.ResolveConfig(skillCfg)
+		if pathErr != nil {
+			log.Printf("main: skill autogen disabled: invalid paths: %v", pathErr)
+		} else {
+			drafter := skillgen.NewOpencodeDrafter(ocClient, skillCfg.ReferenceSkillPath, skillCfg.InstallDir)
+			notifier := skillgen.NewRegistryNotifier(adapterRegistry)
+			skillSvc := skillgen.NewService(skillCfg, memDB, ocClient, asyncQueue, drafter, notifier)
+			ocClient.SetSkillCandidateHook(skillSvc)
+			ocClient.AddCommandInterceptor(skillSvc)
+			log.Printf("main: skill autogen enabled (draftModel=%s alternates=%v selfSelect=%t approvalRequired=%t maxPerDay=%d minConfidence=%.2f onHandoff=%t onLongSession=%t longSessionMinTurns=%d)",
+				skillCfg.DraftModel, skillCfg.AlternateModels, skillCfg.ModelSelfSelect,
+				skillCfg.ApprovalRequired, skillCfg.MaxPerDay, skillCfg.MinConfidence,
+				skillCfg.OnHandoff, skillCfg.OnLongSession, skillCfg.LongSessionMinTurns)
+		}
 	} else if cfg.SkillAutogen.Enabled && memDB == nil {
 		log.Printf("main: skill autogen disabled: memory store unavailable")
+	}
+
+	// ========== Durable knowledge extraction (optional) ==========
+	//
+	// Extraction reads the archive that capture writes, so it needs both the
+	// store (for evidence) and the writer (for facts). It shares asyncQueue with
+	// skillgen: both are background work triggered by the same session
+	// boundaries, and a second queue would only add another goroutine that can
+	// be starved independently.
+	//
+	// The command interceptor is registered even when extraction is disabled, so
+	// /remember and /forget work as soon as capture does. A user asking for a
+	// fact to be stored is not the same feature as the gateway deciding to
+	// extract one, and gating the explicit control behind the automatic one
+	// would make the control unreachable in the default configuration.
+	if memDB != nil && archiveWriter != nil {
+		knowledgeCfg := knowledge.DefaultConfig()
+		knowledgeCfg.Enabled = cfg.Memory.KnowledgeEnabled
+		knowledgeCfg.DraftModel = cfg.SkillAutogen.DraftModel
+		knowledgeCfg.AlternateModels = cfg.SkillAutogen.AlternateModels
+		knowledgeCfg.PerModelTimeout = cfg.SkillAutogen.PerModelTimeout
+		knowledgeSvc := knowledge.NewService(knowledgeCfg, memDB, archiveWriter, knowledge.NewOpencodeDrafter(ocClient))
+		ocClient.AddCommandInterceptor(knowledgeSvc)
+		ocClient.SetKnowledgeIndex(memAdapter)
+		if knowledgeCfg.Enabled {
+			ocClient.SetKnowledgeCandidateHook(knowledgeSvc)
+			knowledgeCtx, stopKnowledge := context.WithCancel(ctx)
+			knowledgeDone := make(chan struct{})
+			go func() {
+				defer close(knowledgeDone)
+				knowledgeSvc.Run(knowledgeCtx)
+			}()
+			defer func() {
+				stopKnowledge()
+				<-knowledgeDone
+			}()
+			log.Printf("main: knowledge extraction enabled (draftModel=%s alternates=%v maxPerDay=%d minTurns=%d evidenceMessages=%d)",
+				knowledgeCfg.DraftModel, knowledgeCfg.AlternateModels, knowledgeCfg.MaxPerDay,
+				knowledgeCfg.MinTurns, knowledgeCfg.MaxEvidenceMessages)
+		} else {
+			log.Printf("main: knowledge extraction disabled (MEMORY_KNOWLEDGE_ENABLED=false); /remember and /forget are available")
+		}
+	} else if cfg.Memory.KnowledgeEnabled {
+		log.Printf("main: knowledge extraction disabled: memory store or capture writer unavailable")
 	}
 
 	// Watch opencode.json for changes and trigger a graceful restart.
@@ -318,7 +538,10 @@ func main() {
 	wechatHandler.SetNLScheduleService(nlScheduleSvc)
 
 	// ========== Offline retry queue (optional) ==========
-	if cfg.RetryQueue.Enabled && memDB != nil {
+	if cfg.RetryQueue.Enabled && archiveWriter != nil {
+		log.Printf("main: legacy offline retry worker disabled in strict capture mode; queued records retained")
+	}
+	if cfg.RetryQueue.Enabled && memDB != nil && archiveWriter == nil {
 		rwCfg := retryworker.Config{
 			Enabled:        true,
 			CronExpr:       cfg.RetryQueue.CronExpr,
@@ -382,15 +605,108 @@ func main() {
 	adapterRegistry.Register(dingtalkHandler.GetAdapter())
 	adapterRegistry.Register(wechatHandler.GetAdapter())
 
-	// erroredSessions tracks sessions that were deliberately cleared after session.error.
-	// The title-recovery logic must not re-map these, otherwise the user gets stuck on
-	// the broken session forever.
-	var erroredSessions sync.Map // map[sessionID]struct{}
+	// Wire the claimed-session bridge.
+	//
+	// A session adopted from the opencode TUI has no adapter callback of its
+	// own, so its output has to be routed by looking up the claim record. The
+	// sender resolves the adapter by channel name and delivers through it; the
+	// hook updates the adapter's own routing tables so the session behaves like
+	// one the gateway created.
+	ocClient.SetClaimedSessionSender(func(ctx context.Context, sessionID, channel, userID, content string) error {
+		adapter, ok := adapterRegistry.Get(channel)
+		if !ok {
+			return fmt.Errorf("no adapter registered for channel %q", channel)
+		}
+		// The claim's channel is the adapter NAME ("feishu"), but adapters use
+		// the per-session "channel" entry as platform routing data: Feishu reads
+		// it as receive_id_type, DingTalk as the conversation id. Passing the
+		// adapter name straight through would ask Feishu for
+		// ?receive_id_type=feishu and make DingTalk drop the message.
+		//
+		// A claimed session has no such entry: /rename carries only the channel
+		// and user ID, so ClaimSession is called with empty channelData and the
+		// hook never populates it. Fall back to "" rather than to the adapter
+		// name — an empty delivery tells each adapter to resolve the target from
+		// its own per-user state (Feishu remembers the chat target from the
+		// user's last inbound message), which is the only correct answer here.
+		delivery, _ := adapter.GetSessionData(sessionID, "channel")
+		return adapter.SendToUserInChannel(ctx, delivery, userID, content)
+	})
+	ocClient.SetClaimedSessionHook(func(ctx context.Context, sessionID, channel, userID, channelData string) error {
+		adapter, ok := adapterRegistry.Get(channel)
+		if !ok {
+			return fmt.Errorf("no adapter registered for channel %q", channel)
+		}
+		// SwitchUserSession (not MapUserToSession) so the user's previous
+		// session stops routing to them and its webhook/receive_id does not
+		// leak into the claimed one.
+		adapter.SwitchUserSession(userID, sessionID)
+		if channelData != "" {
+			adapter.MapSessionData(sessionID, "channel", channelData)
+		}
+		log.Printf("main: claimed session %s mapped to %s/%s", sessionID[:min(8, len(sessionID))], channel, userID)
+		return nil
+	})
+
+	// Resolve a channel-only claim ("[feishu] my work") to the adapter's sole
+	// user. This is what lets a single-user deployment skip typing a platform
+	// user ID into /rename. SoleUser refuses when the adapter has seen zero or
+	// several users, so a multi-user deployment keeps requiring an explicit ID
+	// instead of silently delivering to the wrong person.
+	ocClient.SetClaimUserResolver(func(ctx context.Context, channel string) (string, bool) {
+		adapter, ok := adapterRegistry.Get(channel)
+		if !ok {
+			return "", false
+		}
+		return adapter.SoleUser()
+	})
+
+	// Reject a /transfer target that has no adapter. Without this a typo would
+	// rewrite the session's title to a channel nobody serves, leaving the
+	// session claimed by nobody: invisible in every /sessions list and
+	// unreachable from the chat it was moved away from.
+	ocClient.SetClaimChannelChecker(func(channel string) bool {
+		_, ok := adapterRegistry.Get(channel)
+		return ok
+	})
+	ocClient.SetCronSessionChecker(taskScheduler.IsCronSession)
+
+	// /switch is transactional: the shared logic in internal/opencode decides
+	// what the target needs, and this bridge is the only part that knows how a
+	// channel stores its delivery context. It is injected rather than imported
+	// because internal/opencode must not depend on the adapters.
+	ocClient.SetSessionSwitchRouting(registrySessionRouting{registry: adapterRegistry})
 
 	// Register event handler for OpenCode -> Adapter communication
 	ocClient.RegisterEventHandler(func(ctx context.Context, event *opencodesdk.EventListResponse) error {
 		eventType := string(event.Type)
 		log.Printf("🔍 MAIN EVENT HANDLER - type=%s", eventType)
+
+		// TUI→chat handoff.
+		//
+		// The user runs /rename in the opencode TUI (a built-in slash command)
+		// and types "[feishu:ou_xxx] my work". The server emits an event naming
+		// the session, and this turns that rename into a claim: the title is
+		// already correct, so all that is left is attaching a forwarding handler
+		// and updating the adapter's routing tables.
+		//
+		// Two event shapes are handled. "session.updated" arrives on the
+		// directory-scoped /event stream and carries the title inline. "sync"
+		// arrives on the process-wide /global/event stream and carries only the
+		// session ID, so it acts as a safety net when /event is scoped to a
+		// different directory or has stalled.
+		//
+		// Without this, a TUI session's events are dropped with "no session
+		// handler found" — the gateway only registers handlers for sessions it
+		// created itself.
+		if eventType == "session.updated" || eventType == "sync" {
+			claimed, err := ocClient.AutoClaimFromTitle(ctx, event)
+			if err != nil {
+				log.Printf("main: auto-claim from title failed: %v", err)
+			} else if claimed {
+				log.Printf("main: auto-claimed session from renamed title")
+			}
+		}
 
 		// Extract sessionID from event
 		sessionID := extractSessionIDFromEvent(event)
@@ -458,54 +774,48 @@ func main() {
 		}
 
 		if foundAdapter == nil {
-			// 跳过已被清除（session.error 后）的会话，避免 title 恢复逻辑把坏 session 重新绑定给用户
-			if _, banned := erroredSessions.Load(sessionID); banned {
-				return nil
-			}
-
 			// 尝试从 session Title 中恢复映射关系
 			// Title 格式: [adapter:userId] threadId
-			if session, err := ocClient.GetSession(ctx, sessionID); err == nil && session.Title != "" {
-				title := session.Title
-				// 解析 Title: [adapter:userId] threadId
-				if len(title) > 0 && title[0] == '[' {
-					if closeIdx := strings.Index(title, "]"); closeIdx > 0 {
-						info := title[1:closeIdx] // 提取 "adapter:userId"
-						parts := strings.SplitN(info, ":", 2)
-						if len(parts) == 2 {
-							adapterName := parts[0]
-							userID := parts[1]
+			//
+			// This is the restart path for the TUI→chat handoff. AutoClaimFromTitle
+			// only fires on session.updated, so after a gateway restart the first
+			// event for an already-renamed session is an ordinary message event.
+			// ClaimSessionFromTitle fetches the title once and performs the same
+			// claim, which attaches the forwarding handler — mapping the user
+			// alone is not enough, because without a registered handler the
+			// session's events are dropped with "no session handler found".
+			claimed, claimErr := ocClient.ClaimSessionFromTitle(ctx, sessionID)
+			if claimErr != nil {
+				log.Printf("opencode event: title-based claim failed for session %s: %v",
+					sessionID[:min(8, len(sessionID))], claimErr)
+			}
+			if claimed {
+				log.Printf("opencode event: claimed session %s from its title", sessionID[:min(8, len(sessionID))])
+			}
 
-							// skillgen uses internal drafting sessions; they are not adapter-routable
-							// and should not go through title recovery.
-							if adapterName == "skillgen" {
-								return nil
-							}
-
-							log.Printf("opencode event: recovering mapping from session title - adapter=%s, userID=%s, sessionID=%s",
-								adapterName, userID, sessionID[:min(8, len(sessionID))])
-
-							// 找到对应的 adapter 并恢复映射
-							switch adapterName {
-							case "dingtalk":
-								foundAdapter = dingtalkHandler.GetAdapter()
-							case "feishu":
-								foundAdapter = feishuHandler.GetAdapter()
-							case "wecom":
-								foundAdapter = wecomHandler.GetAdapter()
-							case "wechat":
-								foundAdapter = wechatHandler.GetAdapter()
-							}
-
-							if foundAdapter != nil {
-								foundChannel = adapterName
-								foundUserID = userID
-								// 恢复映射关系到内存
-								foundAdapter.MapUserToSession(userID, sessionID)
-								log.Printf("opencode event: successfully recovered mapping for session %s", sessionID[:min(8, len(sessionID))])
-							}
-						}
-					}
+			// Re-resolve the adapter: the claim hook has just populated the
+			// adapter's user→session table, so the lookup that failed above now
+			// succeeds.
+			for _, adapter := range []struct {
+				name    string
+				handler interface {
+					GetAdapter() *base.BidirectionalAdapter
+				}
+			}{
+				{"dingtalk", dingtalkHandler},
+				{"feishu", feishuHandler},
+				{"wecom", wecomHandler},
+				{"wechat", wechatHandler},
+			} {
+				adapter := adapter.handler.GetAdapter()
+				if userID, ok := adapter.GetUserForSession(sessionID); ok {
+					foundAdapter = adapter
+					foundUserID = userID
+					foundChannel = adapter.Name()
+					isCronSession = strings.HasPrefix(userID, "cron:")
+					log.Printf("opencode event: recovered session %s in adapter %s for user %s",
+						sessionID[:min(8, len(sessionID))], foundChannel, foundUserID)
+					break
 				}
 			}
 		}
@@ -531,22 +841,6 @@ func main() {
 		if err != nil {
 			log.Printf("opencode event: failed to extract content from event type %s: %v", event.Type, err)
 			return err
-		}
-
-		// 会话出错后清除 session 映射，使下一条消息自动建立新会话
-		// 同时将该 sessionID 加入黑名单，防止 title 恢复逻辑把坏 session 重新绑定
-		// 注意：必须在 content == "" 判断之前执行，否则清理逻辑会被跳过
-		if eventType == "session.error" && !isCronSession {
-			log.Printf("opencode event: clearing broken session %s for user %s (session.error)",
-				sessionID[:min(8, len(sessionID))], foundUserID)
-			// 同时清除 client 的 thread→session 缓存：坏 session 在服务端仍然
-			// 存在（stale 检查会通过），但其历史包含失败的请求，opencode 会在
-			// 后续每一轮重放，导致该用户之后所有消息都报同样的错误。
-			if ocClient != nil {
-				ocClient.InvalidateSessionCache(sessionID)
-			}
-			foundAdapter.ClearSessionForUser(foundUserID)
-			erroredSessions.Store(sessionID, struct{}{})
 		}
 
 		if content == "" {
@@ -737,6 +1031,30 @@ func main() {
 	}
 
 	log.Println("gateway stopped")
+}
+
+func openCaptureArchive(ctx context.Context, path string, memory config.MemoryConfig) (*memstore.ArchiveWriter, error) {
+	if !memory.Enabled {
+		if memory.CaptureMode == "strict" {
+			log.Printf("main: MEMORY_ENABLED=false overrides MEMORY_CAPTURE_MODE=strict; v2 capture is off")
+		}
+		return nil, nil
+	}
+	switch memory.CaptureMode {
+	case "", "legacy":
+		return nil, nil
+	case "strict":
+		return memstore.OpenArchiveWriter(ctx, path, memstore.WriterOptions{
+			QueueItems:    memory.QueueMaxItems,
+			QueueBytes:    memory.QueueMaxBytes,
+			BatchItems:    memory.BatchMaxItems,
+			BatchBytes:    memory.BatchMaxBytes,
+			BatchDelay:    memory.BatchMaxDelay,
+			CommitTimeout: memory.CommitTimeout,
+		})
+	default:
+		return nil, fmt.Errorf("MEMORY_CAPTURE_MODE must be legacy or strict")
+	}
 }
 
 func serveArgsContainPort(args []string) bool {
@@ -1196,13 +1514,14 @@ func ensureMCPMemoryTool(opencodeDir, memDBPath string) {
 		mcpSection = make(map[string]interface{})
 	}
 	if _, exists := mcpSection["gateway-memory"]; exists {
+		log.Printf("mcp: existing gateway-memory configuration retained; updated MCP requires explicit --single-owner --adapter --user binding; verify its --db path is %s", memDBPath)
 		return // already registered
 	}
 
 	mcpSection["gateway-memory"] = map[string]interface{}{
 		"type":    "local",
 		"command": []string{mcpBin, "--db", memDBPath},
-		"enabled": true,
+		"enabled": false,
 	}
 	root["mcp"] = mcpSection
 
@@ -1219,7 +1538,7 @@ func ensureMCPMemoryTool(opencodeDir, memDBPath string) {
 		log.Printf("mcp: write %s error: %v", cfgPath, err)
 		return
 	}
-	log.Printf("mcp: auto-registered gateway-memory tool in %s (binary=%s)", cfgPath, mcpBin)
+	log.Printf("mcp: registered disabled gateway-memory tool in %s (binary=%s); enable only on an isolated single-owner instance with --single-owner --adapter --user", cfgPath, mcpBin)
 }
 
 // findMCPBinary locates the openbot-mcp binary next to the current executable,

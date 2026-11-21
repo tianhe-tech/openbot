@@ -2,11 +2,146 @@ package wechat
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+// A chunk that can never be delivered (stale iLink session, ret=-2 "prepare
+// failed") must stop being retried. In production these were critical
+// PriorityHigh notices, so retrying them forever kept them at the head of the
+// user's queue and starved every real reply (171 rows → 18k failed sends).
+func TestOutboundQueueParksAfterSessionExpired(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "expired.db")
+	q, err := newOutboundTextQueue(dbPath, 5*time.Millisecond, 1600, func(item *queuedOutboundText) error {
+		return fmt.Errorf("sendmessage ret=-2 errcode=0 errmsg=prepare failed: %w", ErrSessionExpired)
+	})
+	if err != nil {
+		t.Fatalf("newOutboundTextQueue failed: %v", err)
+	}
+	defer q.Stop()
+	q.setMinGap(0)
+
+	if err := q.EnqueueText("u1", "s1", "", "final", "hello", true); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	for i := 0; i < maxSessionExpiredAttempts; i++ {
+		if _, err := q.db.Exec(`UPDATE wechat_outbound_queue SET next_attempt_at = 0`); err != nil {
+			t.Fatalf("force due failed: %v", err)
+		}
+		did, derr := q.dispatchOne()
+		if derr != nil {
+			t.Fatalf("dispatch %d failed: %v", i, derr)
+		}
+		if !did {
+			t.Fatalf("dispatch %d should do work", i)
+		}
+	}
+
+	if parked, err := q.ListParked("u1"); err != nil || len(parked) != 1 {
+		t.Fatalf("expected session-expired chunk to be parked, got %d parked entries, err=%v", len(parked), err)
+	}
+	if did, derr := q.dispatchOne(); derr != nil || did {
+		t.Fatalf("parked chunk must not be dispatched again (did=%v err=%v)", did, derr)
+	}
+}
+
+// A sender loop that re-enqueues the same notice must not accumulate rows, and
+// real conversation content must never be deduplicated.
+func TestOutboundQueueDedupsIdenticalNotices(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dedup.db")
+	q, err := newOutboundTextQueue(dbPath, 5*time.Millisecond, 1600, func(item *queuedOutboundText) error {
+		return errors.New("no transport in test")
+	})
+	if err != nil {
+		t.Fatalf("newOutboundTextQueue failed: %v", err)
+	}
+	defer q.Stop()
+	q.setMinGap(0)
+
+	notice := "⏳ 检测到模型未进入生成或工具执行阶段，已重建会话并继续原任务。"
+	for i := 0; i < 5; i++ {
+		if err := q.EnqueueText("u1", "s1", "", "question", notice, true); err != nil {
+			t.Fatalf("enqueue notice %d failed: %v", i, err)
+		}
+	}
+	pending, err := q.pendingCount()
+	if err != nil {
+		t.Fatalf("pendingCount failed: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("identical notices must collapse into 1 row, got %d", pending)
+	}
+
+	if err := q.EnqueueText("u1", "s1", "", "question", "另一个提示", true); err != nil {
+		t.Fatalf("enqueue distinct notice failed: %v", err)
+	}
+	if pending, err = q.pendingCount(); err != nil || pending != 2 {
+		t.Fatalf("distinct notice must be queued (pending=%d err=%v)", pending, err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := q.EnqueueText("u1", "s1", "", "final", "same reply", true); err != nil {
+			t.Fatalf("enqueue final %d failed: %v", i, err)
+		}
+	}
+	if pending, err = q.pendingCount(); err != nil || pending != 4 {
+		t.Fatalf("final content must never be deduped (pending=%d err=%v, want 4)", pending, err)
+	}
+}
+
+// A PriorityHigh backlog that keeps failing (iLink rejecting stalled prompt
+// notices) must yield to the user's real replies instead of blocking them
+// indefinitely.
+func TestOutboundQueueHighBacklogDoesNotStarveNormal(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fairness.db")
+	var mu sync.Mutex
+	var sent []string
+	q, err := newOutboundTextQueue(dbPath, 5*time.Millisecond, 1600, func(item *queuedOutboundText) error {
+		if item.Priority >= PriorityHigh {
+			return errors.New("prompt rejected by transport")
+		}
+		mu.Lock()
+		sent = append(sent, item.Content)
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("newOutboundTextQueue failed: %v", err)
+	}
+	defer q.Stop()
+	q.setMinGap(0)
+
+	for i := 0; i < 10; i++ {
+		if err := q.EnqueueTextWithPriority("u1", "s1", "", "question", fmt.Sprintf("prompt-%d", i), true, PriorityHigh); err != nil {
+			t.Fatalf("enqueue prompt %d failed: %v", i, err)
+		}
+	}
+	if err := q.EnqueueTextWithPriority("u1", "s1", "", "final", "real-reply", true, PriorityNormal); err != nil {
+		t.Fatalf("enqueue final failed: %v", err)
+	}
+
+	for i := 0; i < maxHighStreakPerUser+2; i++ {
+		if _, err := q.db.Exec(`UPDATE wechat_outbound_queue SET next_attempt_at = 0`); err != nil {
+			t.Fatalf("force due failed: %v", err)
+		}
+		if _, derr := q.dispatchOne(); derr != nil {
+			t.Fatalf("dispatch %d failed: %v", i, derr)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) == 0 {
+		t.Fatal("PriorityNormal reply was starved by the PriorityHigh backlog")
+	}
+	if sent[0] != "real-reply" {
+		t.Fatalf("unexpected dispatch order: %v", sent)
+	}
+}
 
 func TestOutboundQueueSplitAndDispatchOrder(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "outbound.db")
@@ -272,6 +407,130 @@ func TestOutboundQueueBatchOrderingOnNack(t *testing.T) {
 }
 
 // TestOutboundQueuePriorityJump verifies that a PriorityHigh message
+// The queue is the only durable outbound path: a gateway restart must not lose
+// accepted replies. This reopens the same SQLite file with a fresh queue and
+// verifies the pending rows (content, order, attempt count, and the stable
+// client_id used as the iLink idempotency key) survive and are dispatchable.
+func TestOutboundQueueSurvivesRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "restart.db")
+
+	// First process: every send fails, so both chunks stay pending.
+	failing, err := newOutboundTextQueue(dbPath, 5*time.Millisecond, 1600, func(item *queuedOutboundText) error {
+		return errors.New("transport down")
+	})
+	if err != nil {
+		t.Fatalf("newOutboundTextQueue failed: %v", err)
+	}
+	failing.setMinGap(0)
+	if err := failing.EnqueueText("u1", "s1", "ctx", "final", "first", true); err != nil {
+		t.Fatalf("enqueue first failed: %v", err)
+	}
+	if err := failing.EnqueueText("u1", "s1", "ctx", "final", "second", true); err != nil {
+		t.Fatalf("enqueue second failed: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, derr := failing.dispatchOne(); derr != nil {
+			t.Fatalf("dispatch %d failed: %v", i, derr)
+		}
+	}
+	// Capture the persisted identity before shutdown.
+	type row struct {
+		content  string
+		clientID string
+		attempts int
+	}
+	var before []row
+	rows, err := failing.db.Query(`SELECT content, client_id, attempts FROM wechat_outbound_queue ORDER BY id ASC`)
+	if err != nil {
+		t.Fatalf("read pending rows failed: %v", err)
+	}
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.content, &r.clientID, &r.attempts); err != nil {
+			t.Fatalf("scan pending row failed: %v", err)
+		}
+		before = append(before, r)
+	}
+	rows.Close()
+	if len(before) != 2 {
+		t.Fatalf("expected 2 pending rows before restart, got %d", len(before))
+	}
+	if before[0].attempts == 0 {
+		t.Fatal("failed dispatch did not persist an attempt count")
+	}
+	if before[0].clientID == "" || before[0].clientID == before[1].clientID {
+		t.Fatalf("chunks must carry distinct stable client IDs: %q %q", before[0].clientID, before[1].clientID)
+	}
+	failing.Stop()
+
+	// Second process: same file, working transport.
+	var mu sync.Mutex
+	var sent []string
+	var sentClientIDs []string
+	restarted, err := newOutboundTextQueue(dbPath, 5*time.Millisecond, 1600, func(item *queuedOutboundText) error {
+		mu.Lock()
+		defer mu.Unlock()
+		sent = append(sent, item.Content)
+		sentClientIDs = append(sentClientIDs, item.ClientID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reopen outbound queue failed: %v", err)
+	}
+	defer restarted.Stop()
+	restarted.setMinGap(0)
+
+	// Simulate the backoff window having elapsed while the process was down.
+	if _, err := restarted.db.Exec(`UPDATE wechat_outbound_queue SET next_attempt_at = 0`); err != nil {
+		t.Fatalf("force due failed: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		did, derr := restarted.dispatchOne()
+		if derr != nil {
+			t.Fatalf("restart dispatch %d failed: %v", i, derr)
+		}
+		if !did {
+			t.Fatalf("restart dispatch %d found no work; pending rows were lost", i)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 2 || sent[0] != "first" || sent[1] != "second" {
+		t.Fatalf("restart lost order or content: %v", sent)
+	}
+	// The idempotency key must be the one persisted before the restart, so a
+	// replay after a crash mid-send is recognised by iLink instead of
+	// duplicating the message.
+	for i := range sentClientIDs {
+		if sentClientIDs[i] != before[i].clientID {
+			t.Fatalf("chunk %d client_id changed across restart: %q != %q", i, sentClientIDs[i], before[i].clientID)
+		}
+	}
+	if pending, err := restarted.pendingCount(); err != nil || pending != 0 {
+		t.Fatalf("queue not drained after restart: pending=%d err=%v", pending, err)
+	}
+}
+
+// Stop must not block for the full drain timeout when the queue was never
+// started: there is no drain goroutine, so doneCh never closes.
+func TestOutboundQueueStopWithoutStartIsImmediate(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "nostart.db")
+	q, err := newOutboundTextQueue(dbPath, 5*time.Millisecond, 1600, func(item *queuedOutboundText) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("newOutboundTextQueue failed: %v", err)
+	}
+	start := time.Now()
+	q.Stop()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Stop on an unstarted queue blocked for %s", elapsed)
+	}
+	// Stop must stay idempotent.
+	q.Stop()
+}
+
 // (e.g. permission/question confirmation) can jump ahead of a lower-priority
 // head that is blocked by a failed retry. This prevents the deadlock where:
 //  1. todo (PriorityNormal) is enqueued first, fails, nacks with future retry

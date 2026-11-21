@@ -3,6 +3,7 @@
 package memstore
 
 import (
+	"context"
 	"log"
 	"path/filepath"
 	"strings"
@@ -139,6 +140,30 @@ func (g *GatewayAdapter) BuildHandoffPreamble(summary, prevUnanswered, currentUs
 // memstore recall wrappers from raw user content.
 func (g *GatewayAdapter) SanitizeUserContent(content string) string {
 	return SanitizeHandoffContent("user", content)
+}
+
+// ---- Durable knowledge (opencode.KnowledgeIndexStore) ----
+
+// LoadKnowledgeIndex renders the bounded knowledge block for a scope, or "" when
+// there is nothing to inject.
+//
+// It implements opencode.KnowledgeIndexStore, which is deliberately separate
+// from MemStoreRecorder: a store that can record but not index simply does not
+// implement it, and the client checks for the capability rather than assuming
+// it. The timeout is short because this runs on the request path — a slow
+// knowledge lookup must degrade to "no injection", never to a slow reply.
+func (g *GatewayAdapter) LoadKnowledgeIndex(adapter, userID, project string) string {
+	if g == nil || g.store == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	index, err := g.store.KnowledgeIndex(ctx, SearchScope{Adapter: adapter, UserID: userID, Project: workDirBasename(project)}, 0)
+	if err != nil {
+		log.Printf("memstore: knowledge index error (adapter=%s user=%s project=%s): %v", adapter, userID, project, err)
+		return ""
+	}
+	return index.Text
 }
 
 // workDirBasename returns the last meaningful segment of a working directory path.

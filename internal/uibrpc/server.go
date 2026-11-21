@@ -3,6 +3,7 @@ package uibrpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/user/opencode-gateway/internal/adapters/base"
 	"github.com/user/opencode-gateway/internal/opencode"
 )
 
@@ -187,7 +189,7 @@ func (s *Server) handleSlashCommand(ctx context.Context, state *uiSessionState, 
 
 	switch fields[0] {
 	case "/help":
-		return map[string]string{"message": "可用命令: /help, /model, /model openai/<model>, /provider <base_url> <api_key>, /soul, /soul set <text>, /skills, /skills install <name>, /reset"}, nil
+		return map[string]string{"message": "可用命令: /help, /model, /model openai/<model>, /provider <base_url> <api_key>, /soul, /soul set <text>, /skills, /skills install <name>, /sessions, /switch <序号>, /reset"}, nil
 	case "/model":
 		if len(fields) == 1 {
 			return s.handleModelQuery(ctx, state)
@@ -252,9 +254,90 @@ func (s *Server) handleSlashCommand(ctx context.Context, state *uiSessionState, 
 		state.UpdatedAt = time.Now().Format(time.RFC3339)
 		s.mu.Unlock()
 		return map[string]string{"message": "会话已重置，下条消息将创建新会话"}, nil
+	case "/sessions":
+		return s.handleSessions(ctx, state)
+	case "/switch":
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("用法: /switch <序号|会话ID前缀>")
+		}
+		return s.handleSwitch(ctx, state, fields[1])
 	default:
 		return nil, fmt.Errorf("未知命令: %s", fields[0])
 	}
+}
+
+// webuiUserID is the principal this proxy key acts as. It matches the UserID
+// handleChat sends, so the sessions listed here are exactly the ones this
+// client created.
+func (s *Server) webuiUserID() string {
+	return "proxy:" + shortForID(s.proxyKey)
+}
+
+// handleSessions lists the sessions owned by this webui client.
+//
+// Each row carries a derived preview alongside the stored title: the title is
+// "[channel:userID] <threadID>", so what survives prefix stripping is an opaque
+// chat identifier that tells the user nothing about the conversation.
+func (s *Server) handleSessions(ctx context.Context, state *uiSessionState) (interface{}, error) {
+	sessions, err := s.oc.ListSessionsForUser(ctx, "webui", s.webuiUserID())
+	if err != nil {
+		return nil, err
+	}
+
+	// Only the rows that will be rendered need a preview; each one costs a
+	// history fetch, so the bound is applied before deriving them.
+	s.oc.FillSessionPreviews(ctx, sessions, base.MaxSessionListRows)
+
+	rows := make([]map[string]interface{}, 0, len(sessions))
+	for i, session := range sessions {
+		if i >= base.MaxSessionListRows {
+			break
+		}
+		rows = append(rows, map[string]interface{}{
+			"index":   i + 1,
+			"id":      session.ID,
+			"title":   session.Title,
+			"preview": session.Preview,
+			"updated": session.Updated.Format("2006-01-02 15:04"),
+			"current": session.ID == state.SessionID,
+		})
+	}
+
+	return map[string]interface{}{
+		"message":  fmt.Sprintf("共 %d 个会话，发送 /switch <序号> 继续某个会话", len(sessions)),
+		"sessions": rows,
+		"total":    len(sessions),
+	}, nil
+}
+
+// handleSwitch resumes one of this client's own sessions.
+//
+// Both the state's SessionID and the client's thread→session map must move.
+// handleChat passes state.SessionID to SendMessage, and that field takes
+// precedence over the thread mapping, so updating only the client would leave
+// the next message on the old session. Updating only the state would leave the
+// client's fallback stale.
+func (s *Server) handleSwitch(ctx context.Context, state *uiSessionState, selector string) (interface{}, error) {
+	target, err := s.oc.ResolveUserSession(ctx, "webui", s.webuiUserID(), selector)
+	if err != nil {
+		if errors.Is(err, opencode.ErrSessionNotOwned) {
+			return nil, fmt.Errorf("找不到会话 %q", selector)
+		}
+		return nil, err
+	}
+
+	s.mu.Lock()
+	state.SessionID = target.ID
+	state.UpdatedAt = time.Now().Format(time.RFC3339)
+	threadID := state.ThreadID
+	s.mu.Unlock()
+
+	s.oc.BindSessionToThread(threadID, target.ID)
+
+	return map[string]interface{}{
+		"message":    fmt.Sprintf("已切换到会话: %s", target.Title),
+		"session_id": target.ID,
+	}, nil
 }
 
 func (s *Server) handleSetModel(req modelReq) (interface{}, error) {

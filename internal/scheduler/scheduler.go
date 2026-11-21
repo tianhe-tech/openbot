@@ -44,6 +44,8 @@ type TaskScheduler struct {
 	cfg            TaskSchedulerConfig
 	opencodeClient *opencode.Client
 	taskQueue      chan *Task
+	submitMu       sync.RWMutex
+	stopped        bool
 	activeTasks    map[string]*Task
 	activeTasksMu  sync.RWMutex
 	taskHistory    []*Task // 任务历史（最近的N个）
@@ -119,15 +121,35 @@ func (s *TaskScheduler) Start() error {
 func (s *TaskScheduler) Stop() error {
 	log.Println("scheduler: stopping task scheduler...")
 	s.cancel()
-	close(s.taskQueue)
+	s.submitMu.Lock()
+	s.stopped = true
+	s.submitMu.Unlock()
 	s.wg.Wait()
-	log.Println("scheduler: task scheduler stopped")
-	return nil
+	for {
+		select {
+		case task := <-s.taskQueue:
+			task.Status = TaskStatusCanceled
+			task.Error = s.ctx.Err().Error()
+			task.Result = ""
+			s.finishTask(task)
+			s.addToHistory(task)
+		default:
+			log.Println("scheduler: task scheduler stopped")
+			return nil
+		}
+	}
 }
 
 // SubmitTask 提交任务
 func (s *TaskScheduler) SubmitTask(task *Task) error {
+	s.submitMu.RLock()
+	defer s.submitMu.RUnlock()
+	if s.stopped {
+		return fmt.Errorf("scheduler stopped: %w", context.Canceled)
+	}
 	select {
+	case <-s.ctx.Done():
+		return fmt.Errorf("scheduler stopped: %w", s.ctx.Err())
 	case s.taskQueue <- task:
 		log.Printf("scheduler: task %s submitted (type: %s, priority: %d)", task.ID, task.Type, task.Priority)
 		return nil
@@ -148,16 +170,14 @@ func (s *TaskScheduler) worker(id int) {
 	defer s.wg.Done()
 	log.Printf("scheduler: worker %d started", id)
 
-	for task := range s.taskQueue {
+	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		default:
+		case task := <-s.taskQueue:
 			s.executeTask(id, task)
 		}
 	}
-
-	log.Printf("scheduler: worker %d stopped", id)
 }
 
 // executeTask 执行任务
@@ -184,66 +204,61 @@ func (s *TaskScheduler) executeTask(workerID int, task *Task) {
 
 	log.Printf("scheduler: worker %d executing task %s (type: %s)", workerID, task.ID, task.Type)
 
-	// 创建带超时的context
-	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.TaskTimeout)
-	defer cancel()
-
-	// 根据任务类型执行
-	var result *TaskResult
-	var err error
-
-	switch task.Type {
-	case TaskTypeMessage, TaskTypeAgent, TaskTypeCron:
-		// 定时任务使用和 Agent 相同的执行逻辑
-		result, err = s.executeMessageTask(ctx, task)
-	case TaskTypeScript:
-		result, err = s.executeScriptTask(ctx, task)
-	case TaskTypeMonitoring:
-		result, err = s.executeMonitoringTask(ctx, task)
-	default:
-		err = fmt.Errorf("unknown task type: %s", task.Type)
-	}
-
-	// 更新任务结果
-	completedAt := time.Now()
-	task.CompletedAt = &completedAt
-
-	if err != nil {
-		task.Status = TaskStatusFailed
-		task.Error = err.Error()
-		log.Printf("scheduler: task %s failed: %v", task.ID, err)
-
-		// 检查是否需要重试
-		if task.CanRetry() {
-			task.IncrementRetry()
-			task.Status = TaskStatusPending
-			task.StartedAt = nil
-			task.CompletedAt = nil
-			log.Printf("scheduler: retrying task %s (attempt %d/%d)", task.ID, task.RetryCount, task.MaxRetries)
-			_ = s.SubmitTask(task) // 重新提交任务
-			return
+	for {
+		ctx, cancel := context.WithTimeout(s.ctx, s.cfg.TaskTimeout)
+		var result *TaskResult
+		err := ctx.Err()
+		if err == nil {
+			switch task.Type {
+			case TaskTypeMessage, TaskTypeAgent, TaskTypeCron:
+				result, err = s.executeMessageTask(ctx, task)
+			case TaskTypeScript:
+				result, err = s.executeScriptTask(ctx, task)
+			case TaskTypeMonitoring:
+				result, err = s.executeMonitoringTask(ctx, task)
+			default:
+				err = fmt.Errorf("unknown task type: %s", task.Type)
+			}
 		}
-	} else {
-		task.Status = TaskStatusCompleted
-		if result != nil {
-			task.Result = result.Result
+		cancel()
+		if result != nil && result.SessionID != "" {
 			task.SessionID = result.SessionID
 		}
-		log.Printf("scheduler: task %s completed", task.ID)
+		task.Result = ""
+		if err == nil {
+			task.Status = TaskStatusCompleted
+			task.Error = ""
+			if result != nil {
+				task.Result = result.Result
+			}
+			break
+		}
+		task.Error = err.Error()
+		log.Printf("scheduler: task %s failed: %v", task.ID, err)
+		if s.ctx.Err() != nil {
+			task.Status = TaskStatusCanceled
+			break
+		}
+		if !task.CanRetry() {
+			task.Status = TaskStatusFailed
+			break
+		}
+		task.IncrementRetry()
+		log.Printf("scheduler: retrying task %s (attempt %d/%d)", task.ID, task.RetryCount, task.MaxRetries)
 	}
+	s.finishTask(task)
+}
 
-	// 注册定时任务session到adapter，使SSE事件能正确路由
-	if result != nil && result.SessionID != "" {
-		s.registerCronSession(task, result.SessionID)
-	}
-
-	// 调用回调
-	if result != nil {
-		s.invokeCallbacks(ctx, result)
-	}
-
-	// 如果需要发送结果到adapter
-	shouldSend := task.Result != "" && (task.Channel != "")
+func (s *TaskScheduler) finishTask(task *Task) {
+	completedAt := time.Now()
+	task.CompletedAt = &completedAt
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.invokeCallbacks(ctx, &TaskResult{
+		TaskID: task.ID, Status: task.Status, Result: task.Result, Error: task.Error,
+		SessionID: task.SessionID, UserID: task.UserID, CompletedAt: completedAt,
+	})
+	shouldSend := (task.Result != "" || task.Error != "") && task.Channel != ""
 	if !shouldSend && task.AdapterType == "feishu" {
 		_, hasReceiveID := task.Metadata["receive_id"]
 		shouldSend = hasReceiveID
@@ -260,15 +275,40 @@ func (s *TaskScheduler) executeTask(workerID int, task *Task) {
 
 // executeMessageTask 执行消息任务
 func (s *TaskScheduler) executeMessageTask(ctx context.Context, task *Task) (*TaskResult, error) {
-	response, err := s.opencodeClient.SendMessage(ctx, opencode.MessagePayload{
-		Channel:   task.AdapterType,
-		UserID:    task.UserID,
-		ThreadID:  task.ThreadID,
-		SessionID: task.SessionID,
-		Content:   task.Content,
-		Agent:     task.Agent,
-		Metadata:  convertMetadata(task.Metadata),
-	})
+	if s.opencodeClient == nil {
+		return nil, fmt.Errorf("opencode client is not configured")
+	}
+	payload := opencode.MessagePayload{
+		Channel:           task.AdapterType,
+		UserID:            task.UserID,
+		ThreadID:          task.ThreadID,
+		SessionID:         task.SessionID,
+		Content:           task.Content,
+		Agent:             task.Agent,
+		Metadata:          convertMetadata(task.Metadata),
+		OnSessionResolved: task.OnSessionResolved,
+	}
+	if task.Type == TaskTypeCron {
+		if task.OnSessionResolved == nil {
+			return nil, fmt.Errorf("cron session binding hook is required")
+		}
+		sessionID, err := s.opencodeClient.ResolveOrCreateSession(ctx, payload)
+		if sessionID != "" {
+			task.SessionID = sessionID
+			payload.SessionID = sessionID
+		}
+		if err != nil {
+			return nil, err
+		}
+		status, err := s.opencodeClient.GetSessionStatus(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("check cron session status: %w", err)
+		}
+		if state := status[sessionID].Type; state != "" && state != "idle" {
+			return nil, fmt.Errorf("cron session %s is %s; refusing overlapping prompt", sessionID, state)
+		}
+	}
+	response, err := s.opencodeClient.SendMessage(ctx, payload)
 
 	if err != nil {
 		return nil, fmt.Errorf("send message to opencode: %w", err)
@@ -298,6 +338,10 @@ func (s *TaskScheduler) executeScriptTask(ctx context.Context, task *Task) (*Tas
 			UserID:   task.UserID,
 			ThreadID: task.ThreadID,
 			Content:  "Initialize session for script execution",
+			// Bootstrap prompt: it only materializes an upstream session for
+			// shell execution and is not a user request, so it must never
+			// become an archived conversation turn.
+			Internal: true,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create session: %w", err)
@@ -371,15 +415,26 @@ func (s *TaskScheduler) sendResultToAdapter(ctx context.Context, task *Task) {
 		if name, ok := task.Metadata["name"].(string); ok && name != "" {
 			taskName = name
 		}
-		message = fmt.Sprintf("🔔 定时任务执行完成\n\n📋 任务: %s\n🆔 任务ID: %s\n⏰ 完成时间: %s\n\n📝 执行结果:\n%s",
+		status, body := "完成", task.Result
+		if task.Status != TaskStatusCompleted {
+			status, body = "失败", task.Error
+			if task.Status == TaskStatusCanceled {
+				status = "取消"
+			}
+		}
+		message = fmt.Sprintf("🔔 定时任务执行%s\n\n📋 任务: %s\n🆔 任务ID: %s\n⏰ 完成时间: %s\n\n📝 执行结果:\n%s",
+			status,
 			taskName,
 			task.ID,
 			time.Now().Format("2006-01-02 15:04:05"),
-			task.Result,
+			body,
 		)
 	} else {
 		// 普通任务，直接发送结果
 		message = task.Result
+		if task.Error != "" {
+			message = "任务执行失败: " + task.Error
+		}
 	}
 
 	var channel, userID string
@@ -439,9 +494,10 @@ func (s *TaskScheduler) sendResultToAdapter(ctx context.Context, task *Task) {
 
 // invokeCallbacks 调用任务回调
 func (s *TaskScheduler) invokeCallbacks(ctx context.Context, result *TaskResult) {
-	s.callbacksMu.RLock()
+	s.callbacksMu.Lock()
 	callbacks := s.callbacks[result.TaskID]
-	s.callbacksMu.RUnlock()
+	delete(s.callbacks, result.TaskID)
+	s.callbacksMu.Unlock()
 
 	for _, callback := range callbacks {
 		if err := callback(ctx, result); err != nil {
@@ -449,10 +505,6 @@ func (s *TaskScheduler) invokeCallbacks(ctx context.Context, result *TaskResult)
 		}
 	}
 
-	// 清理回调
-	s.callbacksMu.Lock()
-	delete(s.callbacks, result.TaskID)
-	s.callbacksMu.Unlock()
 }
 
 // addToHistory 添加到历史

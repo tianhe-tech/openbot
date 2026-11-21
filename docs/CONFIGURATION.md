@@ -3,6 +3,112 @@
 
 ## 默认配置
 
+### Memory Storage and Recall
+
+`MEMORY_STORE_PATH` selects the SQLite database; empty uses
+`<OPENCODE_DIRECTORY>/mem/memory.db` and does not disable capture. The gateway
+creates parent directories and migrates the search index. Back up before upgrading.
+
+New `gateway-memory` MCP registrations are disabled. Recall requires an isolated
+single-owner OpenCode/MCP instance and operator-provided `--single-owner`,
+`--adapter`, and `--user` arguments. The MCP `--db` flag (or `GATEWAY_MEMORY_DB`)
+must refer to the same database. Shared-user recall is not supported yet.
+
+See [MCP memory configuration](MCP_MEMORY_TOOL.md) for executable paths, binding,
+upgrade order, limits, and read-only behavior. Hourly decay and startup keyword
+deletion are no longer enabled.
+
+`MEMORY_CAPTURE_MODE=legacy` is the default. Experimental `strict` requires an
+explicitly migrated v2 archive, commits input before dispatch, and recovers final
+assistant text independently of outbound delivery. Invalid modes or missing archive
+schema fail startup. Strict mode stops legacy conversation writes; MCP searches
+those v2 records through the chunked lexical index described below. Legacy offline
+automatic retries are disabled in strict mode so uncertain tasks are not silently
+replayed.
+
+### Memory settings
+
+All memory settings are validated at startup. An invalid value fails the process
+rather than falling back to a default, because a capture queue that silently
+disappears is a durability failure.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `MEMORY_ENABLED` | `true` | `false` disables capture **and** recall: no archive is opened, no legacy store is opened, and no MCP entry is registered. |
+| `MEMORY_STORE_PATH` | `<OPENCODE_DIRECTORY>/mem/memory.db` | Archive path. |
+| `MEMORY_CAPTURE_MODE` | `legacy` | `legacy` or `strict`. `strict` requires a migrated archive. |
+| `MEMORY_SCOPE_MODE` | `disabled` | `disabled` or `single_owner`. Documents the deployment assumption; recall still requires the MCP `--single-owner --adapter --user` binding. |
+| `MEMORY_QUEUE_MAX_ITEMS` | `1024` | Capture queue depth. A full queue applies backpressure and returns an error; it never drops silently. |
+| `MEMORY_QUEUE_MAX_BYTES` | `16777216` | Capture queue byte budget. |
+| `MEMORY_BATCH_MAX_ITEMS` | `64` | Operations per commit batch. |
+| `MEMORY_BATCH_MAX_BYTES` | `262144` | Estimated input bytes per commit batch. |
+| `MEMORY_BATCH_MAX_DELAY_MS` | `10` | Maximum wait before committing a partial batch. |
+| `MEMORY_COMMIT_TIMEOUT_MS` | `2000` | Commit deadline. Exceeding it surfaces an error; it does not silently retry forever. |
+| `MEMORY_KNOWLEDGE_ENABLED` | `false` | Background extraction of durable facts from completed conversations. Requires `MEMORY_ENABLED=true` **and** `MEMORY_CAPTURE_MODE=strict`; the combination is rejected at startup otherwise. The `/remember`, `/forget`, `/knowledge-list` and `/knowledge-help` commands work whether or not this is on. |
+
+The two `_MS` settings take a bare number as **milliseconds**. A value with an
+explicit unit (`250ms`, `1s`) is honoured as written. This differs from the
+duration settings elsewhere in the gateway, where a bare number means seconds.
+
+`MEMORY_BATCH_MAX_ITEMS` cannot exceed `MEMORY_QUEUE_MAX_ITEMS`, and
+`MEMORY_BATCH_MAX_BYTES` cannot exceed `MEMORY_QUEUE_MAX_BYTES`: a batch larger
+than the queue can never be filled, so the writer would wait for a batch that
+cannot exist. Both are rejected at startup.
+
+`MEMORY_SEMANTIC_ENABLED` and `MEMORY_CONVERSATION_RETENTION_DAYS` are **not
+implemented**. Semantic retrieval and retention classes do not exist yet, so a
+setting for them would be a knob that does nothing. They will be added with the
+feature.
+
+`MEMORY_KNOWLEDGE_ENABLED` is off by default because extraction spends model
+calls. It is rejected unless strict capture is on, because extraction reads the
+archive that capture writes: enabling it without capture would produce a service
+that can never find evidence, and a silent no-op would look like a bug in the
+feature rather than a misconfiguration. See
+[durable knowledge](MEMORY_KNOWLEDGE.md).
+
+Internal bootstrap prompts (the synthetic "initialize session" requests that only
+materialize an upstream session for shell execution) are never archived as
+conversation turns. Token-overflow recovery and explicit retries re-dispatch the
+original delivery with `RetryOfDelivery`, which continues the existing turn with a
+new attempt instead of failing closed as a replay or creating a duplicate user
+request; the adapters carry the original transport delivery ID through their
+pending-overflow state so the retry keeps the same turn identity.
+
+See [archive migration and strict capture](MEMORY_MIGRATION.md) before activation.
+Strict mode also records rolling partial snapshots (coalesced to one write per 5
+seconds or 16 KiB of additional text) and tool/attachment metadata (tool output
+bounded to 8 KiB, attachment URLs to 2 KiB, `data:` URIs reduced to their media
+type). These writes are best-effort and never interrupt delivery.
+
+Strict mode also starts a background index worker. It consumes the `kind='index'`
+jobs written with each archived message, chunks the stored body (1 KiB target,
+2 KiB cap, 128-byte overlap, boundary-aware and rune-aligned), and writes
+`mem_v2_chunks` plus the `mem_v2_chunk_fts` trigram index. Indexing is decoupled
+from capture, so a slow index never delays delivery, and a single unindexable
+message records `last_error` without stalling the queue. The worker stops before
+the archive writer drains on shutdown.
+
+`memory_search` reports `Coverage: PARTIAL` while index jobs are pending, so an
+unindexed message is never reported as a confident miss. `memory_get` and
+`memory_scroll` require the migrated archive and refuse a legacy-only database.
+
+Strict mode compresses message bodies automatically; there is no setting to
+enable or disable it. A block is stored with zstd only if it is at least 4 KiB
+and the compressed frame saves at least one byte in eight. Everything else stays
+raw, including short replies, incompressible payloads, and anything above the
+64 MiB decode ceiling. Each block records its codec, codec version, original
+length, stored length, and a checksum over the original text, and every read path
+decodes through one function, so a block written by an older binary stays
+readable. Compression runs inside the capture commit rather than in a background
+pass: the measured cost is 392 µs for a typical 16 KiB answer and 8.93 ms for a
+1 MiB message, against a 2 s commit deadline. `memory_health` reports raw versus
+stored bytes so the saving is visible rather than assumed.
+
+Knowledge extraction, semantic search, and source-backed handoff remain pending.
+Keep the default mode for production until the gates listed in
+[Gate status](MEMORY_IMPLEMENTATION_PLAN.md#gate-status) close.
+
 默认情况下，系统使用以下参数（在 `internal/opencode/client.go` 中定义）：
 
 ```go
@@ -96,6 +202,26 @@ MessageThresholdForSummary = 10
 - ✅ 最小内存占用
 - ✅ 快速响应
 - ⚠️ 频繁切换可能影响体验
+
+## 模型错误与自动降级
+
+模型、账户或上游错误不会清除当前 session 或 `/model` 设置。自动降级只改变本轮请求使用的模型，在原 session 上重试，不通过新建会话或摘要接续恢复上下文。
+
+降级前会等待旧流式回合完成清理。如果服务端仍在重试，会中止该失败回合并等待 session 空闲；无法确认空闲时停止自动重试并提示错误，保留会话和模型设置。
+
+每条降级链不会重复尝试同一个模型；候选模型全部失败后提示错误。后续消息保留用户模型偏好；如果该模型处于熔断状态且有健康候选，则明确使用候选模型，而不是不传模型参数并回到服务端默认模型。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `OPENCODE_CIRCUIT_BREAKER_ENABLED` | `true` | 是否启用熔断和自动降级 |
+| `OPENCODE_CB_FAILURE_THRESHOLD` | `2` | 连续失败多少次后熔断 |
+| `OPENCODE_CB_COOLDOWN_SECONDS` | `60` | 初始熔断冷却时间 |
+| `OPENCODE_CB_MAX_COOLDOWN_SECONDS` | `1800` | 最大冷却时间 |
+| `OPENCODE_CB_TRIP_KEYWORDS` | 见下文 | 触发降级的错误关键词，逗号分隔 |
+
+默认关键词为 `No available client,No available channel,Insufficient Balance,provider unavailable,Access denied,Arrearage,Model not found`。除错误文本外，也检查上游 JSON 响应体中的 `error.code` 和 `error.type`。`Model not found` 按错误中的实际 provider/model 记录失败。
+
+设置 `OPENCODE_CB_TRIP_KEYWORDS` 会替换默认列表。已有自定义配置若需要处理账户异常和模型不存在，也需加入相应关键词。
 
 ## 超时配置
 

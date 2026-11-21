@@ -44,29 +44,6 @@ func newTestService(t *testing.T, drafter Drafter) *Service {
 	return NewService(cfg, nil, nil, nil, drafter, nil)
 }
 
-// TestPerModelTimeoutEachModelGetsFullBudget verifies that when the first
-// model exhausts its own timeout, the second model still gets a full budget
-// (previously the 8m budget was shared across the whole fallback chain).
-func TestPerModelTimeoutEachModelGetsFullBudget(t *testing.T) {
-	drafter := &fakeDrafter{failFor: map[string]int{"model-a": 1}}
-	s := newTestService(t, drafter)
-
-	// Simulate the STEP4 loop with a slow first model: each Draft call blocks
-	// for longer than PerModelTimeout. We verify via recordDraftFailure that
-	// both models are attempted (the loop continues past the first failure).
-	s.recordDraftFailure("model-a")
-	if !s.isDemoted("model-a") {
-		// 1 failure < MaxConsecutiveFails=2, so not demoted yet — expected.
-		t.Log("model-a not yet demoted after 1 failure (expected)")
-	}
-	s.recordDraftFailure("model-a")
-	if !s.isDemoted("model-a") {
-		t.Fatalf("model-a should be demoted after 2 consecutive failures")
-	}
-	// Restore-after-cooldown is covered by TestPickModelRestoresAfterCooldown,
-	// which injects an already-expired demotion instead of sleeping.
-}
-
 // TestPickModelSkipsDemotedModel verifies pickModel falls back to a healthy
 // alternate when the DraftModel is demoted.
 func TestPickModelSkipsDemotedModel(t *testing.T) {
@@ -81,6 +58,68 @@ func TestPickModelSkipsDemotedModel(t *testing.T) {
 	picked := s.pickModel()
 	if picked != "model-b" {
 		t.Fatalf("pickModel should skip demoted model-a, got %q", picked)
+	}
+}
+
+// TestPickModelSkipsDemotedSelfSelectPick verifies the self-select path also
+// moves off a demoted pick instead of returning it unchanged.
+func TestPickModelSkipsDemotedSelfSelectPick(t *testing.T) {
+	drafter := &fakeDrafter{}
+	s := newTestService(t, drafter)
+	s.cfg.ModelSelfSelect = true
+
+	s.mu.Lock()
+	s.modelFails["model-a"] = 2
+	s.demotedAt["model-a"] = time.Now()
+	s.mu.Unlock()
+
+	picked := s.pickModel()
+	if picked == "model-a" {
+		t.Fatal("pickModel returned the demoted model it just logged as unhealthy")
+	}
+	if picked != "model-b" {
+		t.Fatalf("pickModel should select the healthy alternate, got %q", picked)
+	}
+}
+
+// TestSlugifyFallsBackForNonASCIITitles verifies a Chinese-only title still
+// produces a usable, deterministic directory name.
+func TestSlugifyFallsBackForNonASCIITitles(t *testing.T) {
+	const title = "从对话中提取可复用流程"
+	first := slugify(title)
+	if first == "" {
+		t.Fatal("slugify returned an empty slug for a non-ASCII title")
+	}
+	if !strings.HasPrefix(first, "skill-") {
+		t.Fatalf("expected a hash-based fallback slug, got %q", first)
+	}
+	if second := slugify(title); second != first {
+		t.Fatalf("slugify is not deterministic: %q != %q", first, second)
+	}
+	if other := slugify("另一个中文标题"); other == first {
+		t.Fatalf("distinct titles collided on slug %q", first)
+	}
+	if got := slugify("PDF to Excel"); got != "pdf-to-excel" {
+		t.Fatalf("ASCII slug changed: %q", got)
+	}
+	if got := slugify("从 PDF 提取表格到 Excel"); got != "pdf-excel" {
+		t.Fatalf("mixed title should keep its ASCII parts, got %q", got)
+	}
+	if got := slugify("   "); got != "" {
+		t.Fatalf("blank title should stay empty, got %q", got)
+	}
+}
+
+// TestJobBudgetCoversFullFallbackChain verifies the async job timeout is large
+// enough for every model in the chain to get its full per-model budget.
+func TestJobBudgetCoversFullFallbackChain(t *testing.T) {
+	drafter := &fakeDrafter{}
+	s := newTestService(t, drafter)
+	s.cfg.PerModelTimeout = 8 * time.Minute
+
+	chain := s.buildFallbackChain(s.cfg.DraftModel)
+	if got, want := s.jobBudget(), s.cfg.PerModelTimeout*time.Duration(len(chain)); got < want {
+		t.Fatalf("job budget %v cannot cover %d models at %v each", got, len(chain), s.cfg.PerModelTimeout)
 	}
 }
 

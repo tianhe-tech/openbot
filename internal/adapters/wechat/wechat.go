@@ -62,7 +62,14 @@ type Handler struct {
 
 	// outbound is the durable async text queue for streaming event delivery.
 	// It owns pacing, retries, and (via parked entries) offline recovery.
-	outbound *outboundTextQueue
+	outbound        *outboundTextQueue
+	outboundInitErr error
+
+	// inbound is the durable pre-admission buffer for inbound text. It closes
+	// the crash window between iLink acceptance and OpenCode client admission:
+	// a message buffered in the debounce batcher is persisted here first and
+	// replayed on the next startup if the process dies before dispatch.
+	inbound *inboundQueue
 
 	// pendingMu protects pendingMsgs and pendingTimers.
 	// When a user sends a new message while a previous task is still
@@ -94,6 +101,7 @@ type Handler struct {
 // pendingMessage holds a user message that is waiting for a prior task's
 // dispatch to complete before it can be executed.
 type pendingMessage struct {
+	Capture     wechatCaptureInput
 	UserID      string
 	ChatID      string
 	Content     string
@@ -143,7 +151,8 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 	statsLogInterval := parseDurationEnv("WECHAT_OUTBOUND_STATS_LOG_SECONDS", defaultStatsLogInterval)
 	outbound, err := newOutboundTextQueue(outboundPath, outboundInterval, outboundMaxLen, h.sendQueuedText)
 	if err != nil {
-		log.Printf("wechat: outbound queue init failed, async streaming will fallback to inline send: %v", err)
+		h.outboundInitErr = err
+		log.Printf("wechat: outbound queue initialization/recovery failed: %v", err)
 	} else {
 		outbound.setStatsLogInterval(statsLogInterval)
 		cfg := outbound.config()
@@ -156,6 +165,21 @@ func NewHandler(client *opencode.Client, cfg Config) *Handler {
 			cfg.StopDrainTimeout,
 		)
 		h.outbound = outbound
+	}
+
+	// Durable pre-admission buffer for inbound text. Same lifecycle pattern as
+	// the outbound queue: a failure to open it degrades to memory-only
+	// buffering instead of disabling the adapter.
+	inboundPath := filepath.Join(stateDir, "inbound_queue.db")
+	if envPath := strings.TrimSpace(os.Getenv("WECHAT_INBOUND_DB_PATH")); envPath != "" {
+		inboundPath = envPath
+	}
+	if inbound, err := newInboundQueue(inboundPath); err != nil {
+		log.Printf("wechat: inbound queue init failed, pre-admission buffering is memory-only: %v", err)
+	} else {
+		h.inbound = inbound
+		h.batcher.queue = inbound
+		log.Printf("wechat: inbound queue configured db=%s maxReplayAge=%s", inboundPath, maxInboundReplayAge)
 	}
 
 	// Register a stuck session hook so the user is proactively notified when
@@ -293,6 +317,9 @@ func (h *Handler) Start(parentCtx context.Context) error {
 		log.Println("wechat: no credentials configured (WECHAT_BOT_TOKEN / WECHAT_BASE_URL), adapter disabled")
 		return nil
 	}
+	if h.outboundInitErr != nil {
+		return fmt.Errorf("wechat: cannot start with unsafe outbound queue state: %w", h.outboundInitErr)
+	}
 
 	if err := h.store.Init(); err != nil {
 		return fmt.Errorf("wechat: init store: %w", err)
@@ -321,8 +348,20 @@ func (h *Handler) Start(parentCtx context.Context) error {
 	ctx, cancel := context.WithCancel(parentCtx)
 	h.cancel = cancel
 	if h.outbound != nil {
+		refreshCtx, refreshCancel := context.WithTimeout(ctx, 15*time.Second)
+		_, err := h.refreshParkedPrompts(refreshCtx, "", "")
+		refreshCancel()
+		if err != nil {
+			// Old notices are already parked; valid bodies can still drain.
+			log.Printf("wechat: pending prompt refresh failed; old prompts remain parked: %v", err)
+		}
 		h.outbound.Start()
 	}
+
+	// Replay anything that was buffered when the previous process stopped.
+	// This runs before polling starts so a replayed batch cannot race with a
+	// live debounce window for the same sender.
+	h.replayPendingInbound(ctx)
 
 	go h.pollLoop(ctx)
 	return nil
@@ -340,6 +379,13 @@ func (h *Handler) Stop() {
 	}
 	if h.outbound != nil {
 		h.outbound.Stop()
+	}
+	// Close the inbound buffer last: flushAll above may still have persisted
+	// rows to clear, and any row left behind is intentionally kept for replay.
+	if h.inbound != nil {
+		if err := h.inbound.Close(); err != nil {
+			log.Printf("wechat: inbound queue close failed: %v", err)
+		}
 	}
 	if err := h.weClient.NotifyStop(); err != nil {
 		log.Printf("wechat: notify stop failed: %v", err)
@@ -472,7 +518,11 @@ func (h *Handler) handleMessage(ctx context.Context, msg *WeixinMessage) error {
 		h.batcher.enqueueText(ctx, msg, text)
 		return nil
 	}
-	return h.handleBatchedMessage(ctx, msg)
+	err := h.handleBatchedMessage(ctx, msg)
+	if errors.Is(err, errInboundDeferred) {
+		return nil
+	}
+	return err
 }
 
 // isPureTextMessage reports whether a WeChat message contains only text items
@@ -515,6 +565,8 @@ func isCommandText(text string) bool {
 // either directly (commands / media messages) or by the batcher after its
 // quiet window elapses (aggregated text).
 func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) error {
+	ensureDeliveryIDs(msg)
+	captureInput := wechatCaptureInput{DeliveryIDs: append([]string(nil), msg.deliveryIDs...), OriginalContent: h.extractText(msg, nil)}
 	userID := msg.FromUserID
 	chatID := msg.GroupID
 	if chatID == "" {
@@ -719,13 +771,13 @@ func (h *Handler) handleBatchedMessage(ctx context.Context, msg *WeixinMessage) 
 	// This mirrors opencode TUI's session-level task serialization and
 	// guarantees task A's results are fully enqueued before task B starts.
 	if _, busy := h.dispatching.Load(userID); busy {
-		h.enqueuePending(userID, chatID, userText, ctxToken, attachments, agentName)
-		return nil
+		h.enqueuePending(userID, chatID, userText, ctxToken, attachments, agentName, captureInput)
+		return errInboundDeferred
 	}
 
 	// Run dispatch in a goroutine so the poll loop is not blocked.
-	go h.dispatchToOpenCode(ctx, userID, chatID, userText, ctxToken, attachments, agentName)
-	return nil
+	go h.dispatchToOpenCode(ctx, userID, chatID, userText, ctxToken, attachments, agentName, captureInput)
+	return errInboundDeferred
 }
 
 func (h *Handler) extractText(msg *WeixinMessage, savedFiles []string) string {
@@ -775,8 +827,10 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 		return h.helpText(), true
 	case "/fork", "派生":
 		return h.handleFork(ctx, userID), true
-	case "/new", "/reset", "新会话":
-		return h.handleNewSession(userID), true
+	case "/new", "新会话":
+		return h.handleNewSession(ctx, userID, chatID), true
+	case "/reset", "重置":
+		return h.handleResetSession(ctx, userID, chatID), true
 	case "/todo", "/todos", "任务":
 		return h.handleTodo(userID), true
 	case "/abort", "/stop", "停止":
@@ -790,7 +844,7 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 	case "/diff", "/changes", "变更":
 		return h.handleDiff(ctx, userID), true
 	case "/sessions", "/list":
-		return h.handleSessions(ctx), true
+		return h.handleSessions(ctx, userID), true
 	case "/summary", "压缩", "总结":
 		return h.handleSummary(ctx, userID), true
 	case "/clear", "清除":
@@ -809,6 +863,25 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 		return h.handleCmd(ctx, userID, command, msg.ContextToken), true
 	}
 
+	// /switch <序号|会话ID前缀> — resume one of this user's own sessions
+	if text == "/switch" || strings.HasPrefix(text, "/switch ") {
+		selector := strings.TrimSpace(strings.TrimPrefix(text, "/switch"))
+		return h.handleSwitch(ctx, userID, chatID, selector), true
+	}
+
+	// /release [序号|会话ID前缀] — stop mirroring a claimed TUI session
+	if text == "/release" || text == "/unclaim" ||
+		strings.HasPrefix(text, "/release ") || strings.HasPrefix(text, "/unclaim ") {
+		selector := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "/release"), "/unclaim"))
+		return h.handleRelease(ctx, userID, selector), true
+	}
+
+	// /transfer <渠道>[:<用户ID>] [序号|会话ID前缀] — move a claimed TUI session
+	if text == "/transfer" || strings.HasPrefix(text, "/transfer ") {
+		args := strings.TrimSpace(strings.TrimPrefix(text, "/transfer"))
+		return h.handleTransfer(ctx, userID, args), true
+	}
+
 	// /retry [message]
 	if text == "/retry" || strings.HasPrefix(text, "/retry ") {
 		msg := strings.TrimSpace(strings.TrimPrefix(text, "/retry"))
@@ -820,10 +893,10 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 		return h.handlePending(userID), true
 	}
 
-	// /recover [session-id-prefix] — re-queue abandoned messages
+	// /recover [session-id-prefix] — recover bodies and refresh actual prompts
 	if text == "/recover" || strings.HasPrefix(text, "/recover ") {
 		sessionFilter := strings.TrimSpace(strings.TrimPrefix(text, "/recover"))
-		return h.handleRecover(userID, sessionFilter), true
+		return h.handleRecover(ctx, userID, sessionFilter), true
 	}
 
 	// /model [provider/model]
@@ -880,7 +953,8 @@ func (h *Handler) tryCommand(ctx context.Context, userID, chatID, text string, m
 	return "", false
 }
 
-func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string) {
+func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string, captureInputs ...wechatCaptureInput) {
+	captureInput := captureInputForDispatch(content, captureInputs)
 	// ★ Mark this user as dispatching. handleBatchedMessage checks this flag
 	// to decide whether to queue or execute a new message. Cleared via defer
 	// so it is always released even on panic or early return.
@@ -910,7 +984,6 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	var fullReplyMu sync.Mutex
 	var fullReply strings.Builder
 	lastSentLength := 0
-	sessionMapped := sessionID != "" // if we pre-mapped, skip the callback-based mapping
 
 	enqueueBufferedTail := func(eventType string, critical bool) error {
 		fullReplyMu.Lock()
@@ -933,25 +1006,26 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 	defer cancel()
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:     "wechat",
-		UserID:      userID,
-		ThreadID:    threadID,
-		SessionID:   sessionID,
-		Content:     content,
-		Agent:       agentName,
-		Streaming:   true,
-		Attachments: attachments,
+		OnCaptureCommitted: func() { h.acknowledgeCapture(captureInput) },
+		DeliveryID:         captureInput.deliveryID(),
+		OriginalContent:    &captureInput.OriginalContent,
+		RetryOfDelivery:    captureInput.Retry,
+		Channel:            "wechat",
+		UserID:             userID,
+		ThreadID:           threadID,
+		SessionID:          sessionID,
+		Content:            content,
+		Agent:              agentName,
+		Streaming:          true,
+		Attachments:        attachments,
 	}, func(chunk string) error {
 		// Session mapping. Always intercept ses_* chunks (they are the
 		// session ID sent by client.go's callback) so they never leak into
 		// the accumulated text buffer and get delivered to the user.
-		// If we already mapped proactively (Fix 1), just suppress the chunk.
+		// A background recovery can notify a replacement session here.
 		if strings.HasPrefix(chunk, "ses_") && len(chunk) < 100 {
-			if !sessionMapped {
-				h.adapter.MapUserToSession(userID, chunk)
-				log.Printf("wechat: mapped user %s to session %s", userID, chunk[:min(8, len(chunk))])
-				sessionMapped = true
-			}
+			h.adapter.MapUserToSession(userID, chunk)
+			log.Printf("wechat: mapped user %s to session %s", userID, chunk)
 			return nil
 		}
 
@@ -1025,7 +1099,9 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 				// 避免会话卡死（与 dingtalk/feishu/wecom 行为一致）。
 				if h.isTokenOverflowError(msg) && sessionID != "" {
 					log.Printf("wechat: token overflow detected for user %s session %s, auto-recovering", userID, sessionID[:min(8, len(sessionID))])
-					go h.recoverFromTokenOverflow(context.Background(), userID, sessionID, ctxToken, content, attachments, agentName)
+					retryInput := captureInput
+					retryInput.Retry = true
+					go h.recoverFromTokenOverflow(context.Background(), userID, sessionID, ctxToken, content, attachments, agentName, retryInput)
 					return nil
 				}
 
@@ -1087,6 +1163,7 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 		_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "error_notice", "⚠️ 处理出错："+truncate(err.Error(), 300), true)
 		return
 	}
+	h.acknowledgeCapture(captureInput)
 
 	fullReplyMu.Lock()
 	accumulatedContent := fullReply.String()
@@ -1102,16 +1179,14 @@ func (h *Handler) dispatchToOpenCode(ctx context.Context, userID, chatID, conten
 			log.Printf("wechat: ⚠️ final enqueue failed user=%s: %v", userID, sendErr)
 		}
 	} else if len(accumulatedContent) == 0 {
-		// No content was streamed; use the synchronous reply if available.
-		if strings.TrimSpace(response.Reply) != "" {
-			if sendErr := h.enqueueAsyncText(userID, sessionID, ctxToken, "sync_reply", stripDSMLMarkup(response.Reply), true); sendErr != nil {
-				log.Printf("wechat: ⚠️ sync-reply enqueue failed user=%s: %v", userID, sendErr)
-			}
-		} else if len(mediaPaths) == 0 {
-			_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "done", "✅ 处理完成", true)
+		if sendErr := h.enqueueUnstreamedResponse(userID, sessionID, ctxToken, response, len(mediaPaths) > 0); sendErr != nil {
+			log.Printf("wechat: response enqueue failed user=%s: %v", userID, sendErr)
 		}
 	} else {
 		log.Printf("wechat: all content already sent (%d bytes)", len(accumulatedContent))
+	}
+	if response.Deferred {
+		log.Printf("wechat: delivery deferred to background retry user=%s session=%s", userID, response.SessionID)
 	}
 
 	// Send media files detected via MEDIA: directives
@@ -1150,9 +1225,12 @@ func (h *Handler) forceDispatchReset(userID string) {
 // text is appended (newline-joined) — matching the inbound batcher's
 // coalescing behaviour. A long-run reminder timer is (re)armed so the user is
 // notified if the current task takes more than 10 minutes.
-func (h *Handler) enqueuePending(userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string) {
+func (h *Handler) enqueuePending(userID, chatID, content, ctxToken string, attachments []opencode.Attachment, agentName string, captureInputs ...wechatCaptureInput) {
+	captureInput := captureInputForDispatch(content, captureInputs)
 	h.pendingMu.Lock()
 	if existing, ok := h.pendingMsgs[userID]; ok {
+		existing.Capture.DeliveryIDs = append(existing.Capture.DeliveryIDs, captureInput.DeliveryIDs...)
+		existing.Capture.OriginalContent += "\n" + captureInput.OriginalContent
 		existing.Content = existing.Content + "\n" + content
 		h.pendingMu.Unlock()
 		log.Printf("wechat: 📝 appended to pending queue for user %s (total len=%d)", userID, len(existing.Content))
@@ -1160,6 +1238,7 @@ func (h *Handler) enqueuePending(userID, chatID, content, ctxToken string, attac
 	}
 
 	h.pendingMsgs[userID] = &pendingMessage{
+		Capture:     captureInput,
 		UserID:      userID,
 		ChatID:      chatID,
 		Content:     content,
@@ -1217,7 +1296,7 @@ func (h *Handler) dispatchPendingIfAny(userID string) {
 		"✅ 上一个任务已完成，正在处理您的下一条消息...", true)
 
 	go h.dispatchToOpenCode(context.Background(), pending.UserID, pending.ChatID,
-		pending.Content, pending.CtxToken, pending.Attachments, pending.AgentName)
+		pending.Content, pending.CtxToken, pending.Attachments, pending.AgentName, pending.Capture)
 }
 
 // notifyLongRunningTask sends a user-facing notice when the current task has
@@ -1375,12 +1454,22 @@ func (h *Handler) sendCommandReply(userID, text, ctxToken string) {
 	}
 }
 
+func (h *Handler) enqueueUnstreamedResponse(userID, sessionID, ctxToken string, response opencode.Response, hasMedia bool) error {
+	if strings.TrimSpace(response.Reply) != "" {
+		return h.enqueueAsyncText(userID, sessionID, ctxToken, "sync_reply", stripDSMLMarkup(response.Reply), true)
+	}
+	if !response.Deferred && !hasMedia {
+		return h.enqueueAsyncText(userID, sessionID, ctxToken, "done", "✅ 处理完成", true)
+	}
+	return nil
+}
+
 func (h *Handler) enqueueAsyncText(userID, sessionID, ctxToken, eventType, text string, critical bool) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	if h.outbound == nil {
-		// Queue not available (rare: init failed at startup) — send directly.
+		// Direct delivery is retained for callers without a durable queue.
 		h.trackSentText(userID, text)
 		return h.weClient.SendText(userID, text, ctxToken)
 	}
@@ -1422,7 +1511,8 @@ func (h *Handler) helpText() string {
 
 📋 可用命令：
 /help 或 帮助     - 显示此帮助
-/new 或 新会话    - 创建新会话（旧回复自动保存）
+/new 或 新会话    - 开启新会话（保存上下文摘要）
+/reset 或 重置    - 硬重置会话（丢弃上下文）
 /pending          - 查看未送达的旧会话回复
 /recover [会话ID] - 恢复并重新送达旧回复
 /fork 或 派生     - 派生当前会话
@@ -1435,7 +1525,10 @@ func (h *Handler) helpText() string {
 /cmd <命令>       - 在会话中执行 shell 命令
 /answer <回复>    - 回答待确认问题
 /retry            - 重试上一条消息
-/sessions         - 列出所有会话
+/sessions         - 列出我的会话
+/switch <序号>    - 切换到指定会话继续
+/release          - 解除 TUI 会话认领（之后可在 TUI 里 /rename）
+/transfer <渠道>  - 把 TUI 会话直接转交到别的渠道（不用回 TUI）
 /summary 或 总结  - 压缩上下文
 /clear 或 清除    - 清除当前会话
 /refresh          - 刷新技能缓存
@@ -1506,7 +1599,10 @@ func (h *Handler) handlePending(userID string) string {
 	if h.outbound == nil {
 		return "ℹ️ 队列未启用"
 	}
-	entries := h.outbound.ListParked(userID)
+	entries, err := h.outbound.ListParked(userID)
+	if err != nil {
+		return fmt.Sprintf("❌ 查询失败: %v", err)
+	}
 	if len(entries) == 0 {
 		return "ℹ️ 没有未送达的旧会话回复"
 	}
@@ -1517,43 +1613,156 @@ func (h *Handler) handlePending(userID string) string {
 		if len(sid) > 8 {
 			sid = sid[:8]
 		}
-		preview := e.Content
+		preview := []rune(e.Content)
 		if len(preview) > 60 {
-			preview = preview[:60] + "..."
+			preview = append(preview[:60], []rune("...")...)
 		}
-		b.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, sid, preview))
+		status := "可恢复正文"
+		if !isRecoverableBody(e.EventType) {
+			status = "旧通知，不重放"
+		}
+		b.WriteString(fmt.Sprintf("%d. [%s] [%s] %s\n", i+1, sid, status, string(preview)))
 	}
-	b.WriteString("\n发送 /recover 重新送达全部，或 /recover <session-id前缀> 送达指定会话的回复")
+	b.WriteString("\n发送 /recover 恢复正文，或 /recover <session-id前缀> 恢复指定会话正文。旧完成/系统通知不重放；确认提示从服务端当前待回答状态重新生成。")
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (h *Handler) handleRecover(userID, sessionFilter string) string {
+func (h *Handler) handleRecover(ctx context.Context, userID, sessionFilter string) string {
 	if h.outbound == nil {
 		return "ℹ️ 队列未启用"
 	}
-	n, err := h.outbound.RecoverParked(userID, sessionFilter)
+	result, err := h.outbound.RecoverParked(userID, sessionFilter)
 	if err != nil {
 		return fmt.Sprintf("❌ 恢复失败: %v", err)
 	}
-	if n == 0 {
-		return "ℹ️ 没有找到可恢复的回复"
+	reply := fmt.Sprintf("✅ 已恢复 %d 条正文，投递窗口为 24 小时。\n已排除：旧完成提示 %d 条、旧确认提示 %d 条、其他系统/进度通知 %d 条。",
+		result.Recovered, result.SkippedDone, result.SkippedPrompts, result.SkippedOther)
+	refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	refreshed, err := h.refreshParkedPrompts(refreshCtx, userID, sessionFilter)
+	if err != nil {
+		return reply + fmt.Sprintf("\n⚠️ 当前确认提示核验失败，旧提示保持停放：%v", err)
 	}
-	return fmt.Sprintf("✅ 已恢复 %d 条回复，正在通过队列送达...", n)
+	return reply + fmt.Sprintf("\n已根据服务端当前待回答状态重新生成 %d 条确认提示。", refreshed)
 }
 
-func (h *Handler) handleNewSession(userID string) string {
+func isRecoverableBody(eventType string) bool {
+	switch eventType {
+	case "final", "flush", "error_partial", "sync_reply":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) refreshParkedPrompts(ctx context.Context, userFilter, sessionFilter string) (int, error) {
+	targets, err := h.outbound.parkedPromptTargets(userFilter, sessionFilter)
+	if err != nil || len(targets) == 0 {
+		return 0, err
+	}
+	verified := make([]outboundPromptTarget, 0, len(targets))
+	sessionIDs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		session, err := h.client.ResolveUserSession(ctx, "wechat", target.UserID, target.SessionID)
+		if errors.Is(err, opencode.ErrSessionNotOwned) {
+			log.Printf("wechat: skipped old prompt for session no longer owned by recipient user=%s session=%s",
+				target.UserID, target.SessionID)
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("wechat: verify prompt recipient user=%s session=%s: %w", target.UserID, target.SessionID, err)
+		}
+		if session.ID != target.SessionID {
+			return 0, fmt.Errorf("wechat: prompt recipient requires an exact session match: %s", target.SessionID)
+		}
+		verified = append(verified, target)
+		sessionIDs = append(sessionIDs, target.SessionID)
+	}
+	if len(verified) == 0 {
+		return 0, nil
+	}
+	prompts, err := h.client.RefreshPendingPrompts(ctx, sessionIDs)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, target := range verified {
+		var next *opencode.Question
+		for _, prompt := range prompts {
+			if prompt.SessionID == target.SessionID {
+				if next == nil || prompt.CreatedAt.Before(next.CreatedAt) {
+					next = prompt
+				}
+			}
+		}
+		if next == nil {
+			continue
+		}
+		msg := formatQuestionPrompt(next)
+		if next.IsPermission {
+			msg = formatPermissionPrompt(next)
+		}
+		// Never silently change the user's current session to an old one.
+		if current, ok := h.adapter.GetSessionForUser(target.UserID); !ok || current != target.SessionID {
+			msg = fmt.Sprintf("会话 %s 有待回答请求，请先发送 /switch %s 再回复。\n\n%s",
+				target.SessionID, target.SessionID, msg)
+		}
+		if err := h.enqueueAsyncText(target.UserID, target.SessionID, target.ContextToken, "question", msg, true); err != nil {
+			return count, fmt.Errorf("wechat: enqueue current prompt user=%s session=%s request=%s: %w",
+				target.UserID, target.SessionID, next.ID, err)
+		}
+		count++
+	}
+	return count, nil
+}
+
+func (h *Handler) handleNewSession(ctx context.Context, userID, chatID string) string {
 	// Clear pending outbound messages from the previous session.
 	// PriorityNormal entries (AI replies, todo progress) are marked parked=1
-	// so the user can recover them via /pending /recover. PriorityHigh
+	// for inspection via /pending and body recovery via /recover. PriorityHigh
 	// (question/permission) and PriorityLow (skippable progress) are discarded.
 	if h.outbound != nil {
 		h.outbound.ClearForUser(userID)
 	}
-	if sessionID, ok := h.adapter.GetSessionForUser(userID); ok {
-		h.adapter.ClearSessionForUser(userID)
-		return fmt.Sprintf("✅ 已清除旧会话（%s），下次消息将创建新会话\n\n💡 旧会话的未送达回复已保存，发送 /pending 查看", sessionID[:min(8, len(sessionID))])
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		return "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
 	}
-	return "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
+
+	// Soft reset: save a handoff summary so the next message auto-resumes
+	// with context (same as DingTalk/Feishu). The heavy fetch+summarize runs
+	// in a goroutine so the single-threaded poll loop is not blocked; the
+	// session mapping is cleared synchronously first.
+	if chatID != "" {
+		saveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		go func() {
+			defer cancel()
+			if _, err := h.client.SaveHandoffAndReset(saveCtx, chatID, "wechat", userID, sessionID); err != nil {
+				log.Printf("wechat: handleNewSession: SaveHandoffAndReset failed: %v", err)
+			}
+		}()
+	}
+	h.adapter.ClearSessionForUser(userID)
+	return fmt.Sprintf("✅ 已开启新会话（旧: %s），上下文摘要已保存，下一条消息将自动携带\n\n💡 旧会话的未送达回复已保存，发送 /pending 查看",
+		sessionID[:min(8, len(sessionID))])
+}
+
+func (h *Handler) handleResetSession(ctx context.Context, userID, chatID string) string {
+	// Hard reset: drop the session mapping without saving any handoff
+	// summary. The next message starts a clean session with no prior context.
+	if h.outbound != nil {
+		h.outbound.ClearForUser(userID)
+	}
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if !ok {
+		return "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
+	}
+	if chatID != "" {
+		h.client.ResetSession(chatID)
+	}
+	h.adapter.ClearSessionForUser(userID)
+	return fmt.Sprintf("✅ 已重置会话（旧: %s），上下文已丢弃，下次发送消息将创建全新会话\n\n💡 旧会话的未送达回复已保存，发送 /pending 查看",
+		sessionID[:min(8, len(sessionID))])
 }
 
 func (h *Handler) handleUndo(ctx context.Context, userID string) string {
@@ -1682,24 +1891,193 @@ func (h *Handler) handleRetry(ctx context.Context, userID, chatID, extraMsg stri
 	return ""
 }
 
-func (h *Handler) handleSessions(ctx context.Context) string {
-	sessions, err := h.client.ListSessions(ctx)
+// handleSessions lists the sessions owned by this user and tells them how to
+// resume one. Ownership is filtered by the "[channel:userID]" title prefix, so
+// one user never sees another user's conversations.
+//
+// Each row leads with a derived preview rather than the stored title: the title
+// is "[channel:userID] <threadID>", so what survives prefix stripping is an
+// opaque chat identifier that tells the user nothing about the conversation.
+func (h *Handler) handleSessions(ctx context.Context, userID string) string {
+	sessions, err := h.client.ListSessionsForUser(ctx, "wechat", userID)
 	if err != nil {
 		return fmt.Sprintf("❌ 获取会话列表失败: %v", err)
 	}
 	if len(sessions) == 0 {
-		return "📋 暂无会话"
+		return "📋 暂无会话\n\n发送消息即可创建第一个会话"
 	}
+
+	// Only the rows that will be rendered need a preview; each one costs a
+	// history fetch, so the bound is applied before deriving them.
+	h.client.FillSessionPreviews(ctx, sessions, base.MaxSessionListRows)
+
+	current, _ := h.adapter.GetSessionForUser(userID)
+
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📋 会话列表 (共 %d 个)\n\n", len(sessions)))
+	sb.WriteString(fmt.Sprintf("📋 我的会话 (共 %d 个，按更新时间排序)\n\n", len(sessions)))
 	for i, s := range sessions {
-		if i >= 10 {
-			sb.WriteString(fmt.Sprintf("\n... 还有 %d 个会话", len(sessions)-10))
+		if i >= base.MaxSessionListRows {
+			sb.WriteString(fmt.Sprintf("\n... 还有 %d 个会话未显示", len(sessions)-base.MaxSessionListRows))
 			break
 		}
-		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, s.ID[:min(12, len(s.ID))]))
+		marker := "  "
+		if s.ID == current {
+			marker = "▶ "
+		}
+		label := s.Title
+		if s.Preview != "" {
+			label = s.Preview
+		}
+		sb.WriteString(fmt.Sprintf("%s%d. %s\n", marker, i+1, label))
+		sb.WriteString(fmt.Sprintf("     ID: %s · 更新: %s\n",
+			s.ID[:min(8, len(s.ID))], s.Updated.Format("01-02 15:04")))
 	}
+	sb.WriteString("\n💡 发送 /switch <序号> 继续某个会话")
 	return sb.String()
+}
+
+// handleSwitch resumes one of the user's own sessions.
+//
+// The switch itself is transactional and shared with the other channels
+// (opencode.Client.SwitchSession): it updates both session maps, pauses the
+// other claims this chat is mirroring, and restores a claim when the target was
+// adopted from the TUI. Doing that here by hand is what used to leave a failed
+// switch reporting success while the chat pointed at a session whose delivery
+// metadata had already been deleted.
+//
+// WeChat stores no per-session delivery context — SendMessage only needs the
+// user ID — so ChannelData is empty.
+func (h *Handler) handleSwitch(ctx context.Context, userID, chatID, selector string) string {
+	if strings.TrimSpace(selector) == "" {
+		return "❌ 用法: /switch <序号|会话ID前缀>\n\n先发送 /sessions 查看可选的会话"
+	}
+
+	result, err := h.client.SwitchSession(ctx, opencode.SessionSwitchRequest{
+		Channel:  "wechat",
+		UserID:   userID,
+		ThreadID: chatID,
+		Selector: selector,
+	})
+	if err != nil {
+		return opencode.SwitchFailureMessage(selector, err)
+	}
+	return result.Message()
+}
+
+// handleRelease stops mirroring a claimed TUI session into this chat and strips
+// its "[channel:userID]" title prefix.
+//
+// Stripping the prefix is what makes the release stick. AutoClaimFromTitle keys
+// on that prefix, so leaving it in place would let the next session.updated
+// event re-claim the session immediately. It is also what lets the user /rename
+// the session to a different channel afterwards.
+//
+// A session the gateway created itself is refused: it carries the same prefix
+// but is not in claimedSessions, and stripping its prefix would remove it from
+// ListSessionsForUser — the user would lose it from /sessions.
+func (h *Handler) handleRelease(ctx context.Context, userID, selector string) string {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if strings.TrimSpace(selector) != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "wechat", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				return fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector)
+			}
+			return fmt.Sprintf("❌ 解除认领失败: %v", err)
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		return "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		return fmt.Sprintf("ℹ️ 会话 %s 不是从 TUI 认领的，无需解除\n\n（网关自己创建的会话不能解除，否则会从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))])
+	}
+
+	title, err := h.client.UnclaimSession(ctx, sessionID)
+	if err != nil {
+		return fmt.Sprintf("❌ 解除认领失败: %v", err)
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that is no longer mirrored here.
+	if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+		h.adapter.ClearSessionForUser(userID)
+	}
+
+	log.Printf("wechat: /release user=%s session=%s", userID, sessionID[:min(8, len(sessionID))])
+	return fmt.Sprintf("✅ 已解除认领\n\nID: %s\n标题: %s\n\n💡 现在可以在 TUI 里 /rename 成别的渠道，例如 [feishu] 原标题",
+		sessionID[:min(8, len(sessionID))], title)
+}
+
+// handleTransfer moves a claimed TUI session to another chat channel without
+// going back to the TUI.
+//
+// It is the chat-side equivalent of /rename: the session keeps its history and
+// its ID, only the ownership prefix changes. The heavy lifting (release, title
+// rewrite, re-claim) lives in Client.TransferSession so all four adapters share
+// one implementation.
+//
+// The target user must have sent at least one message to that channel's bot,
+// otherwise the platform has no delivery target for them. That precondition is
+// the same one /rename has, and it cannot be checked from here.
+func (h *Handler) handleTransfer(ctx context.Context, userID, args string) string {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return "用法: /transfer <渠道>[:<用户ID>] [序号|会话ID前缀]\n\n" +
+			"例如:\n/transfer feishu\n/transfer dingtalk:manager123\n/transfer wechat 2"
+	}
+
+	channel, targetUser, _ := strings.Cut(fields[0], ":")
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	targetUser = strings.TrimSpace(targetUser)
+	selector := ""
+	if len(fields) > 1 {
+		selector = fields[1]
+	}
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if selector != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "wechat", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				return fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector)
+			}
+			return fmt.Sprintf("❌ 转交失败: %v", err)
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		return "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		return fmt.Sprintf(
+			"ℹ️ 会话 %s 不是从 TUI 认领的，不能转交\n\n（网关自己创建的会话已经绑定在本渠道，转交会让它从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))])
+	}
+
+	title, err := h.client.TransferSession(ctx, sessionID, channel, targetUser)
+	if err != nil {
+		return fmt.Sprintf("❌ 转交失败: %v", err)
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that now belongs to another channel.
+	if !h.client.IsClaimedSessionFor(sessionID, "wechat", userID) {
+		if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+			h.adapter.ClearSessionForUser(userID)
+		}
+	}
+
+	log.Printf("wechat: /transfer user=%s session=%s -> %s/%s",
+		userID, sessionID[:min(8, len(sessionID))], channel, targetUser)
+	return fmt.Sprintf("✅ 已转交到 %s\n\nID: %s\n标题: %s\n\n💡 目标用户需要先给 %s 的 bot 发过至少一条消息，否则那边收不到输出",
+		channel, sessionID[:min(8, len(sessionID))], title, channel)
 }
 
 func (h *Handler) handleSummary(ctx context.Context, userID string) string {
@@ -1736,7 +2114,16 @@ func (h *Handler) isTokenOverflowError(msg string) bool {
 // 1. 尝试调用 SummarizeSession 压缩上下文
 // 2. 压缩成功后重新发送原始消息
 // 3. 压缩失败则通知用户，建议使用 /new 创建新会话
-func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionID, ctxToken, originalContent string, attachments []opencode.Attachment, agentName string) {
+//
+// captureInput carries the original transport identity so the re-dispatch is
+// archived as a second attempt on the same turn rather than a duplicate user
+// request. Without it the retry would mint a synthetic delivery ID and the
+// archive would show the user asking the same thing twice.
+func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionID, ctxToken, originalContent string, attachments []opencode.Attachment, agentName string, captureInput wechatCaptureInput) {
+	if h.client.DurableCaptureEnabled() {
+		_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_notice", "上下文超限；严格记忆模式未自动重发任务。请检查 /status 后决定是否创建新请求。", true)
+		return
+	}
 	_ = h.enqueueAsyncText(userID, sessionID, ctxToken, "overflow_notice",
 		"⚠️ 上下文已超限，正在自动压缩并重试...", true)
 
@@ -1762,7 +2149,7 @@ func (h *Handler) recoverFromTokenOverflow(ctx context.Context, userID, sessionI
 	go func() {
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer retryCancel()
-		h.dispatchToOpenCode(retryCtx, userID, "", originalContent, ctxToken, attachments, agentName)
+		h.dispatchToOpenCode(retryCtx, userID, "", originalContent, ctxToken, attachments, agentName, captureInput)
 	}()
 }
 
@@ -1880,6 +2267,8 @@ func (h *Handler) handleCronTaskAdd(_ context.Context, userID, chatID string, ar
 		Enabled:     true,
 		AdapterType: "wechat",
 		Channel:     chatID,
+		UserID:      userID,
+		ThreadID:    chatID,
 		Content:     taskContent,
 		Agent:       agent,
 		Metadata: map[string]interface{}{
@@ -2052,7 +2441,8 @@ func (h *Handler) sendCronTaskHelp() string {
 • "0 0 0 1 * *" - 每月1号零点
 
 💡 也支持自然语言:
-/crontask 每天早上9点提醒我检查系统`
+/crontask 每天早上9点提醒我检查系统
+/crontask 把每日检查改到每天下午3点`
 }
 
 // parseQuotedArgs parses space-separated arguments respecting double-quoted strings.

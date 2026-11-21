@@ -42,6 +42,10 @@ func ShouldTryNLScheduleText(text string) bool {
 	hints := []string{
 		"定时", "cron", "提醒", "闹钟", "schedule",
 		"每天", "每周", "每月", "工作日", "分钟", "小时", "下周", "明天", "run once", "试运行",
+		// Update phrasings. Without these, "把检查任务改到下午3点" carries no
+		// frequency word and would never reach the parser, so the update flow
+		// would be unreachable for the most natural way of asking for it.
+		"改到", "改成", "改为", "修改任务", "更新任务", "调整任务",
 	}
 	for _, hint := range hints {
 		if strings.Contains(norm, hint) {

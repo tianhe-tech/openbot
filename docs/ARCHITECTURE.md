@@ -23,6 +23,65 @@ OpenCode Gateway 是一个企业级消息网关，实现了 OpenCode AI 服务�
 
 ### 核心组件
 
+The legacy memory path stores received request/response text and its FTS5 index
+atomically in SQLite. Gateway startup owns the one-time response-index migration;
+the MCP process opens the database read-only and filters every tool query to an
+explicitly bound adapter/user. New tool registrations are disabled until an
+isolated single-owner deployment is configured. There is no automatic keyword
+deletion or strength-based history exclusion.
+
+Durable v2 capture is implemented behind `MEMORY_CAPTURE_MODE=strict`. It records
+sessions, turns, attempts, blocks, messages, partial snapshots, tool calls, and
+attachment metadata into the `mem_v2_*` tables (archive schema v8). Message
+bodies are stored as blocks and compressed with zstd when that is smaller than
+the raw bytes, so importing does not increase disk usage by the full size of the
+content.
+
+The gateway also runs a background index worker that chunks archived message
+bodies and writes `mem_v2_chunks` plus two full-text indexes, so capture latency
+never depends on indexing:
+
+- `mem_v2_chunk_word_fts` — `unicode61` word tokens, used for ASCII word queries.
+- `mem_v2_chunk_fts` — trigram tokens, used for CJK and arbitrary substrings.
+
+Both are contentless (`content=''`, `contentless_delete=1`) as of schema v7, so
+neither keeps a second copy of the chunk text; excerpts are reconstructed from
+the chunk's byte range into the decoded message body. `mem_v2_message_scan`
+(schema v5) serves the bounded fallback scan's `ORDER BY`.
+
+The gateway holds a single-instance lease (`mem_v2_instance_lease`, schema v6)
+with a 90-second TTL and a heartbeat every `TTL/3`, so two processes cannot
+capture into one archive, and it runs a WAL maintenance pass that truncates the
+`-wal` file once it exceeds a threshold. Scoped deletion removes one principal's
+archived conversation in a single transaction on the writer's queue; it is
+reachable only through `cmd/memory-delete`, never through MCP, because a model
+must not be able to delete a user's history because a prompt asked it to.
+
+Optional durable knowledge (schema v8, `MEMORY_KNOWLEDGE_ENABLED`) adds three
+tables: `mem_v2_knowledge_facts` for the statements, `mem_v2_knowledge_evidence`
+for the messages that support them, and `mem_v2_knowledge_jobs` for extraction
+work that is still pending. Evidence is a table rather than a JSON column because
+deletion has to find facts *by message*, and a JSON array cannot be indexed or
+joined. Supersession is a column rather than a delete, so a correction keeps the
+history of what was believed. `internal/knowledge` runs extraction off the
+durable job queue on a handoff trigger — never per message — and injects a
+bounded, scoped index at session start. A fact is not evidence: every claimed
+message ID is checked against the owning principal inside the write transaction,
+and an unsupported claim is rejected rather than stored with low confidence. See
+[durable knowledge](MEMORY_KNOWLEDGE.md).
+
+The MCP server opens the archive read-only and reads those indexes for
+`memory_search`, `memory_get`, `memory_scroll`, `memory_list_projects`,
+`memory_recent`, `memory_health`, and `memory_space`; it never builds or migrates
+them. Both binaries refuse to run against an archive newer than themselves,
+because a newer archive has every table this binary knows about, so every query
+succeeds and the process answers from rows whose meaning it does not know. See
+[memory setup](MCP_MEMORY_TOOL.md), the
+[migration guide](MEMORY_MIGRATION.md), the
+[deletion guide](MEMORY_DELETION.md), the
+[durable knowledge guide](MEMORY_KNOWLEDGE.md), and the
+[implementation plan](MEMORY_IMPLEMENTATION_PLAN.md).
+
 ```mermaid
 flowchart LR
     U[用户\n钉钉/飞书/企微] -->|消息/命令| B[openbot\ncmd/gateway]
@@ -46,13 +105,22 @@ opencode-gateway/
 ├── cmd/
 │   ├── gateway/
 │   │   └── main.go                # openbot 主入口
-│   └── attach/
-│       └── main.go                # attach 客户端入口
+│   ├── attach/
+│   │   └── main.go                # attach 客户端入口
+│   ├── mcp/
+│   │   └── main.go                # openbot-mcp：只读 MCP stdio 服务器（记忆工具）
+│   ├── memory-migrate/
+│   │   └── main.go                # openbot-memory-migrate：归档迁移运维工具
+│   └── memory-delete/
+│       └── main.go                # openbot-memory-delete：按 principal 删除运维工具
 ├── internal/
 │   ├── adapters/                  # 钉钉/飞书/企微适配器
 │   ├── opencode/
 │   │   ├── client.go              # OpenCode SDK 客户端封装
+│   │   ├── capture.go             # v2 生命周期捕获接口
 │   │   └── event_listener.go      # SSE 事件监听和分发
+│   ├── memstore/                  # v2 归档：写入器、迁移、分块、双索引、搜索、压缩、租约、删除、持久知识
+│   ├── knowledge/                 # 持久知识：抽取服务、drafter、/remember /forget 命令
 │   ├── config/
 │   │   └── config.go              # 配置管理
 │   ├── proxy/
@@ -160,7 +228,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 ### 前置要求
 
-- Go 1.24.3+
+- Go 1.25.0+（`go.mod` 声明的最低版本）
 - OpenCode Server（本地或远程实例）
 - 飞书/企业微信应用配置
 

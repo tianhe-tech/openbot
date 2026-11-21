@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -158,8 +159,12 @@ type tokenOverflowPendingState struct {
 	Metadata         map[string]string
 	SessionWebhook   string
 	ConversationType string
-	CreatedAt        time.Time
-	Executing        bool // 标记 executeTokenOverflowDecision 是否已在执行中
+	// DeliveryID is the transport identity of the request that overflowed.
+	// The recovery re-dispatch reuses it so the archive records one turn with
+	// a second attempt instead of a duplicate user request.
+	DeliveryID string
+	CreatedAt  time.Time
+	Executing  bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // NewHandler wires the adapter with an OpenCode client.
@@ -1059,14 +1064,40 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return h.handleRetry(ctx, data, userID, strings.TrimPrefix(strings.TrimPrefix(content, "/retry"), " "))
 	}
 
-	// Handle /new or /reset command to create new session
-	if content == "/new" || content == "/reset" || content == "新会话" {
+	// Handle /new command: soft reset — save handoff summary so the next
+	// message auto-resumes with context.
+	if content == "/new" || content == "新会话" {
 		return h.handleNewSession(ctx, data, userID)
+	}
+
+	// Handle /reset command: hard reset — drop the session mapping without
+	// saving any handoff summary. The next message starts a clean session.
+	if content == "/reset" || content == "重置" {
+		return h.handleResetSession(ctx, data, userID)
 	}
 
 	// Handle /sessions or /list command to list sessions
 	if content == "/sessions" || content == "/list" {
-		return h.handleListSessions(ctx, data)
+		return h.handleListSessions(ctx, data, userID)
+	}
+
+	// Handle /switch command to resume one of this user's own sessions
+	if content == "/switch" || strings.HasPrefix(content, "/switch ") {
+		selector := strings.TrimSpace(strings.TrimPrefix(content, "/switch"))
+		return h.handleSwitch(ctx, data, userID, data.ConversationId, selector)
+	}
+
+	// Handle /release command to stop mirroring a claimed TUI session
+	if content == "/release" || content == "/unclaim" ||
+		strings.HasPrefix(content, "/release ") || strings.HasPrefix(content, "/unclaim ") {
+		selector := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(content, "/release"), "/unclaim"))
+		return h.handleRelease(ctx, data, userID, selector)
+	}
+
+	// Handle /transfer command to move a claimed TUI session to another channel
+	if content == "/transfer" || strings.HasPrefix(content, "/transfer ") {
+		args := strings.TrimSpace(strings.TrimPrefix(content, "/transfer"))
+		return h.handleTransfer(ctx, data, userID, args)
 	}
 
 	// Handle /status command to check session status
@@ -1284,10 +1315,12 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	sendReply := func(msg string) error {
+		deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(sendCtx), time.Minute)
+		defer cancel()
 		if !preferAICardForAllReplies {
-			return h.sendReplyBySource(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+			return h.sendReplyBySource(deliveryCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
 		}
-		return h.sendReplyWithAICardFallback(sendCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
+		return h.sendReplyWithAICardFallback(deliveryCtx, data.SessionWebhook, data.ConversationType, conversationID, userID, msg)
 	}
 	sendFinalReply := func(msg string) error {
 		return sendReply(msg)
@@ -1325,17 +1358,22 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	retryContent := sendContent
 	retryMetadata := cloneStringMap(metadata)
 
+	var deliveryMu sync.Mutex
 	response, err := h.client.SendMessageStreamingWithEvents(sendCtx, opencode.MessagePayload{
-		Channel:     "dingtalk",
-		UserID:      userID,
-		ThreadID:    conversationID,
-		SessionID:   sessionID, // Pass existing session if available
-		Content:     sendContent,
-		Agent:       agentName,
-		Streaming:   true,
-		Attachments: attachments,
-		Metadata:    metadata,
+		DeliveryID:      msgID,
+		OriginalContent: &content,
+		Channel:         "dingtalk",
+		UserID:          userID,
+		ThreadID:        conversationID,
+		SessionID:       sessionID, // Pass existing session if available
+		Content:         sendContent,
+		Agent:           agentName,
+		Streaming:       true,
+		Attachments:     attachments,
+		Metadata:        metadata,
 	}, func(chunk string) error {
+		deliveryMu.Lock()
+		defer deliveryMu.Unlock()
 		// 🔍 诊断：记录第一个 callback
 		if !callbackCalled {
 			callbackCalled = true
@@ -1369,6 +1407,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				Metadata:         cloneStringMap(metadata),
 				SessionWebhook:   data.SessionWebhook,
 				ConversationType: data.ConversationType,
+				DeliveryID:       msgID,
 				CreatedAt:        time.Now(),
 			}
 			if state.SessionID == "" {
@@ -1562,13 +1601,15 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 		return nil
 	})
 
+	deliveryMu.Lock()
+	defer deliveryMu.Unlock()
 	// 🔍 诊断日志：streaming完成时的状态
 	accumulatedContent := fullReply.String()
-	log.Printf("dingtalk stream: 🔍 SendMessageStreaming returned - userID=%s, err=%v, reply_len=%d, accumulated_len=%d",
-		userID, err, len(response.Reply), len(accumulatedContent))
+	log.Printf("dingtalk stream: SendMessageStreaming returned - userID=%s, session=%s, deferred=%t, err=%v, reply_len=%d, accumulated_len=%d",
+		userID, response.SessionID, response.Deferred, err, len(response.Reply), len(accumulatedContent))
 
 	// Enqueue for off-peak retry when deadline exceeded with zero content.
-	if retryworker.IsDeadlineErr(err) && len(accumulatedContent) == 0 && len(response.Reply) == 0 {
+	if !h.client.DurableCaptureEnabled() && retryworker.IsDeadlineErr(err) && len(accumulatedContent) == 0 && len(response.Reply) == 0 {
 		if h.retryStore != nil {
 			attJSON := ""
 			if len(attachments) > 0 {
@@ -1635,7 +1676,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 	}
 
 	// Map user to session (whether new or existing)
-	if response.SessionID != "" {
+	if response.SessionID != "" && !response.Deferred {
 		h.adapter.MapUserToSession(userID, response.SessionID)
 		// Store the session webhook for later use
 		h.adapter.MapSessionData(response.SessionID, "channel", data.SessionWebhook)
@@ -1695,6 +1736,7 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 					log.Printf("dingtalk stream: ❌ failed to send final message: %v", err)
 					// 不返回错误，避免影响session映射
 				} else {
+					lastSentLength = len(accumulatedContent)
 					log.Printf("dingtalk stream: ✅ sent final message to user %s (%d chars total, %d new)",
 						userID, len(accumulatedContent), unsentLength)
 				}
@@ -1702,6 +1744,8 @@ func (h *Handler) onChatBotMessageReceived(ctx context.Context, data *chatbot.Bo
 				log.Printf("dingtalk stream: ✓ all content already sent via intermediate updates (%d chars)",
 					len(accumulatedContent))
 			}
+		} else if response.Deferred {
+			log.Printf("dingtalk stream: delivery deferred to background retry user=%s session=%s", userID, response.SessionID)
 		} else {
 			// 没有内容累积（可能是权限请求之类的交互式任务，或者全都是特殊消息）
 			log.Printf("dingtalk stream: ℹ️ async mode completed with no accumulated content "+
@@ -2094,6 +2138,10 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, data *chatbot.BotCal
 			UserID:   userID,
 			ThreadID: data.ConversationId,
 			Content:  "Initialize session",
+			// Bootstrap prompt: it exists only to materialize an upstream
+			// session for shell execution and is not a user request, so it
+			// must never become an archived conversation turn.
+			Internal: true,
 		})
 		if err != nil {
 			log.Printf("dingtalk: failed to create session: %v", err)
@@ -2141,11 +2189,27 @@ func (h *Handler) GetAdapter() *base.BidirectionalAdapter {
 // SendMessage implements the MessageSender interface.
 // Used for sending messages back to users through the platform's messaging API.
 // For scheduled tasks, channel may contain the SessionWebhook URL.
+//
+// channel carries whatever routing data the caller has. Three shapes are
+// accepted, in this order:
+//
+//   - an http(s) URL: a session webhook, used directly;
+//   - an openConversationId plus a userID: the Robot API, which needs no
+//     webhook and is the only path that works for a session the gateway did not
+//     create (a claimed TUI session has no sessionWebhook to reply to);
+//   - an openConversationId alone: a group message.
+//
+// The previous implementation only handled the URL case and silently returned
+// nil for everything else, so a claimed session's output was dropped without an
+// error anywhere.
 func (h *Handler) SendMessage(ctx context.Context, channel, userID, content string) error {
 	if !h.cfg.UseStream {
 		log.Printf("dingtalk: SendMessage only supports Stream mode")
 		return fmt.Errorf("webhook mode does not support push messages")
 	}
+
+	channel = strings.TrimSpace(channel)
+	userID = strings.TrimSpace(userID)
 
 	// 检查 channel 是否是 webhook URL（以 https:// 开头）
 	if strings.HasPrefix(channel, "https://") || strings.HasPrefix(channel, "http://") {
@@ -2154,8 +2218,26 @@ func (h *Handler) SendMessage(ctx context.Context, channel, userID, content stri
 		return h.sendViaWebhook(ctx, channel, content)
 	}
 
-	// Stream 模式下，没有webhook URL 无法主动推送消息
-	log.Printf("dingtalk: no webhook URL provided, cannot send message (channel: %s)", channel)
+	// channel 是 openConversationId：走 Robot API，不依赖 sessionWebhook。
+	if channel != "" {
+		if userID != "" {
+			log.Printf("dingtalk: sending message via robot API (conversation=%s, user=%s)",
+				channel[:min(8, len(channel))], userID)
+			return h.sendReplyRobot(ctx, channel, userID, content)
+		}
+		log.Printf("dingtalk: sending group message via robot API (conversation=%s)", channel[:min(8, len(channel))])
+		return h.sendGroupMessage(ctx, channel, content)
+	}
+
+	// channel 为空但 userID 存在：走 Robot API 的 1:1 消息。
+	// 认领的会话（TUI /rename 转交）没有 openConversationId，只有用户 ID，
+	// 而 oToMessages/batchSend 的 openConversationIds 是可选的。
+	if userID != "" {
+		log.Printf("dingtalk: sending 1:1 message via robot API (user=%s)", userID)
+		return h.sendReplyRobot(ctx, "", userID, content)
+	}
+
+	log.Printf("dingtalk: no webhook URL, conversation id or user id provided, cannot send message")
 	return nil // 返回 nil 避免阻塞任务
 }
 
@@ -2279,12 +2361,16 @@ func (h *Handler) handleHelp(ctx context.Context, data *chatbot.BotCallbackDataM
 
 📊 会话管理：
 /status 或 状态 - 查看当前会话状态
-/new 或 /reset - 创建新会话
-/clear 或 清除 - 删除当前会话
+/new 或 新会话 - 开启新会话（保存上下文摘要，AI 记得之前做过什么）
+/reset 或 重置 - 硬重置会话（丢弃上下文，干净开始）
+/clear 或 清除 - 删除当前会话及历史
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
 /undo 或 撤销 - 撤销上一次操作
 /redo 或 重做 - 重做已撤销的操作
-/sessions 或 /list - 列出所有会话
+/sessions 或 /list - 列出我的会话
+/switch <序号> - 切换到指定会话继续
+/release - 解除 TUI 会话认领（之后可在 TUI 里 /rename 到别的渠道）
+/transfer <渠道> - 把 TUI 会话直接转交到别的渠道（不用回 TUI）
 /summary 或 压缩 - 压缩会话上下文（释放token空间）
 
 📋 任务追踪（对应 TUI 实时看板）：
@@ -3228,15 +3314,17 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 	}
 
 	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
-		Channel:     "dingtalk",
-		UserID:      state.UserID,
-		ThreadID:    state.ThreadID,
-		SessionID:   state.SessionID,
-		Content:     state.Content,
-		Agent:       state.Agent,
-		Streaming:   true,
-		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
-		Metadata:    cloneStringMap(state.Metadata),
+		DeliveryID:      state.DeliveryID,
+		RetryOfDelivery: state.DeliveryID != "",
+		Channel:         "dingtalk",
+		UserID:          state.UserID,
+		ThreadID:        state.ThreadID,
+		SessionID:       state.SessionID,
+		Content:         state.Content,
+		Agent:           state.Agent,
+		Streaming:       true,
+		Attachments:     append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:        cloneStringMap(state.Metadata),
 	}, retryCallback)
 	if err != nil {
 		_ = h.sendReplyBySource(runCtx, state.SessionWebhook, state.ConversationType, state.ThreadID, state.UserID,
@@ -3401,6 +3489,8 @@ func (h *Handler) handleCronTaskAdd(ctx context.Context, data *chatbot.BotCallba
 		Enabled:     true,
 		AdapterType: "dingtalk",
 		Channel:     data.ConversationId,
+		UserID:      userID,
+		ThreadID:    data.ConversationId,
 		Content:     taskContent,
 		Agent:       agent,
 		Metadata: map[string]interface{}{
@@ -3685,7 +3775,8 @@ func (h *Handler) sendCronTaskHelp(ctx context.Context, data *chatbot.BotCallbac
 • "0 0 12 * * 1-5" - 工作日中午12点
 • "0 0 0 1 * *" - 每月1号零点
 
-💡 提示: 任务会在指定时间自动执行，结果会发送到当前会话`
+💡 提示: 任务会在指定时间自动执行，结果会发送到当前会话
+💡 也支持自然语言: /crontask 把每日检查改到每天下午3点`
 
 	_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(helpMsg))
 	return nil, nil
@@ -3914,11 +4005,15 @@ func (h *Handler) sendReplyRobot(ctx context.Context, conversationID, userID, co
 
 	apiURL := "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
 	payload := map[string]interface{}{
-		"robotCode":           h.cfg.ClientID,
-		"msgKey":              "sampleText",
-		"msgParam":            fmt.Sprintf(`{"content":%s}`, jsonStringEscape(content)),
-		"userIds":             []string{userID},
-		"openConversationIds": []string{conversationID},
+		"robotCode": h.cfg.ClientID,
+		"msgKey":    "sampleText",
+		"msgParam":  fmt.Sprintf(`{"content":%s}`, jsonStringEscape(content)),
+		"userIds":   []string{userID},
+	}
+	// openConversationIds 是可选的：1:1 消息只需要 userIds。认领的会话没有
+	// 会话 ID，传空字符串会被钉钉拒绝。
+	if conversationID != "" {
+		payload["openConversationIds"] = []string{conversationID}
 	}
 
 	data, err := json.Marshal(payload)
@@ -3949,8 +4044,12 @@ func (h *Handler) sendReplyRobot(ctx context.Context, conversationID, userID, co
 		return fmt.Errorf("dingtalk robot API status %d: %s", resp.StatusCode, string(body))
 	}
 
-	log.Printf("dingtalk stream: ✅ sent via robot API (%d chars) to conversation %s",
-		len(content), conversationID[:min(8, len(conversationID))])
+	if conversationID == "" {
+		log.Printf("dingtalk stream: ✅ sent via robot API (%d chars) to user %s", len(content), userID)
+	} else {
+		log.Printf("dingtalk stream: ✅ sent via robot API (%d chars) to conversation %s",
+			len(content), conversationID[:min(8, len(conversationID))])
+	}
 	return nil
 }
 
@@ -4086,6 +4185,38 @@ func (h *Handler) handleNewSession(ctx context.Context, data *chatbot.BotCallbac
 	return nil, nil
 }
 
+// handleResetSession 处理 /reset 命令（硬重置）.
+// 与 /new 不同：不保存 handoff 摘要，直接删除 thread→session 映射，
+// 下一条消息在全新 session 中开始，旧上下文全部丢弃。
+func (h *Handler) handleResetSession(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	var oldSessionID string
+	if sid, ok := h.adapter.GetSessionForUser(userID); ok {
+		oldSessionID = sid
+	}
+
+	if threadID := data.ConversationId; threadID != "" {
+		h.client.ResetSession(threadID)
+	}
+	h.adapter.ClearSessionForUser(userID)
+
+	var msg string
+	if oldSessionID != "" {
+		msg = fmt.Sprintf("✅ 已重置会话（旧: %s），上下文已丢弃，下次发送消息将创建全新会话",
+			oldSessionID[:min(8, len(oldSessionID))])
+	} else {
+		msg = "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
+	}
+
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+		log.Printf("dingtalk: failed to send reset session response: %v", err)
+		return nil, err
+	}
+
+	return nil, nil
+}
+
 // handleRetry 处理 /retry 命令
 func (h *Handler) handleRetry(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, subCmd string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
@@ -4129,11 +4260,17 @@ func (h *Handler) handleRetry(ctx context.Context, data *chatbot.BotCallbackData
 	return nil, nil
 }
 
-// handleListSessions 处理列出所有会话命令
-func (h *Handler) handleListSessions(ctx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
+// handleListSessions lists the sessions owned by this user and tells them how
+// to resume one. Ownership is filtered by the "[channel:userID]" title prefix,
+// so one user never sees another user's conversations.
+//
+// Each row leads with a derived preview rather than the stored title: the title
+// is "[channel:userID] <threadID>", so what survives prefix stripping is an
+// opaque chat identifier that tells the user nothing about the conversation.
+func (h *Handler) handleListSessions(ctx context.Context, data *chatbot.BotCallbackDataModel, userID string) ([]byte, error) {
 	replier := chatbot.NewChatbotReplier()
 
-	sessions, err := h.client.ListSessions(ctx)
+	sessions, err := h.client.ListSessionsForUser(ctx, "dingtalk", userID)
 	if err != nil {
 		msg := fmt.Sprintf("❌ 获取会话列表失败: %v", err)
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
@@ -4141,38 +4278,238 @@ func (h *Handler) handleListSessions(ctx context.Context, data *chatbot.BotCallb
 	}
 
 	if len(sessions) == 0 {
-		msg := "📝 当前没有活跃的会话"
+		msg := "📝 暂无会话\n\n发送消息即可创建第一个会话"
 		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg))
 		return nil, nil
 	}
 
-	var msgBuilder strings.Builder
-	msgBuilder.WriteString(fmt.Sprintf("📝 会话列表 (%d个):\n\n", len(sessions)))
+	// Only the rows that will be rendered need a preview; each one costs a
+	// history fetch, so the bound is applied before deriving them.
+	h.client.FillSessionPreviews(ctx, sessions, base.MaxSessionListRows)
 
-	// 只显示最近的10个
-	maxShow := 10
-	if len(sessions) > maxShow {
-		sessions = sessions[:maxShow]
+	current, _ := h.adapter.GetSessionForUser(userID)
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString(fmt.Sprintf("📝 我的会话 (%d个，按更新时间排序):\n\n", len(sessions)))
+
+	shown := sessions
+	if len(shown) > base.MaxSessionListRows {
+		shown = shown[:base.MaxSessionListRows]
 	}
 
-	for i, session := range sessions {
-		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", i+1, session.Title))
-		msgBuilder.WriteString(fmt.Sprintf("   ID: %s\n", session.ID[:8]))
-		msgBuilder.WriteString(fmt.Sprintf("   目录: %s\n", session.Directory))
-		updatedTime := time.Unix(int64(session.Time.Updated), 0).Format("2006-01-02 15:04")
-		msgBuilder.WriteString(fmt.Sprintf("   更新: %s\n", updatedTime))
+	for i, session := range shown {
+		marker := "  "
+		if session.ID == current {
+			marker = "▶ "
+		}
+		label := session.Title
+		if session.Preview != "" {
+			label = session.Preview
+		}
+		msgBuilder.WriteString(fmt.Sprintf("%s%d. %s\n", marker, i+1, label))
+		msgBuilder.WriteString(fmt.Sprintf("     ID: %s\n", session.ID[:min(8, len(session.ID))]))
+		msgBuilder.WriteString(fmt.Sprintf("     更新: %s\n", session.Updated.Format("2006-01-02 15:04")))
 		msgBuilder.WriteString("\n")
 	}
 
-	if len(sessions) == maxShow {
-		msgBuilder.WriteString(fmt.Sprintf("\n💡 只显示最近%d个会话", maxShow))
+	if len(sessions) > len(shown) {
+		msgBuilder.WriteString(fmt.Sprintf("\n💡 只显示最近%d个会话", len(shown)))
 	}
+	msgBuilder.WriteString("\n💡 发送 /switch <序号> 继续某个会话")
 
 	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msgBuilder.String())); err != nil {
 		log.Printf("dingtalk: failed to send sessions list: %v", err)
 		return nil, err
 	}
 
+	return nil, nil
+}
+
+// handleSwitch resumes one of the user's own sessions.
+//
+// The switch itself is transactional and shared with the other channels
+// (opencode.Client.SwitchSession): it updates both session maps, pauses the
+// other claims this chat is mirroring, and restores a claim when the target was
+// adopted from the TUI. Doing that here by hand is what used to leave a failed
+// switch reporting success while the chat pointed at a session whose delivery
+// metadata had already been deleted.
+//
+// DingTalk's delivery context is the session webhook of the message that asked
+// for the switch, stored under the same "channel" key the inbound path uses.
+func (h *Handler) handleSwitch(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, threadID, selector string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	if strings.TrimSpace(selector) == "" {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("❌ 用法: /switch <序号|会话ID前缀>\n\n先发送 /sessions 查看可选的会话"))
+		return nil, nil
+	}
+
+	channelData := map[string]string{}
+	if webhook := strings.TrimSpace(data.SessionWebhook); webhook != "" {
+		channelData["channel"] = webhook
+	}
+
+	result, err := h.client.SwitchSession(ctx, opencode.SessionSwitchRequest{
+		Channel:     "dingtalk",
+		UserID:      userID,
+		ThreadID:    threadID,
+		Selector:    selector,
+		ChannelData: channelData,
+	})
+	if err != nil {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(opencode.SwitchFailureMessage(selector, err)))
+		if errors.Is(err, opencode.ErrSessionNotOwned) || errors.Is(err, opencode.ErrSessionBusy) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(result.Message())); err != nil {
+		log.Printf("dingtalk: failed to send switch confirmation: %v", err)
+		return nil, err
+	}
+	return nil, nil
+}
+
+// handleRelease stops mirroring a claimed TUI session into this chat and strips
+// its "[channel:userID]" title prefix.
+//
+// Stripping the prefix is what makes the release stick. AutoClaimFromTitle keys
+// on that prefix, so leaving it in place would let the next session.updated
+// event re-claim the session immediately. It is also what lets the user /rename
+// the session to a different channel afterwards.
+//
+// A session the gateway created itself is refused: it carries the same prefix
+// but is not in claimedSessions, and stripping its prefix would remove it from
+// ListSessionsForUser — the user would lose it from /sessions.
+func (h *Handler) handleRelease(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, selector string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if strings.TrimSpace(selector) != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "dingtalk", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector)))
+				return nil, nil
+			}
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 解除认领失败: %v", err)))
+			return nil, err
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"))
+		return nil, nil
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf(
+			"ℹ️ 会话 %s 不是从 TUI 认领的，无需解除\n\n（网关自己创建的会话不能解除，否则会从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))])))
+		return nil, nil
+	}
+
+	title, err := h.client.UnclaimSession(ctx, sessionID)
+	if err != nil {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 解除认领失败: %v", err)))
+		return nil, err
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that is no longer mirrored here.
+	if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+		h.adapter.ClearSessionForUser(userID)
+	}
+
+	log.Printf("dingtalk: /release user=%s session=%s", userID, sessionID[:min(8, len(sessionID))])
+	msg := fmt.Sprintf("✅ 已解除认领\n\nID: %s\n标题: %s\n\n💡 现在可以在 TUI 里 /rename 成别的渠道，例如 [feishu] 原标题",
+		sessionID[:min(8, len(sessionID))], title)
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+		log.Printf("dingtalk: failed to send release confirmation: %v", err)
+		return nil, err
+	}
+	return nil, nil
+}
+
+// handleTransfer moves a claimed TUI session to another chat channel without
+// going back to the TUI.
+//
+// It is the chat-side equivalent of /rename: the session keeps its history and
+// its ID, only the ownership prefix changes. The heavy lifting (release, title
+// rewrite, re-claim) lives in Client.TransferSession so all four adapters share
+// one implementation.
+//
+// The target user must have sent at least one message to that channel's bot,
+// otherwise the platform has no delivery target for them. That precondition is
+// the same one /rename has, and it cannot be checked from here.
+func (h *Handler) handleTransfer(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, args string) ([]byte, error) {
+	replier := chatbot.NewChatbotReplier()
+
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("用法: /transfer <渠道>[:<用户ID>] [序号|会话ID前缀]\n\n"+
+			"例如:\n/transfer feishu\n/transfer dingtalk:manager123\n/transfer wechat 2"))
+		return nil, nil
+	}
+
+	channel, targetUser, _ := strings.Cut(fields[0], ":")
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	targetUser = strings.TrimSpace(targetUser)
+	selector := ""
+	if len(fields) > 1 {
+		selector = fields[1]
+	}
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if selector != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "dingtalk", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector)))
+				return nil, nil
+			}
+			_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 转交失败: %v", err)))
+			return nil, err
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte("ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话"))
+		return nil, nil
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf(
+			"ℹ️ 会话 %s 不是从 TUI 认领的，不能转交\n\n（网关自己创建的会话已经绑定在本渠道，转交会让它从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))])))
+		return nil, nil
+	}
+
+	title, err := h.client.TransferSession(ctx, sessionID, channel, targetUser)
+	if err != nil {
+		_ = replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(fmt.Sprintf("❌ 转交失败: %v", err)))
+		return nil, err
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that now belongs to another channel.
+	if !h.client.IsClaimedSessionFor(sessionID, "dingtalk", userID) {
+		if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+			h.adapter.ClearSessionForUser(userID)
+		}
+	}
+
+	log.Printf("dingtalk: /transfer user=%s session=%s -> %s/%s",
+		userID, sessionID[:min(8, len(sessionID))], channel, targetUser)
+	msg := fmt.Sprintf("✅ 已转交到 %s\n\nID: %s\n标题: %s\n\n💡 目标用户需要先给 %s 的 bot 发过至少一条消息，否则那边收不到输出",
+		channel, sessionID[:min(8, len(sessionID))], title, channel)
+	if err := replier.SimpleReplyText(ctx, data.SessionWebhook, []byte(msg)); err != nil {
+		log.Printf("dingtalk: failed to send transfer confirmation: %v", err)
+		return nil, err
+	}
 	return nil, nil
 }
 

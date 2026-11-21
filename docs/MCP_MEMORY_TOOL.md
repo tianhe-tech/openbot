@@ -1,14 +1,43 @@
 # MCP Memory Tool
 
-The gateway ships an MCP (Model Context Protocol) stdio server that exposes the
-memory store directly to OpenCode's LLM as tools. This lets the LLM decide
-**when** to search memory—eliminating the brittle keyword-based recall trigger.
+The gateway ships a read-only MCP stdio server for searching saved requests and
+responses. The model chooses when to call it. This release supports only an
+explicitly configured, isolated single-owner OpenCode/MCP instance.
+
+## Upgrade and Safety
+
+- Back up the database consistently before upgrading. Stop writers before copying
+  SQLite files, or use a WAL-aware SQLite backup tool; do not copy only a live main DB.
+- Upgrade both gateway and MCP binaries, then start the gateway first. It adds a
+  search migration marker and transactionally rebuilds the legacy FTS index once
+  to include stored responses and tags. Records themselves are retained.
+- Newly stored responses are not truncated to 600 bytes. Startup keyword purging,
+  hourly strength decay, and strength-based search exclusion are removed.
+- Deleted history and already-truncated responses cannot be restored without an
+  independent backup or upstream conversation archive.
+- MCP opens with SQLite `mode=ro` and `query_only=1`: it never creates, migrates,
+  purges, or strengthens records. Missing/old databases produce an actionable error.
+  SQLite may still require access to WAL/shared-memory sidecars for a live database.
+- The server checks the archive's schema version at startup and refuses to run
+  against an archive written by a newer binary. Upgrade the MCP binary rather
+  than downgrading the archive: a newer archive still has every table this
+  binary knows about, so nothing would fail on its own and the process would
+  answer from rows whose meaning it does not understand. `memory_health` prints
+  the exact version, and names both numbers when they differ.
+- New automatic registrations are disabled. Existing entries are not overwritten;
+  verify their binary and database paths and configure the binding below.
+
+**Do not enable this MCP process on a shared-user OpenCode instance.** A fixed
+owner flag limits the database rows, but cannot authenticate different users
+calling the same tool process. Shared-user transport isolation is a later phase.
 
 ## Build
 
 ```bash
 go build -o bin/openbot-mcp ./cmd/mcp
 ```
+
+On Windows, build `bin/openbot-mcp.exe` and use that executable in the configuration.
 
 ## Configure opencode.json
 
@@ -20,7 +49,7 @@ Add the following to your project's `opencode.json` (typically at
   "mcp": {
     "gateway-memory": {
       "type": "local",
-      "command": ["./bin/openbot-mcp", "--db", "./tmp/memory.db"],
+      "command": ["./bin/openbot-mcp", "--db", "/absolute/opencode-directory/mem/memory.db", "--single-owner", "--adapter", "wechat", "--user", "YOUR_USER_ID"],
       "enabled": true
     }
   }
@@ -29,15 +58,102 @@ Add the following to your project's `opencode.json` (typically at
 
 If the binary is installed globally or in a different path, adjust `command`
 accordingly. The `--db` flag must point to the same SQLite memory database used
-by the gateway (default: `$OPENCODE_DIRECTORY/tmp/memory.db`).
+by the gateway (default: `$OPENCODE_DIRECTORY/mem/memory.db`, overridden by
+`MEMORY_STORE_PATH`). Use an absolute path and replace the adapter/user with the
+stored channel and user ID. Cross-channel identity linking is not automatic.
+
+`--single-owner`, a nonempty `--adapter`, and a nonempty `--user` are required.
+These are operator-controlled process arguments, never model-supplied tool arguments.
+Missing binding fails closed before opening the database. The example enables the
+tool only after the operator has ensured instance isolation.
 
 ## Tools Exposed
 
 | Tool | Description |
 |------|-------------|
-| `memory_search` | Full-text + fuzzy search over conversation history. Accepts `query` (required), optional `project`, `days`, `limit`. |
-| `memory_list_projects` | List projects the user has worked on, with conversation counts and last-active timestamps. Optional `days` filter. |
-| `memory_recent` | Retrieve recent conversations. Optional `days` (default 7), `limit` (default 20). |
+| `memory_search` | Scoped lexical search. On a migrated v2 archive it searches original message bodies with evidence offsets, project/time filters, cursor pagination, and index-coverage reporting. On a legacy-only archive it falls back to the Phase 0 FTS5/BM25 recall. `query` required (1-1024 characters); optional `days` (default 0: all history), `limit` (default 10), `project`, `cursor`. |
+| `memory_get` | Returns the original stored bodies for up to 100 message IDs. Optional `budget_bytes` (default 32768, max 262144). Requires a migrated v2 archive. |
+| `memory_scroll` | Pages one session chronologically by sequence. `session_id` required; optional `cursor`, `direction` (`forward`/`backward`, default `forward`), `limit` (default 20, max 100). Requires a migrated v2 archive. |
+| `memory_list_projects` | Scoped project counts and last activity. Optional `days` (default 90). |
+| `memory_recent` | Scoped chronological records. Optional `days` (default 7), `limit` (default 10). |
+| `memory_health` | Operational status for the bound principal: scope mode, archive schema, tokenizer version, pending and failed index jobs, word-index completeness and lag, index updated-at, message totals, index lag, chunk count, storage totals (blocks, compressed blocks, raw bytes, stored bytes, bytes saved), and capture state (pending and failed reconcile jobs, active turns, turns awaiting reconciliation, last capture time, and the instance lease). Takes no arguments. Reports no message bodies, no credentials, and no per-user labels, so it is safe to expose to a model. On a legacy-only archive it reports `schema: legacy` and states that indexing is not applicable until `memory-migrate` runs, rather than reporting zeros that would look like a healthy empty index. The storage lines report raw and stored bytes separately so the effect of compression is visible rather than assumed: a report that showed only stored bytes would look identical whether compression worked or was silently disabled. The capture lines report the durable backlog rather than the writer's in-memory queue, because this process opens the archive read-only and cannot see the gateway's queue — and a snapshot of a millisecond-scale latency buffer would be noise even if it could. `instance_lease` is the one line that names an identity, and it is a process (`<hostname>:<pid>`), not a person; an expired lease is reported as expired rather than held, because that is the state a crash leaves behind and calling it held would tell an operator that a dead process is running. |
+| `memory_space` | Where the archive's bytes go. Reports whole-file numbers (database file, WAL, SHM, free pages, logical size, full-text index pages, and the part of the index that is stored text) and, separately, the bound principal's logical sizes (block bytes, artifact bytes, embedding bytes). Optional `backup_path` reports a backup file's size in its own field. The two groups are never added together: every principal shares the same pages, so a per-principal share of the file would be a fiction, and the block and artifact totals are subsets of the file rather than additions to it. Slower than `memory_health` because the full-text index cost is measured with `dbstat`, which walks the page map, so it is a separate tool rather than more lines in the health report. When the SQLite build has no `dbstat`, `fts_bytes` is reported as unknown rather than as zero, because zero would read as "the index is empty". `fts_bytes` is a subset of `logical_bytes`, not of `file_bytes`: `dbstat` reads through the pager and counts pages still in the WAL, while `file_bytes` is the main file alone, so on a freshly written archive the index can legitimately appear larger than the file. `fts_content_bytes` is zero on a schema v7 archive, which made both indexes contentless; a non-zero value means the archive predates v7 or a later change reintroduced a content column. Reports no message bodies and no per-user labels. |
+
+Days must be integers from 0 to 36500; 0 means all history. Limits must be integers
+from 1 to 50. Invalid values are errors.
+
+Search and recent results include record IDs, UTC timestamps, project/directory,
+and request/response excerpts. Different records on the same project/day remain
+distinct. Text excerpts share a 24,000-byte source-text budget per response,
+excluding metadata and explanatory markers; UTF-8 boundaries are preserved.
+Truncation and hitting the requested result limit are labeled. Excerpts are not
+a complete archive export. A missing search match is not replaced with
+unrelated recent records or project lists.
+
+### v2 search, detail, and scroll
+
+When the archive has been migrated to schema v4, `memory_search` searches the
+chunked lexical index instead of the legacy recall tables. Results carry
+`message_id`, `session_id`, `bytes=start-end` evidence offsets, a score, and a
+`mode` that says which index answered the query:
+
+| `mode` | Meaning |
+| --- | --- |
+| `word` | Every term is a plain ASCII word, answered by the word-tokenized index. This is the fast path. |
+| `fts` | At least one term needs the trigram index: a CJK phrase, or a term containing a separator such as `.` or `/`. |
+| `hybrid` | The query mixed both kinds of term, so both indexes were queried and the results merged. |
+| `scan` | Every term was shorter than three characters, so neither index could match it and a bounded scoped scan was used. |
+
+The response also reports coverage:
+
+- `Coverage: PARTIAL` means index jobs are still pending, so a missing match may
+  simply not be indexed yet. It is never reported as a confident "no match".
+- `More results available. Repeat the call with cursor=...` means the page was
+  truncated; the cursor is bound to the query, scope, and index generation, so a
+  reindex invalidates it and the call must be restarted.
+- One- and two-character terms cannot match either index. Those queries fall
+  back to a bounded scoped scan and say so in the notice.
+- `Word index: PARTIAL` means the word index is still being backfilled after a
+  schema upgrade. A `word` or `hybrid` query can miss older messages until it
+  finishes; `fts` queries are unaffected because the trigram index is complete.
+
+`memory_get` returns the original body, not an excerpt, and re-authorizes every
+requested ID against the caller's scope. IDs that are missing or belong to
+another user are reported in a notice rather than silently dropped. The byte
+budget is enforced across the whole response with rune-aligned truncation and a
+continuation cursor.
+
+`memory_scroll` walks a single session in `seq` order. It verifies that the
+session belongs to the caller before reading anything.
+
+Both v2 tools refuse a legacy-only archive with an explicit error instead of
+returning an empty result, so an unmigrated deployment cannot look like an empty
+memory.
+
+### Reading the health report
+
+`memory_health` answers two different questions, and the lines are grouped so
+they are not confused:
+
+- **Is retrieval keeping up?** `pending_index_jobs`, `failed_index_jobs`,
+  `index_lag_messages`, `word_index_complete`. A non-zero lag means a missing
+  search hit may simply not be indexed yet.
+- **Is capture keeping up?** `pending_reconcile_jobs`, `failed_reconcile_jobs`,
+  `active_turns`, `awaiting_reconcile_turns`, `last_capture_at`,
+  `instance_lease`. A turn that stays `active` across restarts, or a reconcile
+  job that stays pending, is the durable evidence that something is stuck.
+
+The capture lines deliberately do not report the writer's queue depth. The MCP
+process opens the archive read-only and is a separate process from the gateway,
+so it cannot read that queue; and the queue is a latency buffer measured in
+milliseconds, so a snapshot of it would be noise rather than a signal. The
+durable backlog is what answers the question an operator is actually asking.
+
+Every count is scoped to the bound principal. An archive-wide count would let
+one principal infer another's activity — "3 turns are stuck" is a disclosure
+even though it carries no text. The lease is the single exception: it is
+archive-wide by construction and holds only `<hostname>:<pid>`, which identifies
+a process rather than a person.
 
 ## How It Works
 
@@ -46,19 +162,43 @@ OpenCode LLM  ──stdin/stdout──▶  openbot-mcp  ──SQLite──▶  m
 ```
 
 The server implements JSON-RPC 2.0 over stdio (the MCP "local" transport).
-When the LLM calls a tool, the server queries the same SQLite FTS5 database
-that the gateway writes to, returning formatted results.
+When the LLM calls a tool, the server queries the same SQLite database that the
+gateway writes to, returning formatted results. The MCP process opens the
+database read-only, so it can never mutate or purge history.
+
+That read-only guarantee is why deletion is not a tool here. Removing a
+principal's archive is done with `cmd/memory-delete`, a separate operator
+command, because a model must not be able to delete a user's history because a
+prompt asked it to. Adding a delete tool would make the guarantee conditional on
+a handler behaving, which is not a guarantee. See
+[docs/MEMORY_DELETION.md](MEMORY_DELETION.md).
+
+The gateway owns indexing. When strict v2 capture is enabled it runs a
+background index worker that turns archived messages into chunks and FTS rows in
+both the trigram index and the word index. When the message queue is drained the
+same worker spends its idle time backfilling the word index for chunks that
+predate the schema-v4 upgrade; that backfill is resumable, so a restart continues
+where it stopped. The MCP server only reads those indexes; it never builds them.
+If the gateway is not running, `memory_search` still works but reports
+`Coverage: PARTIAL` until the backlog drains.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_DB_PATH` | (none) | Alternative to `--db` flag |
+| `GATEWAY_MEMORY_DB` | (none) | MCP alternative to `--db`; explicit flag takes precedence |
+| `MEMORY_STORE_PATH` | `<OPENCODE_DIRECTORY>/mem/memory.db` | Gateway database path; empty selects the default, not disabled capture |
 
 ## Tips
 
 - The LLM will see these tools in its tool list and can invoke them whenever
   it judges a memory lookup is relevant—no keyword trigger needed.
-- Works alongside the existing `DetectRecallIntent` passive recall; both can
-  coexist.
-- The MCP server is read-only; it never writes to the database.
+- OpenCode must actually invoke a memory tool; this release does not implement
+  the previously documented `DetectRecallIntent` passive injection.
+- Durable v2 capture, scoped lexical search, detail retrieval, and scroll are
+  implemented. Compression, knowledge extraction, semantic search, and
+  source-backed handoff are subsequent phases of
+  [the implementation plan](MEMORY_IMPLEMENTATION_PLAN.md).
+- Search/database errors are reported as tool errors rather than disguised as
+  no-match responses. Check gateway startup logs for the actual path and any
+  migration failure; an unavailable memory store does not stop the legacy gateway.

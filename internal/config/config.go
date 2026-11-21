@@ -32,11 +32,18 @@ type Config struct {
 	ProxyKeyFile           string
 	ProxyLocalAddr         string
 	ProxyReconnect         time.Duration
-	MemStorePath           string // path to the SQLite memory database; "" disables memory
-	WeCom                  wecom.Config
-	WeChat                 wechat.Config
-	FeiShu                 feishu.Config
-	DingTalk               dingtalk.Config
+	// MemStorePath is deprecated: read Memory.StorePath instead. It is kept
+	// populated so existing callers keep compiling, but it is a copy and
+	// changing it has no effect.
+	MemStorePath string
+	// MemoryCaptureMode is deprecated: read Memory.CaptureMode instead.
+	MemoryCaptureMode string
+	// Memory is the validated v2 archive configuration.
+	Memory   MemoryConfig
+	WeCom    wecom.Config
+	WeChat   wechat.Config
+	FeiShu   feishu.Config
+	DingTalk dingtalk.Config
 
 	// Skill autogen (Hermes-style): mine reusable SKILL.md drafts from
 	// completed or stuck sessions, idle-gated so it never interferes with
@@ -112,6 +119,107 @@ type RetryQueueConfig struct {
 	BatchSize int
 }
 
+// MemoryConfig is the validated configuration for the v2 memory archive.
+//
+// Only settings that change observable behaviour are exposed. The plan's
+// MEMORY_SEMANTIC_ENABLED and MEMORY_CONVERSATION_RETENTION_DAYS are
+// deliberately absent: semantic retrieval and retention classes are not
+// implemented, so a setting for them would be a knob that does nothing. Add
+// them with the feature, not before it.
+type MemoryConfig struct {
+	// Enabled gates capture and recall. False leaves the archive untouched.
+	Enabled bool
+	// StorePath is the SQLite archive path. Empty resolves to
+	// <OpenCodeDirectory>/mem/memory.db.
+	StorePath string
+	// CaptureMode is "legacy" (no v2 capture) or "strict" (durable v2 capture).
+	CaptureMode string
+	// ScopeMode is "disabled" or "single_owner". It documents the deployment
+	// assumption the MCP recall tools already enforce; the gateway only
+	// validates it.
+	ScopeMode string
+	// KnowledgeEnabled turns on automatic fact extraction at session
+	// boundaries. It requires capture to be enabled, because extraction reads
+	// the archive that capture writes. The explicit /remember command works
+	// regardless: a user asking for a fact to be stored is not the same feature
+	// as the gateway deciding to extract one.
+	KnowledgeEnabled bool
+
+	// Writer tuning. These bound the capture queue and the commit batch.
+	QueueMaxItems int
+	QueueMaxBytes int
+	BatchMaxItems int
+	BatchMaxBytes int
+	BatchMaxDelay time.Duration
+	CommitTimeout time.Duration
+}
+
+// MemoryCaptureEnabled reports whether v2 capture should be opened.
+func (m MemoryConfig) MemoryCaptureEnabled() bool {
+	return m.Enabled && m.CaptureMode == "strict"
+}
+
+// validateMemory normalises and checks the memory settings. It rejects values
+// that would make the writer fail at runtime rather than at startup, because a
+// capture queue that cannot be created is a durability failure, not a warning.
+func validateMemory(m MemoryConfig) (MemoryConfig, error) {
+	m.CaptureMode = strings.ToLower(strings.TrimSpace(m.CaptureMode))
+	switch m.CaptureMode {
+	case "":
+		m.CaptureMode = "legacy"
+	case "legacy", "strict":
+	default:
+		return m, fmt.Errorf("MEMORY_CAPTURE_MODE must be legacy or strict, got %q", m.CaptureMode)
+	}
+
+	m.ScopeMode = strings.ToLower(strings.TrimSpace(m.ScopeMode))
+	switch m.ScopeMode {
+	case "":
+		m.ScopeMode = "disabled"
+	case "disabled", "single_owner":
+	default:
+		return m, fmt.Errorf("MEMORY_SCOPE_MODE must be disabled or single_owner, got %q", m.ScopeMode)
+	}
+
+	limits := []struct {
+		name  string
+		value int
+	}{
+		{"MEMORY_QUEUE_MAX_ITEMS", m.QueueMaxItems},
+		{"MEMORY_QUEUE_MAX_BYTES", m.QueueMaxBytes},
+		{"MEMORY_BATCH_MAX_ITEMS", m.BatchMaxItems},
+		{"MEMORY_BATCH_MAX_BYTES", m.BatchMaxBytes},
+	}
+	for _, limit := range limits {
+		if limit.value < 0 {
+			return m, fmt.Errorf("%s cannot be negative, got %d", limit.name, limit.value)
+		}
+	}
+	if m.BatchMaxDelay < 0 {
+		return m, fmt.Errorf("MEMORY_BATCH_MAX_DELAY_MS cannot be negative, got %s", m.BatchMaxDelay)
+	}
+	if m.CommitTimeout < 0 {
+		return m, fmt.Errorf("MEMORY_COMMIT_TIMEOUT_MS cannot be negative, got %s", m.CommitTimeout)
+	}
+	// A batch larger than the queue can never be filled, so the writer would
+	// wait for a batch that cannot exist. Reject it instead of silently
+	// clamping, because the operator asked for something impossible.
+	if m.QueueMaxItems > 0 && m.BatchMaxItems > m.QueueMaxItems {
+		return m, fmt.Errorf("MEMORY_BATCH_MAX_ITEMS (%d) cannot exceed MEMORY_QUEUE_MAX_ITEMS (%d)", m.BatchMaxItems, m.QueueMaxItems)
+	}
+	if m.QueueMaxBytes > 0 && m.BatchMaxBytes > m.QueueMaxBytes {
+		return m, fmt.Errorf("MEMORY_BATCH_MAX_BYTES (%d) cannot exceed MEMORY_QUEUE_MAX_BYTES (%d)", m.BatchMaxBytes, m.QueueMaxBytes)
+	}
+	// Knowledge extraction reads the archive that capture writes, so enabling it
+	// without capture would produce a service that can never find evidence. That
+	// is a configuration error, not a silent no-op: the operator asked for a
+	// feature whose input does not exist.
+	if m.KnowledgeEnabled && !m.MemoryCaptureEnabled() {
+		return m, fmt.Errorf("MEMORY_KNOWLEDGE_ENABLED requires MEMORY_ENABLED=true and MEMORY_CAPTURE_MODE=strict")
+	}
+	return m, nil
+}
+
 // Load reads configuration from environment variables with sensible defaults.
 func Load() (Config, error) {
 	cfg := Config{
@@ -133,6 +241,20 @@ func Load() (Config, error) {
 		ProxyLocalAddr:         getEnv("PROXY_LOCAL_OPENCODE_ADDR", "127.0.0.1:4096"),
 		ProxyReconnect:         getDuration("PROXY_RECONNECT_DELAY", 180*time.Second),
 		MemStorePath:           getEnv("MEMORY_STORE_PATH", ""),
+		MemoryCaptureMode:      getEnv("MEMORY_CAPTURE_MODE", "legacy"),
+		Memory: MemoryConfig{
+			Enabled:          getBool("MEMORY_ENABLED", true),
+			StorePath:        getEnv("MEMORY_STORE_PATH", ""),
+			CaptureMode:      getEnv("MEMORY_CAPTURE_MODE", "legacy"),
+			ScopeMode:        getEnv("MEMORY_SCOPE_MODE", "disabled"),
+			KnowledgeEnabled: getBool("MEMORY_KNOWLEDGE_ENABLED", false),
+			QueueMaxItems:    getInt("MEMORY_QUEUE_MAX_ITEMS", 1024),
+			QueueMaxBytes:    getInt("MEMORY_QUEUE_MAX_BYTES", 16*1024*1024),
+			BatchMaxItems:    getInt("MEMORY_BATCH_MAX_ITEMS", 64),
+			BatchMaxBytes:    getInt("MEMORY_BATCH_MAX_BYTES", 256*1024),
+			BatchMaxDelay:    getMilliseconds("MEMORY_BATCH_MAX_DELAY_MS", 10*time.Millisecond),
+			CommitTimeout:    getMilliseconds("MEMORY_COMMIT_TIMEOUT_MS", 2*time.Second),
+		},
 		WeCom: wecom.Config{
 			Token:          os.Getenv("WECOM_TOKEN"),
 			EncodingAESKey: os.Getenv("WECOM_AES_KEY"),
@@ -209,13 +331,23 @@ func Load() (Config, error) {
 			Cooldown:         getDuration("OPENCODE_CB_COOLDOWN_SECONDS", 60*time.Second),
 			MaxCooldown:      getDuration("OPENCODE_CB_MAX_COOLDOWN_SECONDS", 30*time.Minute),
 			TripKeywords: splitAndTrim(getEnv("OPENCODE_CB_TRIP_KEYWORDS",
-				"No available client,No available channel,Insufficient Balance,provider unavailable")),
+				"No available client,No available channel,Insufficient Balance,provider unavailable,Access denied,Arrearage,Model not found")),
 		},
 	}
 
 	if cfg.OpenCodeEndpoint == "" {
 		return cfg, fmt.Errorf("missing OPENCODE_ENDPOINT")
 	}
+
+	memory, err := validateMemory(cfg.Memory)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Memory = memory
+	// Keep the deprecated flat fields in sync so callers that still read them
+	// observe the validated values rather than the raw environment.
+	cfg.MemStorePath = memory.StorePath
+	cfg.MemoryCaptureMode = memory.CaptureMode
 
 	if cfg.DingTalk.OwnerUserID != "" {
 		cfg.DingTalk.UserWhitelist = []string{cfg.DingTalk.OwnerUserID}
@@ -255,6 +387,28 @@ func getBool(key string, fallback bool) bool {
 		if val, err := strconv.ParseBool(raw); err == nil {
 			return val
 		}
+	}
+	return fallback
+}
+
+// getMilliseconds parses a setting whose name ends in _MS. A bare number is
+// milliseconds, not seconds: getDuration would read "10" as ten seconds, which
+// would turn a 10 ms batch delay into a 10 s one. A value carrying an explicit
+// unit ("250ms", "1s") is honoured as written.
+//
+// A negative value is returned as parsed rather than replaced by the fallback,
+// so validateMemory can reject it by name. Silently substituting the default
+// would make a typo look like a working configuration.
+func getMilliseconds(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if ms, err := strconv.Atoi(raw); err == nil {
+		return time.Duration(ms) * time.Millisecond
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		return d
 	}
 	return fallback
 }

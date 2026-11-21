@@ -87,7 +87,7 @@ func (s *NLScheduleService) HandleText(ctx context.Context, req NLScheduleReques
 				NeedConfirm:  true,
 				Intent:       pending.Draft,
 				PendingState: pending,
-				Message:      fmt.Sprintf("⚠️ 执行失败：%v\n请补充更明确的时间（例如 每天早上9点 或标准 cron）后再回复“确认”，或回复“取消”。", err),
+				Message:      fmt.Sprintf("⚠️ 执行失败：%v\n%s\n请补充缺失的信息后重新发送指令，或回复“取消”。", err, confirmRetryHint(err)),
 			}, nil
 		}
 		s.state.Delete(req.UserID, req.AdapterType)
@@ -213,6 +213,8 @@ func (s *NLScheduleService) executeIntent(ctx context.Context, req NLScheduleReq
 			Enabled:     true,
 			AdapterType: req.AdapterType,
 			Channel:     req.Channel,
+			UserID:      req.UserID,
+			ThreadID:    nonEmpty(req.Channel, req.UserID),
 			Content:     intent.Content,
 			Agent:       intent.Agent,
 			Metadata: map[string]interface{}{
@@ -247,7 +249,40 @@ func (s *NLScheduleService) executeIntent(ctx context.Context, req NLScheduleReq
 		return fmt.Sprintf("已提交一次性执行任务：%s", runTask.ID), nil
 
 	case NLScheduleActionUpdate:
-		return "", fmt.Errorf("update flow is not implemented in PR-1 skeleton")
+		task, err := s.findTask(req.AdapterType, intent.Selector)
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(intent.CronExpr) == "" {
+			return "", fmt.Errorf("cannot update task: unresolved cron expression")
+		}
+		// Copy before mutating. findTask returns the pointer that lives in the
+		// scheduler's map, and the cron goroutine reads that same struct while
+		// a job fires; writing through the shared pointer would be a data race
+		// that the race detector only catches when a job happens to run during
+		// the update. UpdateScheduledTask replaces the map entry wholesale, so
+		// the copy is what gets stored and the old struct is left untouched.
+		updated := *task
+		previousCron := updated.CronExpr
+		updated.CronExpr = intent.CronExpr
+		if intent.Name != "" {
+			updated.Name = intent.Name
+		}
+		if intent.Content != "" {
+			updated.Content = intent.Content
+		}
+		if intent.Agent != "" {
+			updated.Agent = intent.Agent
+		}
+		if updated.Metadata == nil {
+			updated.Metadata = make(map[string]interface{})
+		}
+		updated.Metadata["updated_by"] = req.UserID
+		updated.Metadata["updated_from"] = req.AdapterType
+		if err := s.cron.UpdateScheduledTask(&updated); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("已更新任务：%s (%s)，Cron %s → %s", updated.ID, updated.Name, previousCron, updated.CronExpr), nil
 	}
 
 	return "", fmt.Errorf("unsupported action: %s", intent.Action)
@@ -284,7 +319,7 @@ func buildDraftMessage(intent *NLScheduleIntent) string {
 	}
 	var b strings.Builder
 	b.WriteString("已解析到定时任务草稿:\n")
-	b.WriteString(fmt.Sprintf("- 动作: %s\n", intent.Action))
+	b.WriteString(fmt.Sprintf("- 动作: %s\n", actionLabel(intent.Action)))
 	if intent.Selector.TaskID != "" {
 		b.WriteString(fmt.Sprintf("- 任务ID: %s\n", intent.Selector.TaskID))
 	}
@@ -323,6 +358,56 @@ func nonEmpty(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+// actionLabel renders an action for the draft message. The raw constant is an
+// English identifier ("update"), which reads as a leaked internal name in a
+// Chinese confirmation prompt.
+func actionLabel(action NLScheduleAction) string {
+	switch action {
+	case NLScheduleActionCreate:
+		return "创建"
+	case NLScheduleActionList:
+		return "列出"
+	case NLScheduleActionInfo:
+		return "查看详情"
+	case NLScheduleActionEnable:
+		return "启用"
+	case NLScheduleActionDisable:
+		return "禁用"
+	case NLScheduleActionDelete:
+		return "删除"
+	case NLScheduleActionUpdate:
+		return "修改"
+	case NLScheduleActionRunOnce:
+		return "试运行"
+	default:
+		return string(action)
+	}
+}
+
+// confirmRetryHint turns an execution error into advice the user can act on.
+// The old message always said "补充更明确的时间", which is wrong for every
+// failure that is not about time: a task that could not be found, or a
+// selector that matched two tasks, needs a different correction, and telling
+// the user to restate the time would send them in a circle.
+func confirmRetryHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "task not found"):
+		return "没有找到匹配的任务，请用任务 ID 或更完整的名称重新指定。"
+	case strings.Contains(msg, "multiple tasks matched"):
+		return "匹配到多个任务，请改用任务 ID 指定唯一目标。"
+	case strings.Contains(msg, "task selector is required"):
+		return "请说明要操作哪个任务（任务 ID 或名称）。"
+	case strings.Contains(msg, "cron expression"):
+		return "请补充更明确的时间（例如 每天早上9点 或标准 cron）。"
+	default:
+		return "请检查指令后重试。"
+	}
 }
 
 func isConfirmReply(text string) bool {

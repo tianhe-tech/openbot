@@ -59,6 +59,10 @@ type StreamingSessionHandler struct {
 	activeToolParts map[string]bool // partID -> true：当前处于 pending/running 状态的 tool part，用于判断是否仍有活跃 tool
 	toolObserved    bool            // 本轮是否曾进入工具执行阶段；慢工具不应被当作模型静默卡死
 
+	// lastAssistantMessageID 是最近一次观察到的 assistant message ID，
+	// 用于给滚动部分快照（partial snapshot）打上上游消息标识。
+	lastAssistantMessageID string
+
 	// 上游 provider 重试状态：opencode 在模型不可用/限流时会发出 type=="retry" 的
 	// message part（{"type":"retry","attempt":N,"error":{"data":{"message":...}}}）。
 	// 这类 part 既不是 session.error，也不会写入 AssistantMessage.Error.Name，
@@ -94,6 +98,22 @@ type StreamingSessionHandler struct {
 	payload                 MessagePayload
 	fallbackRetryAttempted  bool
 	fallbackRetryDispatched bool
+	failedTurn              bool
+	terminalErr             error
+	cleanupDone             chan struct{}
+	cleanupDoneOnce         sync.Once
+
+	// longLived marks a handler that mirrors a session the gateway did not
+	// create (see Client.ClaimSession). Such a handler is never unregistered
+	// when a turn ends; instead it resets itself when the next turn starts.
+	// This is what lets a session adopted from the opencode TUI keep streaming
+	// into a chat across many turns.
+	longLived bool
+
+	// longLivedTurnMessageID is the assistant message ID of the turn currently
+	// being mirrored. A long-lived handler sees many turns, so this is how a
+	// new turn is told apart from trailing events of the previous one.
+	longLivedTurnMessageID string
 }
 
 // NewStreamingSessionHandler 创建流式会话处理器
@@ -121,21 +141,37 @@ func NewStreamingSessionHandlerWithModel(sessionID string, callback StreamCallba
 		activeToolParts:  make(map[string]bool),
 		lastModelUsed:    modelUsed,
 		payload:          payload,
+		cleanupDone:      make(chan struct{}),
 	}
-	// 8秒后若仍未发送过内容，给用户一个等待提示
-	h.waitingTimer = time.AfterFunc(8*time.Second, func() {
-		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
-		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
-		h.mu.Lock()
-		if h.contentSent || h.completed || h.waitingHintSent {
-			h.mu.Unlock()
+	h.startWaitingHintTimer()
+	return h
+}
+
+// startWaitingHintTimer (re)arms the one-shot "still working" hint for the
+// current turn. It fires only if the turn is still running without any content
+// after waitHintDelay (default 30s; override via OPENCODE_WAIT_HINT_SECONDS).
+//
+// The delay used to be a hard-coded 8s, which is shorter than the typical
+// first-token latency — and chat adapters only "send" content when the turn
+// flushes — so nearly every message produced the hint and users learned to
+// ignore it. A turn never gets more than one hint.
+func (s *StreamingSessionHandler) startWaitingHintTimer() {
+	if s.waitingTimer != nil {
+		s.waitingTimer.Stop()
+	}
+	s.waitingTimer = time.AfterFunc(waitHintDelay, func() {
+		// Mark under the lock, send outside it: the hint is informational and
+		// must never block the SSE event loop synchronously (a critical retry
+		// under rate limiting would freeze it for minutes).
+		s.mu.Lock()
+		if s.contentSent || s.completed || s.waitingHintSent {
+			s.mu.Unlock()
 			return
 		}
-		h.waitingHintSent = true
-		h.mu.Unlock()
-		_ = h.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
+		s.waitingHintSent = true
+		s.mu.Unlock()
+		_ = s.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
 	})
-	return h
 }
 
 // SetModelUsed records the final model selected by SendMessage. Streaming
@@ -302,12 +338,21 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		s.sessionID[:8])
 
 	if s.completed {
-		// 即使 completed，仍然处理权限和问题请求（skill 可能在 session.idle 后才请求权限）
-		if eventType != "permission.asked" && eventType != "question.asked" {
+		// A long-lived handler (a claimed session) is never unregistered, so a
+		// new turn has to be detected here rather than by a fresh handler being
+		// created. Resetting on turn *start* — under the lock, before the event
+		// is processed — is what makes consecutive turns reliable: resetting
+		// from onComplete would race, because fireOnComplete runs it in a
+		// goroutine and a fast next turn could arrive first and be dropped.
+		if s.longLived && s.beginLongLivedTurnLocked(event) {
+			log.Printf("opencode: claimed session %s started a new turn", s.sessionID[:min(8, len(s.sessionID))])
+		} else if eventType != "permission.asked" && eventType != "question.asked" {
+			// 即使 completed，仍然处理权限和问题请求（skill 可能在 session.idle 后才请求权限）
 			log.Printf("opencode: ignoring event for completed session %s (type=%s)", s.sessionID[:8], eventType)
 			return nil
+		} else {
+			log.Printf("opencode: processing %s event for completed session %s (skill may need permission)", eventType, s.sessionID[:8])
 		}
-		log.Printf("opencode: processing %s event for completed session %s (skill may need permission)", eventType, s.sessionID[:8])
 	}
 
 	// 仅处理与当前session相关的事件
@@ -331,9 +376,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 			var partMeta2 struct {
 				Properties struct {
 					Part struct {
-						ID     string `json:"id"`
-						Type   string `json:"type"`
-						Tokens struct {
+						ID        string `json:"id"`
+						MessageID string `json:"messageID"`
+						Type      string `json:"type"`
+						Tokens    struct {
 							Input  int `json:"input"`
 							Output int `json:"output"`
 							Total  int `json:"total"`
@@ -351,6 +397,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					partID[:min(8, len(partID))], role, partMeta2.Properties.Part.Type)
 				if partID != "" && role != "" {
 					s.partRoles.Store(partID, role)
+				}
+				if partMeta2.Properties.Part.MessageID != "" {
+					s.lastAssistantMessageID = partMeta2.Properties.Part.MessageID
 				}
 				if partMeta2.Properties.Part.Type == "step-finish" {
 					s.receivedStepFinish = true
@@ -376,10 +425,16 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				// 每次都发一个 type=="retry" 的 part。这类 part 永远不会触发
 				// session.idle，若不拦截会导致会话一直"正在处理中"。
 				if partMeta2.Properties.Part.Type == "retry" {
+					s.mu.Unlock()
 					s.handleRetryPart(jsonData)
+					s.mu.Lock()
+					return nil
 				}
 				if partMeta2.Properties.Part.Type == "tool" {
 					s.toolObserved = true
+					if s.client != nil {
+						s.client.captureToolEvent(s.payload, event)
+					}
 				}
 
 				// 检测 server 端自动压缩（compaction）：当 opencode server 在
@@ -423,6 +478,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						s.stopWaitingTimer()
 					}
 					s.contentSent = true
+					if s.client != nil {
+						s.client.capturePartial(s.payload, s.lastAssistantMessageID, s.lastContent)
+					}
 				}
 			}
 			s.lastUpdateTime = time.Now()
@@ -447,6 +505,19 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: %s event processed for session %s", eventType, s.sessionID[:8])
 
 	case "question.asked", "permission.asked":
+		if s.payload.ForegroundOnly {
+			question, msg := s.extractQuestionFromEvent(event)
+			s.terminalErr = fmt.Errorf("%w: session=%s event=%s", ErrForegroundInteractionRequired, s.sessionID, eventType)
+			s.failedTurn = true
+			s.completed = true
+			kind := StreamEventQuestionAsked
+			if eventType == "permission.asked" {
+				kind = StreamEventPermissionAsked
+			}
+			s.emitEvent(kind, msg, question, nil, nil, eventType)
+			s.notifyCompletion()
+			return nil
+		}
 		// OpenCode 需要用户确认（build 模式或权限请求）
 		// ⚠️ 不再设置 waitingForResponse，以免阻止后续事件处理
 		// s.waitingForResponse = true // 注释掉，让事件继续流动
@@ -529,8 +600,10 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 				var msgUpdate struct {
 					Properties struct {
 						Info struct {
-							ID   string `json:"id"`
-							Role string `json:"role"`
+							ID         string `json:"id"`
+							Role       string `json:"role"`
+							ProviderID string `json:"providerID"`
+							ModelID    string `json:"modelID"`
 						} `json:"info"`
 					} `json:"properties"`
 				}
@@ -539,6 +612,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 					role := msgUpdate.Properties.Info.Role
 					if msgID != "" && role != "" {
 						s.client.messageRoles.Store(msgID, role)
+					}
+					if role == "assistant" && msgUpdate.Properties.Info.ProviderID != "" && msgUpdate.Properties.Info.ModelID != "" {
+						s.lastModelUsed = modelFromRef(msgUpdate.Properties.Info.ProviderID, msgUpdate.Properties.Info.ModelID)
 					}
 				}
 			}
@@ -553,10 +629,21 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		log.Printf("opencode: session status changed for session %s", s.sessionID[:8])
 
 	case "session.error":
+		s.failedTurn = true
 		rawJSON := event.JSON.RawJSON()
 		log.Printf("opencode: 🔴 session.error RAW JSON: %s", rawJSON)
 		errorMsg := s.extractSessionError(event)
+		if s.payload.ForegroundOnly {
+			s.terminalErr = fmt.Errorf("opencode: foreground session %s failed: %s", s.sessionID, errorMsg)
+			s.completed = true
+			s.emitEvent(StreamEventError, errorMsg, nil, nil, nil, eventType)
+			s.notifyCompletion()
+			return nil
+		}
 		log.Printf("opencode: 🔴 session.error extracted message: %q", errorMsg)
+		if model := missingModelFromError(errorMsg); model != nil {
+			s.lastModelUsed = model
+		}
 
 		// Circuit breaker: if this is a provider-level failure (e.g. "No
 		// available client"), record it against the model used for this
@@ -565,7 +652,7 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 		// model; if it succeeds we return without notifying the user of
 		// the error (the retry turn's content reaches them instead).
 		if s.client != nil && s.client.breaker != nil && s.lastModelUsed != nil && !s.fallbackRetryAttempted {
-			if s.client.breaker.IsProviderLevelError(errorMsg) {
+			if s.client.breaker.IsProviderSessionError(rawJSON, errorMsg) {
 				pid := s.lastModelUsed.ProviderID.Value
 				mid := s.lastModelUsed.ModelID.Value
 				s.client.breaker.RecordFailure(pid, mid, errorMsg)
@@ -682,6 +769,9 @@ func (s *StreamingSessionHandler) HandleEvent(ctx context.Context, event *openco
 						s.stopWaitingTimer()
 					}
 					s.contentSent = true
+					if s.client != nil {
+						s.client.capturePartial(s.payload, d.Properties.MessageID, s.lastContent)
+					}
 				}
 				s.lastUpdateTime = time.Now()
 			}
@@ -1175,6 +1265,22 @@ func (s *StreamingSessionHandler) extractSessionError(event *opencode.EventListR
 		return fmt.Sprintf("%s (%s)", message, code)
 	}
 	return message
+}
+
+func missingModelFromError(message string) *opencode.SessionPromptParamsModel {
+	ref, ok := strings.CutPrefix(message, "Model not found: ")
+	if !ok {
+		return nil
+	}
+	fields := strings.Fields(ref)
+	if len(fields) == 0 {
+		return nil
+	}
+	providerID, modelID, ok := parseProviderModelRef(strings.TrimSuffix(fields[0], "."))
+	if !ok {
+		return nil
+	}
+	return modelFromRef(providerID, modelID)
 }
 
 // extractQuestionFromEvent 从 question.asked 或 permission.asked 事件中提取问题内容和选项
@@ -1701,6 +1807,16 @@ func (s *StreamingSessionHandler) handleRetryPart(rawJSON string) {
 	reachedLimit := curAttempt >= maxRetryAttempts
 	if reachedLimit && !alreadySurfaced {
 		s.retrySurfaced = true
+		s.failedTurn = true
+	}
+	if s.payload.ForegroundOnly && reachedLimit && !alreadySurfaced {
+		s.terminalErr = fmt.Errorf("opencode: foreground provider retry limit reached: session=%s attempts=%d: %s",
+			s.sessionID, curAttempt, curMsg)
+		s.completed = true
+		s.emitEvent(StreamEventError, curMsg, nil, nil, nil, "retry")
+		s.notifyCompletion()
+		s.mu.Unlock()
+		return
 	}
 	s.mu.Unlock()
 
@@ -1850,7 +1966,12 @@ func (s *StreamingSessionHandler) notifyCompletion() {
 func (s *StreamingSessionHandler) fireOnComplete() {
 	if s.onComplete != nil {
 		s.onCompleteOnce.Do(func() {
-			go s.onComplete()
+			go func() {
+				s.onComplete()
+				if s.cleanupDone != nil {
+					s.cleanupDoneOnce.Do(func() { close(s.cleanupDone) })
+				}
+			}()
 		})
 	}
 }
@@ -1876,6 +1997,9 @@ func (s *StreamingSessionHandler) stopWaitingTimer() {
 func (s *StreamingSessionHandler) ResetForNewPrompt() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failedTurn {
+		return
+	}
 
 	log.Printf("opencode: resetting handler state for session %s (clearing compression artifacts: contentSent=%t, completed=%t, lastContentLen=%d)",
 		s.sessionID[:min(8, len(s.sessionID))], s.contentSent, s.completed, len(s.lastContent))
@@ -1913,21 +2037,7 @@ func (s *StreamingSessionHandler) ResetForNewPrompt() {
 	s.onCompleteOnce = sync.Once{}
 
 	// Restart the waiting hint timer for the new prompt.
-	if s.waitingTimer != nil {
-		s.waitingTimer.Stop()
-	}
-	s.waitingTimer = time.AfterFunc(8*time.Second, func() {
-		// 锁内仅判断并标记，锁外再发送：提示是信息性的，绝不能持锁
-		// 同步发送（限流下 critical 重试会把整个 SSE 事件循环冻结数分钟）。
-		s.mu.Lock()
-		if s.contentSent || s.completed || s.waitingHintSent {
-			s.mu.Unlock()
-			return
-		}
-		s.waitingHintSent = true
-		s.mu.Unlock()
-		_ = s.callback(WaitHintSignalPrefix + "⏳ 正在处理中，无需操作，请稍候...")
-	})
+	s.startWaitingHintTimer()
 }
 
 // extractPartDelta 从 message.part.delta 事件中提取增量文本

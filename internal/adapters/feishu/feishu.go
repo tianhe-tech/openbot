@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -92,8 +93,12 @@ type feishuTokenOverflowPendingState struct {
 	Attachments []opencode.Attachment
 	Metadata    map[string]string
 	Target      chatTarget
-	CreatedAt   time.Time
-	Executing   bool // 标记 executeTokenOverflowDecision 是否已在执行中
+	// DeliveryID is the transport identity of the request that overflowed.
+	// The recovery re-dispatch reuses it so the archive records one turn with
+	// a second attempt instead of a duplicate user request.
+	DeliveryID string
+	CreatedAt  time.Time
+	Executing  bool // 标记 executeTokenOverflowDecision 是否已在执行中
 }
 
 // SetRetryWorker wires up the retry store and worker for /retry command and
@@ -435,14 +440,40 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		return h.handleRetry(ctx, target, msg.UserID, strings.TrimPrefix(strings.TrimPrefix(content, "/retry"), " "))
 	}
 
-	// Handle /new or /reset command to create new session
-	if content == "/new" || content == "/reset" || content == "新会话" {
+	// Handle /new command: soft reset — save handoff summary so the next
+	// message auto-resumes with context.
+	if content == "/new" || content == "新会话" {
 		return h.handleNewSession(ctx, target, msg.UserID, msg.ChatID)
+	}
+
+	// Handle /reset command: hard reset — drop the session mapping without
+	// saving any handoff summary. The next message starts a clean session.
+	if content == "/reset" || content == "重置" {
+		return h.handleResetSession(ctx, target, msg.UserID, msg.ChatID)
 	}
 
 	// Handle /sessions or /list command to list sessions
 	if content == "/sessions" || content == "/list" {
-		return h.handleListSessions(ctx, target)
+		return h.handleListSessions(ctx, target, msg.UserID)
+	}
+
+	// Handle /switch command to resume one of this user's own sessions
+	if content == "/switch" || strings.HasPrefix(content, "/switch ") {
+		selector := strings.TrimSpace(strings.TrimPrefix(content, "/switch"))
+		return h.handleSwitch(ctx, target, msg.UserID, msg.ChatID, selector)
+	}
+
+	// Handle /release command to stop mirroring a claimed TUI session
+	if content == "/release" || content == "/unclaim" ||
+		strings.HasPrefix(content, "/release ") || strings.HasPrefix(content, "/unclaim ") {
+		selector := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(content, "/release"), "/unclaim"))
+		return h.handleRelease(ctx, target, msg.UserID, selector)
+	}
+
+	// Handle /transfer command to move a claimed TUI session to another channel
+	if content == "/transfer" || strings.HasPrefix(content, "/transfer ") {
+		args := strings.TrimSpace(strings.TrimPrefix(content, "/transfer"))
+		return h.handleTransfer(ctx, target, msg.UserID, args)
 	}
 
 	// Handle /status command to check session status
@@ -576,6 +607,12 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	// 使用独立的 context，避免被飞书 SDK 的事件处理超时影响
 	sendCtx, sendCancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer sendCancel()
+	sendStreamText := func(text string) error {
+		deliveryCtx, cancel := context.WithTimeout(context.WithoutCancel(sendCtx), time.Minute)
+		defer cancel()
+		return h.sendTextChunks(deliveryCtx, target, text)
+	}
+	var deliveryMu sync.Mutex
 
 	// 中间更新追踪（与 DingTalk 适配器保持一致，流式发送避免最终消息丢失）
 	var lastSentLength int
@@ -602,6 +639,8 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	retryMetadata := map[string]string{}
 
 	callback := func(chunk string) error {
+		deliveryMu.Lock()
+		defer deliveryMu.Unlock()
 		raw := chunk
 		trimmed := strings.TrimSpace(chunk)
 		if h.isTokenOverflowErrorText(trimmed) {
@@ -614,6 +653,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 				Attachments: append([]opencode.Attachment(nil), msg.Attachments...),
 				Metadata:    cloneStringMap(retryMetadata),
 				Target:      target,
+				DeliveryID:  msg.MessageID,
 				CreatedAt:   time.Now(),
 			}
 			if state.SessionID == "" {
@@ -625,15 +665,15 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			switch h.getTokenOverflowPolicy(msg.UserID) {
 			case feishuOverflowPolicySummary:
 				h.storeTokenOverflowPending(msg.UserID, state)
-				_ = h.sendTextChunks(sendCtx, target, "⚠️ 检测到上下文超限，已按偏好自动执行“压缩并继续”，请稍候...")
+				_ = sendStreamText("⚠️ 检测到上下文超限，已按偏好自动执行“压缩并继续”，请稍候...")
 				go h.executeTokenOverflowDecision(context.Background(), msg.UserID, "summary")
 			case feishuOverflowPolicyNew:
 				h.storeTokenOverflowPending(msg.UserID, state)
-				_ = h.sendTextChunks(sendCtx, target, "⚠️ 检测到上下文超限，已按偏好自动执行“新会话并继续”，请稍候...")
+				_ = sendStreamText("⚠️ 检测到上下文超限，已按偏好自动执行“新会话并继续”，请稍候...")
 				go h.executeTokenOverflowDecision(context.Background(), msg.UserID, "new")
 			default:
 				h.storeTokenOverflowPending(msg.UserID, state)
-				_ = h.sendTextChunks(sendCtx, target, h.buildTokenOverflowPrompt())
+				_ = sendStreamText(h.buildTokenOverflowPrompt())
 			}
 			return nil
 		}
@@ -655,7 +695,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if toolMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, toolMsg); err != nil {
+			if err := sendStreamText(toolMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send tool message: %v", err)
 				return err
 			}
@@ -667,7 +707,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if stepMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, stepMsg); err != nil {
+			if err := sendStreamText(stepMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send step message: %v", err)
 				return err
 			}
@@ -679,7 +719,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if todoMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, todoMsg); err != nil {
+			if err := sendStreamText(todoMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send todo progress: %v", err)
 				return err
 			}
@@ -690,7 +730,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			if qMsg == "" {
 				return nil
 			}
-			if err := h.sendTextChunks(sendCtx, target, qMsg); err != nil {
+			if err := sendStreamText(qMsg); err != nil {
 				log.Printf("feishu: ⚠️ failed to send question/permission message: %v", err)
 				return err
 			}
@@ -708,7 +748,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 			if thinkingMsg != "" {
 				log.Printf("feishu: 📤 flush signal: sending thinking block (%d bytes)", len(thinkingMsg))
-				if err := h.sendTextChunks(sendCtx, target, thinkingMsg); err != nil {
+				if err := sendStreamText(thinkingMsg); err != nil {
 					log.Printf("feishu: ⚠️ flush thinking send failed: %v", err)
 				} else {
 					fullReplyMu.Lock()
@@ -723,7 +763,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			fullReplyMu.Unlock()
 			if len(toSend) > 0 {
 				log.Printf("feishu: 📤 flush signal: sending final %d bytes", len(toSend))
-				if err := h.sendTextChunks(sendCtx, target, toSend); err != nil {
+				if err := sendStreamText(toSend); err != nil {
 					log.Printf("feishu: ⚠️ flush send failed: %v", err)
 					// don't update lastSentLength; safety-net final send will retry
 				} else {
@@ -741,11 +781,13 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		}
 		if strings.HasPrefix(trimmed, "ses_") && len(trimmed) < 100 {
 			h.adapter.MapUserToSession(msg.UserID, trimmed)
+			h.adapter.MapSessionData(trimmed, "receive_id", target.receiveID)
+			h.adapter.MapSessionData(trimmed, "receive_id_type", target.receiveIDType)
 			return nil
 		}
 		if isImmediateChunk(trimmed) {
 			log.Printf("feishu: 📤 sending immediate message: %s", trimmed[:min(50, len(trimmed))])
-			if err := h.sendTextChunks(sendCtx, target, raw); err != nil {
+			if err := sendStreamText(raw); err != nil {
 				log.Printf("feishu: ⚠️ failed to send immediate message: %v", err)
 				// 发送失败时的处理：
 				// - 对于"正在处理中"提示：只返回error保持waiting timer活跃，不加入fullReply（避免污染最终内容）
@@ -780,7 +822,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 		if shouldSend {
 			log.Printf("feishu: 📤 sending intermediate update (%d new chars, interval: %s)", newContentLen, timeSinceLastUpdate)
-			if err := h.sendTextChunks(sendCtx, target, toSend); err != nil {
+			if err := sendStreamText(toSend); err != nil {
 				log.Printf("feishu: ⚠️ failed to send intermediate update: %v", err)
 				// 发送失败不中断流，下次会重试（包含这部分内容）
 			} else {
@@ -828,15 +870,17 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	retryMetadata = cloneStringMap(metadata)
 
 	response, err := h.client.SendMessageStreaming(sendCtx, opencode.MessagePayload{
-		Channel:     "feishu",
-		UserID:      msg.UserID,
-		ThreadID:    threadID,
-		SessionID:   sessionID,
-		Content:     sendContent,
-		Agent:       agentName,
-		Streaming:   true,
-		Attachments: msg.Attachments,
-		Metadata:    metadata,
+		DeliveryID:      msg.MessageID,
+		OriginalContent: &msg.Content,
+		Channel:         "feishu",
+		UserID:          msg.UserID,
+		ThreadID:        threadID,
+		SessionID:       sessionID,
+		Content:         sendContent,
+		Agent:           agentName,
+		Streaming:       true,
+		Attachments:     msg.Attachments,
+		Metadata:        metadata,
 	}, callback)
 
 	log.Printf("feishu: 🔍 SendMessageStreaming returned - user=%s, err=%v, reply_len=%d, accumulated_len=%d",
@@ -844,7 +888,7 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 
 	// Enqueue for off-peak retry when the request timed out before any content
 	// was received (pure upstream model overload, not a partial-stream timeout).
-	if retryworker.IsDeadlineErr(err) && fullReply.Len() == 0 && len(response.Reply) == 0 {
+	if !h.client.DurableCaptureEnabled() && retryworker.IsDeadlineErr(err) && fullReply.Len() == 0 && len(response.Reply) == 0 {
 		if h.retryStore != nil {
 			attJSON := ""
 			if len(msg.Attachments) > 0 {
@@ -870,13 +914,15 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 		}
 	}
 
+	deliveryMu.Lock()
+	defer deliveryMu.Unlock()
 	if err != nil {
 		errMsg := fmt.Sprintf("❌ 处理失败: %v", err)
 		_ = h.sendTextChunks(sendCtx, target, errMsg)
 		return "", err
 	}
 
-	if response.SessionID != "" {
+	if response.SessionID != "" && !response.Deferred {
 		h.adapter.MapUserToSession(msg.UserID, response.SessionID)
 		h.adapter.MapSessionData(response.SessionID, "receive_id", target.receiveID)
 		h.adapter.MapSessionData(response.SessionID, "receive_id_type", target.receiveIDType)
@@ -933,6 +979,11 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 			}
 			log.Printf("feishu: ✅ sent final message to user %s (%d bytes total, %d new)",
 				userLabel, len(accumulatedContent), len(unsentContent))
+			fullReplyMu.Lock()
+			lastSentLength = len(accumulatedContent)
+			fullReplyMu.Unlock()
+		} else if response.Deferred {
+			log.Printf("feishu: delivery deferred to background retry user=%s session=%s", msg.UserID, response.SessionID)
 		} else if len(accumulatedContent) == 0 {
 			// No accumulated content (might be interactive task like permission request)
 			log.Printf("feishu: async mode completed for user %s with no accumulated content", userLabel)
@@ -946,7 +997,10 @@ func (h *Handler) handleIncomingMessage(ctx context.Context, msg incomingMessage
 	if response.Reply != "" {
 		return response.Reply, nil
 	}
-	return fullReply.String(), nil
+	fullReplyMu.Lock()
+	sentContent := fullReply.String()
+	fullReplyMu.Unlock()
+	return sentContent, nil
 }
 
 func (h *Handler) onMessageReceived(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
@@ -2099,6 +2153,24 @@ type chatTarget struct {
 	receiveIDType string
 }
 
+// sessionData renders the target as the per-session delivery metadata Feishu
+// stores elsewhere in this file ("receive_id"/"receive_id_type").
+//
+// It exists so /switch records the same keys the inbound path records. Passing
+// the chat target as a single opaque string is what previously made the claimed
+// session sender hand Feishu an adapter name where it expected a
+// receive_id_type.
+func (t chatTarget) sessionData() map[string]string {
+	data := make(map[string]string, 2)
+	if t.receiveID != "" {
+		data["receive_id"] = t.receiveID
+	}
+	if t.receiveIDType != "" {
+		data["receive_id_type"] = t.receiveIDType
+	}
+	return data
+}
+
 type incomingMessage struct {
 	UserID         string
 	ChatID         string
@@ -2333,12 +2405,16 @@ func (h *Handler) handleHelp(ctx context.Context, target chatTarget) (string, er
 
 📊 会话管理：
 /status 或 状态 - 查看当前会话状态
-/new 或 /reset - 创建新会话
-/clear 或 清除 - 删除当前会话
+/new 或 新会话 - 开启新会话（保存上下文摘要，AI 记得之前做过什么）
+/reset 或 重置 - 硬重置会话（丢弃上下文，干净开始）
+/clear 或 清除 - 删除当前会话及历史
 /fork - 派生(fork)当前会话（保留历史，创建新分支）
 /undo 或 撤销 - 撤销上一次操作
 /redo 或 重做 - 重做已撤销的操作
-/sessions 或 /list - 列出所有会话
+/sessions 或 /list - 列出我的会话
+/switch <序号> - 切换到指定会话继续
+/release - 解除 TUI 会话认领（之后可在 TUI 里 /rename 到别的渠道）
+/transfer <渠道> - 把 TUI 会话直接转交到别的渠道（不用回 TUI）
 /summary 或 压缩 - 压缩会话上下文（释放token空间）
 
 📋 任务追踪（对应 TUI 实时看板）：
@@ -2618,6 +2694,32 @@ func (h *Handler) handleNewSession(ctx context.Context, target chatTarget, userI
 	return "handled", nil
 }
 
+// handleResetSession 处理 /reset 命令（硬重置）.
+// 与 /new 不同：不保存 handoff 摘要，直接删除 thread→session 映射，
+// 下一条消息在全新 session 中开始，旧上下文全部丢弃。
+func (h *Handler) handleResetSession(ctx context.Context, target chatTarget, userID, threadID string) (string, error) {
+	var oldSessionID string
+	if sid, ok := h.adapter.GetSessionForUser(userID); ok {
+		oldSessionID = sid
+	}
+
+	if threadID != "" {
+		h.client.ResetSession(threadID)
+	}
+	h.adapter.ClearSessionForUser(userID)
+
+	var msg string
+	if oldSessionID != "" {
+		msg = fmt.Sprintf("✅ 已重置会话（旧: %s），上下文已丢弃，下次发送消息将创建全新会话",
+			oldSessionID[:min(8, len(oldSessionID))])
+	} else {
+		msg = "ℹ️ 当前没有活跃会话，直接发送消息即可开始"
+	}
+
+	_ = h.sendTextChunks(ctx, target, msg)
+	return "handled", nil
+}
+
 // handleRetry 处理 /retry 命令：查看队列状态或立即触发重试。
 // subCmd: "" 或 "status" → 查看状态; "now" → 立即处理; "clear" → 清空队列
 func (h *Handler) handleRetry(ctx context.Context, target chatTarget, userID, subCmd string) (string, error) {
@@ -2658,41 +2760,228 @@ func (h *Handler) handleRetry(ctx context.Context, target chatTarget, userID, su
 	return "handled", nil
 }
 
-// handleListSessions 处理列出所有会话命令
-func (h *Handler) handleListSessions(ctx context.Context, target chatTarget) (string, error) {
-	sessions, err := h.client.ListSessions(ctx)
+// handleListSessions lists the sessions owned by this user and tells them how
+// to resume one. Ownership is filtered by the "[channel:userID]" title prefix,
+// so one user never sees another user's conversations.
+//
+// Each row leads with a derived preview rather than the stored title: the title
+// is "[channel:userID] <threadID>", so what survives prefix stripping is an
+// opaque chat identifier that tells the user nothing about the conversation.
+func (h *Handler) handleListSessions(ctx context.Context, target chatTarget, userID string) (string, error) {
+	sessions, err := h.client.ListSessionsForUser(ctx, "feishu", userID)
 	if err != nil {
 		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 获取会话列表失败: %v", err))
 		return "", err
 	}
 
 	if len(sessions) == 0 {
-		_ = h.sendTextChunks(ctx, target, "📝 当前没有活跃的会话")
+		_ = h.sendTextChunks(ctx, target, "📝 暂无会话\n\n发送消息即可创建第一个会话")
 		return "handled", nil
 	}
 
-	var msgBuilder strings.Builder
-	msgBuilder.WriteString(fmt.Sprintf("📝 会话列表 (%d个):\n\n", len(sessions)))
+	// Only the rows that will be rendered need a preview; each one costs a
+	// history fetch, so the bound is applied before deriving them.
+	h.client.FillSessionPreviews(ctx, sessions, base.MaxSessionListRows)
 
-	maxShow := 10
-	if len(sessions) > maxShow {
-		sessions = sessions[:maxShow]
+	current, _ := h.adapter.GetSessionForUser(userID)
+
+	var msgBuilder strings.Builder
+	msgBuilder.WriteString(fmt.Sprintf("📝 我的会话 (%d个，按更新时间排序):\n\n", len(sessions)))
+
+	shown := sessions
+	if len(shown) > base.MaxSessionListRows {
+		shown = shown[:base.MaxSessionListRows]
 	}
 
-	for i, session := range sessions {
-		msgBuilder.WriteString(fmt.Sprintf("%d. %s\n", i+1, session.Title))
-		msgBuilder.WriteString(fmt.Sprintf("   ID: %s\n", session.ID[:min(8, len(session.ID))]))
-		msgBuilder.WriteString(fmt.Sprintf("   目录: %s\n", session.Directory))
-		updatedTime := time.Unix(int64(session.Time.Updated), 0).Format("2006-01-02 15:04")
-		msgBuilder.WriteString(fmt.Sprintf("   更新: %s\n", updatedTime))
+	for i, session := range shown {
+		marker := "  "
+		if session.ID == current {
+			marker = "▶ "
+		}
+		label := session.Title
+		if session.Preview != "" {
+			label = session.Preview
+		}
+		msgBuilder.WriteString(fmt.Sprintf("%s%d. %s\n", marker, i+1, label))
+		msgBuilder.WriteString(fmt.Sprintf("     ID: %s\n", session.ID[:min(8, len(session.ID))]))
+		msgBuilder.WriteString(fmt.Sprintf("     更新: %s\n", session.Updated.Format("2006-01-02 15:04")))
 		msgBuilder.WriteString("\n")
 	}
 
-	if len(sessions) == maxShow {
-		msgBuilder.WriteString(fmt.Sprintf("\n💡 只显示最近%d个会话", maxShow))
+	if len(sessions) > len(shown) {
+		msgBuilder.WriteString(fmt.Sprintf("\n💡 只显示最近%d个会话", len(shown)))
 	}
+	msgBuilder.WriteString("\n💡 发送 /switch <序号> 继续某个会话")
 
 	_ = h.sendTextChunks(ctx, target, msgBuilder.String())
+	return "handled", nil
+}
+
+// handleSwitch resumes one of the user's own sessions.
+//
+// The switch itself is transactional and shared with the other channels
+// (opencode.Client.SwitchSession): it updates both session maps, pauses the
+// other claims this chat is mirroring, and restores a claim when the target was
+// adopted from the TUI. Doing that here by hand is what used to leave a failed
+// switch reporting success while the chat pointed at a session whose delivery
+// metadata had already been deleted.
+//
+// Feishu's delivery context is the receive_id/receive_id_type pair of the
+// message that asked for the switch, so a restored claim can reply into the
+// same chat instead of guessing from per-user state.
+func (h *Handler) handleSwitch(ctx context.Context, target chatTarget, userID, threadID, selector string) (string, error) {
+	if strings.TrimSpace(selector) == "" {
+		_ = h.sendTextChunks(ctx, target, "❌ 用法: /switch <序号|会话ID前缀>\n\n先发送 /sessions 查看可选的会话")
+		return "handled", nil
+	}
+
+	result, err := h.client.SwitchSession(ctx, opencode.SessionSwitchRequest{
+		Channel:     "feishu",
+		UserID:      userID,
+		ThreadID:    threadID,
+		Selector:    selector,
+		ChannelData: target.sessionData(),
+	})
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, opencode.SwitchFailureMessage(selector, err))
+		if errors.Is(err, opencode.ErrSessionNotOwned) || errors.Is(err, opencode.ErrSessionBusy) {
+			return "handled", nil
+		}
+		return "", err
+	}
+	_ = h.sendTextChunks(ctx, target, result.Message())
+	return "handled", nil
+}
+
+// handleRelease stops mirroring a claimed TUI session into this chat and strips
+// its "[channel:userID]" title prefix.
+//
+// Stripping the prefix is what makes the release stick. AutoClaimFromTitle keys
+// on that prefix, so leaving it in place would let the next session.updated
+// event re-claim the session immediately. It is also what lets the user /rename
+// the session to a different channel afterwards.
+//
+// A session the gateway created itself is refused: it carries the same prefix
+// but is not in claimedSessions, and stripping its prefix would remove it from
+// ListSessionsForUser — the user would lose it from /sessions.
+func (h *Handler) handleRelease(ctx context.Context, target chatTarget, userID, selector string) (string, error) {
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if strings.TrimSpace(selector) != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "feishu", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector))
+				return "handled", nil
+			}
+			_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 解除认领失败: %v", err))
+			return "", err
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话")
+		return "handled", nil
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf(
+			"ℹ️ 会话 %s 不是从 TUI 认领的，无需解除\n\n（网关自己创建的会话不能解除，否则会从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))]))
+		return "handled", nil
+	}
+
+	title, err := h.client.UnclaimSession(ctx, sessionID)
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 解除认领失败: %v", err))
+		return "", err
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that is no longer mirrored here.
+	if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+		h.adapter.ClearSessionForUser(userID)
+	}
+
+	log.Printf("feishu: /release user=%s session=%s", userID, sessionID[:min(8, len(sessionID))])
+	_ = h.sendTextChunks(ctx, target, fmt.Sprintf(
+		"✅ 已解除认领\n\nID: %s\n标题: %s\n\n💡 现在可以在 TUI 里 /rename 成别的渠道，例如 [dingtalk] 原标题",
+		sessionID[:min(8, len(sessionID))], title))
+	return "handled", nil
+}
+
+// handleTransfer moves a claimed TUI session to another chat channel without
+// going back to the TUI.
+//
+// It is the chat-side equivalent of /rename: the session keeps its history and
+// its ID, only the ownership prefix changes. The heavy lifting (release, title
+// rewrite, re-claim) lives in Client.TransferSession so all four adapters share
+// one implementation.
+//
+// The target user must have sent at least one message to that channel's bot,
+// otherwise the platform has no delivery target for them. That precondition is
+// the same one /rename has, and it cannot be checked from here.
+func (h *Handler) handleTransfer(ctx context.Context, target chatTarget, userID, args string) (string, error) {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		_ = h.sendTextChunks(ctx, target, "用法: /transfer <渠道>[:<用户ID>] [序号|会话ID前缀]\n\n"+
+			"例如:\n/transfer feishu\n/transfer dingtalk:manager123\n/transfer wechat 2")
+		return "handled", nil
+	}
+
+	channel, targetUser, _ := strings.Cut(fields[0], ":")
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	targetUser = strings.TrimSpace(targetUser)
+	selector := ""
+	if len(fields) > 1 {
+		selector = fields[1]
+	}
+
+	sessionID, ok := h.adapter.GetSessionForUser(userID)
+	if selector != "" {
+		resolved, err := h.client.ResolveUserSession(ctx, "feishu", userID, selector)
+		if err != nil {
+			if errors.Is(err, opencode.ErrSessionNotOwned) {
+				_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 找不到会话 %q\n\n发送 /sessions 查看你自己的会话列表", selector))
+				return "handled", nil
+			}
+			_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 转交失败: %v", err))
+			return "", err
+		}
+		sessionID = resolved.ID
+		ok = true
+	}
+	if !ok || sessionID == "" {
+		_ = h.sendTextChunks(ctx, target, "ℹ️ 当前没有活跃的会话\n\n发送消息将自动创建新会话")
+		return "handled", nil
+	}
+
+	if !h.client.IsClaimedSession(sessionID) {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf(
+			"ℹ️ 会话 %s 不是从 TUI 认领的，不能转交\n\n（网关自己创建的会话已经绑定在本渠道，转交会让它从 /sessions 里消失）",
+			sessionID[:min(8, len(sessionID))]))
+		return "handled", nil
+	}
+
+	title, err := h.client.TransferSession(ctx, sessionID, channel, targetUser)
+	if err != nil {
+		_ = h.sendTextChunks(ctx, target, fmt.Sprintf("❌ 转交失败: %v", err))
+		return "", err
+	}
+
+	// Drop this chat's binding so the next message starts a fresh session
+	// instead of silently continuing one that now belongs to another channel.
+	if !h.client.IsClaimedSessionFor(sessionID, "feishu", userID) {
+		if current, bound := h.adapter.GetSessionForUser(userID); bound && current == sessionID {
+			h.adapter.ClearSessionForUser(userID)
+		}
+	}
+
+	log.Printf("feishu: /transfer user=%s session=%s -> %s/%s",
+		userID, sessionID[:min(8, len(sessionID))], channel, targetUser)
+	_ = h.sendTextChunks(ctx, target, fmt.Sprintf(
+		"✅ 已转交到 %s\n\nID: %s\n标题: %s\n\n💡 目标用户需要先给 %s 的 bot 发过至少一条消息，否则那边收不到输出",
+		channel, sessionID[:min(8, len(sessionID))], title, channel))
 	return "handled", nil
 }
 
@@ -3018,6 +3307,10 @@ func (h *Handler) handleExecuteCommand(ctx context.Context, target chatTarget, u
 			Channel: "feishu",
 			UserID:  userID,
 			Content: "Initialize session",
+			// Bootstrap prompt: it exists only to materialize an upstream
+			// session for shell execution and is not a user request, so it
+			// must never become an archived conversation turn.
+			Internal: true,
 		})
 		if err != nil {
 			log.Printf("feishu: failed to create session: %v", err)
@@ -3475,15 +3768,17 @@ func (h *Handler) executeTokenOverflowDecision(ctx context.Context, userID, deci
 	}
 
 	response, err := h.client.SendMessageStreaming(runCtx, opencode.MessagePayload{
-		Channel:     "feishu",
-		UserID:      state.UserID,
-		ThreadID:    state.ThreadID,
-		SessionID:   state.SessionID,
-		Content:     state.Content,
-		Agent:       state.Agent,
-		Streaming:   true,
-		Attachments: append([]opencode.Attachment(nil), state.Attachments...),
-		Metadata:    cloneStringMap(state.Metadata),
+		DeliveryID:      state.DeliveryID,
+		RetryOfDelivery: state.DeliveryID != "",
+		Channel:         "feishu",
+		UserID:          state.UserID,
+		ThreadID:        state.ThreadID,
+		SessionID:       state.SessionID,
+		Content:         state.Content,
+		Agent:           state.Agent,
+		Streaming:       true,
+		Attachments:     append([]opencode.Attachment(nil), state.Attachments...),
+		Metadata:        cloneStringMap(state.Metadata),
 	}, retryCallback)
 	if err != nil {
 		_ = h.sendTextChunks(runCtx, state.Target, fmt.Sprintf("❌ 已尝试%s后重试，但仍失败：%v", tokenOverflowDecisionLabel(decision), err))
@@ -3687,6 +3982,9 @@ func (h *Handler) handleCronTaskAdd(ctx context.Context, target chatTarget, user
 		CronExpr:    cronExpr,
 		Enabled:     true,
 		AdapterType: "feishu",
+		UserID:      userID,
+		ThreadID:    target.receiveID,
+		Channel:     target.receiveID,
 		Content:     taskContent,
 		Agent:       agent,
 		Metadata: map[string]interface{}{
@@ -3957,7 +4255,8 @@ func (h *Handler) sendCronTaskHelp(ctx context.Context, target chatTarget) (stri
 • "0 0 12 * * 1-5" - 工作日中午12点
 • "0 0 0 1 * *" - 每月1号零点
 
-💡 提示: 任务会在指定时间自动执行，结果会发送到当前会话`
+💡 提示: 任务会在指定时间自动执行，结果会发送到当前会话
+💡 也支持自然语言: /crontask 把每日检查改到每天下午3点`
 
 	_ = h.sendTextChunks(ctx, target, helpMsg)
 	return "handled", nil

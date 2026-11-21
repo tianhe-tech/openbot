@@ -40,26 +40,27 @@ const (
 
 // Task 表示一个待执行的任务
 type Task struct {
-	ID          string                 `json:"id"`
-	Type        TaskType               `json:"type"`
-	Priority    TaskPriority           `json:"priority"`
-	Status      TaskStatus             `json:"status"`
-	AdapterType string                 `json:"adapter_type"` // 来源adapter类型（dingtalk/wecom/feishu）
-	UserID      string                 `json:"user_id"`
-	Channel     string                 `json:"channel"`     // 用于回复的channel
-	ThreadID    string                 `json:"thread_id"`   // 会话ID
-	SessionID   string                 `json:"session_id"`  // OpenCode session ID
-	Content     string                 `json:"content"`     // 任务内容
-	Agent       string                 `json:"agent"`       // 指定的agent名称
-	ScriptPath  string                 `json:"script_path"` // 脚本路径（TaskTypeScript）
-	Metadata    map[string]interface{} `json:"metadata"`    // 额外元数据
-	CreatedAt   time.Time              `json:"created_at"`
-	StartedAt   *time.Time             `json:"started_at"`
-	CompletedAt *time.Time             `json:"completed_at"`
-	Result      string                 `json:"result"`      // 执行结果
-	Error       string                 `json:"error"`       // 错误信息
-	RetryCount  int                    `json:"retry_count"` // 重试次数
-	MaxRetries  int                    `json:"max_retries"` // 最大重试次数
+	OnSessionResolved func(context.Context, string) error `json:"-"`
+	ID                string                              `json:"id"`
+	Type              TaskType                            `json:"type"`
+	Priority          TaskPriority                        `json:"priority"`
+	Status            TaskStatus                          `json:"status"`
+	AdapterType       string                              `json:"adapter_type"` // 来源adapter类型（dingtalk/wecom/feishu）
+	UserID            string                              `json:"user_id"`
+	Channel           string                              `json:"channel"`     // 用于回复的channel
+	ThreadID          string                              `json:"thread_id"`   // 会话ID
+	SessionID         string                              `json:"session_id"`  // OpenCode session ID
+	Content           string                              `json:"content"`     // 任务内容
+	Agent             string                              `json:"agent"`       // 指定的agent名称
+	ScriptPath        string                              `json:"script_path"` // 脚本路径（TaskTypeScript）
+	Metadata          map[string]interface{}              `json:"metadata"`    // 额外元数据
+	CreatedAt         time.Time                           `json:"created_at"`
+	StartedAt         *time.Time                          `json:"started_at"`
+	CompletedAt       *time.Time                          `json:"completed_at"`
+	Result            string                              `json:"result"`      // 执行结果
+	Error             string                              `json:"error"`       // 错误信息
+	RetryCount        int                                 `json:"retry_count"` // 重试次数
+	MaxRetries        int                                 `json:"max_retries"` // 最大重试次数
 }
 
 // ScheduledTask 定时任务
@@ -68,10 +69,13 @@ type ScheduledTask struct {
 	Name          string                 `json:"name"`
 	Description   string                 `json:"description"`
 	Type          TaskType               `json:"type"`
-	CronExpr      string                 `json:"cron_expr"`       // Cron表达式
-	Enabled       bool                   `json:"enabled"`         // 是否启用
-	AdapterType   string                 `json:"adapter_type"`    // 发送结果到哪个adapter
-	Channel       string                 `json:"channel"`         // 发送到哪个channel
+	CronExpr      string                 `json:"cron_expr"`    // Cron表达式
+	Enabled       bool                   `json:"enabled"`      // 是否启用
+	AdapterType   string                 `json:"adapter_type"` // 发送结果到哪个adapter
+	Channel       string                 `json:"channel"`      // 发送到哪个channel
+	UserID        string                 `json:"user_id"`      // 任务归属用户，用于 session 标题前缀
+	ThreadID      string                 `json:"thread_id"`    // 会话/群ID，用于 session 标题后缀
+	SessionID     string                 `json:"session_id,omitempty"`
 	Content       string                 `json:"content"`         // 固定内容或提示词
 	Agent         string                 `json:"agent"`           // 使用的agent
 	ScriptPath    string                 `json:"script_path"`     // 脚本路径

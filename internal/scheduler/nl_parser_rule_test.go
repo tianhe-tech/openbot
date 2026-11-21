@@ -106,3 +106,40 @@ func TestRuleBasedParserAvoidSimpleFalsePositive(t *testing.T) {
 		t.Fatalf("Parse() action = %s, want %s", intent.Action, NLScheduleActionUnknown)
 	}
 }
+
+func TestRuleBasedParserUpdateResolvesNewCron(t *testing.T) {
+	p := NewRuleBasedNLScheduleIntentParser()
+	intent, err := p.Parse("把每日检查改到每天下午3点")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if intent.Action != NLScheduleActionUpdate {
+		t.Fatalf("Parse() action = %s, want %s", intent.Action, NLScheduleActionUpdate)
+	}
+	if intent.CronExpr != "0 0 15 * * *" {
+		t.Fatalf("cron = %q, want %q", intent.CronExpr, "0 0 15 * * *")
+	}
+	// The instruction sentence must not become the task's prompt. Only Create
+	// treats the whole sentence as content; for Update that would overwrite the
+	// task's real prompt with "把每日检查改到每天下午3点".
+	if intent.Content != "" {
+		t.Fatalf("content = %q, want empty for an update instruction", intent.Content)
+	}
+}
+
+func TestRuleBasedParserUpdateWithoutTimeIsAmbiguous(t *testing.T) {
+	p := NewRuleBasedNLScheduleIntentParser()
+	intent, err := p.Parse("修改任务 cron-123")
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if intent.Action != NLScheduleActionUpdate {
+		t.Fatalf("Parse() action = %s, want %s", intent.Action, NLScheduleActionUpdate)
+	}
+	if intent.CronExpr != "" {
+		t.Fatalf("cron = %q, want empty", intent.CronExpr)
+	}
+	if len(intent.Ambiguities) == 0 {
+		t.Fatalf("an update with no new time should report an ambiguity")
+	}
+}

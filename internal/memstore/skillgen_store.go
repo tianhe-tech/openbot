@@ -102,34 +102,32 @@ func (s *Store) GetSkillCandidate(id string) (*SkillCandidate, error) {
 // ListSkillCandidatesByStatus lists candidates filtered by status ("" = any).
 // Newest first, limited to n rows (n <= 0 defaults to 50).
 func (s *Store) ListSkillCandidatesByStatus(status string, n int) ([]SkillCandidate, error) {
+	return s.listSkillCandidates(status, n, "", "")
+}
+
+func (s *Store) ListSkillCandidatesForUser(adapter, userID, status string, n int) ([]SkillCandidate, error) {
+	if adapter == "" || userID == "" {
+		return nil, fmt.Errorf("memstore: candidate listing requires an adapter and user")
+	}
+	return s.listSkillCandidates(status, n, adapter, userID)
+}
+
+func (s *Store) listSkillCandidates(status string, n int, adapter, userID string) ([]SkillCandidate, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("memstore: nil store")
 	}
 	if n <= 0 {
 		n = 50
 	}
-	var (
-		rowsErr error
-		out     []SkillCandidate
-	)
-	if status == "" {
-		rowsPtr, err := s.db.Query(`SELECT id, trigger, adapter, user_id, thread_id, session_id, status, score, model_id, title, skill_md, draft_path, notes, created_at, reviewed_at
-			FROM skill_candidates ORDER BY created_at DESC LIMIT ?`, n)
-		if err != nil {
-			return nil, err
-		}
-		defer rowsPtr.Close()
-		out, rowsErr = scanSkillCandidates(rowsPtr)
-	} else {
-		rowsPtr, err := s.db.Query(`SELECT id, trigger, adapter, user_id, thread_id, session_id, status, score, model_id, title, skill_md, draft_path, notes, created_at, reviewed_at
-			FROM skill_candidates WHERE status = ? ORDER BY created_at DESC LIMIT ?`, status, n)
-		if err != nil {
-			return nil, err
-		}
-		defer rowsPtr.Close()
-		out, rowsErr = scanSkillCandidates(rowsPtr)
+	rows, err := s.db.Query(`SELECT id, trigger, adapter, user_id, thread_id, session_id, status, score, model_id, title, skill_md, draft_path, notes, created_at, reviewed_at
+		FROM skill_candidates
+		WHERE (? = '' OR status = ?) AND (? = '' OR (adapter = ? AND user_id = ?))
+		ORDER BY created_at DESC LIMIT ?`, status, status, adapter, adapter, userID, n)
+	if err != nil {
+		return nil, err
 	}
-	return out, rowsErr
+	defer rows.Close()
+	return scanSkillCandidates(rows)
 }
 
 // scanSkillCandidates is a shared row-scanner.

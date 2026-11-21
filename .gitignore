@@ -29,6 +29,22 @@ Thumbs.db
 .env
 .env.local
 
+# Memory archive. The default MEMORY_STORE_PATH is <OPENCODE_DIRECTORY>/mem/memory.db,
+# and OPENCODE_DIRECTORY defaults to ".", so a default deployment writes the
+# conversation archive into the repository root. It holds private conversation
+# text, so it must never be committed.
+mem/
+*.db
+*.db-wal
+*.db-shm
+
+# SSH private keys — never commit these
+huoshanyun*
+hunshanyun*
+*.pem
+id_rsa
+id_ed25519
+
 # Test coverage
 *.cover
 coverage.txt
@@ -37,3 +53,10 @@ coverage.txt
 tmp/
 temp/
 node_modules
+
+# Local scratch files under test/. These are personal debugging helpers, not
+# part of the test suite, and they do not compile as a package (duplicate
+# main functions), so `go build ./...` fails while they are present. Keep them
+# on disk but out of the repository.
+test/test1.go
+test/viewer.go

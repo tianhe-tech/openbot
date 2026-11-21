@@ -25,6 +25,7 @@ type QRCodeStatusResponse struct {
 // --- GetUpdates Types ---
 
 type WeixinMessage struct {
+	deliveryIDs  []string
 	Seq          int           `json:"seq,omitempty"`
 	MessageID    int64         `json:"message_id,omitempty"`
 	FromUserID   string        `json:"from_user_id,omitempty"`
